@@ -194,25 +194,43 @@ export class SellerScoringService {
         const composite = this.round(100 * (0.5 * fulfillmentSla + 0.5 * (1 - cancellationReturnRate)));
         const flagged = composite < this.options.flaggingThreshold;
 
-        // 7. Upsert the current SellerScore and insert exactly one immutable snapshot.
-        // Snapshot integrity (AAP §0.9.3): exactly one SellerScoreSnapshot per non-null
-        // recalculation, always freshly constructed and inserted (never updated).
-        const sellerScore = await this.upsertSellerScore(ctx, sellerId, {
-            score: composite,
-            fulfillmentSla,
-            cancellationReturnRate,
-            flagged,
-            lastCalculatedAt: now,
-        });
-        await this.connection.getRepository(ctx, SellerScoreSnapshot).save(
-            new SellerScoreSnapshot({
-                sellerId,
+        // 7. Upsert the current SellerScore and insert exactly one immutable snapshot,
+        // atomically. Snapshot integrity (AAP §0.9.3): exactly one SellerScoreSnapshot per
+        // non-null recalculation, always freshly constructed and inserted (never updated).
+        //
+        // The current-score upsert and the snapshot insert are wrapped in a single
+        // transaction so they commit — or roll back — as a unit: a successful non-null
+        // recalculation always leaves behind exactly one new snapshot, and if either write
+        // fails neither is persisted (no orphaned current-score update without its snapshot).
+        // Combined with the conflict-safe upsert in upsertSellerScore(), this guarantees no
+        // snapshot is dropped even when two events for the same seller are processed
+        // concurrently: the first recalculation INSERTs the current row, the second takes the
+        // ON-CONFLICT UPDATE path (neither aborts on the unique sellerId constraint), and —
+        // because the snapshot table is not uniquely keyed by sellerId — both still insert
+        // their own snapshot. withTransaction runs in 'auto' mode, so it joins an ambient
+        // transaction (e.g. the recalculateSellerScore mutation's @Transaction) when one is
+        // already open and otherwise starts its own for event-driven recalculations. All
+        // writes inside the callback MUST use `txCtx` (never the outer `ctx`) so they run
+        // inside the transaction.
+        const sellerScore = await this.connection.withTransaction(ctx, async txCtx => {
+            const current = await this.upsertSellerScore(txCtx, sellerId, {
                 score: composite,
                 fulfillmentSla,
                 cancellationReturnRate,
-                calculatedAt: now,
-            }),
-        );
+                flagged,
+                lastCalculatedAt: now,
+            });
+            await this.connection.getRepository(txCtx, SellerScoreSnapshot).save(
+                new SellerScoreSnapshot({
+                    sellerId,
+                    score: composite,
+                    fulfillmentSla,
+                    cancellationReturnRate,
+                    calculatedAt: now,
+                }),
+            );
+            return current;
+        });
         Logger.verbose(
             `Recalculated seller ${String(sellerId)}: score=${composite} sla=${fulfillmentSla} ` +
                 `crr=${cancellationReturnRate} flagged=${String(flagged)}`,
@@ -270,11 +288,21 @@ export class SellerScoringService {
     }
 
     /**
-     * Upserts the single current {@link SellerScore} row for a seller. There is exactly
-     * one current-score row per seller (enforced by a unique index on `sellerId`), so an
-     * existing row is loaded and mutated in place; otherwise a new row is created. Only
-     * the score, per-metric values, flag, and last-calculated timestamp are written — the
-     * `sellerId` reference is set once on creation and never changed.
+     * Atomically upserts the single current {@link SellerScore} row for a seller. There is
+     * exactly one current-score row per seller, enforced by a unique index on `sellerId`.
+     *
+     * A read-then-write (findOne + save) is NOT concurrency-safe: two first-time
+     * recalculations for the same seller could both observe no row, both construct a new
+     * SellerScore, and the second save() would then violate the unique `sellerId`
+     * constraint — aborting that recalculation before its snapshot is written and thereby
+     * dropping a required snapshot (AAP §0.9.3). Instead a single atomic upsert is issued,
+     * keyed on the unique `sellerId` column (`INSERT ... ON CONFLICT (sellerId) DO UPDATE`,
+     * abstracted across the supported SQL drivers by TypeORM — the same pattern core uses in
+     * its SqlCacheStrategy). Concurrent first recalculations therefore resolve to one INSERT
+     * and one conflict-driven UPDATE with no constraint failure. Only the score, per-metric
+     * values, flag, and last-calculated timestamp are written; `sellerId` is set on insert
+     * and never changed. `upsert()` returns only an InsertResult, so the managed row is
+     * re-read and returned (guaranteed present immediately after a successful upsert).
      */
     private async upsertSellerScore(
         ctx: RequestContext,
@@ -285,16 +313,18 @@ export class SellerScoringService {
         >,
     ): Promise<SellerScore> {
         const repo = this.connection.getRepository(ctx, SellerScore);
-        let sellerScore = await repo.findOne({ where: { sellerId } });
-        if (!sellerScore) {
-            sellerScore = new SellerScore({ sellerId });
-        }
-        sellerScore.score = data.score;
-        sellerScore.fulfillmentSla = data.fulfillmentSla;
-        sellerScore.cancellationReturnRate = data.cancellationReturnRate;
-        sellerScore.flagged = data.flagged;
-        sellerScore.lastCalculatedAt = data.lastCalculatedAt;
-        return repo.save(sellerScore);
+        await repo.upsert(
+            new SellerScore({
+                sellerId,
+                score: data.score,
+                fulfillmentSla: data.fulfillmentSla,
+                cancellationReturnRate: data.cancellationReturnRate,
+                flagged: data.flagged,
+                lastCalculatedAt: data.lastCalculatedAt,
+            }),
+            ['sellerId'],
+        );
+        return repo.findOneOrFail({ where: { sellerId } });
     }
 
     /**
