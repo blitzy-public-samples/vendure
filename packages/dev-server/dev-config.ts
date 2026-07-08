@@ -20,6 +20,7 @@ import {
 import { DashboardPlugin } from '@vendure/dashboard/plugin';
 import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
 import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
+import { SellerScoringPlugin } from '@vendure/seller-scoring-plugin';
 import { TelemetryPlugin } from '@vendure/telemetry-plugin';
 import 'dotenv/config';
 import path from 'path';
@@ -125,6 +126,10 @@ export const devConfig: VendureConfig = {
         // }),
         ReadonlySettingsTestPlugin,
         ReviewsPlugin,
+        // Registers the new Seller Performance Scoring plugin (@vendure/seller-scoring-plugin).
+        // slaHours = fulfillment SLA window (default 48h); flaggingThreshold = composite-score
+        // cutoff below which a seller is flagged. Added for the Seller Performance Scoring feature.
+        SellerScoringPlugin.init({ slaHours: 48, flaggingThreshold: 70 }),
         // FieldTestPlugin,
         NavModifierPlugin,
         GraphiqlPlugin.init(),
