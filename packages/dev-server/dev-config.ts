@@ -20,11 +20,20 @@ import {
 import { DashboardPlugin } from '@vendure/dashboard/plugin';
 import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
 import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
-import { SellerScoringPlugin } from '@vendure/seller-scoring-plugin';
 import { TelemetryPlugin } from '@vendure/telemetry-plugin';
 import 'dotenv/config';
 import path from 'path';
 import { DataSourceOptions } from 'typeorm';
+// The Seller Performance Scoring plugin is registered via a RELATIVE import to its
+// workspace source (mirroring ReviewsPlugin / NavModifierPlugin below) rather than by
+// its published package name (`@vendure/seller-scoring-plugin`). This routes it through
+// the @vendure/dashboard Vite plugin's local-source discovery path so its dashboard
+// extension (seller-detail score block, Flagged Sellers route, summary widget) is
+// compiled into the dashboard bundle. A bare package-name import is not discovered in
+// this Bun workspace layout (the dashboard build's node_modules-root guess resolves the
+// symlinked workspace package incorrectly), which would leave the three UI surfaces
+// absent at runtime.
+import { SellerScoringPlugin } from '../seller-scoring-plugin/src/seller-scoring.plugin';
 import { NavModifierPlugin } from './test-plugins/nav-modifier-plugin/nav-modifier-plugin';
 // import { FieldTestPlugin } from './test-plugins/field-test/field-test-plugin';
 import { ReviewsPlugin } from './test-plugins/reviews/reviews-plugin';

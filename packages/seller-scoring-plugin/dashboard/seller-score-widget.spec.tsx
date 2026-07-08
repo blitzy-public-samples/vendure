@@ -26,7 +26,7 @@ vi.mock('@tanstack/react-query', () => ({
 vi.mock('@lingui/react/macro', () => ({
     Trans: ({ children }: any) => createElement('span', null, children),
 }));
-vi.mock('@/graphql/operations', () => ({ getFlaggedSellersDocument: { __doc: 'GetFlaggedSellers' } }));
+vi.mock('./graphql/operations', () => ({ getFlaggedSellersDocument: { __doc: 'GetFlaggedSellers' } }));
 vi.mock('@vendure/dashboard', () => ({
     Alert: ({ children, variant }: any) =>
         createElement('div', { 'data-slot': 'alert', 'data-variant': variant ?? 'default' }, children),

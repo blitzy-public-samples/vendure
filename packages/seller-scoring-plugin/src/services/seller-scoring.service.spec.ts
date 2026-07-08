@@ -12,15 +12,20 @@ import { SellerScoringService } from './seller-scoring.service';
  * Minimal shape of a mocked TypeORM repository. The {@link SellerScoringService}
  * resolves repositories via `TransactionalConnection.getRepository` and calls
  * `findOne`/`find` (reads), `save` (the immutable snapshot insert), and — for the
- * single current-score row — the atomic `upsert(entity, ['sellerId'])` followed by
- * `findOneOrFail({ where: { sellerId } })`. Those are the methods the fakes expose.
+ * single current-score row — an atomic query-builder upsert
+ * (`createQueryBuilder().insert().values(...).updateEntity(false).orUpdate(..., ['sellerId']).execute()`)
+ * followed by `findOneOrFail({ where: { sellerId } })`. Those are the methods the fakes expose.
+ * `insertValues`/`insertOrUpdate`/`insertExecute` are the recorded links of the upsert chain.
  */
 type RepoMock = {
     findOne: ReturnType<typeof vi.fn>;
     findOneOrFail: ReturnType<typeof vi.fn>;
     find: ReturnType<typeof vi.fn>;
     save: ReturnType<typeof vi.fn>;
-    upsert: ReturnType<typeof vi.fn>;
+    createQueryBuilder: ReturnType<typeof vi.fn>;
+    insertValues: ReturnType<typeof vi.fn>;
+    insertOrUpdate: ReturnType<typeof vi.fn>;
+    insertExecute: ReturnType<typeof vi.fn>;
 };
 
 /**
@@ -28,24 +33,45 @@ type RepoMock = {
  * `find` resolves an empty array, and `save` echoes back the entity it was given
  * (so a returned {@link SellerScore} carries the fields the service set on it).
  *
- * The current-score row is persisted with an atomic `upsert(entity, ['sellerId'])`
- * (returning a TypeORM InsertResult) followed by `findOneOrFail({ where: { sellerId } })`.
- * The fake records the entity handed to `upsert` and has `findOneOrFail` resolve that
- * same entity, so the value the service returns still carries exactly the score,
- * per-metric, flag and timestamp fields it just computed — preserving the exact-value
- * assertions below.
+ * The current-score row is persisted with an atomic query-builder upsert —
+ * `createQueryBuilder().insert().values(payload).updateEntity(false).orUpdate([...], ['sellerId']).execute()`
+ * — followed by `findOneOrFail({ where: { sellerId } })`. A single chainable builder
+ * stand-in is returned by every `createQueryBuilder()` call; its `values`/`orUpdate`/
+ * `execute` links are shared `vi.fn()` spies (so cross-recalc call counts stay exact),
+ * while `insert`/`into`/`updateEntity` are pass-through links. The fake records the
+ * payload handed to `values(...)` and has `findOneOrFail` resolve that same payload, so
+ * the value the service returns still carries exactly the score, per-metric, flag and
+ * timestamp fields it just computed — preserving the exact-value assertions below.
  */
 function createRepoMock(): RepoMock {
     let lastUpserted: any;
+    const insertValues = vi.fn().mockImplementation((values: any) => {
+        lastUpserted = values;
+        return builder;
+    });
+    const insertOrUpdate = vi.fn().mockImplementation(() => builder);
+    const insertExecute = vi
+        .fn()
+        .mockImplementation(() => Promise.resolve({ identifiers: [], generatedMaps: [], raw: [] }));
+    // A chainable InsertQueryBuilder stand-in. insert()/into()/updateEntity() are
+    // pass-through links; values()/orUpdate()/execute() are the recorded spies above.
+    const builder: any = {
+        insert: vi.fn(() => builder),
+        into: vi.fn(() => builder),
+        updateEntity: vi.fn(() => builder),
+        values: insertValues,
+        orUpdate: insertOrUpdate,
+        execute: insertExecute,
+    };
     return {
         findOne: vi.fn().mockResolvedValue(null),
         findOneOrFail: vi.fn().mockImplementation(() => Promise.resolve(lastUpserted)),
         find: vi.fn().mockResolvedValue([]),
         save: vi.fn().mockImplementation((entity: any) => Promise.resolve(entity)),
-        upsert: vi.fn().mockImplementation((entity: any) => {
-            lastUpserted = entity;
-            return Promise.resolve({ identifiers: [], generatedMaps: [], raw: [] });
-        }),
+        createQueryBuilder: vi.fn(() => builder),
+        insertValues,
+        insertOrUpdate,
+        insertExecute,
     };
 }
 
@@ -147,7 +173,7 @@ describe('SellerScoringService', () => {
         expect(result!.cancellationReturnRate).toBe(0.1);
         expect(result!.score).toBe(85.0);
         expect(result!.flagged).toBe(false);
-        expect(scoreRepo.upsert).toHaveBeenCalledTimes(1);
+        expect(scoreRepo.insertExecute).toHaveBeenCalledTimes(1);
         expect(snapshotRepo.save).toHaveBeenCalledTimes(1);
     });
 
@@ -161,7 +187,7 @@ describe('SellerScoringService', () => {
         expect(result!.cancellationReturnRate).toBe(1);
         expect(result!.score).toBe(0.0);
         expect(result!.flagged).toBe(true);
-        expect(scoreRepo.upsert).toHaveBeenCalledTimes(1);
+        expect(scoreRepo.insertExecute).toHaveBeenCalledTimes(1);
         expect(snapshotRepo.save).toHaveBeenCalledTimes(1);
     });
 
@@ -175,7 +201,7 @@ describe('SellerScoringService', () => {
         expect(result!.cancellationReturnRate).toBeNull();
         expect(result!.flagged).toBe(false);
         expect(result!.lastCalculatedAt).toBeInstanceOf(Date);
-        expect(scoreRepo.upsert).toHaveBeenCalledTimes(1);
+        expect(scoreRepo.insertExecute).toHaveBeenCalledTimes(1);
         expect(snapshotRepo.save).not.toHaveBeenCalled();
     });
 
@@ -235,7 +261,7 @@ describe('SellerScoringService', () => {
         await service.recalculate(ctx, SELLER_ID);
         await service.recalculate(ctx, SELLER_ID);
 
-        expect(scoreRepo.upsert).toHaveBeenCalledTimes(2);
+        expect(scoreRepo.insertExecute).toHaveBeenCalledTimes(2);
         expect(snapshotRepo.save).toHaveBeenCalledTimes(2);
     });
 
@@ -248,7 +274,8 @@ describe('SellerScoringService', () => {
 
         expect(result).toBe(existing);
         expect(orderRepo.find).not.toHaveBeenCalled();
-        expect(scoreRepo.upsert).not.toHaveBeenCalled();
+        expect(scoreRepo.insertExecute).not.toHaveBeenCalled();
+        expect(scoreRepo.createQueryBuilder).not.toHaveBeenCalled();
         expect(scoreRepo.save).not.toHaveBeenCalled();
         expect(snapshotRepo.save).not.toHaveBeenCalled();
     });
@@ -284,19 +311,28 @@ describe('SellerScoringService', () => {
 
         const result = await service.recalculate(ctx, SELLER_ID);
 
-        // The current-score row is written with a single atomic upsert — never the legacy
-        // findOne + read-modify-write save path — so concurrent first recalculations cannot
-        // both insert and collide on the unique sellerId constraint (AAP §0.9.3).
-        expect(scoreRepo.upsert).toHaveBeenCalledTimes(1);
+        // The current-score row is written with a single atomic query-builder upsert — never
+        // the legacy findOne + read-modify-write save path — so concurrent first recalculations
+        // cannot both insert and collide on the unique sellerId constraint (AAP §0.9.3).
+        expect(scoreRepo.insertExecute).toHaveBeenCalledTimes(1);
         expect(scoreRepo.save).not.toHaveBeenCalled();
 
         // The upsert's conflict target is the unique `sellerId` column, guaranteeing exactly
-        // one current row per seller (an existing row is updated in place, not duplicated).
-        const [upsertedEntity, conflictPaths] = scoreRepo.upsert.mock.calls[0];
+        // one current row per seller (an existing row is updated in place, not duplicated); the
+        // overwrite list carries exactly the mutable score/metric/flag/timestamp columns.
+        const [insertedValues] = scoreRepo.insertValues.mock.calls[0];
+        const [overwriteColumns, conflictPaths] = scoreRepo.insertOrUpdate.mock.calls[0];
         expect(conflictPaths).toEqual(['sellerId']);
-        expect(upsertedEntity.sellerId).toBe(SELLER_ID);
-        expect(upsertedEntity.score).toBe(100);
-        expect(upsertedEntity.flagged).toBe(false);
+        expect(overwriteColumns).toEqual([
+            'score',
+            'fulfillmentSla',
+            'cancellationReturnRate',
+            'flagged',
+            'lastCalculatedAt',
+        ]);
+        expect(insertedValues.sellerId).toBe(SELLER_ID);
+        expect(insertedValues.score).toBe(100);
+        expect(insertedValues.flagged).toBe(false);
 
         // The returned value is the current row re-read after the upsert (findOneOrFail),
         // carrying the freshly-computed score.

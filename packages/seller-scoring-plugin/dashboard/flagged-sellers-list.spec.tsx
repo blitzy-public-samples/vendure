@@ -40,7 +40,7 @@ vi.mock('@lingui/react/macro', () => ({
     useLingui: () => ({ t: (s: any) => (Array.isArray(s) ? s.join('') : s) }),
 }));
 vi.mock('sonner', () => ({ toast: { success: h.toastSuccess, error: h.toastError } }));
-vi.mock('@/graphql/operations', () => ({
+vi.mock('./graphql/operations', () => ({
     getFlaggedSellersDocument: { __doc: 'GetFlaggedSellers' },
     recalculateSellerScoreDocument: { __doc: 'RecalculateSellerScore' },
 }));

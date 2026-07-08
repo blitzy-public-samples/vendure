@@ -29,7 +29,7 @@ vi.mock('@lingui/react/macro', () => ({
     Trans: ({ children }: any) => createElement('span', null, children),
     useLingui: () => ({ t: (s: any) => (Array.isArray(s) ? s.join('') : s) }),
 }));
-vi.mock('@/graphql/operations', () => ({ getSellerScoreDocument: { __doc: 'GetSellerScore' } }));
+vi.mock('./graphql/operations', () => ({ getSellerScoreDocument: { __doc: 'GetSellerScore' } }));
 vi.mock('recharts', () => {
     const P = ({ children }: any) => createElement('div', null, children);
     return { CartesianGrid: P, Line: P, LineChart: P, XAxis: P, YAxis: P };

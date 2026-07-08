@@ -1,6 +1,4 @@
-import type { VariablesOf } from '@/graphql/graphql';
-import { getFlaggedSellersDocument, recalculateSellerScoreDocument } from '@/graphql/operations';
-import { Trans, useLingui } from '@lingui/react/macro';
+import type { VariablesOf } from './graphql/graphql';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createColumnHelper } from '@tanstack/react-table';
 import {
@@ -20,6 +18,9 @@ import {
 } from '@vendure/dashboard';
 import { Flag, RefreshCw, TriangleAlert } from 'lucide-react';
 import { toast } from 'sonner';
+
+import { getFlaggedSellersDocument, recalculateSellerScoreDocument } from './graphql/operations';
+import { Trans, useLingui } from './i18n-runtime';
 
 /**
  * @description

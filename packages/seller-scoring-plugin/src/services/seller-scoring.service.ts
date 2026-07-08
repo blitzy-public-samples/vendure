@@ -295,14 +295,23 @@ export class SellerScoringService {
      * recalculations for the same seller could both observe no row, both construct a new
      * SellerScore, and the second save() would then violate the unique `sellerId`
      * constraint — aborting that recalculation before its snapshot is written and thereby
-     * dropping a required snapshot (AAP §0.9.3). Instead a single atomic upsert is issued,
-     * keyed on the unique `sellerId` column (`INSERT ... ON CONFLICT (sellerId) DO UPDATE`,
-     * abstracted across the supported SQL drivers by TypeORM — the same pattern core uses in
-     * its SqlCacheStrategy). Concurrent first recalculations therefore resolve to one INSERT
-     * and one conflict-driven UPDATE with no constraint failure. Only the score, per-metric
-     * values, flag, and last-calculated timestamp are written; `sellerId` is set on insert
-     * and never changed. `upsert()` returns only an InsertResult, so the managed row is
-     * re-read and returned (guaranteed present immediately after a successful upsert).
+     * dropping a required snapshot (AAP §0.9.3). Instead a single atomic `INSERT ... ON
+     * CONFLICT (sellerId) DO UPDATE` is issued via the query builder, keyed on the unique
+     * `sellerId` column and abstracted across the supported SQL drivers by TypeORM.
+     * Concurrent first recalculations therefore resolve to one INSERT and one conflict-driven
+     * UPDATE with no constraint failure. Only the score, per-metric values, flag, and
+     * last-calculated timestamp are overwritten on conflict; `sellerId` is set on insert and
+     * never changed.
+     *
+     * `.updateEntity(false)` is required. Without it, TypeORM appends a post-write reload of
+     * the entity's auto-managed columns (the inherited `@UpdateDateColumn`/`@CreateDateColumn`);
+     * on drivers without `UPDATE ... RETURNING` support (e.g. better-sqlite3) that reload
+     * re-selects the row by its primary key. Because this upsert is keyed on `sellerId` (not
+     * the generated `id`), the row constructed for the write carries no `id`, so the reload
+     * throws "Cannot update entity because entity id is not set in the entity." Disabling the
+     * reload avoids that failure and mirrors the identical fix Vendure core applies in
+     * `ProductVariantService` and `DefaultSchedulerStrategy`. The managed row is then re-read
+     * and returned (guaranteed present immediately after a successful upsert).
      */
     private async upsertSellerScore(
         ctx: RequestContext,
@@ -313,17 +322,27 @@ export class SellerScoringService {
         >,
     ): Promise<SellerScore> {
         const repo = this.connection.getRepository(ctx, SellerScore);
-        await repo.upsert(
-            new SellerScore({
+        await repo
+            .createQueryBuilder()
+            .insert()
+            .into(SellerScore)
+            .values({
                 sellerId,
                 score: data.score,
                 fulfillmentSla: data.fulfillmentSla,
                 cancellationReturnRate: data.cancellationReturnRate,
                 flagged: data.flagged,
                 lastCalculatedAt: data.lastCalculatedAt,
-            }),
-            ['sellerId'],
-        );
+            })
+            // Prevents TypeORM's post-write RETURNING/re-select reload of the inherited
+            // create/update date columns, which on better-sqlite3 would re-select by primary
+            // key and throw because this sellerId-keyed upsert row has no `id` (see method doc).
+            .updateEntity(false)
+            .orUpdate(
+                ['score', 'fulfillmentSla', 'cancellationReturnRate', 'flagged', 'lastCalculatedAt'],
+                ['sellerId'],
+            )
+            .execute();
         return repo.findOneOrFail({ where: { sellerId } });
     }
 

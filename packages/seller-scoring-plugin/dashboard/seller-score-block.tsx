@@ -1,5 +1,3 @@
-import { getSellerScoreDocument } from '@/graphql/operations';
-import { Trans, useLingui } from '@lingui/react/macro';
 import { useQuery } from '@tanstack/react-query';
 import {
     Alert,
@@ -23,6 +21,9 @@ import {
 import { ClockIcon, FlagIcon, GaugeIcon, TriangleAlertIcon } from 'lucide-react';
 import { type ReactNode } from 'react';
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from 'recharts';
+
+import { getSellerScoreDocument } from './graphql/operations';
+import { Trans, useLingui } from './i18n-runtime';
 
 /**
  * The score is reported by the plugin's Admin API on a fixed 0–100 scale. Kept as a

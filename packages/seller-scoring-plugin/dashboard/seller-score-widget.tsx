@@ -1,5 +1,3 @@
-import { getFlaggedSellersDocument } from '@/graphql/operations';
-import { Trans } from '@lingui/react/macro';
 import { useQuery } from '@tanstack/react-query';
 import {
     Alert,
@@ -12,6 +10,9 @@ import {
     type DashboardWidgetDefinition,
 } from '@vendure/dashboard';
 import { FlagIcon, TriangleAlertIcon } from 'lucide-react';
+
+import { getFlaggedSellersDocument } from './graphql/operations';
+import { Trans } from './i18n-runtime';
 
 /**
  * @description
