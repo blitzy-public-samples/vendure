@@ -2,13 +2,16 @@ import { getFlaggedSellersDocument } from '@/graphql/operations';
 import { Trans } from '@lingui/react/macro';
 import { useQuery } from '@tanstack/react-query';
 import {
+    Alert,
+    AlertDescription,
+    AlertTitle,
     api,
     Badge,
     DashboardBaseWidget,
     type DashboardBaseWidgetProps,
     type DashboardWidgetDefinition,
 } from '@vendure/dashboard';
-import { FlagIcon } from 'lucide-react';
+import { FlagIcon, TriangleAlertIcon } from 'lucide-react';
 
 /**
  * @description
@@ -43,7 +46,7 @@ const FLAGGED_SELLERS_QUERY_KEY = ['flaggedSellers'] as const;
  * @since 3.8.0
  */
 export function FlaggedSellersWidgetComponent(props: DashboardBaseWidgetProps) {
-    const { data, isPending } = useQuery({
+    const { data, isPending, isError } = useQuery({
         queryKey: FLAGGED_SELLERS_QUERY_KEY,
         queryFn: () => api.query(getFlaggedSellersDocument),
     });
@@ -64,6 +67,21 @@ export function FlaggedSellersWidgetComponent(props: DashboardBaseWidgetProps) {
                 <span className="text-muted-foreground text-sm">
                     <Trans>Loading…</Trans>
                 </span>
+            ) : isError ? (
+                // Error state (MANDATORY): the `flaggedSellers` query failed. This MUST be handled
+                // before the healthy count below — otherwise a failed request would compute
+                // `count = 0` and render the reassuring "No sellers flagged" state, hiding the
+                // failure and falsely reassuring the admin. A count of `0` is only shown for a
+                // successful response whose `flaggedSellers` array is genuinely empty.
+                <Alert variant="destructive">
+                    <TriangleAlertIcon className="h-4 w-4" />
+                    <AlertTitle>
+                        <Trans>Unable to load flagged sellers</Trans>
+                    </AlertTitle>
+                    <AlertDescription>
+                        <Trans>The flagged sellers count could not be loaded. Please try again.</Trans>
+                    </AlertDescription>
+                </Alert>
             ) : (
                 <div className="flex items-center gap-3">
                     <FlagIcon

@@ -18,7 +18,7 @@ import {
     Progress,
     useLocalFormat,
 } from '@vendure/dashboard';
-import { Flag, RefreshCw } from 'lucide-react';
+import { Flag, RefreshCw, TriangleAlert } from 'lucide-react';
 import { toast } from 'sonner';
 
 /**
@@ -77,7 +77,7 @@ function FlaggedSellersTable() {
     const { formatDate } = useLocalFormat();
     const queryClient = useQueryClient();
 
-    const { data, isPending } = useQuery({
+    const { data, isPending, isError } = useQuery({
         queryKey: FLAGGED_SELLERS_QUERY_KEY,
         queryFn: () => api.query(getFlaggedSellersDocument),
     });
@@ -180,8 +180,38 @@ function FlaggedSellersTable() {
         }),
     ];
 
+    // Error state (MANDATORY): the `flaggedSellers` query failed. This MUST be handled before the
+    // healthy empty-state branch below — otherwise a failed request (where `rows` defaults to `[]`)
+    // would be misrendered as the reassuring "No sellers are currently flagged" notice, hiding the
+    // failure and falsely implying every seller is healthy. Rendered as a destructive Alert with an
+    // explicit refresh/retry action so the admin can re-run the query.
+    if (!isPending && isError) {
+        return (
+            <Alert variant="destructive">
+                <TriangleAlert className="h-4 w-4" />
+                <AlertTitle>
+                    <Trans>Unable to load flagged sellers</Trans>
+                </AlertTitle>
+                <AlertDescription>
+                    <Trans>The flagged sellers list could not be loaded. Please refresh to try again.</Trans>
+                </AlertDescription>
+                <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="mt-2 w-fit"
+                    onClick={refreshFlaggedSellers}
+                >
+                    <RefreshCw className="h-4 w-4" />
+                    <Trans>Refresh</Trans>
+                </Button>
+            </Alert>
+        );
+    }
+
     // Healthy/normal case: no seller is currently below the threshold. This reads as a
-    // positive, reassuring state rather than an error.
+    // positive, reassuring state rather than an error. Only reached on a SUCCESSFUL response
+    // (no error) that returned zero flagged sellers.
     if (!isPending && rows.length === 0) {
         return (
             <Alert>
@@ -232,6 +262,11 @@ export const flaggedSellersList: DashboardRouteDefinition = {
         url: '/flagged-sellers',
         title: 'Flagged sellers',
         icon: Flag,
+        // Gate nav-item visibility on the same permission the backend enforces for the
+        // `flaggedSellers`/`sellerScore` queries (Permission.ReadSeller). This mirrors the in-repo
+        // reviews dashboard route (which gates its nav item with `requiresPermission`) and ensures
+        // administrators without seller-read access do not see a route they cannot use.
+        requiresPermission: ['ReadSeller'],
     },
     loader: () => ({ breadcrumb: 'Flagged sellers' }),
     component: () => (

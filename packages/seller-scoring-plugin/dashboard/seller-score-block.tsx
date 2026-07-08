@@ -164,7 +164,7 @@ function SellerScoreBlockComponent({ context }: Readonly<{ context: PageContextV
     const sellerId = context.entity?.id as string | undefined;
     const enabled = !!sellerId && sellerId !== 'new';
 
-    const { data, isPending } = useQuery({
+    const { data, isPending, isError } = useQuery({
         queryKey: ['sellerScore', sellerId],
         queryFn: async (): Promise<SellerScoreQueryResult> => {
             // Narrow `sellerId` to a definite string for the query variables. The query is
@@ -192,6 +192,28 @@ function SellerScoreBlockComponent({ context }: Readonly<{ context: PageContextV
             <div className="text-sm text-muted-foreground">
                 <Trans>Loading…</Trans>
             </div>
+        );
+    }
+
+    // Error state (MANDATORY): the `sellerScore` query failed. This MUST be handled before the
+    // null-score branch below — otherwise a failed request would fall through to `score === null`
+    // and be misrendered as the "no orders in window" notice, telling the admin the seller has no
+    // recent orders when in fact the data could not be loaded. Rendered as a destructive Alert that
+    // is visually distinct from both the null-score notice and a real score.
+    if (isError) {
+        return (
+            <Alert variant="destructive">
+                <TriangleAlertIcon className="h-4 w-4" />
+                <AlertTitle>
+                    <Trans>Unable to load performance score</Trans>
+                </AlertTitle>
+                <AlertDescription>
+                    <Trans>
+                        The seller performance score could not be loaded. This does not mean the seller has no
+                        orders — please try again.
+                    </Trans>
+                </AlertDescription>
+            </Alert>
         );
     }
 
