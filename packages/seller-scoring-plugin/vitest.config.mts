@@ -68,6 +68,22 @@ export default defineConfig({
         // `@Mutation`, `@Injectable`, etc.) used throughout `src/`. This mirrors
         // `packages/email-plugin/vitest.config.mts`.
         // See https://github.com/vitest-dev/vitest/issues/708#issuecomment-1118628479
-        swc.vite(),
+        swc.vite({
+            jsc: {
+                transform: {
+                    // Vendure entities (extending VendureEntity) populate their columns from
+                    // the constructor's `DeepPartial` input via base-class assignment. That
+                    // pattern only survives transpilation when class fields use assignment —
+                    // not "define" — semantics, matching the project's tsconfig (target es2017,
+                    // useDefineForClassFields defaults to false). SWC otherwise defaults to
+                    // define semantics, which re-initialises the declared columns to `undefined`
+                    // after the base constructor sets them (e.g. `new SellerScore({ score })`
+                    // would yield `score === undefined`). Every other entity-transpiling Vitest
+                    // config in the repo sets this for the same reason.
+                    // See https://github.com/vendurehq/vendure/issues/2099
+                    useDefineForClassFields: false,
+                },
+            },
+        }),
     ],
 });
