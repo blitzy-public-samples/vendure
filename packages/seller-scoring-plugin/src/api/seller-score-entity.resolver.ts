@@ -17,6 +17,13 @@ import { SellerScore } from '../entities/seller-score.entity';
 export class SellerScoreEntityResolver {
     constructor(private connection: TransactionalConnection) {}
 
+    /**
+     * @description
+     * Resolves the seller's full score history as `SellerScoreSnapshot` rows
+     * ordered chronologically by `calculatedAt` ascending.
+     *
+     * @since 3.8.0
+     */
     @ResolveField()
     async history(@Ctx() ctx: RequestContext, @Parent() score: SellerScore): Promise<SellerScoreSnapshot[]> {
         return this.connection.getRepository(ctx, SellerScoreSnapshot).find({
@@ -25,6 +32,13 @@ export class SellerScoreEntityResolver {
         });
     }
 
+    /**
+     * @description
+     * Resolves the related read-only core `Seller` for this score by id, or
+     * `undefined` when the seller cannot be found.
+     *
+     * @since 3.8.0
+     */
     @ResolveField()
     async seller(@Ctx() ctx: RequestContext, @Parent() score: SellerScore): Promise<Seller | undefined> {
         const seller = await this.connection

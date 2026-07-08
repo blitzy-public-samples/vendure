@@ -28,6 +28,13 @@ export class SellerScoreAdminResolver {
         private sellerScoringService: SellerScoringService,
     ) {}
 
+    /**
+     * @description
+     * Returns the current persisted `SellerScore` for the given seller, or
+     * `undefined` when no score row exists yet. Requires `Permission.ReadSeller`.
+     *
+     * @since 3.8.0
+     */
     @Query()
     @Allow(Permission.ReadSeller)
     async sellerScore(
@@ -40,6 +47,15 @@ export class SellerScoreAdminResolver {
         return sellerScore ?? undefined;
     }
 
+    /**
+     * @description
+     * Returns only sellers whose score is currently flagged (persisted
+     * `flagged = true`), ordered worst-first by ascending `score`. Does not
+     * re-evaluate the threshold live and never returns a generic all-sellers
+     * list. Requires `Permission.ReadSeller`.
+     *
+     * @since 3.8.0
+     */
     @Query()
     @Allow(Permission.ReadSeller)
     async flaggedSellers(@Ctx() ctx: RequestContext): Promise<SellerScore[]> {
@@ -49,6 +65,14 @@ export class SellerScoreAdminResolver {
         });
     }
 
+    /**
+     * @description
+     * Forces a recalculation of the given seller's score inside a transaction and
+     * returns the resulting `SellerScore` (nullable when the seller has no orders
+     * in the rolling window). Requires `Permission.UpdateSeller`.
+     *
+     * @since 3.8.0
+     */
     @Transaction()
     @Mutation()
     @Allow(Permission.UpdateSeller)
