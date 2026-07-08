@@ -1,4 +1,4 @@
-import type { ResultOf, VariablesOf } from '@/graphql/graphql';
+import type { VariablesOf } from '@/graphql/graphql';
 import { getFlaggedSellersDocument, recalculateSellerScoreDocument } from '@/graphql/operations';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -32,7 +32,28 @@ import { toast } from 'sonner';
  *
  * @since 3.8.0
  */
-type FlaggedSeller = ResultOf<typeof getFlaggedSellersDocument>['flaggedSellers'][number];
+interface FlaggedSeller {
+    id: string;
+    sellerId: string;
+    score: number | null;
+    fulfillmentSla: number | null;
+    cancellationReturnRate: number | null;
+    lastCalculatedAt: string | null;
+    flagged: boolean;
+    seller: { id: string; name: string } | null;
+}
+
+/**
+ * @description
+ * Result shape of the fixed `flaggedSellers` Admin API query (`[SellerScore!]!`). The
+ * dashboard's static `gql.tada` introspection does not include the plugin's runtime Admin
+ * API schema extension, so — exactly as the seller-detail block does — we narrow the query
+ * result to this locally-declared, authoritative shape (aligned field-for-field with the
+ * plugin's `SellerScore` type). At runtime the server provides these fields.
+ */
+interface FlaggedSellersQueryResult {
+    flaggedSellers: FlaggedSeller[];
+}
 
 /**
  * @description
@@ -79,7 +100,12 @@ function FlaggedSellersTable() {
 
     const { data, isPending, isError } = useQuery({
         queryKey: FLAGGED_SELLERS_QUERY_KEY,
-        queryFn: () => api.query(getFlaggedSellersDocument),
+        // The dashboard's static gql.tada introspection does not include the plugin's
+        // runtime Admin API types, so we narrow the result to the locally-declared,
+        // authoritative shape ({@link FlaggedSellersQueryResult}). At runtime the server
+        // provides these fields. This mirrors the seller-detail block's queryFn.
+        queryFn: async (): Promise<FlaggedSellersQueryResult> =>
+            (await api.query(getFlaggedSellersDocument)) as FlaggedSellersQueryResult,
     });
     const rows: FlaggedSeller[] = data?.flaggedSellers ?? [];
 

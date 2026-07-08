@@ -30,7 +30,8 @@
         "@vendure/asset-server-plugin": "3.7.0",
         "@vendure/common": "3.7.0",
         "@vendure/core": "3.7.0",
-        "@vendure/email-plugin": "3.7.0"
+        "@vendure/email-plugin": "3.7.0",
+        "@vendure/seller-scoring-plugin": "3.7.0"
     },
     "devDependencies": {
         "@typescript/native-preview": "7.0.0-dev.20260515.1",

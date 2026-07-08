@@ -140,7 +140,12 @@ describe('flaggedSellersList route definition', () => {
     });
 
     it('exposes a breadcrumb loader', () => {
-        expect(flaggedSellersList.loader?.({} as any)).toEqual({ breadcrumb: 'Flagged sellers' });
+        // `DashboardRouteDefinition.loader` is a TanStack Router union (a loader function OR
+        // a loader object), so narrow to the callable arm via `typeof` before invoking it.
+        const loader = flaggedSellersList.loader;
+        expect(typeof loader === 'function' ? loader({} as any) : undefined).toEqual({
+            breadcrumb: 'Flagged sellers',
+        });
     });
 });
 

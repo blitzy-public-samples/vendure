@@ -3,3 +3,8 @@
 # These are regenerated on every run and must never be committed. Mirrors the
 # convention used by other Vendure packages (e.g. packages/dashboard/.gitignore).
 e2e/__data__/
+
+# Compiled build output produced by `npm run build`
+# (tsc -> lib/**, then build/copy-dashboard.mjs -> lib/dashboard/**).
+# Regenerated on every build and never committed. Mirrors packages/email-plugin/.gitignore.
+lib

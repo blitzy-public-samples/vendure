@@ -32,6 +32,34 @@ const FLAGGED_SELLERS_QUERY_KEY = ['flaggedSellers'] as const;
 
 /**
  * @description
+ * Local, hand-written shape of a single `SellerScore` row returned by the fixed
+ * `flaggedSellers` Admin API query, aligned field-for-field with the plugin's
+ * `SellerScore` type.
+ */
+interface FlaggedSellerData {
+    id: string;
+    sellerId: string;
+    score: number | null;
+    fulfillmentSla: number | null;
+    cancellationReturnRate: number | null;
+    lastCalculatedAt: string | null;
+    flagged: boolean;
+    seller: { id: string; name: string } | null;
+}
+
+/**
+ * @description
+ * Result shape of the `flaggedSellers` query (`[SellerScore!]!`). The dashboard's static
+ * `gql.tada` introspection does not include the plugin's runtime Admin API schema
+ * extension, so — exactly as the seller-detail block does — we narrow the query result to
+ * this locally-declared, authoritative shape. At runtime the server provides these fields.
+ */
+interface FlaggedSellersQueryResult {
+    flaggedSellers: FlaggedSellerData[];
+}
+
+/**
+ * @description
  * Dashboard home widget body. Renders the number of sellers whose current
  * composite performance score is below the plugin's configured flagging
  * threshold, sourced exclusively from the fixed `flaggedSellers` Admin API
@@ -48,7 +76,12 @@ const FLAGGED_SELLERS_QUERY_KEY = ['flaggedSellers'] as const;
 export function FlaggedSellersWidgetComponent(props: DashboardBaseWidgetProps) {
     const { data, isPending, isError } = useQuery({
         queryKey: FLAGGED_SELLERS_QUERY_KEY,
-        queryFn: () => api.query(getFlaggedSellersDocument),
+        // The dashboard's static gql.tada introspection does not include the plugin's
+        // runtime Admin API types, so we narrow the result to the locally-declared,
+        // authoritative shape ({@link FlaggedSellersQueryResult}). At runtime the server
+        // provides these fields. This mirrors the seller-detail block's queryFn.
+        queryFn: async (): Promise<FlaggedSellersQueryResult> =>
+            (await api.query(getFlaggedSellersDocument)) as FlaggedSellersQueryResult,
     });
 
     // `flaggedSellers` is non-null in the Admin API schema ([SellerScore!]!),
