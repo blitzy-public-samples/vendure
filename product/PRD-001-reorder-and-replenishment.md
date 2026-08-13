@@ -11,19 +11,19 @@ The **requirements are proposals**: argue, rewrite or delete them. The **finding
 ## 3. How to Edit This Document
 
 - Identifiers are stable, and **a retired one is never reused**.
-- Dependencies are identifier references, so a deleted row leaves a visible break.
+- Dependencies are identifier references naming what a row needs first; a deletion leaves a visible break.
 - Nothing refers to a section number, so insert or reorder freely.
 - All technical identifiers and evidence sit in the appendices, so this body can be rewritten without touching them.
 - One marker closes the body, its stated length capped; answer lines stay blank.
 
 ## 4. The Problem
 
-A buyer returning for the same things rebuilds the order by hand. Prices move and items run out between purchases, so a buyer told nothing finds out at checkout.
+A returning buyer rebuilds the same order by hand. Prices move and items run out between purchases, so a buyer told nothing finds out at checkout.
 
 ## 5. Who This Is For
 
 - **Returning Buyer**: repeat without rebuilding, knowing what changed.
-- **Buying Account Administrator**: lists outliving a colleague, and who may edit them.
+- **Buying Account Administrator**: lists outliving a colleague, and who edits them.
 - **Marketplace Category Manager**: sight of what is bought repeatedly.
 - **Seller Operations Manager**: the same, their own goods only.
 - **Customer Support Agent**: what a buyer was shown when a repeat fails.
@@ -31,9 +31,9 @@ A buyer returning for the same things rebuilds the order by hand. Prices move an
 
 ## 6. What Already Exists
 
-Six things ship; proposing them as new would be wrong. Adding many items at once reports an outcome per item, establishing partial success. Availability is by default three states, in stock, low stock or out of stock, never a quantity. Order history is buyer-tied, storefront-confined, sortable by placement, its items and quantities readable. Buyer preferences need no new store. The cart compares prices, with one limit. Reporting reaches a daily order count, its total and an average order value.
+Six things ship; proposing them as new would be wrong. Adding many items at once reports an outcome per item, establishing partial success. Availability is by default three states, in stock, low stock or out of stock, never a quantity. Order history is buyer-tied, storefront-confined, sortable by placement, items and quantities readable. Buyer preferences need no new store. The cart compares prices, with one limit. Reporting reaches a daily order count, total and average order value.
 
-That limit: the comparison covers only movement since a line entered the cart, guarded by its own automated suite, saying nothing about the price last paid. Nothing implements repeat ordering, replenishment, repeat-demand reporting or reminders.
+That limit: it covers only movement since a line entered the cart, guarded by its own automated suite, saying nothing about the price last paid. Nothing implements repeat ordering, replenishment, repeat-demand reporting or reminders.
 
 ## 7. What a Buyer Will Be Able To Do
 
@@ -80,7 +80,7 @@ Recomputed from the table below: 22 proposals, 7 quoting a clause of the Objecti
 |REQ-019|Show most repurchased items in the viewer's range, denied by default|Marketplace Category Manager|Inferred from the Business Targets|REQ-006|
 |REQ-020|Prepare repurchase figures on a schedule, safely repeatable|Marketplace Category Manager, Seller Operations Manager|Inferred from a codebase finding|REQ-019|
 |REQ-021|Confine a seller's figures to their own goods, checked per request|Seller Operations Manager|Inferred from the Business Targets|REQ-019|
-|REQ-022|One documented addition, disturbing no existing call|Storefront Developer|Inferred from the Business Targets|REQ-001, REQ-005, REQ-009, REQ-012|
+|REQ-022|One documented addition, disturbing no existing call|Storefront Developer|Inferred from the Business Targets|REQ-001, REQ-012|
 
 ## 9. Impact of Implementation
 
@@ -189,7 +189,7 @@ An explicit negative result: **no service-level, latency, availability, conversi
 
 ## 15. Suggested Sequencing
 
-First, CA-1 Reorder from a past order with CA-4 Change awareness before commit and CA-7 Storefront integration surface: a repeat without the disclosure is the worse half. Second, CA-2 Regularly purchased items, setting the rule everything downstream waits for. Third, CA-6 Recurring demand visibility, following because one computation feeds both.
+First, CA-1 Reorder from a past order with CA-4 Change awareness before commit and CA-7 Storefront integration surface, extended as each later capability lands: a repeat without the disclosure is the worse half. Second, CA-2 Regularly purchased items, setting the rule everything downstream waits for. Third, CA-6 Recurring demand visibility, following because one computation feeds both.
 
 Two run alongside: CA-3 Saved reorder lists depends on nothing else and parallels any step after the first; CA-5 Reorder reminders needs the regular-items rule, so follows the second.
 
