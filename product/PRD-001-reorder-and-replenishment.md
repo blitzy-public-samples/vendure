@@ -55,13 +55,13 @@ Seven capability areas, named identically throughout: **CA-1 Reorder from a past
 
 Origins are four, one to a row, and no other label is permitted.
 
-Recomputed from the table below: 22 proposals, 7 quoting a clause of the Objective Statement, 4 inferred from the Business Targets, 5 from the Primary Users and 6 from a codebase finding.
+Recomputed from the table below: 22 proposals, 5 quoting a clause of the Objective Statement, 4 inferred from the Business Targets, 7 from the Primary Users and 6 from a codebase finding.
 
 |ID|Requirement|Who it serves|Origin|Depends on|
 |---|---|---|---|---|
 |REQ-001|Repeat a past order in one act|Returning Buyer, Customer Support Agent|"Make it effortless for returning buyers to reorder the items they purchase regularly"|—|
 |REQ-002|Add what can be added, name every refusal|Returning Buyer|Inferred from a codebase finding|REQ-001|
-|REQ-003|Never silently reduce a quantity, state the shortfall|Returning Buyer|"so that buyers are made aware of price and availability changes before they commit to a reorder"|REQ-002|
+|REQ-003|Never silently reduce a quantity, state the shortfall|Returning Buyer|Inferred from the Primary Users|REQ-002|
 |REQ-004|Confine a repeat to one storefront, applied per operation|Returning Buyer, Storefront Developer|Inferred from a codebase finding|REQ-001|
 |REQ-005|Show what this buyer buys repeatedly, most repeated first|Returning Buyer|"Make it effortless for returning buyers to reorder the items they purchase regularly"|—|
 |REQ-006|Let the operator define regular|Marketplace Category Manager, Returning Buyer|Inferred from a codebase finding|REQ-005|
@@ -72,7 +72,7 @@ Recomputed from the table below: 22 proposals, 7 quoting a clause of the Objecti
 |REQ-011|Share a list across one account|Buying Account Administrator|Inferred from the Primary Users|REQ-009|
 |REQ-012|Show the price last paid beside the price now|Returning Buyer|"so that buyers are made aware of price and availability changes before they commit to a reorder"|REQ-001|
 |REQ-013|Show availability per line before commit|Returning Buyer|Inferred from a codebase finding|REQ-001|
-|REQ-014|Require deliberate acceptance of a moved price|Returning Buyer|"so that buyers are made aware of price and availability changes before they commit to a reorder"|REQ-012|
+|REQ-014|Require deliberate acceptance of a moved price|Returning Buyer|Inferred from the Primary Users|REQ-012|
 |REQ-015|Let only an authorised agent see what was shown and accepted, and nothing more|Customer Support Agent|Inferred from the Primary Users|REQ-012, REQ-014|
 |REQ-016|Reminders by opt-in only|Returning Buyer|Inferred from the Business Targets|REQ-005|
 |REQ-017|Reminder delivery behind one interface, defaulting to no outside service and an in-platform record keyed so a repeat cannot send twice|Storefront Developer|Inferred from a codebase finding|REQ-016|
@@ -217,9 +217,9 @@ The Objective Statement in full, unaltered:
 
 Measured: 1 sentence, 48 words, 302 characters, 4 clauses, 3 top-level and quotable as origins, the fourth inside the first.
 
-Recomputed from the emitted table: 22 proposals: 7 quoting a clause, 4 from the Business Targets, 5 from the Primary Users, 6 from a codebase finding.
+Recomputed from the emitted table: 22 proposals: 5 quoting a clause, 4 from the Business Targets, 7 from the Primary Users, 6 from a codebase finding.
 
-Measured body word count: 2994, to the marker closing the body.
+Measured body word count: 2970, to the marker closing the body.
 
 Mechanical check for technical identifiers in the body: PASS, zero tokens found.
 
@@ -424,8 +424,8 @@ Each assertion below states what it observed and, where it replaces a narrower f
 - **B1. Exactly one boundary marker, counted as a comment line and not as a phrase.** The marker closing the body is the only line in this file that is an HTML comment, so `grep -c '^<!--.*-->$'` counts it exactly and must return `1`. Observed: `1`. The form is deliberate on two counts. A copy carrying a second marker inserted at a line inside the body was accepted as written: the extracted body came to 2652 words, comfortably inside the range, and the identifier search over it found nothing — while an injected technical identifier sat beyond the truncation point, read by neither. Counting the bare phrase would catch that, but it would also fail a correct document whose prose merely mentions the phrase, which a copy with such a sentence appended demonstrated. Counting the comment line catches the first and is immune to the second, which is why the phrase itself appears exactly once in this file and is never quoted anywhere else in it.
 - **B2. The extracted body ends exactly one line before the marker.** Take the marker's line number with `mk=$(grep -n '^<!--.*-->$' "$file" | head -1 | cut -d: -f1)`, extract with `sed -n "1,$((mk-1))p"`, then assert both that the extracted line count equals `mk-1` and that no appendix heading appears inside it. Observed: marker at line 226, body 225 lines, no appendix heading in the extract. This extraction was compared and found byte-identical to stopping at the phrase, and it is stricter in one useful way: a stray earlier mention of the phrase silently truncates a phrase-based extraction, and the mismatch between the extracted line count and the marker's line number is what exposes it. A copy carrying such a sentence early in the body truncated to 99 lines against a marker at line 227, and the mismatch was reported.
 - **B3. The extracted body is non-empty before anything scans it.** `[ -s "$body" ]`. Observed: present and non-empty. Without this, an absent or empty extraction reads as a clean result on every scan that follows it.
-- **B4. The body's word count, measured by the one command that defines it.** `wc -w` over the extracted body, required to fall between 2200 and 3000. Observed: 2994, so six words of headroom. The figure is sensitive to tokenisation: splitting the register's column separators as well as its spaces counts 3115 words over exactly the same text, so the number quoted in this document is the plain word count of the extracted body and nothing else. Treat the ceiling as hard — six words is the entire margin, and an edit exceeding it breaks the gate whatever else it improves.
-- **B5. The figures the body states about itself must equal the figures measured.** The word count printed in the body's provenance must equal the measured count, and the identifier verdict the body reports must be the verdict observed. Observed: stated 2994 against measured 2994, and a reported pass against zero matches found. Nothing previously tied the two together, so an edit could leave the body reporting a stale number about itself while every other gate still passed.
+- **B4. The body's word count, measured by the one command that defines it.** `wc -w` over the extracted body, required to fall between 2200 and 3000. Observed: 2970, so thirty words of headroom. The figure is sensitive to tokenisation: splitting the register's column separators as well as its spaces counts 3091 words over exactly the same text, so the number quoted in this document is the plain word count of the extracted body and nothing else. Treat the ceiling as hard — thirty words is the entire margin, and an edit exceeding it breaks the gate whatever else it improves.
+- **B5. The figures the body states about itself must equal the figures measured.** The word count printed in the body's provenance must equal the measured count, and the identifier verdict the body reports must be the verdict observed. Observed: stated 2970 against measured 2970, and a reported pass against zero matches found. Nothing previously tied the two together, so an edit could leave the body reporting a stale number about itself while every other gate still passed.
 - **B6. Every scan is triaged by its exit code.** Matched means a defect, nothing matched means clean, and anything else means the scan failed rather than the document. The convenient alternative — printing a pass whenever a search returns nothing — was demonstrated to print a pass for a body file that did not exist, whose search in fact ended in an error, and again for an empty one.
 
 **Part two — structure and registry.** Each mandated name is asserted where it is required to be, not merely somewhere in the file. That distinction is what the assertions below turn on, because every one of these names deliberately recurs later in the evidence, so a search of the whole file answers a weaker question than the one being asked.
