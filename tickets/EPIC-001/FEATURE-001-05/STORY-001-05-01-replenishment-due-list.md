@@ -47,7 +47,7 @@ The disclosure is split deliberately, because the two halves of this story have 
 
 **Three further differences from the shipped analogue, so that "partial" is a measured verdict rather than a hedge.** The wishlist read returns an unbounded list, while this story returns a bounded paginated list for the reason the epic states once for every collection in this set [tickets/EPIC-001-reorder-and-replenishment.md:§7.7 Bounded Collections]. The wishlist rows are written by the buyer, while every row this story reads is **derived** by a computation the buyer never invokes. And the wishlist table is keyed by customer and variant, while this story's table is keyed by customer, variant **and** channel, because a derived interval is a per-channel figure [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.10 Channel Scoping, Language Scoping And Monetary Values].
 
-**One name-collision check, run rather than assumed.** `ReplenishmentSignal`, `ReplenishmentSignalList` and `PurchaseCadence` are each absent from the checked-in Shop API introspection snapshot [schema-shop.json], so every type name this story publishes is free.
+**One name-collision check, run rather than assumed.** `ReplenishmentSignal`, `ReplenishmentSignalList` and `PurchaseCadence` are each absent from the checked-in Shop API introspection snapshot [schema-shop.json:data.__schema.types], so every type name this story publishes is free.
 
 ---
 
