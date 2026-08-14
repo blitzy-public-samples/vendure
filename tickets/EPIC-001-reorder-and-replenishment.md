@@ -972,7 +972,7 @@ A batch is a unit of *scheduling*, not a licence to open every story in it at on
 - **Gate 1 — STORY-001-07-01 precedes all three FEATURE-001-08 stories.** Every recurring-demand read aggregates over the attempt rows that 07-01 creates. Until that table exists and is being written, the three administrative reads have nothing to aggregate and their acceptance criteria have no fixture to assert against. 07-02, which publishes the events, is not a gate on FEATURE-001-08 at all: the aggregate reads rows, not events.
 - **Gate 2 — the FEATURE-001-06 share stories precede STORY-001-08-03.** The support lookup surfaces a buyer's lists, and a buying account's lists include the ones shared with the buyer's seat, so the share rows from 06-01 and the grant-and-revoke behaviour from 06-02 must exist before 08-03 can assert what a support agent sees.
 - **Gate 3 — STORY-001-08-01 precedes STORY-001-08-02, and this one is internal to FEATURE-001-08 rather than a cross-feature edge.** 08-01 publishes the `recurringDemand` operation, its two published types, its options mapping and **the one permission definition that gates it**, `ReadReorderDemand` — the feature's second definition belongs to story 08-03 and the seller-unscoped entitlement is the platform's own existing `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71], so no story registers more than one; 08-02 publishes no operation of its own and composes the seller predicate and the entitlement branch into that operation, so there is nothing for it to constrain until 08-01 has merged. **This gate was absent from an earlier version of this list, which said the two stories proceeded together** — a claim story 08-02 already contradicted from its own side, and the owning feature now carries the edge and the page-ownership consequence that follows from it [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§4.3 Intra-Feature Story Order — One Edge, And It Is Declared Rather Than Denied].
-- **What is genuinely parallel inside B5:** FEATURE-001-06's three stories and FEATURE-001-07's two stories have no dependency on each other and may proceed together; and after gate 1, 08-01 may proceed alongside 06-01, 06-02, 06-03, 07-01 and 07-02 — but **not** alongside 08-02, which waits on gate 3.
+- **What is genuinely parallel inside B5, stated at the granularity each claim holds at:** the independence is between the two **feature groups**, not among the stories inside them. **No story of FEATURE-001-06 is a prerequisite of any story of FEATURE-001-07, and none in the other direction**, so the two groups may be worked alongside each other; **the order INSIDE each group is that feature's own section 4.3 to state, and both groups are sequential rather than open** — 06-01 → 06-02 → 06-03 [tickets/EPIC-001/FEATURE-001-06-buying-account-list-sharing.md:§4.3 Intra-Feature Story Order] and 07-01 → 07-02 [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§4.3 Intra-Feature Story Order]. Five stories sharing a batch is therefore not five stories startable at once, and this bullet is not a licence to open any of those five ahead of its own predecessor. The three FEATURE-001-08 stories open where their gates put them and nowhere earlier: **08-01** after gate 1, alongside whatever is still open in either group; **08-02** after gate 3 and therefore after 08-01, never alongside it; and **08-03** after gate 2 as well, which places it after 06-01 and 06-02 and leaves it parallel with 08-01 and 08-02 rather than with the FEATURE-001-06 chain — the same three placements the owning feature states from its own side [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§4.3 Intra-Feature Story Order — One Edge, And It Is Declared Rather Than Denied]. **An earlier version of this bullet said FEATURE-001-06's three stories and FEATURE-001-07's two stories had no dependency on each other and then enumerated all five as available alongside 08-01, which is true of the two groups and false of the five stories** — three prerequisite edges run inside them — **so read at story granularity it licensed exactly the mis-scheduling the rest of this sub-section exists to prevent, and it also left 08-03 looking parallel with the share stories that gate 2 places ahead of it. The granularity is now named rather than left to the reader, and the internal orders are stated here rather than only in the three feature files that a scheduler reading this sub-section alone would not open.**
 
 The dependency graph in section 4.1 carries one edge per **cross-feature** gate, and both were checked against this list rather than assumed to be there. **Gate 1 is the `F7 → F8` edge; gate 2 is the `F6 → F8` edge. Gate 3 has no edge in that figure and needs none**, because it runs between two stories of one feature and the figure's nodes are features — an intra-feature ordering is expressible only at story granularity, which is what this sub-section and the owning feature's section 4.3 are for. The second was missing from an earlier version of that figure while this sub-section already asserted that both gates appeared in it — a claim that was false about the figure rather than about the ordering, and the figure was corrected rather than the claim softened. `F1 → F6` and `F2 → F6` sit upstream of gate 2 and are prerequisites of the sharing model rather than gates on FEATURE-001-08. What this sub-section adds beyond the figure is story granularity: an edge says FEATURE-001-06 precedes FEATURE-001-08, while gate 2 says which single story that binds, and a batch table alone can express neither.
 
@@ -1198,7 +1198,7 @@ Each absence below is reported with the search that established it, because a ge
 
 ### 11.10 The Local Validator Suite — The Only Enforcement This Artifact Has
 
-Section 11.4 establishes that nothing in the pipeline inspects this artifact. This subsection is the enforcement that closes that gap, and it is placed here rather than in a file of its own because this ticket set may add no file outside `tickets/` without breaking the count reconciliation in section 12. **Twenty-two validators and three evidence commands follow — twenty-five steps.** Run all twenty-three from the repository root before any file in this set is emitted or changed. **The gate is that all twenty-three exit zero; a step is never relaxed to accommodate content.** **The count was ten validators until a review found two defects this suite could not see** — a citation naming a section that does not exist inside a sibling ticket, and a required diagram that did not render — so V6 was made heading-aware for intra-ticket targets and V15 and V16 were added. **It moved from sixteen to twenty when a second review found four defect classes that all nineteen then-existing steps passed clean over**: an ambiguous identifier, a GraphQL name declared twice, a stated definition-of-done count that disagreed with its own list, and one settled contract stated two ways in two files. V17 through V20 are those four, and the sub-section that closes this one states what a green suite does and does not establish rather than leaving the reader to assume. Every correction is recorded in its own block rather than folded in silently, because a suite that grows without saying why invites the assumption that it was always sufficient.
+Section 11.4 establishes that nothing in the pipeline inspects this artifact. This subsection is the enforcement that closes that gap, and it is placed here rather than in a file of its own because this ticket set may add no file outside `tickets/` without breaking the count reconciliation in section 12. **Twenty-two validators and three evidence commands follow — twenty-five steps.** Run all twenty-five from the repository root before any file in this set is emitted or changed. **The gate is that all twenty-five exit zero; a step is never relaxed to accommodate content.** **The count was ten validators until a review found two defects this suite could not see** — a citation naming a section that does not exist inside a sibling ticket, and a required diagram that did not render — so V6 was made heading-aware for intra-ticket targets and V15 and V16 were added. **It moved from sixteen to twenty when a second review found four defect classes that all nineteen then-existing steps passed clean over**: an ambiguous identifier, a GraphQL name declared twice, a stated definition-of-done count that disagreed with its own list, and one settled contract stated two ways in two files. V17 through V20 are those four, and the sub-section that closes this one states what a green suite does and does not establish rather than leaving the reader to assume. Every correction is recorded in its own block rather than folded in silently, because a suite that grows without saying why invites the assumption that it was always sufficient.
 
 **Every one of the eighteen numbered validation rules now has a step that enforces it, and twelve of the twenty-five exist because a review found something nothing checked:** four rules with no enforcement at all, one required diagram that did not render, one story-template invariant that nothing parsed, and — in a second review — four whole defect classes that lay outside every rule as written, namely identifier ambiguity, duplicate schema declaration, definition-of-done count drift at the feature tier, and one settled contract stated two ways; and — in a third review — two further classes that lay outside all twenty of those steps, namely a stated count anywhere other than a definition-of-done block, and prose severed mid-sentence, which are V21 and V22. An earlier revision of this subsection carried ten validators and asserted eighteen rules, which meant the persona invariant (rule 3), the demonstration requirement (rule 9), the nomination conditions (rule 11) and dependency referential integrity (rule 13) were claimed as gated while nothing checked them. V11 through V14 are those four. A rule asserted without a step is worse than an acknowledged gap, because the acknowledged gap gets worked on.
 
@@ -1232,6 +1232,8 @@ Five scoping facts are stated here rather than left to be discovered:
 - **Neither condition is discharged by reading the steps and finding them harmless.** A reviewer who has read this file has audited **this** revision; the control has to hold for the next one, which is what the digest is for. And neither condition permits a pipeline to run the suite automatically on a contributed branch: an automated gate that executes contributed text is the same defect with a machine holding the credentials instead of a person.
 
 **What follows, therefore, is twenty-five specified steps — twenty-two validators and three evidence commands — each with its exact source, its exemptions and its verdict rule.** Read them as the contract the artifact is held to. The one command in this sub-section is the digest computation a maintainer uses when populating or re-auditing the manifest of Condition A — it reads bytes and writes nothing, and it executes no step.
+
+**These twenty-five steps supersede the shorter command set the requirements sketch, and the supersession is declared once here so no reader mistakes the sketch for the enforcement.** Every rule that set states is enforced below, but not one of its command forms is the form used, and two of them fail outright against this artifact rather than merely differing from it: the invented-metric grep reports a substantial number of lines, every one a row-lifecycle mention rather than a figure, which the step that replaces it states in full; and the estimate skeleton raises on this file's own table shape and prints nothing, which the step that replaces it also states in full. The other eight are each blind to at least one class its replacement detects. **A reviewer who runs the sketch instead of these steps gets a weaker gate that reports both false alarms and clean results on real defects**, so where the two disagree the step below is the contract and the sketch is history. This paragraph is the record that the difference was measured rather than assumed.
 
 ```bash
 # Run from the MAINTAINER's validator location, never from a contributed branch. This block
@@ -1458,6 +1460,8 @@ Every assertion below is now bounded by the section that owns it. The ten number
 
 **The heading parse skips fenced blocks, and that is not a detail.** The demonstration blocks in this set carry shell comments at column zero — `# Terminal 1, from the repository root.` — and a parser that reads those as headings truncates section 4 at its first command block, after which every later section boundary is wrong and the counts it reports are measurements of the wrong text.
 
+**The precedent disclosure is a label line, and requiring the label rather than the vocabulary is a correction a review earned by deleting one.** A later revision of the check asked only whether some line in section 3 carried the word "precedent" together with one of the three permitted values, and that predicate is satisfied by ordinary narrative: a sentence explaining that a story's operation raises the platform's forbidden-access error when there is **none** contains both, so deleting the mandated `**PRECEDENT:**` line from a story left this step reporting success, and renaming the label to anything else did the same. The disclosure rule is a rule about a labelled field a reader can find in a pasted story, not about a word appearing somewhere in a paragraph. The step now requires **exactly one** line matching `**PRECEDENT:** <near-identical|partial|none>` inside section 3 and none outside it, keeps the section-title assertion, and keeps the vocabulary assertion beside the label one so a label carrying a value the prose contradicts is still reported. The value is bounded by a space rather than by the end of the line, because several stories in this set continue the sentence after the value and an end-anchored form would have reported every one of them.
+
 ```python
 import glob, re, sys
 
@@ -1476,6 +1480,10 @@ QUOTED_CLAUSE = re.compile(r'^> "')
 INFERRED_LABEL = re.compile(r'(?:\*\*|`)Inferred[.`*]')
 NEGATED = re.compile(r'\bnot\b[^.]{0,40}$')
 PRECEDENT_VALUE = re.compile(r'\b(near-identical|partial|none)\b', re.IGNORECASE)
+# The mandated disclosure is a LABEL LINE, not a sentence that happens to carry the word. The value
+# may be followed by prose on the same line, which several stories in this set do, so the value is
+# bounded by a space or by the end of the line rather than anchored to the end of it.
+PRECEDENT_LABEL = re.compile(r'^\*\*PRECEDENT:\*\* (near-identical|partial|none)(?:\s|$)')
 
 
 def headings(lines):
@@ -1567,6 +1575,15 @@ for path in sorted(glob.glob('tickets/**/STORY-*.md', recursive=True)):
             f'{path}: section 3 is titled "{title_three}", expected "Precedent In This Repository"')
     require(any(PRECEDENT_VALUE.search(line) for _, line in body(3) if 'precedent' in line.lower()),
             f'{path}: section 3 discloses none of near-identical, partial or none')
+    labelled = [n for n, line in body(3) if PRECEDENT_LABEL.match(line)]
+    labelled_anywhere = [n for n, line in enumerate(lines, 1) if PRECEDENT_LABEL.match(line)]
+    require(len(labelled) == 1,
+            f'{path}: section 3 carries {len(labelled)} "**PRECEDENT:** '
+            f'<near-identical|partial|none>" label line(s), expected exactly 1 — the disclosure is a '
+            f'label and a sentence mentioning precedent does not stand in for one')
+    require(len(labelled_anywhere) == len(labelled),
+            f'{path}: {len(labelled_anywhere) - len(labelled)} precedent label line(s) lie outside '
+            f'section 3')
 
     # Section 4.1 — the six INVEST criteria, each stated exactly once, inside the INVEST sub-section.
     invest_bounds = subsection(lines, *bounds.get(4, (0, 0)), number='4.1') if 4 in bounds else None
@@ -1644,7 +1661,9 @@ sys.exit(fail)
 
 Three prohibitions, each judged by markdown structure rather than by the presence of a character.
 
-**A table is a header row followed by a delimiter row, and detecting the delimiter is what removes a false positive that mattered.** An earlier revision reported *any* pipe inside a criterion, which makes an enumerated value written as `ADDED | REJECTED` a format violation — so the step that exists to keep tables out of criteria was also a reason to reword prose that was never a table. A delimiter row is now required before a table is reported, and the report names the line that proves it is one.
+**A table is a header row followed by a delimiter row, and detecting the delimiter is what removes a false positive that mattered.** An earlier revision reported *any* pipe inside a criterion, which makes an enumerated value written as `ADDED | REJECTED` a format violation — so the step that exists to keep tables out of criteria was also a reason to reword prose that was never a table. A delimiter row is required before a *table* is reported, and the report names the line that proves it is one.
+
+**Requiring the delimiter row was then narrowed too far, and the correction is a second, less specific diagnostic beside the first rather than a return to the earlier revision.** Requiring it meant a pipe-delimited **row** carrying no delimiter line was invisible — and that row is precisely the shape the rule exists to prevent, because it is what breaks a paste into an external tracker whose renderer is not this repository's. A criterion line is now reported when it carries **two or more unescaped pipes outside a code span**, which is a row; a delimiter row is reported under its own more specific message; and the carve-out the paragraph above earned is kept intact, because a single separator in prose is left alone and a pipe inside a code span or written as `\|` is masked before counting rather than counted. So `ADDED | REJECTED` in prose still passes, the same value written as a two-cell row does not, and the report states how many pipes it counted so a reader can see which of the two it is.
 
 **A diagram is any diagram, not only a Mermaid one.** That revision matched the single fence tag `mermaid`, so a PlantUML, Graphviz, D2 or WaveDrom block satisfied it, as did an embedded image or inline vector markup — none of which is less of a diagram for being written in another notation. A closed set of diagram fence languages is refused, and so is a markdown image, an `<img>` and an `<svg>`. An unterminated fence is itself a failure, because a file whose fences do not close cannot be parsed and must not be reported as clean.
 
@@ -1661,6 +1680,10 @@ HEADING = re.compile(r'^#{1,6} ')
 # what makes this markdown-aware: a lone pipe inside a criterion is prose and is left alone, while a
 # real table is reported with the line that proves it is one.
 DELIMITER = re.compile(r'^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$')
+# A pipe inside a code span is a literal — that is how this set writes an enumerated value — and a
+# backslash-escaped pipe is a character. Neither separates a cell, so both are masked before counting.
+CODE_SPAN = re.compile(chr(96) + r'[^' + chr(96) + r']*' + chr(96))
+ESCAPED_PIPE = re.compile(r'\\\|')
 DIAGRAM_LANGUAGES = {
     'mermaid', 'plantuml', 'puml', 'uml', 'dot', 'graphviz', 'mscgen', 'msc', 'nomnoml',
     'wavedrom', 'vega', 'vega-lite', 'blockdiag', 'seqdiag', 'actdiag', 'nwdiag', 'ditaa',
@@ -1668,6 +1691,15 @@ DIAGRAM_LANGUAGES = {
     'd2', 'structurizr', 'erd', 'gnuplot', 'plantuml-svg',
 }
 EMBED = re.compile(r'<svg\b|<img\b|<picture\b|!\[[^\]]*\]\(')
+
+
+def bare_pipes(line):
+    """Pipe characters a renderer or a tracker would read as cell separators: outside code spans and
+    not backslash-escaped. Two or more of them on one line is a pipe-delimited row, which is the shape
+    that breaks a paste into an external tracker whether or not a delimiter row follows it."""
+    masked = CODE_SPAN.sub(lambda m: ' ' * len(m.group(0)), line)
+    return ESCAPED_PIPE.sub('  ', masked).count('|')
+
 
 failures, inspected = [], 0
 for path in sorted(glob.glob('tickets/**/STORY-*.md', recursive=True)):
@@ -1714,10 +1746,16 @@ for path in sorted(glob.glob('tickets/**/STORY-*.md', recursive=True)):
             cursor = index + 1
             while (cursor < len(lines) and not AC.match(lines[cursor])
                    and not HEADING.match(lines[cursor])):
-                if (cursor not in fenced and '|' in lines[cursor]
-                        and DELIMITER.match(lines[cursor]) and '|' in lines[cursor]):
-                    failures.append(f'{path}:{cursor + 1}: markdown table inside the '
-                                    f'acceptance-criterion block beginning at line {head}')
+                if cursor not in fenced and '|' in lines[cursor]:
+                    pipes = bare_pipes(lines[cursor])
+                    if DELIMITER.match(lines[cursor]):
+                        failures.append(f'{path}:{cursor + 1}: markdown table — this is its '
+                                        f'delimiter row — inside the acceptance-criterion block '
+                                        f'beginning at line {head}')
+                    elif pipes >= 2:
+                        failures.append(f'{path}:{cursor + 1}: pipe-delimited row carrying {pipes} '
+                                        f'unescaped table pipes inside the acceptance-criterion '
+                                        f'block beginning at line {head}')
                 cursor += 1
             index = cursor
         else:
@@ -2443,11 +2481,15 @@ echo 'V8: PASS'
 
 **A claim is made in prose or in a comment; a command argument is not a claim.** So the numeric rule reads prose and comment lines, **including comments inside a fenced block** — which is where a performance promise is most naturally written next to the command it describes — while a fenced command line is exempt from it, because a demonstration that backdates a row by a stated interval has to name that interval to run at all. The named-term rules read every line either way, since no command needs to name a service level.
 
+**A figure written in words is still a figure, and a revision that recognised only digits was blind to the single most likely route for an invented figure to enter this set.** Two probes established it: a response-time promise written out in words, and a retention period written out in words. Both passed a revision that read `\d`, and the second matters more than the first — the audit-row retention period is one of this epic's own open decisions, stated repeatedly as undeclared, so the spelled form is exactly how a number nobody decided would arrive looking like prose.
+
+**The correction binds the word form to claim vocabulary rather than to unit adjacency, and that choice was measured rather than reasoned.** The obvious repair is to let a word-figure stand wherever a digit may stand, immediately before a unit. Measured against this set that repair reports **twenty-six occurrences, every one of them legitimate**, in five kinds: an ordinal or an adjective the pattern misreads as a unit — a second *language*, the twenty-second *item*, the two *hour figures* of an estimate row; an interval the cadence algorithm has to define to be implementable at all; a relative offset a demonstration fixture needs so it carries no literal date; an illustration of an open decision, written precisely to show that the decision is unquantified; and one value read out of this repository and cited. A step that reports twenty-six correct sentences is the noise class V21's own narrative rejects, and rewording twenty-six correct sentences to satisfy a pattern is the tail wagging the dog. **So the four routes require the vocabulary of a claim next to the figure:** a promise about how fast a running system answers; a retention period, which rule 16 names outright; a cadence or a bound on a duration, which is a service level written as a schedule; and a percentage written in words, which the percent sign in the unit set cannot see. Each route matches **nothing** in this set as it stands, and each catches its class in the spelled form and the digit form alike — so the exemptions did not have to widen and no correct sentence had to move. **What the routes do not claim to be is exhaustive:** a figure with no claim vocabulary anywhere near it and no unit remains a reading obligation, which is the boundary the closing sub-section of this section states for the suite as a whole.
+
 **The named terms are in two classes, because one rule cannot serve both.** Class A terms cannot appear except as a claim about a running system, so they are reported wherever they appear. Class B names a concept the requirements *oblige* this set to declare the absence of — a ticket has to be able to state that no such objective is declared anywhere in this repository — so a class B term is reported only when a quantity sits beside it, which is what turns naming a concept into asserting a figure. Two words are deliberately in neither class: in this set they mean how long a row is kept and how much code moved, so banning them would report the audit-row lifecycle rather than a business claim; their business forms are in class A.
 
 **Two exemptions exist, both scoped to the matched span, and both supplied rather than invented.** The first is the line-coverage figure the requirements themselves supply. The second is the pair of estimation lines carrying generation and review hours, which section 9 declares are artifact-accounting effort figures rather than business or performance figures — without that exemption the widened unit set would report every story's own estimate block, which is the one place in this set where an hour figure is legitimate and is not a claim about the running system. Nothing else is exempt, and the correct response to a report is to reword the explanation, never to widen the exemption.
 
-**This step diverges from the shorter form the requirements state, and the divergence is declared here rather than left for a reader to discover.** That shorter command bans the two bare words the class definition above deliberately places in neither class, and it recognises a narrower unit set. Run literally against this set it therefore prints a substantial number of lines, and **every one of them is a row-lifecycle mention** — how long an audit row is kept, which plugin option sets that period, which definition-of-done item gates it — or a count of executions. Not one is an invented metric, and that was verified three ways: by reading each reported line, by the two-class rule above, and by the three independent greps section 11.8 records. So the requirements' rule is honoured in substance and superseded in form. This step is **wider** than that command on units, on rate spellings and on named service-level terms, and **narrower** on exactly those two words, whose meaning in this set is a row lifecycle rather than a business outcome — while the business forms built on them stay in class A and are reported wherever they appear. **The obligation this creates is stated so it is not lost: a reader who runs the requirements' command verbatim must expect output and must confirm each reported line is a row-lifecycle mention, and it is this step, not that one, whose empty output is the gate.** No count of those lines is quoted here, deliberately: a total stated outside its own authority is the drift this epic has already had to correct once, and a total stated in the sentence that describes it would change the number it reports. **The companion divergence in V1 was closed in the other direction rather than declared** — the four narrative sentences that made the requirements' forbidden-term command print anything have been reworded, so that command and this suite's V1 now both report nothing.
+**This step diverges from the shorter form the requirements state, and the divergence is declared here rather than left for a reader to discover.** That shorter command bans the two bare words the class definition above deliberately places in neither class, and it recognises a narrower unit set. Run literally against this set it therefore prints a substantial number of lines, and **every one of them is a row-lifecycle mention** — how long an audit row is kept, which plugin option sets that period, which definition-of-done item gates it — or a count of executions, or this step's own statement of the rule that reads that vocabulary, in the blocks above and in the source below. Not one is an invented metric, and that was verified three ways: by reading each reported line, by the two-class rule above, and by the three independent greps section 11.8 records. So the requirements' rule is honoured in substance and superseded in form. This step is **wider** than that command on units, on rate spellings and on named service-level terms, and **narrower** on exactly those two words, whose meaning in this set is a row lifecycle rather than a business outcome — while the business forms built on them stay in class A and are reported wherever they appear. **The obligation this creates is stated so it is not lost: a reader who runs the requirements' command verbatim must expect output and must confirm each reported line is a row-lifecycle mention, and it is this step, not that one, whose empty output is the gate.** No count of those lines is quoted here, deliberately: a total stated outside its own authority is the drift this epic has already had to correct once, and a total stated in the sentence that describes it would change the number it reports. **The companion divergence in V1 was closed in the other direction rather than declared** — the four narrative sentences that made the requirements' forbidden-term command print anything have been reworded, so that command and this suite's V1 now both report nothing.
 
 ```python
 import glob, re, sys
@@ -2464,6 +2506,43 @@ COMMENT = re.compile(r'^\s*(?:#|--|//|/\*|\*[^*])')
 UNITS = (r'%|\b(?:ms|milliseconds?|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?'
          r'|rps|qps|rpm|tps|requests?[ ]per[ ](?:second|minute|hour))\b')
 NUMERIC = re.compile(r'\b\d+(?:[.,]\d+)?\s*(?:' + UNITS + r')', re.IGNORECASE)
+# A FIGURE MAY BE WRITTEN IN WORDS, and a figure written in words is still a figure. The vocabulary
+# below is the one QUANTITY already carries; what is new is that it may stand where a digit stands.
+# It is deliberately NOT wired into NUMERIC, and the reason was measured rather than assumed: a bare
+# word-figure standing before a unit occurs twenty-six times in this set and every occurrence is
+# legitimate — an ordinal or adjective the pattern misreads as a unit, an interval the cadence
+# algorithm defines, a relative offset a demonstration fixture needs, an illustration of an open
+# decision this set states is unquantified, or a value read out of this repository with its citation.
+# Reporting those is the noise class V21's narrative rejects. So the word form is bound to CLAIM
+# VOCABULARY instead, in four routes, each of which matches nothing in this set as it stands and each
+# of which catches its class in the spelled form and the digit form alike.
+WORD_UNIT = r'(?:ms|milliseconds?|seconds?|secs?|minutes?|mins?|hours?|hrs?|days?|weeks?|months?)'
+WORD_ONES = (r'one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen'
+             r'|fifteen|sixteen|seventeen|eighteen|nineteen')
+WORD_TENS = r'twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand'
+WORD_FIGURE = (r'(?:' + WORD_ONES + r'|' + WORD_TENS + r')'
+               r'(?:[ -](?:and[ ])?(?:' + WORD_ONES + r'|' + WORD_TENS + r'))*')
+FIGURE = r'(?:\d+(?:[.,]\d+)?|' + WORD_FIGURE + r')'
+DURATION = FIGURE + r'[ -]' + WORD_UNIT + r'\b'
+SPELLED = (
+    # A promise about how fast a running system answers.
+    (re.compile(r'\b(?:respond|reply|answer|complete|return|resolve|render|finish|load|serve'
+                r'|process)(?:s|es|ed|ing)?\s+(?:with)?in\s+(?:less than\s+|under\s+|at most\s+'
+                r'|no more than\s+)?' + DURATION, re.IGNORECASE),
+     'a response-time claim stated as a figure and a unit'),
+    # A retention period, which rule 16 names explicitly and which this set declares is undecided.
+    (re.compile(r'\b(?:kept|retained|held|stored|preserved|purged|deleted|removed|expires?|expired'
+                r'|retention(?:\s+(?:period|window))?(?:\s+of)?)\s+'
+                r'(?:for|of|after|following|beyond)?\s*' + DURATION, re.IGNORECASE),
+     'a retention period stated as a figure and a unit'),
+    # A cadence or a bound on a duration, which is a service level written as a schedule.
+    (re.compile(r'\b(?:every|once every|at most|no more than|no longer than|up to|within'
+                r'|older than|newer than|faster than|slower than)\s+' + DURATION, re.IGNORECASE),
+     'a bounded or scheduled duration stated as a figure and a unit'),
+    # A percentage written in words, which the percent sign in UNITS cannot see.
+    (re.compile(r'\b' + FIGURE + r'[ -]per[ ]?cent\b', re.IGNORECASE),
+     'a percentage stated in words'),
+)
 # Named service-level and business-outcome terms, in two classes, because one rule cannot serve
 # both. Class A cannot appear except as a claim about a running system, so it is reported wherever it
 # appears. Class B names a concept the requirements oblige this set to declare the ABSENCE of — a
@@ -2551,6 +2630,10 @@ for path in sorted(glob.glob('tickets/**/*.md', recursive=True)):
         # either way, because no command needs to name a service level.
         patterns = [(TERMS_ALWAYS, 'business or service-level term', False),
                     (TERMS_WITH_FIGURE, 'service-level term stated with a quantity', True)]
+        # The four claim-bound routes read every line, for the same reason the named-term rules do:
+        # no command needs to promise a response time, a retention period or a cadence, so a figure
+        # standing beside that vocabulary is a claim wherever it is written.
+        patterns.extend((pattern, label, False) for pattern, label in SPELLED)
         if not inside_fence or COMMENT.match(line):
             patterns.insert(0, (NUMERIC, 'numeric figure with a unit', False))
         for pattern, label, needs_figure in patterns:
@@ -2562,7 +2645,11 @@ for path in sorted(glob.glob('tickets/**/*.md', recursive=True)):
                     window = line[max(0, start - FIGURE_WINDOW):min(len(line), end + FIGURE_WINDOW)]
                     if not QUANTITY.search(window.replace(m.group(0), ' ' * len(m.group(0)))):
                         continue
-                where = 'comment inside a fenced block' if inside_fence else 'prose'
+                if inside_fence:
+                    where = ('a comment inside a fenced block' if COMMENT.match(line)
+                             else 'a fenced block')
+                else:
+                    where = 'prose'
                 failures.append(f'{path}:{ln}:{start + 1}: invented-metric candidate ({label}) in '
                                 f'{where}: "{m.group(0).strip()}"')
 
@@ -2590,6 +2677,8 @@ Second, **an extra or duplicated rollup group fails.** A rollup row for a batch 
 Third, **every numeric cell is parsed defensively.** A malformed figure used to abort the run with an interpreter error, which reported nothing about the remaining rows; it is now a named failure against the row and the column it appeared in, and the run continues.
 
 Fourth, **every table row must match exactly one story file, and the number of rows cross-checked is itself asserted.** That revision skipped a row whose story file did not exist and moved on in silence, so it could report success having compared only part of the table — the failure mode of a gate that reports on what it happened to find rather than on what was declared.
+
+**This step supersedes the shorter skeleton the requirements state, and the reason is stated here rather than left for a reader to discover the hard way.** That skeleton selects a table row by shape — a line beginning with a pipe and containing a story identifier anywhere in it — and then takes the first cell that *starts* with the identifier. This file carries rows that satisfy the first condition and not the second: a settled-ruling row and an inventory row each name a story inside a sentence in a cell, with no cell beginning with it. Run against this set the skeleton therefore raises rather than reports, exits non-zero with **nothing printed at all** — not even the row count its own comment promises — and a reader who took that exit status as a verdict about the artifact would be reading a defect in the selector as a defect in the tickets. It also compares nothing: it parses rows, looks for a file per row, and performs none of the arithmetic rules 6 and 7 require. So the requirements' rule is honoured in substance and superseded in form, exactly as it is in the invented-metric step: this step binds the table by its own section heading, requires one file per row, asserts the number of rows it cross-checked, and does the decimal arithmetic. **The obligation this creates is stated so it is not lost: the requirements' §0.9.2 command set is a draft that this suite replaces step for step, and it is these steps, not those, whose exit status is the gate.**
 
 ```python
 import glob, os, re, sys
@@ -4047,11 +4136,14 @@ sys.exit(1 if failures else 0)
 
 **This validator exists because a review of this set found six template defects that every other step in this suite reported nothing about, and a suite that misses a defect a reviewer finds by hand is a formality rather than a gate.** V3 asserts that the mandated markers and quantities are present; nothing asserted that the ten sections appear once each **in order**, that the story sentence is present, that there is exactly **one** demonstration, that each criterion carries exactly **one** Given/When/Then triplet, that each dependency is **classified**, or that the definition of done holds exactly **ten** items. Run against the state that review examined, the block below reports nineteen failures: thirteen definition-of-done blocks between eleven and eighteen items long, five criteria carrying two triplets each behind an `And …` lead-in, and one story whose demonstration sub-section had been retitled after its execution model. Every one of those is a defect the requirements name explicitly, and none of them changes a citation, a link, a count in a table or a forbidden term — which is exactly why the other ten validators pass on them.
 
+**This step also failed open, and it was the only one that did.** A review ran every step against a corpus of nothing — an empty `tickets/`, a `tickets/` holding a single story, and a tree with no `tickets/` directory at all — and twenty-one of the twenty-two validators reported the shortfall and exited non-zero, as the exact-counts invariant above requires. This one printed no expectation, found no failures because it had read no file, and exited zero. That is the failure mode the invariant exists to prevent, and it is worse here than a missed defect would be: an operator generating files incrementally reads a green result as template conformance when nothing was inspected. The step now carries the declared story count, states it in its verdict line, and fails on any shortfall while naming how many story files it never read.
+
 Three scoping decisions are stated rather than left implicit. **The demonstration check accepts either published title** — `Demonstration Path` or `Demonstration Requirement`, both of which occur in this set — and requires exactly one of them inside section 4, so a story that keeps a second demonstration after a rewrite, or retitles the sub-section after something else, fails. **The story sentence is counted inside section 4 only**, because the estimation section legitimately opens a sentence with `As a cross-check` and a whole-file count would report that as a second story sentence. **The dependency-form check is case-insensitive and accepts the phrase with or without its article**, because this set writes the classification both as a bolded `Classification: a shared code path` and as a bare `Shared code path` label, and a pattern tied to one form would report the other as missing.
 
 ```python
 import glob, re, sys
 
+EXPECTED_STORIES = 25
 SECTIONS = ('Story Title', 'Source Traceability', 'Precedent In This Repository', 'User Story',
             'Acceptance Criteria', 'Sub-tasks', 'Edge Cases', 'Dependencies',
             'Story Estimation Guidance', 'Definition of Done (Story-Level)')
@@ -4134,10 +4226,19 @@ for path in sorted(glob.glob('tickets/**/STORY-*.md', recursive=True)):
         if items != 10:
             failures.append(f'{path}: definition-of-done items: {items}, expected exactly 10')
 
-print(f'V16: story files inspected: {inspected}; template failures: {len(failures)}')
+print(f'V16: story files inspected: {inspected} (expected exactly {EXPECTED_STORIES}); '
+      f'template failures: {len(failures)}')
 for f in failures:
     print('  FAIL ' + f)
-sys.exit(1 if failures else 0)
+fail = 1 if failures else 0
+# A step that reports success having read nothing is not a gate. Every sibling step that reads the
+# corpus asserts the size it read, and this one asserts it too rather than trusting the glob.
+if inspected != EXPECTED_STORIES:
+    print(f'  FAIL story files inspected: {inspected}, expected exactly {EXPECTED_STORIES}; no '
+          f'template conformance is established for the {EXPECTED_STORIES - inspected} story '
+          f'file(s) this run never read')
+    fail = 1
+sys.exit(fail)
 ```
 
 #### V17 — Heading Uniqueness And Ruling-Identifier Uniqueness, In Both Directions
@@ -4991,6 +5092,8 @@ sys.exit(1 if failures else 0)
 
 **The scope is this set's own exhaustive-enumeration idioms, not every number word, and that narrowness was measured rather than assumed.** A draft of this step reconciled every number-word-introduced line followed by a bullet list: one hundred enumerations and thirteen mismatches, of which **twelve were correct prose the check had misread** — "One open decision bears on this story and two have been closed" above three bullets is right, and a step that reports it is noise a reader learns to ignore, which is worse than no step at all. So three idioms are anchored instead, each measured to zero false positives across the corpus: the phrase this set uses when it means an exhaustive list (**a count, a noun, then "are load-bearing"**), the phrase it uses to designate a single authority (**a count "enumerated once, in section N.N"**, reconciled against that section's ledger rows), and the phrase section 8 uses to state its own size (**a count "in two groups"**, reconciled against both subsections' ordered entries and their sum).
 
+**A fourth idiom was added because the count this suite states about itself was the one count nothing reconciled.** The operating instruction that opens section 11.10 told a reviewer to run all of a number of steps and made the gate that all of that number exit zero — and the number was a superseded total that had survived a revision which added steps, sitting in the same sentence as the current one. Three idioms and twenty-one sibling steps were blind to it, and the consequence is operator-facing rather than cosmetic: a maintainer following the instruction is told the gate is one size while another size is specified, which leaves the difference ambiguous as to whether those steps belong to the gate at all. The idiom is now anchored — a count standing before "from the repository root" or before "exit zero" — and reconciled against the number of step headings section 11.10 actually carries, counted fence-aware from the headings themselves so that adding a step without updating the instruction fails, and so does the reverse. **The step also fails when it can locate no step heading**, for the same reason its exemption fails when it can locate no source block: a reconciliation against zero is not a reconciliation.
+
 **Two subtleties are handled because the corpus contains both.** A **self-numbering** list states its own reading numbers, and then the count is the *highest label* rather than the bullet total — FEATURE-001-08 carries twenty-six labels across thirty bullets, because unlabelled continuation bullets and trailing notes share the run without being readings; where two or more labels are present the step counts by label and additionally asserts the labels are contiguous with no gap and no repeat, which is the property that makes counting by label sound. And **sibling-list boundary detection** ends a run at the first line that is neither a bullet, nor blank, nor an indented continuation, so a following paragraph, heading or nested list never inflates a count. A line that states a count and is followed by no list at all is enumerating in prose and is skipped rather than reported.
 
 **What it does not establish.** That the list contains the *right* items, that two lists which should agree do, or that a number nobody stated is correct. It establishes that every number this set states about one of its own enumerations agrees with that enumeration.
@@ -5047,6 +5150,14 @@ TABLE_ROW = re.compile(r'^\|(?!\s*-{2,})')
 GROUPS = re.compile(r'^(' + NUM + r')\s+entries in two groups\s+\u2014\s+(' + NUM + r')\s+([a-z]+)'
                     r'\s+and\s+(' + NUM + r')\s+([a-z]+)', re.IGNORECASE)
 ORDERED = re.compile(r'^\d+\. ')
+# RULE 4. The suite's own step-count idiom, which is the operating instruction a reviewer follows. It
+# is reconciled against the step headings section 11.10 actually carries, because a gate whose stated
+# size disagrees with its own contents leaves the difference ambiguous as to whether it is in the gate
+# — and this is the class that produced the defect: two references to a superseded total survived a
+# revision that added steps, in the same sentence that stated the current one.
+SUITE_COUNT = re.compile(r'\b(?:[Rr]un all|all)\s+(' + NUM + r')\s+'
+                         r'(?:from the repository root|exit(?:s|ing)?\s+zero)', re.IGNORECASE)
+STEP_TITLE = re.compile(r'^#### [VE][0-9]+\s+\u2014\s')
 
 failures = []
 reconciled = 0
@@ -5127,6 +5238,22 @@ def bullet_run(lines, start):
     return total, labels
 
 
+def suite_step_count(lines):
+    """The number of steps this suite carries, counted from its own step headings with fenced blocks
+    skipped, so the number the operating instruction states is reconciled against the number present
+    rather than against another number in the same sentence."""
+    total, inside = 0, False
+    for line in lines:
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if STEP_TITLE.match(line):
+            total += 1
+    return total
+
+
 def section_span(lines, number):
     """The inclusive body span of a numbered section, located by its own heading."""
     opening = re.compile(r'^#{2,4}\s+' + re.escape(number) + r'(\s|$)')
@@ -5146,6 +5273,11 @@ paths = sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True))
 if len(paths) != 34:
     failures.append(f'expected 34 markdown files under {TICKETS}/, found {len(paths)}')
 EXEMPT_SPANS = suite_source_spans(EPIC)
+EPIC_LINES = read(EPIC)
+SUITE_STEPS = suite_step_count(EPIC_LINES) if EPIC_LINES is not None else 0
+if SUITE_STEPS == 0:
+    failures.append(f'{EPIC}: no step heading was located, so no stated step count can be '
+                    f'reconciled against the suite')
 inspected = 0
 
 for path in paths:
@@ -5222,6 +5354,15 @@ for path in paths:
                 failures.append(f'{path}:{index + 1}: states {stated} {point.group(2)} enumerated '
                                 f'once in section {point.group(3)}, but that section\'s ledger '
                                 f'carries {rows} rows')
+
+        for stated_steps in SUITE_COUNT.finditer(line):
+            reconciled += 1
+            claimed = WORDS[stated_steps.group(1).lower()]
+            if claimed != SUITE_STEPS:
+                failures.append(f'{path}:{index + 1}: the operating instruction states {claimed} '
+                                f'steps ("{stated_steps.group(0).strip()}"), but section 11.10 '
+                                f'carries {SUITE_STEPS} step headings — so {abs(SUITE_STEPS - claimed)} '
+                                f'step(s) are ambiguous as to whether they belong to the gate')
 
         group = GROUPS.match(stripped)
         if group:
