@@ -218,13 +218,13 @@ Every type implementing the `ErrorResult` interface is appended to the published
 
 **C3 — Automatic `Permission` enum growth, `Permission.Owner` is not an access control, and a custom permission cannot reach a customer at all. Verdict: the enum growth is a declared side effect; the other two halves are correctness traps, and the third would make every buyer-facing operation unreachable if it were not carried into the design.**
 
-The `Permission` enum is declared with no members in source and annotated as populated at run time [packages/core/src/api/schema/common/common-enums.graphql:L20-L21], filled by `generatePermissionEnum` from the default and custom permission definitions [packages/core/src/api/config/generate-permissions.ts:L39-L68], and that generator also runs after plugin extensions are merged [packages/core/src/api/config/get-final-vendure-schema.ts:L116]. Registering the three new permission definitions this epic settles on in section 6.4 therefore grows a published enum by **four members**, on the same additive-but-published footing as C2 — four rather than three because one of the three is a read-write definition that yields two members [packages/core/src/common/permission-definition.ts:L255-L262]. **Stated with before-and-after figures rather than only as a delta, so the growth is as concrete here as C2's is:** both checked-in snapshots currently publish **ninety-seven** `Permission` members [schema-admin.json:Permission] and [schema-shop.json:Permission], so **each enum goes from ninety-seven to one hundred and one**. **The entitlement to the seller-unscoped form of FEATURE-001-08's aggregate read. That separation of scope from read is retained of FEATURE-001-08's aggregate is deliberately not a fourth definition**, and that is the one place this count could have grown and does not: deriving "no seller to filter by" and "authorised to see every seller" on a single branch is fail-open, so the wide form needs its own entitlement — but the platform already publishes one that says exactly that, `Permission.ReadSeller`, generated from the shipped `new CrudPermissionDefinition('Seller')` [packages/core/src/common/constants.ts:L71], and the wide form is admitted by requiring it *together with* the narrow read permission in code rather than by registering a second name for the same idea [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.7 The Seller-Scoping Rule, Stated As A Hard Contract] — but the entitlement is the platform's existing `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71] rather than a new member, so it costs this row nothing. Least privilege is preserved — a seller-scoped role holds the read permission and not `ReadSeller` — and the published enum does not grow for a scope. The figure is identical in the two APIs because the generator draws from one registry rather than per-API sets [packages/core/src/api/config/generate-permissions.ts:L46] — which is worth stating plainly, because **all four new members gate Admin operations only and yet all four appear in the published Shop enum as well.** That is not a leak: an enum member is a name, and the operations it gates are absent from the Shop schema. It does mean a Shop-side client switching exhaustively on `Permission` without a default branch will break, exactly as ruling R9 requires every consuming example to guard against.
+The `Permission` enum is declared with no members in source and annotated as populated at run time [packages/core/src/api/schema/common/common-enums.graphql:L20-L21], filled by `generatePermissionEnum` from the default and custom permission definitions [packages/core/src/api/config/generate-permissions.ts:L39-L68], and that generator also runs after plugin extensions are merged [packages/core/src/api/config/get-final-vendure-schema.ts:L116]. Registering the three new permission definitions this epic settles on in section 6.4 therefore grows a published enum by **four members**, on the same additive-but-published footing as C2 — four rather than three because one of the three is a read-write definition that yields two members [packages/core/src/common/permission-definition.ts:L255-L262]. **Stated with before-and-after figures rather than only as a delta, so the growth is as concrete here as C2's is:** both checked-in snapshots currently publish **ninety-seven** `Permission` members [schema-admin.json:Permission] and [schema-shop.json:Permission], so **each enum goes from ninety-seven to one hundred and one**. **The entitlement to the seller-unscoped form of FEATURE-001-08's aggregate read is deliberately not a fourth definition**, and that is the one place this count could have grown and does not. The separation of scope from read is retained rather than abandoned: deriving "no seller to filter by" and "authorised to see every seller" on a single branch is fail-open, so the wide form does need an entitlement of its own. It does not need a *new* one — the platform already publishes a member that says exactly that, `Permission.ReadSeller`, generated from the shipped `new CrudPermissionDefinition('Seller')` [packages/core/src/common/constants.ts:L71] — so the wide form is admitted by requiring `ReadSeller` *together with* the narrow read permission in code, rather than by registering a second name for the same idea [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.7 The Seller-Scoping Rule, Stated As A Hard Contract]. Requiring an already-published member costs this row nothing. Least privilege is preserved — a seller-scoped role holds the read permission and not `ReadSeller` — and the published enum does not grow for a scope. The figure is identical in the two APIs because the generator draws from one registry rather than per-API sets [packages/core/src/api/config/generate-permissions.ts:L46] — which is worth stating plainly, because **all four new members gate Admin operations only and yet all four appear in the published Shop enum as well.** That is not a leak: an enum member is a name, and the operations it gates are absent from the Shop schema. It does mean a Shop-side client switching exhaustively on `Permission` without a default branch will break, exactly as ruling R9 requires every consuming example to guard against.
 
 The second half is the ownership caveat, stated in the platform's own source: any resolver using `Permission.Owner` **must** include logic enforcing that only the owner of the resource has access, and if it does not, the effect is equivalent to `Permission.Public` [packages/core/src/api/config/generate-permissions.ts:L32-L34].
 
 **The third half is the one that decides the design, and it was read rather than assumed: a custom permission definition can never be granted to a customer.** Three citations establish it and none of them is an inference:
 
-*Resolution.* Pair the gate with an explicit in-service ownership predicate derived from the authenticated session, and make "a request authenticated as a different customer is refused" a mandatory acceptance criterion rather than an edge case. The wishlist service shows the minimal form of the session guard this must build on [packages/dev-server/example-plugins/wishlist-plugin/service/wishlist.service.ts:L74-L76]. **Which gate is paired with it is settled by C7, not here:** buyer-facing operations use `Permission.Owner`, and the custom permission definitions this epic registers are Admin-only. The enum growth reported above is therefore **three definitions producing four members, all of them administrative** — the count section 6.4's published-symbol inventory fixes and the only count any file in this set may state. **An earlier revision of this sentence said three definitions producing four members**, which was the arithmetic before FEATURE-001-08 separated the seller-unscoped entitlement from the aggregate read; it is withdrawn here rather than left to be reconciled by a reader who found the two figures in one section.
+*Resolution.* Pair the gate with an explicit in-service ownership predicate derived from the authenticated session, and make "a request authenticated as a different customer is refused" a mandatory acceptance criterion rather than an edge case. The wishlist service shows the minimal form of the session guard this must build on [packages/dev-server/example-plugins/wishlist-plugin/service/wishlist.service.ts:L74-L76]. **Which gate is paired with it is settled by C7, not here:** buyer-facing operations use `Permission.Owner`, and the custom permission definitions this epic registers are Admin-only. The enum growth reported above is therefore **three definitions producing four members, all of them administrative** — the count section 6.4's published-symbol inventory fixes and the only count any file in this set may state. **An earlier revision of this sentence said four definitions producing five members**, which was the arithmetic before FEATURE-001-08 separated the seller-unscoped entitlement from the aggregate read and satisfied it with the platform's existing `Permission.ReadSeller` rather than with a definition of its own; that count is withdrawn here rather than left to be reconciled by a reader who found two different figures in one section.
 - **The Customer Role ships holding exactly one permission.** It is created with `permissions: [Permission.Authenticated]` [packages/core/src/service/services/role.service.ts:L443] and it is the special role every customer user is given [packages/core/src/service/services/user.service.ts:L106-L107].
 - **That role cannot be amended.** `RoleService.update` throws `error.cannot-modify-role` when the target is the Customer Role [packages/core/src/service/services/role.service.ts:L290-L291], so there is no Admin API call, no seeding step and no configuration that adds a permission to it. It is assigned to each newly created channel [packages/core/src/api/resolvers/admin/channel.resolver.ts:L65-L67], so the constraint holds on every channel rather than only on the default one.
 - **`Permission.Owner` is not assignable either, and that is deliberate.** It is declared `assignable: false` and `internal: true` [packages/core/src/common/constants.ts:L28-L31]. What makes it usable on a customer-facing resolver is the guard's own arithmetic: `authorizedAsOwnerOnly` is set when the session lacks the required permission and `Permission.Owner` was requested [packages/core/src/service/helpers/request-context/request-context.service.ts:L109], and the access-control strategy admits the request on that basis [packages/core/src/config/auth/default-entity-access-control-strategy.ts:L56]. That is exactly why the platform warns it is equivalent to `Permission.Public` without in-resolver logic — the gate lets everyone through by construction.
@@ -344,7 +344,7 @@ Five claims in existing repository documentation do not match the repository's b
 
 ### 6.4 The Settled Rulings, And The Complete Published-Symbol Inventory
 
-The collisions above settle **twenty-one** rulings. They are gathered here so a story author reads them as a list rather than reconstructing them from prose, and so a reviewer can check a story against a fixed set. **Every one of the twenty-one is binding on all twenty-five stories.** R1 to R9 were settled by the collisions in sections 6.1 and 6.2; R10 to R20 were settled by reviews of this set that found the same defect class recurring across sibling files; **R20 and R21 were settled by a second review, which found one published mutation writing to a cart whose owner the set still called an open decision, and two administrative reads whose subject scope a caller could compose its way out of.** Each ruling names the single contract that replaces the thing it settles — a contract stated here once so that no two features can state it differently, and appended rather than interleaved so that no existing reference to a numbered ruling is silently re-pointed.
+The collisions above settle **twenty-two** rulings. They are gathered here so a story author reads them as a list rather than reconstructing them from prose, and so a reviewer can check a story against a fixed set. **Every one of the twenty-two is binding on all twenty-five stories, and every identifier below is unique — which an earlier revision of this table could not claim.** That revision numbered two different rulings `R20`, with `R21` between them, so a story citing "R20" cited an ambiguity: the cart-ownership ruling and the package-export ruling answered to one name. **The export ruling is now `R22`, the cart-ownership ruling keeps `R20`, and the count moves from twenty-one to twenty-two** — the row was always there and only its label was missing, so nothing is added and nothing is dropped. R1 to R9 were settled by the collisions in sections 6.1 and 6.2; R10 to R19 were settled by reviews of this set that found the same defect class recurring across sibling files; **R20, R21 and R22 were settled by a second review, which found one published mutation writing to a cart whose owner the set still called an open decision, two administrative reads whose subject scope a caller could compose its way out of, and a set of public strategy, option and event symbols with no declared export site.** Each ruling names the single contract that replaces the thing it settles — a contract stated here once so that no two features can state it differently, and appended rather than interleaved so that no existing reference to a numbered ruling is silently re-pointed.
 
 
 
@@ -368,30 +368,30 @@ The collisions above settle **twenty-one** rulings. They are gathered here so a 
 | R16 | Every Shop API read and write in this epic is scoped to the one channel the request names, and no Shop surface aggregates across channels. A cross-channel view is an Admin API aggregate behind its own permission, and is outside this epic. | C3, and the channel-scoping constraint | A story touching cadence, a due signal, a snooze or a list read asserts the active-channel row set and asserts that a row under a second token is absent from it. No story leaves channel identity as an open option. |
 | R17 | Every negative branch names the exact top-level error, its stable code and its error location. "A request-level error", "no payload" and "the request is refused" are not assertions. | C7, and the observability finding in 6.1 | A criterion asserting a refusal names `ForbiddenError` [packages/core/src/common/error/errors.ts:L67] or `UserInputError` [packages/core/src/common/error/errors.ts:L27], names the `extensions.code` value that error carries — `FORBIDDEN` [packages/core/src/common/error/errors.ts:L69] or `USER_INPUT_ERROR` [packages/core/src/common/error/errors.ts:L29] — and names the response location the assertion reads. The mechanism is the platform's: both extend `I18nError`, which extends `GraphQLError` and places the code in `extensions.code` [packages/core/src/i18n/i18n-error.ts:L18] and [packages/core/src/i18n/i18n-error.ts:L25-L27], so a test reads `errors[0].extensions.code` and the field the operation would have returned is null. **The reason this is a ruling rather than a style note: an assertion of the form "no payload was returned" is satisfied by an internal server error, a resolver crash, a schema-validation failure and a genuine refusal alike**, so it cannot distinguish the behaviour under test from a defect. A criterion that names only the absence of data has not tested the refusal. |
 | R18 | Cadence recompute is a `ScheduledTask` that **enqueues one idempotent job per channel and derives nothing inside `execute`**. The `Job` record is the observable completion signal. | The platform's own scheduler mechanics, and FEATURE-001-05 | No story writes a conditional completion criterion, and no story states an alternative execution model as still open. Section 8.2's first entry records the closure. |
-| R19 | **This epic registers exactly one `ScheduledTask`, and it is FEATURE-001-05's cadence recompute. The customer-data-lifecycle pass is one job, not a task; it has one mechanism, one owner and exactly two triggers, and this row is its single authority.** **The mechanism** is a single bounded, idempotent, resumable job on the plugin's own queue [packages/core/src/job-queue/job-queue.service.ts:L51-L82], carrying one handler with two job kinds and nothing else — no second `ScheduledTask`, no purge outside this job, no deletion inside a request. **The owner** is FEATURE-001-07, and the owning story is STORY-001-07-01. **The two triggers are named here because a mechanism with no trigger cannot enforce anything.** **Trigger one — erasure:** the platform's own shipped customer event reporting a delete [packages/core/src/event-bus/events/customer-event.ts:L22-L30], observed through the typed subscribe [packages/core/src/event-bus/event-bus.ts:L130], enqueues the job scoped to that customer, and the job applies FEATURE-001-07's erasure map — every customer-identifying and re-identifying column nulled on the audit tables while every aggregate column is retained, the saved-list and cadence rows for that customer deleted outright. **Trigger two — expiry:** the recording path, which is the only writer to those tables, runs one bounded indexed probe after its own transaction commits and enqueues the same job scoped to that channel when a row past the configured keep period exists. **The batching model** is identical for both kinds: bounded pages ordered by the inherited creation timestamp [packages/core/src/entity/base/base.entity.ts:L31] with the row identifier as the final tie-breaker, proved across more than one batch against a configured batch size. **The policy gate** is a required finite retention period: the plugin refuses to start with recording enabled and no finite value, so unbounded accumulation is not reachable by leaving product decision 3 unmade. **Because the job is idempotent and bounded, a duplicate enqueue is harmless, so no claim row, no lock table and no exclusive scheduler is introduced.** The enqueue is the deleted customer's identifier and nothing else, because `Job.data` is persisted and published as a JSON field on the Admin API [packages/core/src/api/schema/admin-api/job.api.graphql:L51]; the owner is **STORY-001-07-01**, which is the only story in this set that builds it, prices it or tests it; and the observable completion signal is the job's terminal state with its removed-and-anonymised row per-table counts, read through the existing `job` query [packages/core/src/api/schema/admin-api/job.api.graphql:L28-L35]. **The pass covers every plugin-owned table that names a customer, counted independently so a table cannot be silently omitted: six.** `ReorderList` and `ReorderListLine` are deleted outright, the line rows following their parent through the declared cascade; `ReorderListShare` is deleted outright; `PurchaseCadence` is deleted outright; `ReorderAttempt` and `ReorderAttemptLine` are anonymised by nulling their customer identifier while their aggregate columns are retained, because a demand aggregate keeps its meaning without an owner and a saved list does not. The job reports one count per table so a zero is distinguishable from a table the observable completion signal [packages/core/src/api/schema/admin-api/job.api.graphql:L27-L34]. **There is no periodic sweep, and the consequence is stated rather than hidden**: expiry advances in a channel while that channel records reorders, and a channel that records none neither accrues new rows nor runs a pass. **Worker topology is part of the contract because the platform will otherwise publish these jobs into a queue nothing processes.** `jobQueueOptions.activeQueues` [packages/core/src/config/vendure-config.ts:L1054] filters *processing* and never *publishing*, and the name it is compared against is the **prefixed** one, since `createQueue` prepends `jobQueueOptions.prefix` [packages/core/src/config/vendure-config.ts:L1065] to the declared name [packages/core/src/job-queue/job-queue.service.ts:L85-L87] before the start decision reads it [packages/core/src/job-queue/job-queue.service.ts:L206-L211]. So a deployment that restricts its worker must list `${prefix}reorder-customer-data-lifecycle` — and `${prefix}recompute-purchase-cadence` for R18's queue — or erasure and cadence both stall with every job sitting `PENDING` and no error anywhere. | The one-task architecture inventory in this section, the batch order of section 9.4, and a review finding that four different lifecycle mechanisms were described across five files | A story may not register a second `ScheduledTask`, may not fold the pass into R18's task — FEATURE-001-07 is B5 and that task is B4, so it would be a backwards batch dependency — may not describe its row work as running **inside** that task's `execute` or its counts as reported in the task's own returned object, both of which belong to the job, may not describe a periodic purge, a cron sweep or a second task under any name. A story that needs the pass **references STORY-001-07-01's contract rather than restating a mechanism of its own**, and names the queue, **both** triggers, the payload, the page bound, the terminal job state and the absent periodic sweep. The owning story additionally asserts the restricted-worker case: with `activeQueues` set to a list omitting the prefixed lifecycle queue name, the job is created and stays `PENDING`, and with the name present it settles — which is the assertion that turns the topology note into a test. |
+| R19 | **This epic registers exactly one `ScheduledTask`, and it is FEATURE-001-05's cadence recompute. The customer-data-lifecycle pass is one job, not a task; it has one mechanism, one owner and exactly two triggers, and this row is its single authority.** **The mechanism** is a single bounded, idempotent, resumable job on the plugin's own queue [packages/core/src/job-queue/job-queue.service.ts:L51-L82], carrying one handler with two job kinds and nothing else — no second `ScheduledTask`, no purge outside this job, no deletion inside a request. **The owner** is FEATURE-001-07, and the owning story is STORY-001-07-01. **The two triggers are named here because a mechanism with no trigger cannot enforce anything.** **Trigger one — erasure:** the platform's own shipped customer event reporting a delete [packages/core/src/event-bus/events/customer-event.ts:L22-L30], observed through the typed subscribe [packages/core/src/event-bus/event-bus.ts:L130], enqueues the job **carrying no subject identifier at all — the job kind and the channel id and nothing else** — and the job then finds its own work by a bounded scan for rows whose customer is soft-deleted, `Customer` being soft-deletable so that neither a soft nor a hard delete removes these rows by itself [packages/core/src/entity/customer/customer.entity.ts:L23]. **The payload is non-personal by construction and that is a requirement rather than a preference**, because `Job.data` is persisted and published as a JSON field on the Admin API [packages/core/src/api/schema/admin-api/job.api.graphql:L51], so a customer identifier placed in it would be a customer identifier published to every holder of the job-reading permission and retained for as long as the job row is. The job applies FEATURE-001-07's erasure map — every customer-identifying and re-identifying column nulled on the audit tables while every aggregate column is retained, the saved-list and cadence rows for that customer deleted outright. **Trigger two — expiry:** the recording path, which is the only writer to those tables, runs one bounded indexed probe after its own transaction commits and enqueues the same job scoped to that channel when a row past the configured keep period exists. **The batching model** is identical for both kinds: bounded pages ordered by the inherited creation timestamp [packages/core/src/entity/base/base.entity.ts:L31] with the row identifier as the final tie-breaker, proved across more than one batch against a configured batch size. **The policy gate** is a required finite retention period: the plugin refuses to start with recording enabled and no finite value, so unbounded accumulation is not reachable by leaving product decision 3 unmade. **Because the job is idempotent and bounded, a duplicate enqueue is harmless, so no claim row, no lock table and no exclusive scheduler is introduced.** The owner is **STORY-001-07-01**, which is the only story in this set that builds it, prices it or tests it; and the observable completion signal is the job's terminal state with its removed-and-anonymised row per-table counts, read through the existing `job` query [packages/core/src/api/schema/admin-api/job.api.graphql:L28-L35]. **The pass covers every plugin-owned table that names a customer, counted independently so a table cannot be silently omitted: six.** `ReorderList` and `ReorderListLine` are deleted outright, the line rows following their parent through the declared cascade; `ReorderListShare` is deleted outright; `PurchaseCadence` is deleted outright; `ReorderAttempt` and `ReorderAttemptLine` are anonymised by nulling **every customer-identifying and re-identifying column, not one of them**, while every aggregate column is retained — because a demand aggregate keeps its meaning without an owner and a saved list does not. The column-level shape is FEATURE-001-07's map: eleven columns nulled across the two tables, two re-digested, one set, and everything else retained [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§5. Definition of Done (Feature-Level)]. **"Their customer identifier" is the wrong name for what is cleared and an earlier version of this sentence used it: neither audit table carries a column of that name, and both carry two customer roles plus references that reach a person through one join.** **The job reports one count per table, so a table that had nothing to erase is distinguishable from a table the pass never reached** — a single total would report both as the same number — and the six counts are read off the job's terminal record through the existing `job` query [packages/core/src/api/schema/admin-api/job.api.graphql:L27-L34]. **There is no periodic sweep, and the consequence is stated rather than hidden**: expiry advances in a channel while that channel records reorders, and a channel that records none neither accrues new rows nor runs a pass. **Worker topology is part of the contract because the platform will otherwise publish these jobs into a queue nothing processes.** `jobQueueOptions.activeQueues` [packages/core/src/config/vendure-config.ts:L1054] filters *processing* and never *publishing*, and the name it is compared against is the **prefixed** one, since `createQueue` prepends `jobQueueOptions.prefix` [packages/core/src/config/vendure-config.ts:L1065] to the declared name [packages/core/src/job-queue/job-queue.service.ts:L85-L87] before the start decision reads it [packages/core/src/job-queue/job-queue.service.ts:L206-L211]. So a deployment that restricts its worker must list `${prefix}reorder-customer-data-lifecycle` — and `${prefix}recompute-purchase-cadence` for R18's queue — or erasure and cadence both stall with every job sitting `PENDING` and no error anywhere. | The one-task architecture inventory in this section, the batch order of section 9.4, and a review finding that four different lifecycle mechanisms were described across five files | A story may not register a second `ScheduledTask`, may not fold the pass into R18's task — FEATURE-001-07 is B5 and that task is B4, so it would be a backwards batch dependency — may not describe its row work as running **inside** that task's `execute` or its counts as reported in the task's own returned object, both of which belong to the job, may not describe a periodic purge, a cron sweep or a second task under any name. A story that needs the pass **references STORY-001-07-01's contract rather than restating a mechanism of its own**, and names the queue, **both** triggers, the payload, the page bound, the terminal job state and the absent periodic sweep. The owning story additionally asserts the restricted-worker case: with `activeQueues` set to a list omitting the prefixed lifecycle queue name, the job is created and stays `PENDING`, and with the name present it settles — which is the assertion that turns the topology note into a test. |
 | R20 | **A reorder always writes the acting session's own active order, and never another customer's.** Where the source is a list shared with the caller, the lines are added to the cart belonging to the authenticated caller who made the request; the sharer's cart is not a candidate. This is not a preference between two workable designs: the ownership predicate that R3 makes the whole of the control is derived from the acting session [packages/dev-server/example-plugins/wishlist-plugin/service/wishlist.service.ts:L74-L76], so writing a cart resolved from a *different* customer is a cross-customer write with no predicate that could authorise it, and the active-order strategy set is called with the request's own context and empty input [packages/core/src/service/helpers/active-order/active-order.service.ts:L114-L120] — it has no argument for "somebody else's cart". | A review finding that the target cart was left as an open product decision while a published mutation already wrote to one | A story touching a shared source asserts that the resulting order's `customer` is the acting caller, asserts it in **both** directions — the owner acting on their own list and a grantee acting on the owner's list — and never states the target principal as open. Product decision 6 in section 8.1 records the closure. |
 | R21 | **A subject or tenant scope is a required argument applied server-side, and a presence check on a generated filter is never a scope.** The generated filter input is caller-controlled and its operators include the negations and set forms that make a "the caller must filter by X" rule vacuous — `notEq`, `in`, `notIn` and `isNull` on an id field [packages/core/src/api/schema/common/common-types.graphql:L92-L99], `regex` and the string forms beside them [packages/core/src/api/schema/common/common-types.graphql:L80-L90] — and `filterOperator: OR` [packages/core/src/api/schema/common/common-enums.graphql:L32-L35] turns any one satisfied term into the whole predicate. The scope therefore arrives as its own **non-null argument** and is applied through the builder's own server-side surface: `ExtendedListQueryOptions.where` [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L51], which is set on the query before the caller's filter is added [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L292] while that filter is confined to a bracketed `andWhere` group [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L330-L341] — so no caller filter, however composed, can widen it. | A review finding that two administrative reads relied on the caller supplying an equality filter, so a negated or OR-composed filter returned rows outside the caller's subject | A story publishing a subject-scoped or tenant-scoped read declares the scope as a required argument, asserts that a request omitting it fails schema validation rather than returning everything, and asserts that a **negated or OR-composed** filter naming another subject returns zero rows rather than that subject's rows. "The caller must pass a filter" is not an assertion this ruling accepts. |
-| R20 | **Every symbol a deployment configures, implements or subscribes to is exported from the plugin package root, and the export is proved by a static import rather than assumed.** The package's `index.ts` barrel re-exports the plugin class, `ReorderPluginOptions`, the `SubstitutionCandidateStrategy` interface with its shipped default, and all three event classes — the form the shipped plugin packages use [packages/harden-plugin/index.ts:L1-L3] against a build whose only entry file is that barrel [packages/harden-plugin/tsconfig.build.json:L1-L9]. **A plugin's own event classes are never imported from the core event-bus barrel**, because that barrel exports core's events and not a plugin's [packages/core/src/event-bus/index.ts:L1-L4]: a subscriber reaches `EventBus.ofType` [packages/core/src/event-bus/event-bus.ts:L130] with a class imported from this package root. | A review finding that public strategy, option and event symbols had no declared export site, so a deployment could not name the type it was told to configure | A story publishing a configurable strategy, an option or an event names the barrel line it adds and carries a test that imports that symbol **from the package root** — not from a deep source path — and asserts it is defined; the scaffold story owns the barrel itself [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap]. |
+| R22 | **Every symbol a deployment configures, implements or subscribes to is exported from the plugin package root, and the export is proved by a static import rather than assumed.** The package's `index.ts` barrel re-exports the plugin class, `ReorderPluginOptions`, the `SubstitutionCandidateStrategy` interface with its shipped default, and all three event classes — the form the shipped plugin packages use [packages/harden-plugin/index.ts:L1-L3] against a build whose only entry file is that barrel [packages/harden-plugin/tsconfig.build.json:L1-L9]. **A plugin's own event classes are never imported from the core event-bus barrel**, because that barrel exports core's events and not a plugin's [packages/core/src/event-bus/index.ts:L1-L4]: a subscriber reaches `EventBus.ofType` [packages/core/src/event-bus/event-bus.ts:L130] with a class imported from this package root. | A review finding that public strategy, option and event symbols had no declared export site, so a deployment could not name the type it was told to configure | A story publishing a configurable strategy, an option or an event names the barrel line it adds and carries a test that imports that symbol **from the package root** — not from a deep source path — and asserts it is defined; the scaffold story owns the barrel itself [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap]. |
 
-**The complete published-symbol inventory.** The architectural constraints require a collision-checked inventory, and an inventory of counts is not checkable — so every symbol this epic proposes to publish is named. The check was run against both checked-in introspection snapshots, `schema-shop.json` and `schema-admin.json`, over the type map and over the `Query`, `Mutation` and `Permission` members: **none of the names below exists in either snapshot**, so every one is free. The full field-by-field SDL for each group lives in the feature file that owns it, named in the last column; this table is the index and the collision record, not a second copy of the contract.
+**The complete published-symbol inventory.** The architectural constraints require a collision-checked inventory, and an inventory of counts is not checkable — so every symbol this epic proposes to publish is named. The check was run against both checked-in introspection snapshots, `schema-shop.json` and `schema-admin.json`, over the type map and over the `Query`, `Mutation` and `Permission` members: **none of the names below exists in either snapshot**, so every one is free. The full field-by-field SDL for each group lives in the feature file that owns it, named in the last column; this table is the index and the collision record, not a second copy of the contract. **That last sentence is load-bearing and is now enforced:** step V18 of the validator suite parses every fenced `graphql` block in all thirty-four files and requires each name below to be **declared exactly once** across the set — twice only for the five enums this inventory deliberately publishes on both the Shop and the Admin document, those being two separate schema documents [packages/core/src/api/config/get-final-vendure-schema.ts:L87-L118] — with a block that reproduces a sibling's declaration for a reader's convenience marked as a reproduction rather than counted as a second declaration [tickets/EPIC-001-reorder-and-replenishment.md:§11.10 The Local Validator Suite — The Only Enforcement This Artifact Has]. A name declared twice with two field sets is the defect that step exists to catch, and it is the defect that motivated the deduplication of this table.
 
 | Group | Symbols | Owning feature |
 |---|---|---|
-| Plugin and options | `ReorderPlugin`, `ReorderPluginOptions` — **whose nineteen keys are enumerated once, in section 7.10, and nowhere else** | Epic-level; registered in the dev-server plugin array [packages/dev-server/dev-config.ts:L121-L155] |
+| Plugin and options | `ReorderPlugin`, `ReorderPluginOptions` — **whose twenty-one keys are enumerated once, in section 7.10, and nowhere else** | Epic-level; registered in the dev-server plugin array [packages/dev-server/dev-config.ts:L121-L155] |
 | Shop queries (4) | `activeCustomerReorderLists`, `activeCustomerReorderList`, `reorderPreview`, `activeCustomerReplenishmentDue` | FEATURE-001-01, FEATURE-001-03, FEATURE-001-05 |
 | Shop mutations (10) | `createReorderList`, `updateReorderList`, `deleteReorderList`, `addItemToReorderList`, `adjustReorderListLine`, `removeReorderListLine`, `applyReorderToActiveOrder`, `shareReorderList`, `revokeReorderListShare`, `snoozeReplenishmentSignal` | FEATURE-001-01, FEATURE-001-02, FEATURE-001-05, FEATURE-001-06 |
 | Admin queries (4) | `recurringDemand`, `customerReorderLists`, `reorderAttempts`, `substitutionCandidates` | FEATURE-001-04, FEATURE-001-08 |
 | Admin mutations (1) | `setSubstitutionCandidates` | FEATURE-001-04 |
-| Object types | `ReorderList`, `ReorderListLine`, `ReorderListViewerAccess`, `ReorderListGrant`, `ReorderListSharePayload`, `ReorderPreview`, `ReorderPreviewLine`, `ReorderPreviewSource`, `ReorderPreviewContributor`, `ReorderSubstitutionCandidateOffer`, `ReorderSourceLineRef`, `ReorderSubstitutionCandidateOffer`, `ReorderResult`, `ReorderLineOutcome`, `ReplenishmentSignal`, `AdminReorderListAccessInfo`, `SubstitutionCandidate`, `SubstitutionCandidateState`, `SubstitutionCandidateSet`, `SubstitutionCandidateState`, `RecurringDemand`, `AdminReorderListSummary`, `ReorderAttemptSummary`, `ReorderAttemptLineSummary` | The feature owning each operation. **`SubstitutionCandidateState` joined this row when a review found that story 04-03 asserted a `deletedAt` value the Admin `ProductVariant` type does not declare** [schema-admin.json:data.__schema.types]: the withdrawal state a curator needs is therefore a nested, computed projection this plugin owns rather than a core field it borrows, nested for the same reason `ReorderListViewerAccess` is [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.7 Named API Surfaces — Zero New Buyer-Facing Operations, Two New Admin Operations]. The last five are Admin-schema types; because a plugin's `adminApiExtensions` and `shopApiExtensions` are two separate schema documents [packages/dev-server/test-plugins/reviews/reviews-plugin.ts:L14-L21], an Admin row type is never the Shop type of a similar name, and the Admin projections deliberately carry less. **`ReorderSubstitutionCandidateOffer` is declared by FEATURE-001-03 and populated by FEATURE-001-04**, on the same first-version-completeness reasoning that puts `ReorderPermissionDeniedError`'s declaration in FEATURE-001-02 rather than in the feature that returns it: the feature publishing a type is its **SDL authority** and declares every field of it in that type's first version, while the feature supplying a field's behaviour is its **behaviour authority** and may not add the field later — a type that grows a field in a later batch has been redefined for the clients already reading it [tickets/EPIC-001/FEATURE-001-03-price-and-availability-delta-preview.md:§2.6 Named API Surfaces] and [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.7 Named API Surfaces — Zero New Buyer-Facing Operations, Two New Admin Operations]. **`ReorderSourceLineRef` and `ReorderPreviewContributor` are the two types that carry source-line identity** — a projected result row names the source lines that contributed to it rather than collapsing them, which is what makes a keyed outcome traceable back to the order or list line it came from [tickets/EPIC-001/FEATURE-001-02-reorder-from-order-history.md:§2.6a The Keyed Line-Result Contract — How Identity Is Constructed, Not Assumed] |
+| Object types | `ReorderList`, `ReorderListLine`, `ReorderListViewerAccess`, `ReorderListGrant`, `ReorderListSharePayload`, `ReorderPreview`, `ReorderPreviewLine`, `ReorderPreviewSource`, `ReorderPreviewContributor`, `ReorderSubstitutionCandidateOffer`, `ReorderSourceLineRef`, `ReorderResult`, `ReorderLineOutcome`, `ReplenishmentSignal`, `AdminReorderListAccessInfo`, `SubstitutionCandidate`, `SubstitutionCandidateDisplay`, `SubstitutionCandidateState`, `SubstitutionCandidateValidationDetail`, `SubstitutionCandidateSet`, `RecurringDemand`, `RecurringDemandDisplay`, `RecurringDemandVariantState`, `AdminReorderListSummary`, `ReorderAttemptSummary`, `ReorderAttemptLineSummary`, `ReorderAttemptVariantState` | The feature owning each operation. **Two names were listed TWICE in an earlier revision of this row and each is now listed once**: `ReorderSubstitutionCandidateOffer`, a transcription duplicate, and `SubstitutionCandidateState`, which mirrored a genuine defect in FEATURE-001-04's own SDL — that feature declared the type twice with two different field vocabularies, the first of them carrying a `candidateState` field of its own type and therefore recursive and unbuildable. **FEATURE-001-04 now publishes one non-recursive four-boolean state object and this row names it once** [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.7 Named API Surfaces — Zero New Buyer-Facing Operations, Two New Admin Operations]. **Three names are additions rather than corrections**, and all three replace a published `ProductVariant` relation or an unstructured error message with a minimal plugin-owned projection: `SubstitutionCandidateDisplay` and `RecurringDemandDisplay` are the two-field display projections that keep raw inventory, price rows and cross-channel assignments out of an administrative reorder read, and `SubstitutionCandidateValidationDetail` is the structured rejection payload FEATURE-001-04's write returns in its error extensions. **`SubstitutionCandidateState` joined this row when a review found that story 04-03 asserted a `deletedAt` value the Admin `ProductVariant` type does not declare** [schema-admin.json:data.__schema.types]: the withdrawal state a curator needs is therefore a nested, computed projection this plugin owns rather than a core field it borrows, nested for the same reason `ReorderListViewerAccess` is [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.7 Named API Surfaces — Zero New Buyer-Facing Operations, Two New Admin Operations]. The last **thirteen** are Admin-schema types — `AdminReorderListAccessInfo` through `ReorderAttemptVariantState`, and the figure is stated as thirteen rather than the eleven a later revision claimed or the five an earlier one did, each having been stale against this row's own contents: the eleven predates the two nested variant-state objects that closed the raw-`ProductVariant` exposure on `RecurringDemand` and on `ReorderAttemptLineSummary`, and the five predates the additions before those; because a plugin's `adminApiExtensions` and `shopApiExtensions` are two separate schema documents [packages/dev-server/test-plugins/reviews/reviews-plugin.ts:L14-L21], an Admin row type is never the Shop type of a similar name, and the Admin projections deliberately carry less. **`ReorderSubstitutionCandidateOffer` is declared by FEATURE-001-03 and populated by FEATURE-001-04**, on the same first-version-completeness reasoning that puts `ReorderPermissionDeniedError`'s declaration in FEATURE-001-02 rather than in the feature that returns it: the feature publishing a type is its **SDL authority** and declares every field of it in that type's first version, while the feature supplying a field's behaviour is its **behaviour authority** and may not add the field later — a type that grows a field in a later batch has been redefined for the clients already reading it [tickets/EPIC-001/FEATURE-001-03-price-and-availability-delta-preview.md:§2.6 Named API Surfaces] and [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.7 Named API Surfaces — Zero New Buyer-Facing Operations, Two New Admin Operations]. **`ReorderSourceLineRef` and `ReorderPreviewContributor` are the two types that carry source-line identity** — a projected result row names the source lines that contributed to it rather than collapsing them, which is what makes a keyed outcome traceable back to the order or list line it came from [tickets/EPIC-001/FEATURE-001-02-reorder-from-order-history.md:§2.6a The Keyed Line-Result Contract — How Identity Is Constructed, Not Assumed] |
 | Paginated list types | `ReorderListList`, `ReorderListLineList`, `ReorderListGrantList`, `ReplenishmentSignalList`, `SubstitutionCandidateList`, `RecurringDemandList`, `AdminReorderListSummaryList`, `ReorderAttemptSummaryList` | Each is a `PaginatedList` implementor whose `…ListOptions` input is **generated, never hand-written** [packages/core/src/api/config/generate-list-options.ts:L31-L60]. **Every name here is exactly its row type plus the suffix `List`, and that is a build requirement rather than a convention:** the generator strips a trailing `List` and looks the remainder up in the schema [packages/core/src/api/config/generate-list-options.ts:L52-L53], generating nothing when the lookup fails [packages/core/src/api/config/generate-list-options.ts:L54]. **`ReorderListLineList` joined this row when FEATURE-001-01 settled `ReorderList.lines` as a paginated field rather than a plain list, which is what bounds a list's own lines** [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.6 Named API Surfaces], and §7.7.2 carries the matching bound. An earlier revision of this row named the third Admin list type `ReorderAttemptList` against a row type of `ReorderAttemptSummary`; that pair strips to a name no schema declares, so the options input would have shipped empty — no `skip`, no `take`, no `sort`, no `filter` — in a schema that still builds. Corrected to `ReorderAttemptSummaryList` [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5 Named API Surfaces]. **The five `…ListOptions` inputs each feature declares as an empty stub are deliberately absent from the input-types row below**, and the absence is a statement rather than an omission: their fields are produced by the generator rather than by this epic, so inventorying them as authored symbols would claim authorship of `skip`, `take`, `sort` and `filter`. They are named in the owning feature files, which is where the stub is declared |
 | Input types | `ReorderSourceInput`, `ApplyReorderInput`, `ReorderLineSelectionInput`, `ReorderLineResolutionInput`, `ReorderPreviewInput`, `CreateReorderListInput`, `UpdateReorderListInput`, `AddItemToReorderListInput`, `AdjustReorderListLineInput`, `RemoveReorderListLineInput`, `ShareReorderListInput`, `RevokeReorderListShareInput`, `SnoozeReplenishmentSignalInput`, `SetSubstitutionCandidatesInput`, `SubstitutionCandidateInput`, `ReorderAttemptSubjectInput` | The feature owning each operation |
 | Result unions | `CreateReorderListResult`, `UpdateReorderListResult`, `DeleteReorderListResult`, `AddItemToReorderListResult`, `AdjustReorderListLineResult`, `RemoveReorderListLineResult`, `ApplyReorderResult`, `ShareReorderListResult`, `RevokeReorderListShareResult` | **Nine** unions, each with its own `__resolveType` resolver per R8. **An earlier revision of this row listed a tenth, `ReorderPreviewResult`, and that union is withdrawn rather than renamed:** the preview read returns `ReorderPreview!` directly, because a union whose error members named a missing or inaccessible source would have been an enumeration oracle over another customer's order codes, and the same information is carried inside the payload as a per-source state instead [tickets/EPIC-001/FEATURE-001-03-price-and-availability-delta-preview.md:§2.6 Named API Surfaces]. A union listed here that no feature SDL declares is a symbol nothing publishes, which is why the withdrawal is recorded in this row rather than left to be inferred from its absence downstream |
-| Enums | `ReorderLineOutcomeCode`, `ReorderRequestOutcome`, `ReorderLineAvailability`, `ReorderLineResolutionAction`, `ReorderListAccess`, `ReorderListCapability`, `ReorderListShareState`, `ReplenishmentSignalState`, `ReorderPreviewSourceState`, `ReorderSourceType`, `ReorderAttemptOutcome` | The feature owning each. **`ReorderPreviewSourceState` is the enum that replaced the withdrawn preview result union**, reporting a missing or inaccessible source as a state on the payload rather than as an error member. **Five are declared in both schemas, which is a consequence of the two-document split and not a redeclaration inside one schema:** `ReorderLineOutcomeCode`, `ReorderListAccess` and `ReorderListCapability` are FEATURE-001-02's and FEATURE-001-01's on the Shop side and are declared again in `adminApiExtensions` by FEATURE-001-08, which is also the SDL authority for `ReorderSourceType` and `ReorderAttemptOutcome` — FEATURE-001-07 uses those two as TypeScript column types and publishes no API. **One of the five is deliberately WIDER on the Admin side by exactly one member, and that is the only asymmetry in this table:** the audit column adds `NOT_EVALUATED` to `ReorderLineOutcomeCode` for the lines of an aborted or refused-after-projection attempt, so the Shop union publishes ten members and the Admin projection eleven [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4a Three Closed Outcome Enums, And The Counting Rule That Makes Them Add Up]. A GraphQL enum cannot return an undeclared value, so the Admin declaration must carry the stored set rather than the published Shop set — an earlier revision of FEATURE-001-08 declared nine members and three attempt outcomes against a stored ten and ten [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5 Named API Surfaces] |
+| Enums | `ReorderLineOutcomeCode`, `ReorderRequestOutcome`, `ReorderLineAvailability`, `ReorderLineResolutionAction`, `ReorderListAccess`, `ReorderListCapability`, `ReorderListShareState`, `ReplenishmentSignalState`, `ReorderPreviewSourceState`, `ReorderSourceType`, `ReorderAttemptOutcome`, `SubstitutionCandidateRejectionReason` | The feature owning each. **`ReorderPreviewSourceState` is the enum that replaced the withdrawn preview result union**, reporting a missing or inaccessible source as a state on the payload rather than as an error member. **Five are declared in both schemas, which is a consequence of the two-document split and not a redeclaration inside one schema:** `ReorderLineOutcomeCode`, `ReorderListAccess` and `ReorderListCapability` are FEATURE-001-02's and FEATURE-001-01's on the Shop side and are declared again in `adminApiExtensions` by FEATURE-001-08, which is also the SDL authority for `ReorderSourceType` and `ReorderAttemptOutcome` — FEATURE-001-07 uses those two as TypeScript column types and publishes no API. **One of the five is deliberately WIDER on the Admin side by exactly one member, and that is the only asymmetry in this table:** the audit column adds `NOT_EVALUATED` to `ReorderLineOutcomeCode` for the lines of an aborted or refused-after-projection attempt, so the Shop union publishes ten members and the Admin projection eleven [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4a Three Closed Outcome Enums, And The Counting Rule That Makes Them Add Up]. A GraphQL enum cannot return an undeclared value, so the Admin declaration must carry the stored set rather than the published Shop set — an earlier revision of FEATURE-001-08 declared nine members and three attempt outcomes against a stored ten and ten [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5 Named API Surfaces] |
 | Non-union payload types | `ReplenishmentSnoozeResult` — a normalized non-disclosing payload rather than a union, for the reason FEATURE-001-05 gives; and `ReorderListSharePayload` — the success member of both share unions, carrying the affected list plus the owner-only grant collection, so that FEATURE-001-06 publishes that collection without adding a field to the `ReorderList` type FEATURE-001-01 owns | FEATURE-001-05 and FEATURE-001-06 |
 | New error results (6) | `ReorderListNotFoundError`, `ReorderListNameConflictError`, `ReorderListLimitError`, `ReorderListLineNotFoundError` — declared field-by-field in [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.10 The Error Vocabulary This Feature Introduces]; `NoReorderableLinesError` in [tickets/EPIC-001/FEATURE-001-02-reorder-from-order-history.md:§2.11 The Error Vocabulary This Feature Introduces]; `ReorderPermissionDeniedError` also in [tickets/EPIC-001/FEATURE-001-02-reorder-from-order-history.md:§2.11 The Error Vocabulary This Feature Introduces], declared there rather than in the feature that returns it because F2's result union names it from its first published version and a union member's type must exist for the schema to build; FEATURE-001-06 consumes that declaration in its own two unions [tickets/EPIC-001/FEATURE-001-06-buying-account-list-sharing.md:§2.12 The Error Vocabulary This Feature Introduces]. **Each is an object type implementing `ErrorResult` with `errorCode: ErrorCode!` and `message: String!` at minimum**, matching the shape every shipped one has [packages/core/src/api/schema/common/common-error-results.graphql:L2-L5], because the enum growth below is *derived from those declarations* — the generator collects the types that implement the interface and upper-snake-cases their names [packages/core/src/api/config/generate-error-code-enum.ts:L11-L28], so a name that appears only in a union contributes no enum member and fails the schema build instead. Ruling R8 carries the obligation. | FEATURE-001-01 declares four, FEATURE-001-02 declares two |
-| Permission definitions (3) | **This row is the ledger, and it is the only statement of this arithmetic in the whole set — a feature or story cites it and never restates a total.** `RwPermissionDefinition('ReorderSubstitution')` → members `ReadReorderSubstitution` and `WriteReorderSubstitution` (**1 definition → 2 members**); `PermissionDefinition` `ReadReorderDemand`; `PermissionDefinition` `ReadReorderCustomerActivity` (**2 definitions → 2 members**) | **Per feature, exhaustively: FEATURE-001-04 registers one definition yielding two members; FEATURE-001-08 registers two definitions yielding two members; FEATURE-001-01, FEATURE-001-02, FEATURE-001-03, FEATURE-001-05, FEATURE-001-06 and FEATURE-001-07 each register ZERO** — not as an omission but because a customer session can hold no custom permission, so a definition registered for a buyer-facing operation would gate nothing and refuse everyone (R2, R3). The six zeros are enumerated rather than left to be inferred from the first, FEATURE-001-08 the other two. **The seller-unscoped form of the aggregate gates a SCOPE rather than an operation, and it consumes an EXISTING permission rather than adding a fourth definition** — the wide form is admitted only where the caller holds `ReadReorderDemand` **and** the platform's own `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71], checked with `userHasAllPermissions` [packages/core/src/api/common/request-context.ts:L296] before a seller-unscoped aggregate is answered, because a multi-argument `@Allow` is an OR [packages/core/src/api/decorators/allow.decorator.ts:L11-L12] and would have made the second an alternative to the first rather than an addition to it. **An earlier revision of this row registered a fourth definition, `ReadReorderDemandAllSellers`, for exactly that scope; it is withdrawn rather than renamed** — it published a second name for an entitlement the platform already publishes, and it took the definition count past the three this epic's architecture admits [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.8 Permission Gating, And The Enum Growth Referenced Rather Than Re-Argued] |
+| Permission definitions (3) | **This row is the ledger, and it is the only statement of this arithmetic in the whole set — a feature or story cites it and never restates a total.** `RwPermissionDefinition('ReorderSubstitution')` → members `ReadReorderSubstitution` and `WriteReorderSubstitution` (**1 definition → 2 members**); `PermissionDefinition` `ReadReorderDemand`; `PermissionDefinition` `ReadReorderCustomerActivity` (**2 definitions → 2 members**) | **Per feature, exhaustively: FEATURE-001-04 registers one definition yielding two members; FEATURE-001-08 registers two definitions yielding two members; FEATURE-001-01, FEATURE-001-02, FEATURE-001-03, FEATURE-001-05, FEATURE-001-06 and FEATURE-001-07 each register ZERO** — not as an omission but because a customer session can hold no custom permission, so a definition registered for a buyer-facing operation would gate nothing and refuse everyone (R2, R3). The six zeros are enumerated rather than left to be inferred from the two non-zero rows: FEATURE-001-04 registers the first definition and FEATURE-001-08 the other two. **The seller-unscoped form of the aggregate gates a SCOPE rather than an operation, and it consumes an EXISTING permission rather than adding a fourth definition** — the wide form is admitted only where the caller holds `ReadReorderDemand` **and** the platform's own `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71], checked with `userHasAllPermissions` [packages/core/src/api/common/request-context.ts:L296] before a seller-unscoped aggregate is answered, because a multi-argument `@Allow` is an OR [packages/core/src/api/decorators/allow.decorator.ts:L11-L12] and would have made the second an alternative to the first rather than an addition to it. **An earlier revision of this row registered a fourth definition, `ReadReorderDemandAllSellers`, for exactly that scope; it is withdrawn rather than renamed** — it published a second name for an entitlement the platform already publishes, and it took the definition count past the three this epic's architecture admits [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.8 Permission Gating, And The Enum Growth Referenced Rather Than Re-Argued] |
 | Configurable strategy (1) | `SubstitutionCandidateStrategy`, with `DefaultSubstitutionCandidateStrategy` as its database-backed default, selected by the `substitutionCandidateStrategy` option. **Its single method, `getCandidates`, is batched and keyed by origin** — it takes the whole set of origin variants a resolution round is asking about and returns a map from each origin's id to its candidate array, with exactly one entry per origin asked about and an empty array where there is nothing to offer, so "asked and answered none" is distinguishable from "not asked". Its parameter and return types are existing platform entity types and a built-in map, so they are deliberately not listed as new names in this table. **An earlier revision declared a one-origin form**, which could only answer a resolution round by being called once per unavailable line — the uncounted per-line query shape section 7.7 forbids — so the batch form is a correction the owning feature records rather than a preference. Its result is bounded by the second option, `ReorderPluginOptions.maxSubstitutionCandidatesPerVariant` [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.6 Named Services And Configurable Strategies] | FEATURE-001-04 |
-| Scheduled tasks (1) | **One, and it is named with its owner, its configuration and the story that builds it.** `recompute-purchase-cadence` — owned by FEATURE-001-05, registered through `schedulerOptions.tasks`, its schedule and batch size plugin options, built by STORY-001-05-02. **An earlier revision of this row counted two and admitted a second task, `purge-reorder-attempts`, for FEATURE-001-07's audit-table disposition. That second task is withdrawn rather than renamed, and this row is the authority for why.** The ground that closes it is the inventory itself: this epic's architecture admits exactly one scheduled task, so a second one is a change to the inventory rather than a detail inside it. **What replaces it is a step inside this one task, and the direction of the dependency is what makes that buildable rather than circular.** FEATURE-001-05 lands in B4 and FEATURE-001-07 in B5 [tickets/EPIC-001-reorder-and-replenishment.md:§9.4 Run Batches], so B4 ships the task enqueuing one job kind — the cadence job — and references nothing FEATURE-001-07 owns; B5 then adds the retention enqueue to that same `execute`, which is a forward-only additive change to a file the plugin owns and not a B4 surface depending on a B5 feature. Ruling R19 below is the single authority for the whole lifecycle mechanism, its owner, its two triggers, its batching, its policy gate and its completion signal | FEATURE-001-05 |
+| Scheduled tasks (1) | **One, and it is named with its owner, its configuration and the story that builds it.** `recompute-purchase-cadence` — owned by FEATURE-001-05, registered through `schedulerOptions.tasks`, its schedule and batch size plugin options, built by STORY-001-05-02. **An earlier revision of this row counted two and admitted a second task, `purge-reorder-attempts`, for FEATURE-001-07's audit-table disposition. That second task is withdrawn rather than renamed, and this row is the authority for why.** The ground that closes it is the inventory itself: this epic's architecture admits exactly one scheduled task, so a second one is a change to the inventory rather than a detail inside it. **What replaces it is not a step inside this task either, and that is a second correction this row now carries.** An intermediate revision kept the retention work and moved it into this task's `execute`, so that batch B5 would add a retention enqueue beside the cadence enqueue — and that reading is withdrawn as well, because it contradicts ruling R19 in the same file: **the customer-data-lifecycle pass is a job with exactly two triggers and no periodic form at all**, so a scheduled task enqueuing it periodically would be the third mechanism a review already found described four times. **This task therefore has exactly one job kind for the whole life of the epic — the cadence job — and FEATURE-001-05's `execute` gains nothing in B5.** The retention side is reached from R19's two triggers instead, both owned by STORY-001-07-01, so there is no B4 surface depending on a B5 feature and no forward-only edit to arrange: B4 ships the task complete and B5 ships the job. Ruling R19 below is the single authority for the whole lifecycle mechanism, its owner, its two triggers, its batching, its policy gate and its completion signal | FEATURE-001-05 |
 | Events (3) | `ReorderAttemptEvent`, `ReorderAppliedEvent`, `ReorderLineRejectedEvent` | FEATURE-001-07, which is their authority |
 | Tables (7) | `ReorderList`, `ReorderListLine`, `ReorderListShare`, `PurchaseCadence`, `ReorderAttempt`, `ReorderAttemptLine`, `SubstitutionCandidate` | Section 7.8 carries the persistence contract |
 
@@ -461,6 +461,7 @@ Four engine jobs already exist and every migration this epic describes must be e
 
 - **Node.** The declared range is `^20.19.0 || >=22.12.0` [package.json:engines.node]. Because the upper bound is open, the declaration alone does not identify a highest supported line, so the matrix decides it: the unit-test job exercises 20.x, 22.x and 24.x [.github/workflows/build_and_test.yml:L96-L97], making **24.x the highest explicitly documented line**. The engine jobs narrow to a single line on a pull request, so a story's local reproduction should not assume the full matrix.
 - **Bun.** Pinned to **1.3.10**, with an in-file note that it is to be bumped only when explicitly re-validated against a newer release [.github/actions/setup/action.yml:bun-version]. The setup action installs with a frozen lockfile, so a story must not introduce a dependency without updating the lockfile in the same change. There is no `.nvmrc`.
+- **Toolchain currency, recorded as a revalidation item rather than as a vulnerability.** A review of this set checked both pinned runtimes against their publishers. The Node line this epic cites remains a current maintenance line, so nothing there needs revisiting. **The pinned Bun version is older than the publisher's current release**, and its publisher lists no advisory affecting it — so this is a *revalidation* item and not a known exposure, and it is recorded here at that weight rather than escalated. The consequence for this epic is narrow and is stated so that no story quietly changes it: **no story in this set bumps the pin**, because the pin is set by the composite setup action [.github/actions/setup/action.yml:bun-version] which is neither a plugin file nor one of the two permitted configuration exceptions [tickets/EPIC-001-reorder-and-replenishment.md:§11.7 The Two Permitted Configuration Exceptions — Named, Not Touched]. A bump is a separately assignable maintenance change owned by whoever maintains that action, and every command this set quotes is quoted against the pinned version so that a story remains reproducible either way.
 - **Test harness.** `@vendure/testing` supplies the client, the test server, the test configuration, the environment factory, the table-clearing helper, the customer-population helper and the error-result guard. Its whole published surface is fourteen re-exports from a single index, so the citation for the surface as a whole is that file in its entirety [packages/testing/src/index.ts:L1-L14]; the narrower range cited for the database initializers elsewhere in this epic [packages/testing/src/index.ts:L10-L12] covers only the three initializer exports and must not be used to support a claim about the harness as a whole. Every story's end-to-end sub-task is written against this harness and adds no alternative.
 
 ### 7.4 Existing Entities And Services The Work Depends On
@@ -474,9 +475,32 @@ Named so that no story invents an entity that already exists, and so that a revi
 
 Every operation in this epic is channel-scoped and language-scoped, so three preconditions hold for every story without being restated in each one:
 
-- **A channel token.** The active channel is identified by a unique token read from the `vendure-token` request header [packages/core/src/entity/channel/channel.entity.ts:L62], and channel-level `defaultLanguageCode` [packages/core/src/entity/channel/channel.entity.ts:L74], `defaultCurrencyCode` [packages/core/src/entity/channel/channel.entity.ts:L88] and `pricesIncludeTax` [packages/core/src/entity/channel/channel.entity.ts:L113] govern how a reorder's prices and translations resolve. **Stock settings are declared at channel level and are the normative surface, while the shipped read path has not moved onto them yet — the divergence is stated here rather than assumed away.** The channel declares a `trackInventory` column [packages/core/src/entity/channel/channel.entity.ts:L100] and an `outOfStockThreshold` column [packages/core/src/entity/channel/channel.entity.ts:L108], and those are the fields a ticket names as its intended settings; **in this version nothing in the core sources reads either at run time**, the values the platform resolves against being the single global settings row combined with the variant's own flags [packages/core/src/service/services/product-variant.service.ts:L323-L324] and [packages/core/src/config/catalog/multi-channel-stock-location-strategy.ts:L181-L195]. Collision C10 ranks this and discrepancy (iii) in section 6.3 sets out the evidence; ruling R6 fixes the consequence for a fixture, which is that an availability precondition states the Channel-level values **and** mirrors them onto the global row for as long as that row is what the code reads. A story that needs availability to differ by channel computes that difference itself from the resolved channel and says so; it does not inherit it from a Channel column.
+- **A channel token.** The active channel is identified by a unique token [packages/core/src/entity/channel/channel.entity.ts:L62] carried under the configured `vendure-token` key, **which the platform resolves from the query string first and from the request header second** [packages/core/src/service/helpers/request-context/request-context.service.ts:L124-L134] — both forms are part of the contract and section 7.5.1 fixes what a story asserts about each. And channel-level `defaultLanguageCode` [packages/core/src/entity/channel/channel.entity.ts:L74], `defaultCurrencyCode` [packages/core/src/entity/channel/channel.entity.ts:L88] and `pricesIncludeTax` [packages/core/src/entity/channel/channel.entity.ts:L113] govern how a reorder's prices and translations resolve. **Stock settings are declared at channel level and are the normative surface, while the shipped read path has not moved onto them yet — the divergence is stated here rather than assumed away.** The channel declares a `trackInventory` column [packages/core/src/entity/channel/channel.entity.ts:L100] and an `outOfStockThreshold` column [packages/core/src/entity/channel/channel.entity.ts:L108], and those are the fields a ticket names as its intended settings; **in this version nothing in the core sources reads either at run time**, the values the platform resolves against being the single global settings row combined with the variant's own flags [packages/core/src/service/services/product-variant.service.ts:L323-L324] and [packages/core/src/config/catalog/multi-channel-stock-location-strategy.ts:L181-L195]. Collision C10 ranks this and discrepancy (iii) in section 6.3 sets out the evidence; ruling R6 fixes the consequence for a fixture, which is that an availability precondition states the Channel-level values **and** mirrors them onto the global row for as long as that row is what the code reads. A story that needs availability to differ by channel computes that difference itself from the resolved channel and says so; it does not inherit it from a Channel column.
 - **An authenticated session.** Every buyer-facing operation reads or writes data owned by one customer, so an authenticated session is required. Its identity is the basis of the ownership predicate that collisions C3 and C7 make the entire control. **The session carries `Permission.Authenticated` and nothing else** [packages/core/src/service/services/role.service.ts:L443] — it does not carry `Permission.Owner`, which is a requirement the resolver declares rather than a permission a caller holds, and which is satisfied through `authorizedAsOwnerOnly` [packages/core/src/service/helpers/request-context/request-context.service.ts:L109] and [packages/core/src/config/auth/default-entity-access-control-strategy.ts:L49-L57]. **The gate therefore admits an unauthenticated request too** [packages/core/src/api/middleware/auth-guard.ts:L140], which is why an authenticated session is a precondition the *service* enforces and not one the gate establishes — the four-way distinction C7 sets out.
 - **At least one placed order for that customer — a prerequisite of the history-derived paths only, and not of the set.** It is required by the reorder-from-history path, the cadence recompute and the replenishment read, all of which derive their source data from placed orders [packages/core/src/api/schema/common/customer.type.graphql:L11]. **It is explicitly not a prerequisite of the list-curation stories**: creating a named list, adding a line to it, editing it and reading it back all work for a customer who has never placed an order, which is why STORY-001-01-01 correctly declares no data prerequisite and is the harness-proving nomination in section 9.5. A customer with no placed order is a required edge case for the history-derived paths, not an untested state — and for the curation paths it is the ordinary case.
+
+#### 7.5.1 The Transport And Credential Contract — Three Prerequisites A Review Found Missing Everywhere
+
+**This sub-section exists because the three preconditions above described *what* a request must carry and said nothing about *how* it arrives, and a review found the gap in every one of the thirty-four files at once.** Three properties of this platform's request handling are load-bearing for authorization, and each of them contradicts something the set previously assumed. They are settled here once; a feature or story states the criteria this sub-section mandates and never re-argues the mechanism.
+
+**One — cross-site request forgery and cross-site search are not covered by this baseline, so every plugin operation carries its own transport requirement.** The evidence is two configuration facts read together. Cookie authentication is enabled — it is the platform's own default token method [packages/core/src/config/default-config.ts:L104] and the dev server enables cookies alongside bearer tokens and API keys [packages/dev-server/dev-config.ts:L89] — while the GraphQL layer sets `csrfPrevention: false` [packages/core/src/api/config/configure-graphql-module.ts:L111]. With that combination a browser will attach the session cookie to a cross-site request, and the server will not reject a browser-simple one. **So the plugin supplies the control itself, because raising it in core is outside this epic's boundary** [tickets/EPIC-001-reorder-and-replenishment.md:§11.7 The Two Permitted Configuration Exceptions — Named, Not Touched]. Four obligations follow, and each is an acceptance criterion rather than a note:
+
+- **Every operation this epic publishes is reachable only by `POST` carrying `content-type: application/json`.** That content type is not one of the three a browser may send without a preflight, so a cross-site request for one of these operations must first pass a CORS preflight the browser will not send for a simple form or image load. The refusal is performed by the plugin's own middleware, registered from the plugin's configuration function rather than by editing core, and it runs **before** any resolver logic and therefore before any row is read.
+- **A `GET` request naming one of these operations is refused with the platform's own input error** [packages/core/src/common/error/errors.ts:L27] and its `USER_INPUT_ERROR` code [packages/core/src/common/error/errors.ts:L29], whatever credential it carries. This matters beyond forgery: a `GET` operation is cacheable, loggable in a proxy and expressible as an image or link, which is what makes cross-site search possible against a read.
+- **A plugin query performs no write.** The two administrative support reads are the single declared exception in this set and they declare it explicitly rather than claiming to be read-only [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5.2 The One Write These Reads Perform, And The Governance That Makes It Addable]; every other query in this epic writes nothing, and the story that publishes it asserts the absence rather than describing it.
+- **The test is a real cross-origin call, not an assertion about configuration.** Each feature's matrix carries one case that issues a cookie-authenticated request with a foreign `Origin` header and a browser-simple content type and asserts the refusal, and one case that issues the same operation correctly and asserts the success — because a refusal that also refuses the legitimate call is a broken gate rather than a strict one.
+
+**Two — the cookie outranks the bearer token and the API key, so an authorization test can silently run as the wrong principal.** The platform tries the cookie first, then the `Authorization` header, then the API-key header, and its own documentation says so [packages/core/src/api/common/extract-session-token.ts:L14-L19]; the cookie branch returns before either header is examined [packages/core/src/api/common/extract-session-token.ts:L27-L29], and that result is what the auth guard resolves the session from [packages/core/src/api/middleware/auth-guard.ts:L116]. **The consequence for this set is specific: a test that signs in as a superadmin, keeps the cookie jar, then sets a restricted administrator's bearer token and asserts a refusal is asserting nothing** — the request ran as the superadmin, and a *successful* response would have been reported as a policy failure while a refusal would have been reported as a pass for the wrong reason. Three obligations follow:
+
+- **Every credential lives in its own isolated client.** A test or demonstration that exercises two principals uses two clients with two cookie jars, and never reuses one client after changing its token.
+- **The principal is asserted immediately before the call under test**, by reading the existing `me` query [packages/core/src/api/schema/admin-api/auth.api.graphql:L2] and checking the identifier and the active-channel permissions it reports, so the assertion under test is anchored to a proved principal rather than an intended one.
+- **One credential-precedence case is carried per feature that has an authorization matrix**: a client holding a valid cookie for principal A sends a bearer token for principal B, and the test asserts the request was executed as **A**, which is the platform's documented behaviour and is therefore the thing to encode rather than to be surprised by.
+
+**Three — the channel token is resolved from the query string BEFORE the header, so "the `vendure-token` header" is an incomplete statement of the contract.** The platform reads the configured key from `req.query` first and only then from `req.headers` [packages/core/src/service/helpers/request-context/request-context.service.ts:L124-L134], and the option's own documentation states that the property may be carried "either in the request header or as a query string" [packages/core/src/config/vendure-config.ts:L178-L180]. **Every statement in this set that names the header names both forms and states the precedence**, because a caller can select the channel through a URL a browser will follow, and a scope that is part of every plugin-owned row's identity may not be described as arriving one way when it arrives another. Two obligations follow:
+
+- **Two criteria per feature.** One issues the operation with the token **only** in the query string and asserts the active-channel row set is the one that token selects; one issues it with **two different** tokens — one in the query string, one in the header — and asserts the query-string value won, which is the platform's resolution order rather than a preference this epic holds.
+- **No ticket describes the header as the only carrier**, and no criterion asserts a refusal for the query form. Refusing it would be a plugin overriding a platform behaviour for its own operations while every core operation still honours it, which is a divergence a storefront would meet as an inconsistency; the settled contract is that the resolved channel is whatever the platform resolves, stated exactly, and tested in both forms.
+
 
 ### 7.6 Data-Volume Assumptions And The Benchmark Workflow
 
@@ -577,7 +601,7 @@ A table name is not a schema. This sub-section carries the obligations that are 
   - **A constraint-shape assertion carries the remaining engines, and it is a different assertion.** On all four engines — sql.js included — the story asserts what the barrier cannot: that the named unique index exists in the generated migration, and that a *sequential* duplicate write is refused by the database rather than by a service pre-check, evidenced by writing the duplicate through the repository directly so no service code can intercept it. That is the property the constraint provides; the barrier tests the interleaving the constraint exists to survive. **Both are required, and neither is a substitute for the other.**
 - **String column lengths are declared, and the ceiling is 191 characters** for any column that participates in an index, which is the length that keeps a UTF-8 index inside the key-size limit on the MySQL and MariaDB engines the four existing engine jobs exercise [.github/workflows/build_and_test.yml:jobs]. A column that does not participate in an index may be longer, and states its length.
 - **Money is an integer column declared with `@Money()`** [packages/dev-server/example-plugins/product-bundles/entities/product-bundle-item.entity.ts:L24], stored in the smallest unit of the currency, and is always accompanied by the `currencyCode` it belongs to. No decimal column and no floating-point column appears in any of the seven.
-- **A data-lifecycle rule applies to every customer-linked table** — `ReorderList`, `ReorderListLine`, `ReorderListShare`, `PurchaseCadence`, `ReorderAttempt` and its lines. When a `Customer` is deleted, the plugin **either deletes the row or de-links it, and which of the two applies is fixed per table rather than left to a reader**: **the data-lifecycle pass of ruling R19 — one bounded job on the plugin's own queue with the two triggers that ruling names, and deliberately not a second scheduled task** — deletes the other four and cadence rows outright, because a saved list and a per-customer cadence have no purpose without their owner, and anonymises the two audit tables, because a demand aggregate does. **"The `customerId`" is the wrong name for what is cleared on the audit tables and an earlier version of this bullet used it: `ReorderAttempt` carries no such column.** It deliberately separates the acting customer from the owner of the list the attempt read from, so the pass clears `actingCustomerId` and `sourceListOwnerCustomerId` **independently, each only where it names the customer being erased**, together with the keyed idempotency digest that is derived from the acting customer's own request — three columns on one table, with the line table untouched and the exact field-level dispositions and their costs owned by that feature [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4c The Row Lifecycle — Append-Only In Its Business Facts, With Exactly Two Lifecycle Writes]. Naming a single column would have erased the wrong person's link on every attempt made against a shared list. **Anonymising means every column that names or re-identifies a person is nulled, not merely one of them**, and the reason this is spelled out at epic level is that an earlier revision of this bullet named a single `customerId` column which those tables do not have: they carry **two** customer roles, and a row also carries references that resolve back to a person. FEATURE-001-07 publishes the column-by-column map and is its authority [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.13 Privacy And How Long An Audit Row Is Kept — No Policy Is Declared Anywhere]; what this bullet fixes is the rule the map has to satisfy — **after the pass, no column on a retained row resolves to a customer, directly or through another row** — and the retained set is therefore the channel, the language code, the source discriminator, the outcome codes, the counts, the variant identifiers, the quantities, the money triple and the correlation id, and nothing else. **The handler and both job kinds are owned by FEATURE-001-07 and built by STORY-001-07-01 in batch B5, and each earlier feature's table-specific disposal step is contributed *into that handler* when B5 lands rather than shipped as a pass of its own** — which keeps the dependency direction forward-only across the batches of section 9.4 and keeps the mechanism count at one. **The consequence is stated rather than left to be discovered: before B5 lands, no disposal of any kind runs**, so batches B1 to B4 ship the tables, the minimised column sets and the present-state behaviour their stories assert, and nothing else. That is why ruling R19 makes a finite period a *required* configuration in the same feature that ships the handler — the guard and the mechanism arrive together — and why every story in B1 to B4 states that it implements no deletion, anonymisation or purge behaviour itself. **The keep period itself is an open product decision recorded in section 8.1 and no duration is invented here; the *mechanism* and its two triggers are settled by R19 and are not deferred with it.**
+- **A data-lifecycle rule applies to every customer-linked table** — `ReorderList`, `ReorderListLine`, `ReorderListShare`, `PurchaseCadence`, `ReorderAttempt` and its lines. When a `Customer` is deleted, the plugin **either deletes the row or de-links it, and which of the two applies is fixed per table rather than left to a reader**: **the data-lifecycle pass of ruling R19 — one bounded job on the plugin's own queue with the two triggers that ruling names, and deliberately not a second scheduled task** — deletes the other four and cadence rows outright, because a saved list and a per-customer cadence have no purpose without their owner, and anonymises the two audit tables, because a demand aggregate does. **"The `customerId`" is the wrong name for what is cleared on the audit tables and an earlier version of this bullet used it: `ReorderAttempt` carries no such column.** It deliberately separates the acting customer from the owner of the list the attempt read from, so the pass clears `actingCustomerId` and `sourceListOwnerCustomerId` **independently, each only where it names the customer being erased**, and **overwrites the keyed replay digest that is derived from the acting customer's own request with a digest over the row's own `correlationId` rather than nulling it, because that column is `NOT NULL` and carries a unique index** — **and those three are not the whole of it, which an earlier version of this bullet said they were**. That version called it "three columns on one table, with the line table untouched", which contradicted the rule this same bullet then states two sentences later and is withdrawn: the pass also clears every column that reaches a person through one join, on the line table as well as the attempt table. The exact field-level dispositions, their group counts and their costs are owned by that feature [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4c The Row Lifecycle — Append-Only In Its Business Facts, With Exactly Two Lifecycle Writes]. Naming a single column would have erased the wrong person's link on every attempt made against a shared list. **Anonymising means every column that names or re-identifies a person is nulled, not merely one of them**, and the reason this is spelled out at epic level is that an earlier revision of this bullet named a single `customerId` column which those tables do not have: they carry **two** customer roles, and a row also carries references that resolve back to a person. FEATURE-001-07 publishes the column-by-column map and is its authority [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.13 Privacy And How Long An Audit Row Is Kept — No Policy Is Declared Anywhere]; what this bullet fixes is the rule the map has to satisfy — **after the pass, no column on a retained row resolves to a customer, directly or through another row** — and the retained set is therefore the channel, the language code, **both source discriminators**, the outcome codes **including the closed error-code collection**, the counts, the variant identifiers, **the catalogue name and SKU snapshots, which name a catalogue item and no person**, the quantities, the money values **including the two channel currency codes**, the correlation id, **the opaque label recording which HMAC key produced a digest, which is key identity and never key material**, and **the structural columns — each row's own identifier, the child's parent reference and denormalised channel, the projected key index, and the two inherited timestamps, without which an aggregate over a time range is not computable**. **An earlier version of this sentence listed nine categories and closed with "and nothing else", which left several declared columns in no category at all and made the map's own exhaustiveness claim unsatisfiable**; the list above is the corrected one and the map that satisfies it is that feature's. **The handler and both job kinds are owned by FEATURE-001-07 and built by STORY-001-07-01 in batch B5, and each earlier feature's table-specific disposal step is contributed *into that handler* when B5 lands rather than shipped as a pass of its own** — which keeps the dependency direction forward-only across the batches of section 9.4 and keeps the mechanism count at one. **The consequence is stated rather than left to be discovered: before B5 lands, no disposal of any kind runs**, so batches B1 to B4 ship the tables, the minimised column sets and the present-state behaviour their stories assert, and nothing else. That is why ruling R19 makes a finite period a *required* configuration in the same feature that ships the handler — the guard and the mechanism arrive together — and why every story in B1 to B4 states that it implements no deletion, anonymisation or purge behaviour itself. **The keep period itself is an open product decision recorded in section 8.1 and no duration is invented here; the *mechanism* and its two triggers are settled by R19 and are not deferred with it.**
 - **Migration ordering follows the dependency direction, and one later migration adds a column to an earlier table.** `ReorderList` precedes `ReorderListLine` and `ReorderListShare`; **FEATURE-001-06's migration additionally adds the unpublished counter column `activeGrantCount NOT NULL DEFAULT 0` to `reorder_list`**, which is additive, reversible, on a plugin-owned table rather than a core one, and declared in that feature's own migration rather than by editing FEATURE-001-01's [tickets/EPIC-001/FEATURE-001-06-buying-account-list-sharing.md:§2.3.1 The Seats-Per-List Bound Is Enforced By A Conditional Counter Update, Not By A Count-Then-Insert]; `ReorderAttempt` precedes `ReorderAttemptLine`. Where a table holds a nullable reference to a sibling feature's table — the saved-list reference on an attempt — the reference is declared nullable and **without** a foreign key, so the two features' migrations can be applied in either order; FEATURE-001-07 states that choice and its consequence explicitly.
 - **Every migration is generated through the existing lifecycle** [packages/core/src/migrate.ts:L118] and applied through [packages/core/src/migrate.ts:L40], never hand-written as raw DDL, and is evidenced on MariaDB, MySQL, PostgreSQL and sql.js with native SQLite named unverified per discrepancy (i).
 
@@ -589,7 +613,7 @@ A buildable, registered, startable package must exist before *any* operation in 
 
 - **The package directory and its manifest:** `packages/reorder-plugin/package.json`, taking its shape from a shipped plugin package — `main` and `types` pointing into the build output [packages/harden-plugin/package.json:L5-L6], the `watch`, `build` and `lint` scripts [packages/harden-plugin/package.json:L14-L18], and `@vendure/core` and `@vendure/common` pinned to the workspace version as development dependencies [packages/harden-plugin/package.json:L30-L33]. It additionally declares a `ci` script delegating to `build`, exactly as the one shipped plugin that declares one does [packages/job-queue-plugin/package.json:L20], because the four engine jobs build the workspace with `bunx lerna run ci` [.github/workflows/build_and_test.yml:L104] and a package without that script is silently skipped rather than failing loudly.
 - **The two build configurations:** `tsconfig.json` extending the workspace root and emitting declarations [packages/harden-plugin/tsconfig.json:L1-L9], and `tsconfig.build.json` naming the output directory and the single entry file [packages/harden-plugin/tsconfig.build.json:L1-L9].
-- **The package entrypoint:** an `index.ts` barrel at the package root re-exporting the plugin and its public types, in the form the shipped plugin uses [packages/harden-plugin/index.ts:L1-L3]. Ruling R20 in section 6.4 fixes what that barrel must contain.
+- **The package entrypoint:** an `index.ts` barrel at the package root re-exporting the plugin and its public types, in the form the shipped plugin uses [packages/harden-plugin/index.ts:L1-L3]. Ruling **R22** in section 6.4 — the package-root export ruling — fixes what that barrel must contain, R20 being the cart-ownership ruling and not this one.
 - **The plugin class:** `ReorderPlugin` with its `entities`, `providers`, `shopApiExtensions` and `adminApiExtensions` members — the shape the shipped wishlist example demonstrates [packages/dev-server/example-plugins/wishlist-plugin/wishlist.plugin.ts:L9-L16] — populated by this story with its own entities and operations rather than left empty. **A class in a directory is not the whole of it, and an earlier revision of this bullet stopped there:** the package must also declare the manifest fields, dependency split, scripts and compatibility range that make it participate in the workspace's own build, lint, test, end-to-end and continuous-integration aggregates rather than being skipped by them in silence. Section 7.9.2 is that contract, and it is part of this same prerequisite rather than a separate concern.
 - **Its registration in the dev-server plugin array** [packages/dev-server/dev-config.ts:L121-L155], which is one of exactly two files a future implementation may touch outside its own package [tickets/EPIC-001-reorder-and-replenishment.md:§11.7 The Two Permitted Configuration Exceptions]. The permission registration point it populates is currently an empty array [packages/dev-server/dev-config.ts:L91], and the custom-fields object beside it is likewise empty and stays empty under R1 [packages/dev-server/dev-config.ts:L116] — both are the state a reviewer should expect before the first story runs.
 - **A boot-and-schema proof**, because the five deliverables above are all satisfiable by code that never runs: the server starts with the plugin registered, and the regenerated Shop schema declares this story's operation while the nineteen pre-existing root queries and thirty-two root mutations are byte-identical [tickets/EPIC-001-reorder-and-replenishment.md:§6.5 The Cumulative Published-Surface Ledger].
@@ -644,16 +668,23 @@ reorder_toolchain() {
     [ "$problems" -eq 0 ] || { echo "TOOLCHAIN FAILED: $problems problem(s)."; return 1; }
     echo 'TOOLCHAIN OK'
 }
-# 1. Dependencies from the committed lockfile, 2. every package built, 3. a disposable database.
-#    Chained, so a failed step stops the sequence instead of the next one starting on its wreckage.
+# 1. Dependencies from the committed lockfile, 2. every package built, 3. a disposable database
+# pinned to the line continuous integration validates, 4. the read-only preflight of section 11.11.1.
+# EVERY step is chained with &&, so a failed step stops the sequence instead of the next one starting
+# on its wreckage. An earlier revision chained only as far as the pull and then left the tag and the
+# service start as separate statements, so a failed pull was followed by a tag of an image that had
+# not arrived and a service started on whatever mariadb:latest already happened to be locally -- the
+# exact unpinned line the pin exists to avoid, reached by the failure path rather than by the command.
 reorder_toolchain &&
     bun install --frozen-lockfile &&
     bun run build &&
-docker pull mariadb:11.5
-docker tag mariadb:11.5 mariadb:latest
-docker compose up -d mariadb
-# 4. Confirm the whole prerequisite took effect with the canonical preflight of section 11.11.1,
-#    which additionally checks the build artefacts steps 1 and 2 are supposed to have produced.
+    docker pull mariadb:11.5 &&
+    docker tag mariadb:11.5 mariadb:latest &&
+    docker compose up -d mariadb &&
+    reorder_preflight
+# reorder_preflight is the function section 11.11.1 declares. It is read-only and fail-closed, and it
+# additionally checks the build artefacts steps 1 and 2 are supposed to have produced -- so a green
+# exit here is the prerequisite having taken effect rather than the commands having been typed.
 ```
 
 Each line is the repository's own, cited rather than composed:
@@ -668,6 +699,8 @@ Each line is the repository's own, cited rather than composed:
   - **The validated line is resolved locally under the name the compose file requests**, which is why step 3 pulls `mariadb:11.5` and tags it before starting the service. That keeps every `docker compose` invocation elsewhere in this set working unchanged — including the service-scoped client call a story uses to seed a fixture [tickets/EPIC-001/FEATURE-001-05/STORY-001-05-03-snooze-replenishment-signal.md:§4. User Story] — because the service name and the container name are the compose file's and are untouched.
   - **The pin is verified rather than assumed**, by reading the running server's own version. A pin that silently did not take effect is worse than no pin, because it converts a reproducibility claim into a false one. **Editing `docker-compose.yml` to pin the tag at source would be the better fix and is deliberately not proposed here**: that file is neither of the two permitted configuration exceptions [tickets/EPIC-001-reorder-and-replenishment.md:§11.7 The Two Permitted Configuration Exceptions], so the correction is recorded as separately assignable follow-up work in the same way this epic records the three documentation discrepancies it declines to edit in place [tickets/EPIC-001-reorder-and-replenishment.md:§6.3 Repository Documentation Discrepancies — Noted, Not Propagated].
 
+- **Step 4 — the preflight.** `reorder_preflight` is the read-only, fail-closed function section 11.11.1 declares [tickets/EPIC-001-reorder-and-replenishment.md:§11.11 The Canonical Local Demonstration Preflight, Destructive-Setup Warning And Administrative Sign-In]. It is the last link of the chain rather than a separate instruction because the three steps above are all satisfiable by commands that ran and produced nothing usable: it re-tests the toolchain, and it additionally checks the build artefact the dev scripts shell out to at `packages/cli/dist/cli.js` [packages/dev-server/package.json:L13], which is the one thing steps 1 and 2 exist to produce and the one thing their exit status does not prove.
+
 **What the prerequisite deliberately excludes, so that no story outsources its own subject matter to it.** It seeds no data, starts no server, authenticates nobody and executes no operation. Seeding [CONTRIBUTING.md:L147-L150] and starting a session [CONTRIBUTING.md:L178-L181] are the first steps *of a story's own demonstration*, because a story's demonstration is where the destructive nature of the seed script and the choice of session are stated. **A story needing a fixture beyond the seeded data — a placed order, a repriced variant, a stock adjustment, a cadence row — names every operation, every variable, the authentication and channel context each call runs under, and the intermediate state it expects to observe**, rather than instructing a reader to "place an order". That obligation is part of every story-level definition of done in this set, and a story that states a fixture as a summary rather than as an executable sequence has not met it.
 
 **Two executable checks on the prerequisite itself**, so that a reader knows before proceeding whether it took effect: `docker compose version` prints a version rather than reporting an unknown command, and the built command-line interface the dev scripts invoke exists on disk at `packages/cli/dist/cli.js`. If either check fails, the demonstration has not started and nothing downstream of it is evidence of anything.
@@ -676,11 +709,11 @@ Each line is the repository's own, cited rather than composed:
 
 **This sub-section exists because a review found that the bootstrap above named a class and a registration edit and nothing else.** A directory containing a `ReorderPlugin` class satisfies every word of §7.9 and still fails to take part in the workspace: `lerna run <script>` executes the script only in packages that declare it, so a package with no `build`, no `test`, no `e2e`, no `lint` and no `ci` script is **silently skipped** by the root aggregates [package.json:L25], [package.json:L26], [package.json:L27] and by the command every engine job runs before its suite, `bunx lerna run ci` [.github/workflows/build_and_test.yml:L104]. **A green root run would then mean nothing about this plugin**, and the failure mode is the worst kind: it reports success rather than absence. The single `bench` script §7.6.2 owns does not close it, because nothing in the workspace invokes `bench`.
 
-**The contract below is therefore a named, owned prerequisite in the same class as the skeleton and the registration edit** — performed by the implementation run, priced by no story row in section 9.2, and observable to nobody, which is exactly why it is not a story. Every field and script is cited to a shipped first-party plugin rather than invented, so the plugin looks like the packages beside it instead of like a new convention.
+**The contract below is therefore part of the same named, owned prerequisite as the skeleton and the registration edit** — performed by the implementation run, owned by STORY-001-01-01 and priced inside that story's own section 9.2 row [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap — Owned By STORY-001-01-01, And Priced There]. **An earlier revision of this sentence said it was priced by no row at all**, which contradicted section 7.9 four paragraphs above it and left the manifest, the scripts and the compatibility range as work no tracker could accept; it is withdrawn. What remains true is that none of it is separately observable to a buyer, which is why it is not a twenty-sixth story rather than why it is unowned. Every field and script is cited to a shipped first-party plugin rather than invented, so the plugin looks like the packages beside it instead of like a new convention.
 
 - **Manifest identity, copied in shape from the smallest shipped first-party plugin** [packages/harden-plugin/package.json:L1-L33]: `name` `@vendure/reorder-plugin` [packages/harden-plugin/package.json:L2]; `version` equal to the workspace version, because Lerna fixed versioning over a `packages/*` glob publishes one number for every package [lerna.json:L2-L3] and the sibling declares that number literally [packages/harden-plugin/package.json:L3]; `license` matching its siblings [packages/harden-plugin/package.json:L4]; `repository` [packages/harden-plugin/package.json:L10-L13]; and `publishConfig` [packages/harden-plugin/package.json:L21-L23].
 - **Consumable entry points, without which a registration import resolves to nothing after a build**: `main` and `types` pointing at the compiled output [packages/harden-plugin/package.json:L5-L6], and a `files` allow-list so the published artifact carries the compiled tree and not the sources [packages/harden-plugin/package.json:L7-L9]. An `index.ts` re-exporting the plugin, its options type, its entities, its strategy interface and its default implementation is what those two fields resolve to; a package whose public surface is reachable only by deep import is not the shape this workspace publishes.
-- **Dependency declaration, split the way the workspace splits it.** `@vendure/core` and `@vendure/common` are **development** dependencies at the pinned workspace version rather than runtime ones, which is what the shipped sibling declares [packages/harden-plugin/package.json:L30-L33] — the plugin is loaded *into* a Vendure server, so the platform is present at run time by construction. Anything the plugin genuinely needs at run time is a `dependencies` entry [packages/harden-plugin/package.json:L24-L26]. **The four dashboard-surface stories additionally put their localisation tooling in this manifest rather than borrowing a sibling's**, and the reason is that nothing they need is reachable from where they would otherwise expect it: the localisation configuration in the dev-server package is scoped by path to one unrelated test plugin's catalogue directory [packages/dev-server/lingui.config.js:L6-L9], the extraction and check scripts live in the dashboard package [packages/dashboard/package.json:L28] and [packages/dashboard/package.json:L30] alongside the tooling entries they need [packages/dashboard/package.json:L75-L79], and the dev-server package declares no localisation dependency in either of its two dependency blocks [packages/dev-server/package.json:L27-L34] and [packages/dev-server/package.json:L35-L48]. The plugin therefore declares its own, and the full contract is stated once [tickets/EPIC-001-reorder-and-replenishment.md:§11.12 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files].
+- **Dependency declaration, split the way the workspace splits it.** `@vendure/core` and `@vendure/common` are **development** dependencies at the pinned workspace version rather than runtime ones, which is what the shipped sibling declares [packages/harden-plugin/package.json:L30-L33] — the plugin is loaded *into* a Vendure server, so the platform is present at run time by construction. Anything the plugin genuinely needs at run time is a `dependencies` entry [packages/harden-plugin/package.json:L24-L26]. **The four dashboard-surface stories additionally put their localisation tooling in this manifest rather than borrowing a sibling's**, and the reason is that nothing they need is reachable from where they would otherwise expect it: the localisation configuration in the dev-server package is scoped by path to one unrelated test plugin's catalogue directory [packages/dev-server/lingui.config.js:L6-L9], the extraction and check scripts live in the dashboard package [packages/dashboard/package.json:L28] and [packages/dashboard/package.json:L30] alongside the tooling entries they need [packages/dashboard/package.json:L75-L79], and the dev-server package declares no localisation dependency in either of its two dependency blocks [packages/dev-server/package.json:L27-L34] and [packages/dev-server/package.json:L35-L48]. The plugin therefore declares its own, and the full contract is stated once [tickets/EPIC-001-reorder-and-replenishment.md:§11.13 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files].
 - **Scripts, and the list is exactly the set the workspace invokes rather than a generous one.** `build` and `lint` in the shape every sibling uses [packages/harden-plugin/package.json:L16-L17]; `test` for the co-located unit specifications [packages/core/package.json:L27]; `e2e` in the cross-package form that names the package to the shared configuration [packages/core/package.json:L28]; `bench` as §7.6.2 fixes it [packages/core/package.json:L30]; and `ci`, which is the one the engine jobs actually call [packages/core/package.json:L31]. **The assertion is behavioural rather than a file read**: `bunx lerna run ci` and `bun run test` and `bun run e2e` from the repository root each report this package by name in their output, and a run that does not mention it has skipped it.
 - **A compatibility range, declared and tested, because omitting it is a silent degradation rather than a neutral choice.** `VendurePluginMetadata.compatibility` is optional [packages/core/src/plugin/vendure-plugin.ts:L70] and the platform's own reaction to its absence is a single informational log line saying the plugin "is not guaranteed to be compatible" [packages/core/src/bootstrap.ts:L335-L338] — which nothing fails on and nobody reads. Declared, it is enforced: a range the running version does not satisfy throws and the server does not start [packages/core/src/bootstrap.ts:L340-L349]. **The range is declared in the form the first-party plugins use** — `'^3.0.0'` is what five shipped plugins declare [packages/harden-plugin/src/harden.plugin.ts:L167], [packages/email-plugin/src/plugin.ts:L307], [packages/asset-server-plugin/src/plugin.ts:L195], [packages/graphiql-plugin/src/plugin.ts:L80] and [packages/admin-ui-plugin/src/plugin.ts:L154], and a plugin depending on a mechanism introduced later states the floor instead, as the telemetry plugin does [packages/telemetry-plugin/src/telemetry.plugin.ts:L121]. **This plugin's floor is the scheduler and its `configure` surface, both introduced in the 3.3 line** [packages/core/src/scheduler/scheduled-task.ts:L38] and [packages/core/src/scheduler/scheduled-task.ts:L115], so the range states that floor rather than copying `^3.0.0` unexamined. **Two tests, because a declaration nobody exercises is a declaration that regresses:** a server bootstrapped with the declared range starts, and one bootstrapped with a deliberately unsatisfiable range fails with the platform's own message rather than starting anyway.
 - **A build configuration that the `build` script resolves.** The sibling's `build` compiles a dedicated `tsconfig.build.json` [packages/harden-plugin/package.json:L16], so the package owns that file; a `build` script pointing at a configuration the package does not contain fails on first invocation, which is a first-run defect rather than a design question.
@@ -707,7 +740,9 @@ Each line is the repository's own, cited rather than composed:
 | `maxQuantityPerLine` | `number` — integer units, finite, at least 1, and no greater than a signed 32-bit integer | **Required**, no value in this set | `addItemToReorderList` and `adjustReorderListLine`, applied to the **resulting** quantity rather than to the increment, and consumed as the range of FEATURE-001-02's optional quantity override | STORY-001-01-01 |
 | `maxProjectedSourceLines` | `number` — integer, finite, at least 1 | **Required**, no value in this set | `applyReorderToActiveOrder` and `reorderPreview`, checked after the source projects and **before any variant load or availability read** | STORY-001-02-01 |
 | `substitutionCandidateStrategy` | `SubstitutionCandidateStrategy` | **Defaulted** to `DefaultSubstitutionCandidateStrategy`, the database-backed implementation | Resolution rounds, called once per round in its batch form | STORY-001-04-02 |
+| `substitutionCandidateTimeoutMs` | `number` — integer milliseconds, finite, at least 1 | **Required**, no value in this set | The deadline the wrapper bounds every `getCandidates` call with; on expiry the round fails closed to the empty candidate map and the late answer is discarded [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.6.2 What Crosses The Strategy Boundary, And What The Wrapper Around It Guarantees] | STORY-001-04-02 |
 | `maxSubstitutionCandidatesPerVariant` | `number` — integer, finite, at least 1 | **Required**, no value in this set | `setSubstitutionCandidates` input, the value a configured strategy may return, and the offer made against one unavailable line — all three refused rather than truncated | STORY-001-04-02 |
+| `cadenceHistoryWindowDays` | `number` — integer whole days, finite, at least 1 | **Required**, no value in this set | The inclusive lower bound on `Order.orderPlacedAt` [packages/core/src/entity/order/order.entity.ts:L90] carried by every cadence derivation statement, which is what bounds a tick's **input** rather than only its pages | STORY-001-05-02 |
 | `cadenceRecomputeSchedule` | `string \| ((cronTime: typeof CronTime) => string)` — a cron expression or the generator form [packages/core/src/scheduler/scheduled-task.ts:L75] | **Required**, no value in this set | The `schedule` member of the one `ScheduledTask` | STORY-001-05-02 |
 | `cadenceRecomputeTimeout` | `number \| string` — milliseconds, or a duration string [packages/core/src/scheduler/scheduled-task.ts:L83] | **Required**, no value in this set | The `timeout` member of the same task | STORY-001-05-02 |
 | `cadenceBatchSize` | `number` — integer rows, finite, at least 1 | **Required**, no value in this set | The task's `params.batchSize`, and re-checked at the top of `execute` because `configure` replaces `params` wholesale [packages/core/src/scheduler/scheduled-task.ts:L166-L177] | STORY-001-05-02 |
@@ -718,11 +753,16 @@ Each line is the repository's own, cited rather than composed:
 | `recordReorderAttempts` | `boolean` | **Defaulted** to `true` | The recording service, which writes nothing on either audit table when it is false | STORY-001-07-01 |
 | `attemptRetentionPeriod` | `number` — integer whole days, finite, at least 1 | **Required whenever `recordReorderAttempts` is true**, no value in this set | The customer-data-lifecycle job's age predicate over the two audit tables | STORY-001-07-01 |
 | `customerDataLifecycleBatchSize` | `number` — integer rows, finite, at least 1 | **Required**, no value in this set | The batch size of the customer-data-lifecycle job's pass over all six tables | STORY-001-07-01 |
+| `replayClaimHmacKey` | `string` — the raw key material, supplied by the deployment from its own environment and **never a literal in configuration, in a fixture or in this ticket set** | **Required whenever `recordReorderAttempts` is true**, no value in this set | The keyed digest that produces `replayClaimDigest` and `requestFingerprint`, per the one digest contract [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4 Named Entities Touched]. A key shorter than the digest's own block requirement fails startup rather than being padded | STORY-001-07-01 |
+| `replayClaimKeyId` | `string` — a short stable label, at most 32 characters, naming which key produced a digest | **Required whenever `replayClaimHmacKey` is set**, no value in this set | Stored on every attempt row beside its digests, and compared as a conjunct of the replay claim, so a rotated key yields a new claim rather than a silent mismatch against digests it cannot reproduce | STORY-001-07-01 |
+| `recordAdminReorderReadAccess` | `boolean` | **Defaulted** to `true` | The two administrative support reads, each of which records one customer-history entry through the platform's own history service when it is true and records nothing when it is false — the one declared write a query in this epic performs [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5.2 The One Write These Reads Perform, And The Governance That Makes It Addable] | STORY-001-08-03 |
 | `recurringDemandMinimumPurchases` | `number` — integer placements, finite, at least 2 | **Required**, no value in this set. **At least two, not at least one**, because a single placement is not a recurrence by any reading and a bound admitting one would make the aggregate a purchase log | The `HAVING` clause of the `recurringDemand` aggregate | STORY-001-08-01 |
 | `demandWindowDays` | `number` — integer whole days, finite, at least 1 | **Required**, no value in this set | The inclusive lower time bound in the `WHERE` clause of `recurringDemand` and of `reorderAttempts`, published on each list type as `windowStart` | STORY-001-08-01 |
 | `adminReadDefaultPageSize` | `number` — integer rows, finite, at least 1, and no greater than the platform's own configured list limit | **Required**, no value in this set | The `take` applied to every Admin read in FEATURE-001-08 when a caller supplies none | STORY-001-08-01 |
+| `maxAdminFilterArrayLength` | `number` — integer array elements, finite, at least 1 | **Required**, no value in this set | Each of the three Admin reads, validating the length of every generated `in` and `notIn` array before a statement is issued and refusing an over-bound array with the platform's input error naming the field and the maximum — the platform's own identifier operators declaring no length limit of their own [packages/core/src/api/schema/common/common-types.graphql:L93-L99] | STORY-001-08-01 |
+| `maxSupportResponseLineObjects` | `number` — integer nested objects, finite, at least 1 | **Required**, no value in this set | `reorderAttempts`, refusing a request whose `take` multiplied by the source-lines maximum exceeds it, with the input error naming both operands and the ceiling so a caller learns which to reduce | STORY-001-08-03 |
 
-**Nineteen keys, and the count is stated so a key added during implementation is visible as an addition rather than absorbed.** Two are defaulted and seventeen are required; one of the seventeen is conditionally required, and one admits an explicit `null`. **Three keys belong to one story that no reading of the table makes obvious, so it is stated:** FEATURE-001-01's three bounds — the lists-per-customer maximum, the lines-per-list maximum and the quantity-per-line maximum — are all **declared** by STORY-001-01-01, which is the story that brings the plugin and its options object into existence, and are **read** by 01-02 and 01-03. An earlier revision of this table gave the lines-per-list maximum to 01-02 on the reasoning that the reading story should own the key, which put two stories in the business of declaring the same option object and omitted the quantity bound from the ledger altogether.
+**Twenty-six keys, and the count is stated so a key added during implementation is visible as an addition rather than absorbed.** Three are defaulted and twenty-three are required; **three of the twenty-three are conditionally required** — the audit retention period whenever recording is enabled, and the two replay-claim credentials whenever recording is enabled — and one admits an explicit `null`. **The count was nineteen until two reviews found seven keys that features and stories required while this table did not carry them, and all seven are named here rather than folded in silently**, because a ledger that grows without saying why invites the assumption that it was always complete: the substitution deadline; the cadence history window; the two replay-claim credentials, `replayClaimHmacKey` and `replayClaimKeyId`, without which the audit row's keyed digest had no key material and no rotation label anywhere; `maxAdminFilterArrayLength`, the cardinality every Admin read validates a generated `in` or `notIn` array against; `maxSupportResponseLineObjects`, the ceiling on the product of the attempt read's page size and its nested line collection — both of those bounds having existed in prose with no key anywhere in the set, which is a bound no implementation can be held to and no deployment can set [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5 Named API Surfaces — Three New Admin API Operations, Zero Shop API Change]; and `recordAdminReorderReadAccess`, the switch over the access-audit write on the two support reads, which had been specified only inside STORY-001-08-03 with no declaration in the owning feature and no row here — so a durable, customer-linked write performed by a read had no ledgered switch. That behaviour is now declared by the feature that owns those operations [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.8a The Access-Audit Write On The Two Support Reads, And The Two Error-Extension Keys — Declared HERE Because A Story May Not Introduce Either] and its key is ledgered here. **Two of those seven arrived twice under two names — the filter cardinality and the read-access switch — and each is carried once, under the name that matches the ledger's own conventions**, so the count is twenty-six rather than twenty-eight. **A required key with no value in this set is an open decision and not an omission** — the rule the table's third column states — and **a key that appears in a feature or story but not in this table is a defect in that file rather than a licence to introduce a twenty-seventh setting**. **Three keys belong to one story that no reading of the table makes obvious, so it is stated:** FEATURE-001-01's three bounds — the lists-per-customer maximum, the lines-per-list maximum and the quantity-per-line maximum — are all **declared** by STORY-001-01-01, which is the story that brings the plugin and its options object into existence, and are **read** by 01-02 and 01-03. An earlier revision of this table gave the lines-per-list maximum to 01-02 on the reasoning that the reading story should own the key, which put two stories in the business of declaring the same option object and omitted the quantity bound from the ledger altogether.
 
 **One bound is deliberately *not* an option, and it is recorded here so that its absence from the table is read as a ruling rather than as the gap a review reported.** The **list-name length is fixed at 191 characters** and is not configurable. The reasoning is that it is not a product choice at all: the name and its normalised key both participate in a composite unique index, and 191 is the length at which a four-byte UTF-8 index stays inside the key-size limit on the MySQL and MariaDB engines the existing engine jobs exercise [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.4 Named Entities Touched]. An option would therefore have exactly one legal value — the column's own length, since a larger bound is a database error rather than a validated rejection and a smaller one is a restriction no engine asks for — and **an option with one legal value is a way for a deployment to break itself**. So the rule replaces the key: the input validation bound, the `varchar` length in the additive migration and the number a story asserts against are **one constant, 191**, changed only by changing the column, and a story asserts the boundary at 190, 191 and 192 characters rather than against a configured value. What remains open about the name is everything except its length — normalisation before the uniqueness comparison, whitespace trimming and the treatment of control characters — and section 8's fifth decision carries those three [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.11 Names, Bounds And Concurrency — The Rules That Make The Contract Deterministic].
 
@@ -730,7 +770,7 @@ Each line is the repository's own, cited rather than composed:
 
 **Finite versus unlimited, which is the rule the seat cap needed and did not have.** An explicit "no cap" is a legitimate product outcome, and an earlier revision of this epic offered it while the enforcing statement was written as `activeGrantCount < :max` — a comparison with no value that expresses "unbounded", since every candidate value is itself a cap. **`null` is therefore part of the option's type rather than a sentinel smuggled into a number**, and it selects a different statement rather than a different parameter: with a finite value the write is the conditional counter update and a zero affected-row count is the refusal, and with `null` the counter column is still incremented but the `AND` comparison is absent, so the write cannot be refused for exceeding a bound that does not exist. Two consequences are stated rather than left to an implementer. **The counter is maintained either way**, so a deployment that later sets a finite value has a correct count to compare against instead of a column it must backfill. And **`undefined` is not `null`**: an absent key fails startup, because "the operator has not decided" and "the operator has decided there is no cap" are different states and only the second is a configuration.
 
-**What this ledger does not contain, so its absences are not read as oversights.** It carries no value for any required key, because every one of the seventeen is an open product or operational decision — most of them ranked in section 8, and the three scheduled-task members recorded there under the architectural entry that closed the execution model — and this epic invents no figures. It carries no key for a behaviour no story builds — in particular no notification-transport option, the strategy that once proposed one having been withdrawn. And it carries no key that only a test needs: every row is a deployment-facing configuration, and a story needing a value for a fixture configures one of these rather than introducing a test-only switch.
+**What this ledger does not contain, so its absences are not read as oversights.** It carries no value for any required key, because every one of the twenty-three is an open product or operational decision — most of them ranked in section 8, and the three scheduled-task members recorded there under the architectural entry that closed the execution model — and this epic invents no figures. It carries no key for a behaviour no story builds — in particular no notification-transport option, the strategy that once proposed one having been withdrawn. And it carries no key that only a test needs: every row is a deployment-facing configuration, and a story needing a value for a fixture configures one of these rather than introducing a test-only switch.
 
 
 
@@ -738,8 +778,7 @@ Each line is the repository's own, cited rather than composed:
 
 ## 8. Decisions Required Before Build
 
-Eighteen entries in two groups — twelve product and six architectural — each group ordered by the number of stories blocked, descending. **The twelfth product entry was added by a review that found FEATURE-001-05's derivation bounding its pages and not its input**, which is the one gap in this section that a reader could not have inferred from the entries around it. **Fifteen of the eighteen are open. Three are recorded as closed in place rather than deleted — product entries 2 and 6, and architectural entry 1**, each because a closed decision and its reasoning are worth more to a reader than a gap, and because every reference to a numbered entry elsewhere in this set — architectural decision 5 in particular, which four files cite as a sign-off gate — continues to resolve when the numbering does not move;
-where two entries block the same number, the one whose earliest blocked story sits in the earlier batch comes first. The closed entry keeps its rank position and blocks nothing. Every entry is labelled either an *objective ambiguity* or a *decision the codebase forces*, and several were surfaced by a feature file rather than by the objective, each of which says so where it appears.
+Nineteen entries in two groups — twelve product and seven architectural — each group ordered by the number of stories blocked, descending. **The twelfth product entry was added by a review that found FEATURE-001-05's derivation bounding its pages and not its input**, which is the one gap in this section that a reader could not have inferred from the entries around it. **Fifteen of the nineteen are open. Four are recorded as closed in place rather than deleted — product entries 2 and 6, and architectural entries 1 and 7**, each because a closed decision and its reasoning are worth more to a reader than a gap, and because every reference to a numbered entry elsewhere in this set — architectural decision 5 in particular, which four files cite as a sign-off gate — continues to resolve when the numbering does not move. **The tie-break inside each group is stated because two entries can block the same number of stories:** where they do, the one whose earliest blocked story sits in the earlier batch comes first. **A closed entry keeps its rank position and blocks nothing**, which is why the ranks are not contiguous in the count of stories blocked. Every entry is labelled either an *objective ambiguity* or a *decision the codebase forces*, and several were surfaced by a feature file rather than by the objective, each of which says so where it appears.
 
 **No entry below supplies the value it asks for.** Several of these decisions are the kind a reader expects a number against — a cap, a window, a keep-period, a page size — and this epic states none of them, because this repository declares none and the constraints forbid inventing one. **The one number this epic does state is the list-name length**, and it is stated precisely because it is not a product value: it is forced by an index key-size limit on two of the four engines already under test, so declining to state it would have been declining to state a repository fact [section 7.10 above]. What each entry does instead is name the exact thing to be decided, the acceptance criterion that cannot be written until it is, and the platform mechanism that already exists in the neighbourhood so that a maintainer decides against evidence rather than in a vacuum.
 
@@ -747,9 +786,11 @@ where two entries block the same number, the one whose earliest blocked story si
 
 1. **Maximum number of named lists per customer, and maximum lines per list. Blocks 8 stories** (01-01, 01-02, 01-03, 01-04, 02-03, 06-01, 06-03, 08-03). *Objective ambiguity.* The objective asks for effortless reorder and says nothing about limits, yet the proposed `ReorderListLimitError` exists precisely to enforce one, and without a number that error has no trigger condition and cannot be given a testable acceptance criterion. Note that the platform already carries order-level limits with their own error type [packages/core/src/api/schema/common/common-error-results.graphql:L37], so a limit is idiomatic here; only its value is undecided.
 2. **CLOSED — the replenishment due list is channel-scoped, and this entry is retained in place rather than removed.** *Not a decision, and no longer blocking any story.* It was published here as an objective ambiguity blocking five stories (05-01, 05-02, 05-03, 08-01, 08-02) on the reasoning that a buyer purchasing one variant in two channels has one real-world cadence but two channel-scoped histories. **That reasoning was wrong about which of the two options was available, not about which was preferable.** Channel scoping is not the platform default that a deviation could argue against — it is a hard constraint on this epic, so a cross-channel Shop aggregate was never a candidate and offering it as one made a settled boundary look negotiable. Ruling R16 states the closure and every affected story asserts it: cadence identity, the scheduled recompute, the due-signal read and the snooze are each bound to the one channel the request names through its `vendure-token` header [packages/core/src/entity/channel/channel.entity.ts:L62], a row written under one token is absent from the read under another, and the buyer-visible consequence — that two channels give two cadences for one variant — is a stated behaviour rather than an open question. **A cross-channel view remains buildable and is not being ruled undesirable: it is an Admin API aggregate behind its own permission, outside this epic's Shop surface and outside its scope.** The entry keeps position 2 so that no later ordinal moves and no sibling file's reference to a numbered decision is invalidated by the closure.
-3. **The erasure window for customer-linked reorder rows, and whether an anonymised audit row is kept without expiry. Blocks 5 stories** (01-01, 05-02, 06-01, 07-01, 08-03). *Decision the codebase forces, with a product component.* `Customer` is soft-deletable [packages/core/src/entity/customer/customer.entity.ts:L23], so a soft delete leaves every plugin-owned row in place and no cascade reclaims it. Section 7.8 fixes the *mechanism* over all **six** customer-linked tables — anonymise the two audit tables by nulling **every** customer-identifying and re-identifying column on them, both customer roles included, and delete `ReorderList`, `ReorderListLine`, `ReorderListShare` and `PurchaseCadence` outright, all in the saved-list and cadence rows outright, all of it driven by the single `reorder-customer-data-lifecycle` job of ruling R19 with its two named triggers rather than in a scheduled task, and owned by STORY-001-07-01 — and that mechanism is not in question. **What is undecided is the window**: how long after a soft delete the anonymisation runs, and whether the anonymised aggregate is kept without expiry. No duration is invented here, because this repository declares none anywhere; the five stories can be built against a configured value, but none of their definitions of done can be signed off until a maintainer sets it. This is the decision the review of this epic identified as blocking, and it is recorded as blocking rather than resolved unilaterally. **This entry also carries the attempt-row half of the same question**, because the audit tables are where the exposure is sharpest: a plugin-owned attempt table keyed by customer id inherits none of the platform's soft-delete behaviour for free — its rows survive the delete, carry what the buyer tried to buy and when, and stay readable through the support lookup, whereas the platform's own membership read filters soft-deleted rows out [packages/core/src/service/services/customer-group.service.ts:L75-L88]. **So this entry covers the attempt row's period as well as the saved-list tables', and it covers nothing else — which is narrower than an earlier version of this entry, and the narrowing is recorded rather than applied silently.** That version closed by listing six questions the decision had to answer: the purpose each retained row serves, how long it is kept, what a customer deletion does to it, whether anonymisation or purge is the mechanism, what performs that mechanism, and whether a support lookup may still return the row afterwards. **Five of those six are settled by ruling R19 and by section 7.8, and listing them as open contradicted the same entry's own opening sentence.** Settled: the purpose is that a demand aggregate reads these rows while a saved list has no purpose without its owner; a customer deletion anonymises the audit tables by nulling the acting-customer column and deletes the saved-list and cadence tables outright; the mechanism is anonymisation for the first group and deletion for the second; what performs it is the single bounded, idempotent job of the plugin's own queue that ruling R19 fixes, reached through that ruling's two triggers and no third — the shipped customer soft-delete event for the erasure pass, and the recording path's own post-commit bounded indexed probe for the expiry pass, with no periodic sweep and no retention work inside the one declared `ScheduledTask`; and **the support lookup may still return an anonymised attempt row** — resolvable through the permission-gated read and through the recorded source order code, still counted in the attempt and line counts, excluded from the distinct-customer count, and addressable by the erased customer identifier no longer. **What is open is the sixth question and only the sixth: the duration, plus whether the anonymised remainder expires at all.**
+3. **The erasure window for customer-linked reorder rows, and whether an anonymised audit row is kept without expiry. Blocks 5 stories** (01-01, 05-02, 06-01, 07-01, 08-03). *Decision the codebase forces, with a product component.* `Customer` is soft-deletable [packages/core/src/entity/customer/customer.entity.ts:L23], so a soft delete leaves every plugin-owned row in place and no cascade reclaims it. Section 7.8 fixes the *mechanism* over all **six** customer-linked tables — anonymise the two audit tables by nulling **every** customer-identifying and re-identifying column on them, both customer roles included, and delete the saved-list and cadence rows — `ReorderList`, `ReorderListLine`, `ReorderListShare` and `PurchaseCadence` — outright, all of it driven by the single `reorder-customer-data-lifecycle` job of ruling R19 with its two named triggers rather than in a scheduled task, and owned by STORY-001-07-01 — and that mechanism is not in question. **What is undecided is the window**: how long after a soft delete the anonymisation runs, and whether the anonymised aggregate is kept without expiry. No duration is invented here, because this repository declares none anywhere; the five stories can be built against a configured value, but none of their definitions of done can be signed off until a maintainer sets it. This is the decision the review of this epic identified as blocking, and it is recorded as blocking rather than resolved unilaterally. **This entry also carries the attempt-row half of the same question**, because the audit tables are where the exposure is sharpest: a plugin-owned attempt table keyed by customer id inherits none of the platform's soft-delete behaviour for free — its rows survive the delete and carry what the buyer tried to buy and when, whereas the platform's own membership read filters soft-deleted rows out [packages/core/src/service/services/customer-group.service.ts:L75-L88]. **The exposure is therefore the period between the soft delete and the erasure pass rather than the state after it**: until the pass runs those rows remain readable through the support lookup, and once it has run neither of that lookup's keys reaches them. **So this entry covers the attempt row's period as well as the saved-list tables', and it covers nothing else — which is narrower than an earlier version of this entry, and the narrowing is recorded rather than applied silently.** That version closed by listing six questions the decision had to answer: the purpose each retained row serves, how long it is kept, what a customer deletion does to it, whether anonymisation or purge is the mechanism, what performs that mechanism, and whether a support lookup may still return the row afterwards. **Five of those six are settled by ruling R19 and by section 7.8, and listing them as open contradicted the same entry's own opening sentence.** Settled: the purpose is that a demand aggregate reads these rows while a saved list has no purpose without its owner; a customer deletion anonymises the audit tables by nulling **every** customer-identifying and re-identifying column on them — both customer roles, both order identifiers, **both order-code snapshots**, the source-list identifier, the share identifier and its capability, with the two `NOT NULL` digests re-digested over the row's own retained correlation identifier and the line table's source-line identifiers cleared — and deletes the saved-list and cadence tables outright; the mechanism is anonymisation for the first group and deletion for the second; what performs it is the single bounded, idempotent job of the plugin's own queue that ruling R19 fixes, reached through that ruling's two triggers and no third — the shipped customer soft-delete event for the erasure pass, and the recording path's own post-commit bounded indexed probe for the expiry pass, with no periodic sweep and no retention work inside the one declared `ScheduledTask`; and **the anonymised attempt row survives as an aggregate contribution and is NOT individually reachable through the support lookup afterwards** — still counted in the attempt and line counts, excluded from the distinct-customer count, and addressable by **neither** of that lookup's two keys, the erased customer identifier being cleared and the source order code being cleared with it.
 
-*What the tickets do while this is open, so no story is blocked on design.* Every affected feature **minimises rather than guesses**: identifiers, integer quantities, closed enum members and platform-returned values only, with no free-text buyer input, no contact detail, no payment data and no request context on any plugin-owned row. **Each affected story additionally carries one assertion of the *observable* behaviour for a soft-deleted customer** — whichever behaviour the decision selects — so that the choice lands in one place per story rather than reshaping the story. It sits in the story's acceptance criteria where that story has a criterion to spare, and in its edge-case section where the story already publishes the maximum of eight criteria, since both carry the identical Given/When/Then form and are exercised by the same end-to-end specification; **story 01-01 is the second case and states so explicitly** [tickets/EPIC-001/FEATURE-001-01/STORY-001-01-01-create-named-reorder-list.md:§5. Acceptance Criteria]. **What no story may do is ship a *chosen keep period* before the decision is taken**, because an implemented duration is far harder to change than an absent one. **What is no longer on that list is the customer-deletion behaviour**: an earlier version of this paragraph forbade a story from shipping "one of the two customer-deletion behaviours", which was correct while two were on offer and is wrong now that ruling R19 has taken one — every affected story ships the settled behaviour and asserts both sides of the erasure boundary [tickets/EPIC-001-reorder-and-replenishment.md:§6.4 The Settled Rulings]. **The lifecycle *mechanism* is a different thing again and is not deferred with the period**, which is the distinction an earlier version of this paragraph blurred: STORY-001-07-01 ships the batched lifecycle job of ruling R19, its two triggers and its bound, of its own, the count of one being a ceiling — of its own — — and makes a finite keep period a **required** configuration, so that a deployment cannot accumulate customer-linked rows indefinitely simply by never taking this decision [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§5. Definition of Done (Feature-Level)]. That invents no duration: it makes the value mandatory without supplying it, and what this decision still owes is the shipped default or the explicit ruling that every deployment must set one. **Two further corrections to that earlier version, because each of them made the obligation escapable.** It called the mechanism a *task*, which R19 forbids and which the batch order makes unbuildable in that direction. And it offered "or disables recording explicitly" as the alternative to configuring a period — which is not an alternative at all: the recording switch governs whether new attempt rows are written and reaches neither the four non-audit tables nor rows already on disk, so a deployment taking that branch would still hold customer-linked data with no declared lifecycle over it. **The only supported routes are to configure a finite period or to not run the plugin.**
+   **That last clause is a correction, and it is recorded here because an earlier version of this entry stated the opposite and the two could not both hold.** That version said the support lookup "may still return an anonymised attempt row — resolvable through the permission-gated read and through the recorded source order code". **Ruling R19 is the authority and it governs**: it requires every *re-identifying* column nulled, and an order code resolves in one lookup to an `Order` carrying its own `customerId` [packages/core/src/entity/order/order.entity.ts:L99], so the code is re-identifying by that ruling's own definition and is cleared. Keeping it addressable would have made the erasure a rename rather than an erasure: an operator who knew the order code of an erased buyer's order could still pull that buyer's reorder history. **So the individual-row support read after erasure is withdrawn rather than qualified**, the erasure map is field-complete and enumerated in exactly one place [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4c The Row Lifecycle — Append-Only In Its Business Facts, With Exactly Two Lifecycle Writes], and the consequence a consumer must build against is that a support lookup naming an erased buyer — or naming the code of an order that buyer placed — returns an empty page indistinguishable from a lookup naming a buyer who never existed. **What the row is still good for is the aggregate**, which reads it by channel, variant and outcome and publishes no customer, no order identifier and no order code at all. **What is open is the sixth question and only the sixth: the duration, plus whether the anonymised remainder expires at all.**
+
+*What the tickets do while this is open, so no story is blocked on design.* Every affected feature **minimises rather than guesses**: identifiers, integer quantities, closed enum members and platform-returned values only, with no free-text buyer input, no contact detail, no payment data and no request context on any plugin-owned row. **Each affected story additionally carries one assertion of the *observable* behaviour for a soft-deleted customer** — whichever behaviour the decision selects — so that the choice lands in one place per story rather than reshaping the story. It sits in the story's acceptance criteria where that story has a criterion to spare, and in its edge-case section where the story already publishes the maximum of eight criteria, since both carry the identical Given/When/Then form and are exercised by the same end-to-end specification; **story 01-01 is the second case and states so explicitly** [tickets/EPIC-001/FEATURE-001-01/STORY-001-01-01-create-named-reorder-list.md:§5. Acceptance Criteria]. **What no story may do is ship a *chosen keep period* before the decision is taken**, because an implemented duration is far harder to change than an absent one. **What is no longer on that list is the customer-deletion behaviour**: an earlier version of this paragraph forbade a story from shipping "one of the two customer-deletion behaviours", which was correct while two were on offer and is wrong now that ruling R19 has taken one — every affected story ships the settled behaviour and asserts both sides of the erasure boundary [tickets/EPIC-001-reorder-and-replenishment.md:§6.4 The Settled Rulings]. **The lifecycle *mechanism* is a different thing again and is not deferred with the period**, which is the distinction an earlier version of this paragraph blurred: STORY-001-07-01 ships the batched lifecycle job of ruling R19, its two triggers and its page bound, and makes a finite keep period a **required** configuration, so that a deployment cannot accumulate customer-linked rows indefinitely simply by never taking this decision [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§5. Definition of Done (Feature-Level)]. That invents no duration: it makes the value mandatory without supplying it, and what this decision still owes is the shipped default or the explicit ruling that every deployment must set one. **Two further corrections to that earlier version, because each of them made the obligation escapable.** It called the mechanism a *task*, which R19 forbids and which the batch order makes unbuildable in that direction. And it offered "or disables recording explicitly" as the alternative to configuring a period — which is not an alternative at all: the recording switch governs whether new attempt rows are written and reaches neither the four non-audit tables nor rows already on disk, so a deployment taking that branch would still hold customer-linked data with no declared lifecycle over it. **The only supported routes are to configure a finite period or to not run the plugin.**
 
 4. **The maximum number of source lines a single `applyReorderToActiveOrder` call accepts, and what happens to a source that exceeds it. Blocks 4 stories** (02-01, 02-02, 02-03, 06-03). *Decision the codebase forces.* The *resulting order* is already bounded by the platform: the bulk add runs `assertNotOverOrderItemsLimit` and `assertNotOverOrderLineItemsLimit` against every item [packages/core/src/service/services/order.service.ts:L678-L679], and each returns `OrderLimitError` carrying the configured maximum as `maxItems` [packages/core/src/service/services/order.service.ts:L2286-L2290] and [packages/core/src/service/services/order.service.ts:L2298-L2302]. The *request* is not bounded at all: before any limit is reached, the plugin will have performed one existing-line lookup, one variant load and one saleable-stock computation for every projected source line, so a single public mutation call can be made to do work in proportion to the size of the largest order or list its caller can point at. **Two halves of this decision are now taken by FEATURE-001-02 and one half remains genuinely open, and the split is what unblocks the four stories.** Taken: the plugin declares its own maximum on projected source lines, and an over-bound source is **refused at request level** with the platform's own `UserInputError` [packages/core/src/common/error/errors.ts:L27] before any variant is loaded and before any availability read — not truncated, and not reported as unprocessed entries [tickets/EPIC-001/FEATURE-001-02-reorder-from-order-history.md:§2.5 Named API Surfaces — One New Mutation, Zero Existing Signatures Changed]. **Also taken, and named here rather than left as "its own maximum": the key, its type and its fail-fast behaviour.** The option is `ReorderPluginOptions.maxProjectedSourceLines`, typed `number` and constrained to a finite integer of at least 1, **required with no value supplied by this set**, validated at plugin initialisation so that an absent, zero, negative, fractional or non-finite value fails startup with the option named [section 7.10 below]. That is not a detail: a bound whose value is read at request time from an unvalidated option is not a bound, because the one configuration that disables it — the key silently absent — is also the one a deployment reaches by omission, and the refusal this entry relies on would then never fire. An earlier version of this entry required "its own maximum" without naming a key or a validation point, which left every consuming story free to name a different one. **Still open, and it is what this entry now blocks on: the production value of that maximum**, which no ticket in this set may invent. **The open value no longer blocks a story's acceptance criteria**, because each story configures the option to a stated value for its own test deployment and asserts one line under it, exactly at it and one line over it — which is how 02-01 asserts the order path and 02-03 the list path. An earlier version of this entry said a story "cannot assert a plugin-level bound, because no value exists to assert against"; that reasoning was wrong, and its cost was that the only public mutation in this epic capable of unbounded work had no test of its own bound.
 5. **The list-name input contract: normalisation before the uniqueness comparison, whitespace trimming, and treatment of control characters — its length bound is now closed at 191. Blocks 3 stories** (01-01, 01-03, 01-04). *Decision the codebase forces.* The name is the one piece of free text a buyer writes into a plugin-owned table, and four sub-decisions hung on it. **The first is now closed, and it is closed by an engine constraint rather than by a product choice — which is also why it is not an option.** The maximum length in characters is **fixed at 191**, matching the additive migration's `varchar` length exactly, because the name and its normalised key both sit in a composite unique index and 191 is the length at which a four-byte UTF-8 index stays inside the key-size limit on the MySQL and MariaDB engines the existing engine jobs exercise; a larger bound is a database error rather than a validated rejection and a smaller one restricts what no engine restricts, so the option a review asked for would have exactly one legal value and would exist only to let a deployment break itself [section 7.10 above]. An earlier version of this entry left the length open and named no key and no column length, which meant three stories asserted a name bound that no number and no schema rule supported. **The remaining three sub-decisions are open**, and none of them is a length. Second, whether the uniqueness comparison that gives `ReorderListNameConflictError` its trigger is exact, whitespace-trimmed, case-insensitive or Unicode-normalised — the platform's own precedent is to choose deliberately and say so, having moved coupon-code comparison to case-insensitive in this very release [CHANGELOG.md:L32]. Third, whether leading and trailing whitespace is trimmed before storage, which decides whether two visually identical names can coexist. Fourth, whether C0 and C1 control characters and zero-width characters are rejected or stripped. One rule is **not** open and is stated here rather than left to the decision: the stored name is returned as data and rendered as text by every consumer, never interpolated into markup — the platform has already had to fix a cross-site scripting defect in its own administrative surface [CHANGELOG.md:L43], and a buyer-supplied string displayed to a support agent or an account administrator is exactly that class of input.
@@ -764,9 +805,10 @@ where two entries block the same number, the one whose earliest blocked story si
 11. **Whether a category manager curates substitution candidates one origin variant at a time or by a bulk action across a collection. Blocks 1 story** (04-03). *Objective ambiguity.* Per-collection authoring is far less work for a category manager and reuses an existing catalogue concept; per-variant authoring is more precise. **This entry has been narrowed, and the narrowing is recorded rather than performed silently.** It once read "curated per variant or per collection" and was counted as blocking two stories on the grounds that the `SubstitutionCandidate` table's key differed between the options. That part is settled and was settled by the platform, not chosen: `SubstitutionCandidateStrategy` answers about one variant and returns variants, so the row it reads must be keyed on a variant, and collection membership is a many-to-many association carrying no curator ordering [packages/core/src/entity/product-variant/product-variant.entity.ts:L174] — a collection-keyed row could not serve that signature deterministically. FEATURE-001-04 therefore carries the table's complete mapping, and story 04-02 is no longer blocked [tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md:§2.5 Named Entities Touched]. What survives is a workflow question about the authoring surface, which expands to identical rows either way and changes no column, no index and no operation signature — so it blocks story 04-03's acceptance criteria alone.
 
 12. **The history window the cadence derivation reads, `ReorderPluginOptions.cadenceHistoryWindowDays`. Blocks 3 stories** (05-01, 05-02, 05-03). *Decision the codebase forces.* Section 7.7 requires a workload to bound its **input**, and an earlier revision of FEATURE-001-05 bounded only its pages: every tick re-walked the whole placed-order history in keyset batches, which is unbounded total work however small each batch is. The window closes that, and its **mechanism** is fixed by that feature — a lower bound on `Order.orderPlacedAt` [packages/core/src/entity/order/order.entity.ts:L90] carried in every derivation statement and served by the two composite indexes the plugin's own migration creates [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.6.1b The Input Is Bounded By A Window And Served By Named Indexes — Because Bounded Pages Over Unbounded History Is Still Unbounded]. **Its value cannot be invented here, and the reason it is a product decision rather than a tuning knob is a behavioural consequence rather than a performance one:** a pair whose two purchases straddle the lower bound loses the older one, so it falls below the two-observation minimum and produces no signal at all. **The window must therefore exceed the longest repurchase interval the signal is meant to detect** — which is a statement about what the business wants detected, not about how fast a query runs. It is taken alongside decision 8, whose aggregate window is the same kind of value for a different read, and until both are taken every affected story configures its own value and asserts behaviour against that value: a fixture whose interval exceeds the configured window is asserted **absent** from the due list, which is the behaviour rather than a number.
+13. **Whether an administrative route may carry a customer-linked identifier, or whether a support subject must be addressed by a short-lived non-linkable handle. Blocks 1 story** (08-03). *Decision with a product and a privacy component; the codebase forces the question but not the answer.* The support surface is deep-linkable to one buyer, which is a capability an agent needs — a reload keeps the subject, and a colleague can be handed a link to the exact record under discussion. **What that costs is stated rather than disclaimed:** the identifier is written into browser history, is carried in the `Referer` header of any request the page originates to another origin, and is captured verbatim by any deployment-level telemetry that records URLs, **and all three outlive the moment the subject is cleared** [tickets/EPIC-001/FEATURE-001-08/STORY-001-08-03-support-agent-reorder-lookup.md:§4.3.3 The Subject Binding Is A Safety Contract, Not A Convenience]. The story carries four controls that narrow it — the route value is an opaque identifier and never a contact detail, a subject change replaces the current history entry instead of appending one, clearing the subject removes the identifier from the route, and the page originates no cross-origin request and embeds no third-party script, image, font or beacon. **Controls are not a permission, and this entry exists because an earlier revision of the set had the controls and no ruling** — which left the story granting itself one. **The two answers and what each costs:** *accept the route identifier* and the surface ships as designed with the four controls as its contract, at the cost that an operator's URL telemetry now holds administrative-lookup identifiers it must govern; *require a short-lived non-linkable handle* minted per session and resolved server-side, and history and telemetry hold a value that expires, at the cost that a link handed to a colleague stops working and a reload after expiry returns the page to its no-subject state. **No answer is invented here**, because the trade turns on a deployment's own privacy posture and on whether cross-shift link sharing is a workflow an operator wants. The story is buildable against either — the addressing surface is the route parameter in both cases and the four controls are unchanged — so what the ruling gates is sign-off rather than design, exactly as decision 3's retention window gates story 07-01's.
 
 ### 8.2 Architectural Decisions
-**Two decisions that stood here have been closed, and they are recorded as closed rather than deleted.** An earlier draft of this epic listed "declare zero custom fields, or accept the C1 widening" as blocking eleven stories, and "which ownership enforcement mechanism" as blocking nine. Neither was a genuine choice. The first is refused by the architectural constraints themselves, which classify a side-effect widening as a reportable violation rather than a costed option, so it is now ruling R1 in section 6.4. The second was worse than open — it was **wrong**, because the option it favoured cannot work: collision C7 shows that a customer session can never hold a custom permission, so "a dedicated `CrudPermissionDefinition` per entity" would have produced fourteen unreachable Shop operations. It is now rulings R2 and R3. Presenting either as an open decision would invite a maintainer to choose an unbuildable design, which is why they are settled here instead. **Five genuine architectural decisions remain, and the fifth was added by a review of this set** which found that this epic had settled a platform-versus-specification divergence by ruling against the specification — a resolution an artifact of this kind is not entitled to make, and therefore a decision rather than a ruling.
+**Two decisions that stood here have been closed, and they are recorded as closed rather than deleted.** An earlier draft of this epic listed "declare zero custom fields, or accept the C1 widening" as blocking eleven stories, and "which ownership enforcement mechanism" as blocking nine. Neither was a genuine choice. The first is refused by the architectural constraints themselves, which classify a side-effect widening as a reportable violation rather than a costed option, so it is now ruling R1 in section 6.4. The second was worse than open — it was **wrong**, because the option it favoured cannot work: collision C7 shows that a customer session can never hold a custom permission, so "a dedicated `CrudPermissionDefinition` per entity" would have produced fourteen unreachable Shop operations. It is now rulings R2 and R3. Presenting either as an open decision would invite a maintainer to choose an unbuildable design, which is why they are settled here instead. **Six genuine architectural decisions remain, and entries 5 and 7 were each added by a review of this set** — entry 5 because this epic had settled a platform-versus-specification divergence by ruling against the specification, a resolution an artifact of this kind is not entitled to make and therefore a decision rather than a ruling; entry 7 because a comment specified a keyed digest over a secret that no authority in this set declares.
 
 
 1. **CLOSED — the cadence-recompute execution model. Now ruling R18, blocking 0 stories.** The entry keeps its position and its ordinal so that every existing reference to "the epic's first architectural decision" still resolves to this subject rather than to a renumbered neighbour. *Decision the codebase forces, and now taken.* Both mechanisms exist and are separately configurable [packages/core/src/scheduler/scheduled-task.ts:L42-L96] and [packages/core/src/job-queue/job-queue.service.ts:L51-L82], and three models were available: a task deriving inline, a queued job, or a task that enqueues a job. **The third is settled as ruling R18** on two pieces of cited evidence rather than on preference. First, it is the shipped shape: `cleanSessionsTask` is a scheduled task whose `execute` triggers work and returns a named result [packages/core/src/scheduler/tasks/clean-sessions-task.ts:L37]. Second, the inline model runs a long derivation inside a race against the task timeout [packages/core/src/plugin/default-scheduler-plugin/default-scheduler-strategy.ts:L113], and a timeout that fires mid-derivation leaves partially recomputed cadence with no record of how far it got — which is a correctness hazard rather than a performance one. **Why this had to close rather than stay open with a recommendation:** an earlier revision left all three models available and asked FEATURE-001-05 to write its completion criteria conditionally, while STORY-001-05-02 was already written against the enqueue model as settled. A story cannot be acceptance-tested against a model its parent feature calls undecided, and conditional completion criteria are the one form of criterion a test cannot be written from. **What a maintainer may still decide is the schedule and the batch size**, both plugin options; the model is no longer among them.
@@ -777,6 +819,8 @@ where two entries block the same number, the one whose earliest blocked story si
 5. **Which surface is the authority for inventory tracking and the out-of-stock threshold — the Channel columns the specification names, or the global settings row the code reads. Blocks 0 stories' design, gates the sign-off of every availability criterion in FEATURE-001-03, FEATURE-001-04 and every feature that states a threshold or a tracking state.** *Decision the codebase forces, and the one decision in this section that this epic is not entitled to take.* The specification this set is built to names `Channel.trackInventory` [packages/core/src/entity/channel/channel.entity.ts:L100] and `Channel.outOfStockThreshold` [packages/core/src/entity/channel/channel.entity.ts:L108] as the live values and the `ProductVariant` JSDoc as stale. The code disagrees about which values are *read*: the saleable computation destructures both from the global settings service [packages/core/src/service/services/product-variant.service.ts:L323-L324], that service reads a single row with no channel predicate [packages/core/src/service/services/global-settings.service.ts:L63-L75], the shipped multi-channel location strategy resolves the effective pair the same way [packages/core/src/config/catalog/multi-channel-stock-location-strategy.ts:L181-L195], and stock movements agree [packages/core/src/service/services/stock-movement.service.ts:L158]. **Two admissible outcomes, and this epic picks neither:** the platform's effective-settings resolution is reconciled with the Channel columns upstream — which is a core change and therefore outside this epic's boundary — or the specification is amended by whoever owns it. **What is not admissible is a ticket ruling that promotes the deprecated pair to authority**, which is what an earlier revision of collision C10 did and what this entry replaces. *What the tickets do while it is open:* every availability precondition names the Channel pair as the authority and additionally seeds the single global row consistently with it as a stated fixture-determinism requirement, per ruling R6, so that no criterion passes for the wrong reason and no criterion silently endorses the divergence. *What no story may do:* sign off a definition of done on the strength of an availability criterion while this is open, which section 12 states as a merge gate.
 
 6. **Whether the checkout is rebased onto at least 3.7.2 before production validation, or a dated non-production-only risk acceptance is recorded instead. Blocks 0 stories' design, gates the production sign-off of all 25.** *Decision the codebase forces.* **This entry is appended in sixth position rather than ranked first**, even though it gates more sign-offs than any other entry here, so that every existing reference to a numbered architectural decision in this set still resolves to the entry it always did — the same device entry 1 uses. The finding is section 2.3's: this checkout declares 3.7.0 [packages/core/package.json:L2-L3] and the newest published line is v3.7.2, described upstream as a security patch line above it. *Two admissible outcomes, and this epic picks neither because neither is its to pick:* a maintainer rebases the workspace onto at least 3.7.2 and re-resolves every citation in this set against the new tree, or a named owner records a dated risk acceptance with an explicit expiry that confines this work to non-production environments until the rebase lands. *What the tickets do while it is open:* every locator in this set stays resolved against 3.7.0, and no ticket claims currency. *What no story may do:* record a production sign-off while this entry is neither taken nor accepted, which is what section 12's final item asserts.
+
+7. **CLOSED — what keys the replay-claim digest on the audit row. Blocks 0 stories, and no longer gates a sign-off.** The entry keeps its position and its ordinal so that every existing reference to a numbered architectural decision in this set still resolves to its own subject rather than to a renumbered neighbour. *Decision the codebase forces, and now taken.* FEATURE-001-07 stores the replay claim as a keyed digest rather than as the caller's key, so that a client-chosen string which may encode an address or an internal reference is never persisted in a customer-linked table a support surface reads [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4 Named Entities Touched]. A keyed construction needs a key, and none could be borrowed from the platform: its only comparable secret is optional and defaults to a per-process random value [packages/core/src/config/default-config.ts:L106], documented as a random character string that applies only to the cookie token method [packages/core/src/config/vendure-config.ts:L273-L282] — so a digest keyed on it would change when a process restarts and would differ between instances of one deployment, which is the one property a replay claim cannot survive. **Of the two admissible outcomes this entry recorded, the first is the one taken: a dedicated ledger key is declared rather than a platform secret being reused.** The option ledger now carries `replayClaimHmacKey`, required whenever `recordReorderAttempts` is true, holding a confidential high-entropy value the deployment supplies from its own environment and never a literal in configuration, in a fixture or in this ticket set, with startup refused when it is absent or too short; and `replayClaimKeyId` beside it, so that a rotation writes new rows under a new label while old rows stay comparable under the old one rather than turning every stored digest into an unmatchable value [tickets/EPIC-001-reorder-and-replenishment.md:§7.10 The Plugin Option Ledger — One Authority For Every Configured Key]. **The ledger is the single authority for both, and no ticket restates their values.** *What no story may do, and this survives the entry being closed:* claim that the digest cannot be reversed. The property a keyed digest carries is resistance to offline guessing of its preimage for as long as the key stays confidential, and that is the form every ticket in this set states it in.
 
 **What is deliberately not on either list.** The `ActiveOrderStrategy` question — what the reorder mutation does when the deployment's configured strategy cannot resolve a cart — is *not* an open decision, because leaving it open would leave a published operation without a defined failure result. It is settled in FEATURE-001-02: the strategy set is called with an empty input, and the throw that a non-default configuration produces [packages/core/src/service/helpers/active-order/active-order.service.ts:L114-L120] is caught and mapped to the existing `NoActiveOrderError` [packages/core/src/api/schema/common/common-error-results.graphql:L95]. Nor is the transaction guarantee for audit and events open; collision C9 settles it as ruling R5.
 
@@ -797,9 +841,9 @@ Two notes on what the numbers are and are not. The hour figures are **artifact-a
 
 **The bands price one unit of work, so a story bundling more than one same-shaped operation prices at the next value up.** The rule is stated because one row in the table below depends on it and would otherwise be unreproducible: `STORY-001-01-03` carries four mutations rather than one — two over list lines and two over the list row itself — and every one of them is the same shape, resolving an existing row in an existing plugin-owned table, enforcing ownership, writing, and returning the affected list or a named error result. Four of those is not a two-point story, and it is not a three-point story by the second band either, because it adds no table and no migration. It is priced at **three** by this aggregation rule, and the rule is applied nowhere else in the table because no other row bundles four operations that way. The rule moves the point value only; the row's lines of code and hours then sit on the three-point anchor below with no further adjustment.
 
-Lines of code are anchored to the nearest shipped analogue in the example-plugin tree rather than to intuition: the wishlist plugin is seven files end to end, and the reviews plugin — two entities, dual-API resolvers, a dashboard extension and its translation catalogues — is fifty-seven. The baseline anchors are `120 / 90` at two points, `200 / 150` at three, `340 / 260` at five and `560 / 420` at eight, and exactly **five** rows sit above their anchor, each for a stated reason: 01-01 ships two plugin-owned entities in one additive migration and is the first row to carry an end-to-end specification against the harness; 01-04 carries the unchanged-operation regression assertions, which are test lines and nothing else; 02-04 introduces new payload types; and 04-02 and 07-01 each add a second structural element beyond their base shape. **Two things are deliberately not among those reasons.** The plugin scaffold is not, because no story prices it — it is the epic's own prerequisite [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap]; and no permission definition is, because ruling R2 leaves every buyer-facing story registering none. **Story 01-03 sits exactly on the three-point anchor and carries no adjustment**, which is worth stating because it moved: it was priced at two points while it was scoped to the two line-level mutations, and it moved to three when the two list-level mutations were assigned to it under the story-ownership rule below — the point value moving while the lines and hours settled onto the anchor below it.
+Lines of code are anchored to the nearest shipped analogue in the example-plugin tree rather than to intuition: the wishlist plugin is seven files end to end, and the reviews plugin — two entities, dual-API resolvers, a dashboard extension and its translation catalogues — is fifty-seven. The baseline anchors are `120 / 90` at two points, `200 / 150` at three, `340 / 260` at five and `560 / 420` at eight, and exactly **five** rows sit above their anchor, each for a stated reason: 01-01 ships two plugin-owned entities in one additive migration and is the first row to carry an end-to-end specification against the harness; 01-04 carries the unchanged-operation regression assertions, which are test lines and nothing else; 02-04 introduces new payload types; and 04-02 and 07-01 each add a second structural element beyond their base shape. **Row 01-01 is the one row whose adjustment includes the project bootstrap, and that is stated here because an earlier revision of this paragraph denied it.** That revision listed the scaffold among the things deliberately *not* priced, on the ground that no story owned it — which section 7.9 has since reversed: STORY-001-01-01 owns all six scaffold deliverables and its row prices them, which is exactly why that row moved from 3 points and 240 production lines to 5 and 320 [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap — Owned By STORY-001-01-01, And Priced There]. **One thing is still deliberately not among the reasons any row sits above its anchor:** no permission definition is, because ruling R2 leaves every buyer-facing story registering none. **Story 01-03 sits exactly on the three-point anchor and carries no adjustment**, which is worth stating because it moved: it was priced at two points while it was scoped to the two line-level mutations, and it moved to three when the two list-level mutations were assigned to it under the story-ownership rule below — the point value moving while the lines and hours settled onto the anchor below it.
 
-**No row prices the plugin scaffold or its dev-server registration**, because those are a project-level prerequisite belonging to no story and estimated by none [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap]. Row 01-01 sits above its anchor for the two reasons just given and not for that one.
+**Row 01-01 prices the plugin scaffold and its dev-server registration, and no other row prices any part of them** [tickets/EPIC-001-reorder-and-replenishment.md:§7.9 Project Bootstrap — Owned By STORY-001-01-01, And Priced There]. An earlier revision of this sentence said no row priced them at all, which contradicted section 7.9 in the same document; the ownership is single and so is the pricing, and row 01-01 sits above its anchor partly for that reason and partly for the two given above.
 
 ### 9.2 Story Table
 
@@ -862,9 +906,9 @@ An operation named in the section 6.4 inventory that no story delivers is a hole
 
 **Owner footnote.** Twenty-one stories are owned by the automated run. Exactly four — 04-03, 08-01, 08-02 and 08-03 — are assigned to a developer working in parallel, under one consistent rationale that applies identically to all four: each ships a React dashboard extension whose acceptance requires **visual verification in the running dashboard** and **an internationalisation catalogue that stays in step with its own source**. No automated documentation or generation run can discharge a visual check, and that alone is sufficient reason for the assignment. Those four rows carry an added increment of review hours for the same reason, and no other row does.
 
-**What gates each of those two concerns is not what the workflow's job names suggest, and the finding is severe enough that it is stated once as a contract rather than repeated here: neither existing dashboard job can discharge either concern for this epic.** The four-shard end-to-end suite cannot load `ReorderPlugin` at all, and the catalogue-synchronisation job checks one directory that is not a plugin's. The full contract — why both are closed to this epic, the two options a story may take for its visual gate, and the single role the existing suite retains — is stated in section 11.4.1 [tickets/EPIC-001-reorder-and-replenishment.md:§11.4.1 The Dashboard End-To-End Suite Cannot Load This Epic's Plugin, So The Gate Is Named Explicitly], and the localisation half of it in section 11.12 [tickets/EPIC-001-reorder-and-replenishment.md:§11.12 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files]. Both are the authority; this footnote does not restate them.
+**What gates each of those two concerns is not what the workflow's job names suggest, and the finding is severe enough that it is stated once as a contract rather than repeated here: neither existing dashboard job can discharge either concern for this epic.** The four-shard end-to-end suite cannot load `ReorderPlugin` at all, and the catalogue-synchronisation job checks one directory that is not a plugin's. The full contract — why both are closed to this epic, the two options a story may take for its visual gate, and the single role the existing suite retains — is stated in section 11.4.1 [tickets/EPIC-001-reorder-and-replenishment.md:§11.4.1 The Dashboard End-To-End Suite Cannot Load This Epic's Plugin, So The Gate Is Named Explicitly], and the localisation half of it in section 11.12 [tickets/EPIC-001-reorder-and-replenishment.md:§11.13 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files]. Both are the authority; this footnote does not restate them.
 
-*Consequence, carried into FEATURE-001-04 and FEATURE-001-08 and into each of the four stories.* Each of the four owns a **plugin-local extraction-and-diff command** as an acceptance obligation: re-extract the plugin's own catalogues against **the plugin's own** Lingui configuration — which the plugin package must itself ship, because neither existing configuration reaches its files and the full four-part contract is stated in section 11.12 [tickets/EPIC-001-reorder-and-replenishment.md:§11.12 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files] — then require the catalogue directory to be unchanged, failing non-zero when it is not. The shipped dashboard script is the model to copy and is cited as such rather than reused: it extracts and then requires a clean diff of its own scoped directory [packages/dashboard/scripts/check-i18n-sync.sh:L11] and [packages/dashboard/scripts/check-i18n-sync.sh:L13], ignores only the source-reference and obsolete-marker comment lines when deciding whether a difference is meaningful [packages/dashboard/scripts/check-i18n-sync.sh:L20], and exits non-zero when it is [packages/dashboard/scripts/check-i18n-sync.sh:L33]. The command is run by the story's owner; **no existing continuous-integration job supplies it**, and that absence is stated rather than papered over. Extraction is per-package by configuration as well — the locale list and source locale live in each package's own tooling configuration [packages/dashboard/lingui.config.js:L3-L4], which is why the plugin declares its own rather than inheriting a scope, and why **this epic fixes that the list is declared in one place and that every locale it declares has a catalogue file, rather than fixing the list itself** [tickets/EPIC-001-reorder-and-replenishment.md:§11.12 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files] — and the change-detection flag both dashboard jobs depend on is set only when a changed path is under the dashboard package [.github/workflows/build_and_test.yml:L66-L70], so a change confined to the plugin package starts neither job in the first place.
+*Consequence, carried into FEATURE-001-04 and FEATURE-001-08 and into each of the four stories.* Each of the four owns a **plugin-local extraction-and-diff command** as an acceptance obligation: re-extract the plugin's own catalogues against **the plugin's own** Lingui configuration — which the plugin package must itself ship, because neither existing configuration reaches its files and the full four-part contract is stated in section 11.12 [tickets/EPIC-001-reorder-and-replenishment.md:§11.13 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files] — then require the catalogue directory to be unchanged, failing non-zero when it is not. The shipped dashboard script is the model to copy and is cited as such rather than reused: it extracts and then requires a clean diff of its own scoped directory [packages/dashboard/scripts/check-i18n-sync.sh:L11] and [packages/dashboard/scripts/check-i18n-sync.sh:L13], ignores only the source-reference and obsolete-marker comment lines when deciding whether a difference is meaningful [packages/dashboard/scripts/check-i18n-sync.sh:L20], and exits non-zero when it is [packages/dashboard/scripts/check-i18n-sync.sh:L33]. The command is run by the story's owner; **no existing continuous-integration job supplies it**, and that absence is stated rather than papered over. Extraction is per-package by configuration as well — the locale list and source locale live in each package's own tooling configuration [packages/dashboard/lingui.config.js:L3-L4], which is why the plugin declares its own rather than inheriting a scope, and why **this epic fixes that the list is declared in one place and that every locale it declares has a catalogue file, rather than fixing the list itself** [tickets/EPIC-001-reorder-and-replenishment.md:§11.13 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files] — and the change-detection flag both dashboard jobs depend on is set only when a changed path is under the dashboard package [.github/workflows/build_and_test.yml:L66-L70], so a change confined to the plugin package starts neither job in the first place.
 
 ### 9.3 Rollup
 
@@ -921,7 +965,7 @@ A batch is a unit of *scheduling*, not a licence to open every story in it at on
 
 - **Gate 1 — STORY-001-07-01 precedes all three FEATURE-001-08 stories.** Every recurring-demand read aggregates over the attempt rows that 07-01 creates. Until that table exists and is being written, the three administrative reads have nothing to aggregate and their acceptance criteria have no fixture to assert against. 07-02, which publishes the events, is not a gate on FEATURE-001-08 at all: the aggregate reads rows, not events.
 - **Gate 2 — the FEATURE-001-06 share stories precede STORY-001-08-03.** The support lookup surfaces a buyer's lists, and a buying account's lists include the ones shared with the buyer's seat, so the share rows from 06-01 and the grant-and-revoke behaviour from 06-02 must exist before 08-03 can assert what a support agent sees.
-- **Gate 3 — STORY-001-08-01 precedes STORY-001-08-02, and this one is internal to FEATURE-001-08 rather than a cross-feature edge.** 08-01 publishes the `recurringDemand` operation, its two published types, its options mapping and both permission definitions; 08-02 publishes no operation of its own and composes the seller predicate and the entitlement branch into that operation, so there is nothing for it to constrain until 08-01 has merged. **This gate was absent from an earlier version of this list, which said the two stories proceeded together** — a claim story 08-02 already contradicted from its own side, and the owning feature now carries the edge and the page-ownership consequence that follows from it [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§4.3 Intra-Feature Story Order — One Edge, And It Is Declared Rather Than Denied].
+- **Gate 3 — STORY-001-08-01 precedes STORY-001-08-02, and this one is internal to FEATURE-001-08 rather than a cross-feature edge.** 08-01 publishes the `recurringDemand` operation, its two published types, its options mapping and **the one permission definition that gates it**, `ReadReorderDemand` — the feature's second definition belongs to story 08-03 and the seller-unscoped entitlement is the platform's own existing `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71], so no story registers more than one; 08-02 publishes no operation of its own and composes the seller predicate and the entitlement branch into that operation, so there is nothing for it to constrain until 08-01 has merged. **This gate was absent from an earlier version of this list, which said the two stories proceeded together** — a claim story 08-02 already contradicted from its own side, and the owning feature now carries the edge and the page-ownership consequence that follows from it [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§4.3 Intra-Feature Story Order — One Edge, And It Is Declared Rather Than Denied].
 - **What is genuinely parallel inside B5:** FEATURE-001-06's three stories and FEATURE-001-07's two stories have no dependency on each other and may proceed together; and after gate 1, 08-01 may proceed alongside 06-01, 06-02, 06-03, 07-01 and 07-02 — but **not** alongside 08-02, which waits on gate 3.
 
 The dependency graph in section 4.1 carries one edge per **cross-feature** gate, and both were checked against this list rather than assumed to be there. **Gate 1 is the `F7 → F8` edge; gate 2 is the `F6 → F8` edge. Gate 3 has no edge in that figure and needs none**, because it runs between two stories of one feature and the figure's nodes are features — an intra-feature ordering is expressible only at story granularity, which is what this sub-section and the owning feature's section 4.3 are for. The second was missing from an earlier version of that figure while this sub-section already asserted that both gates appeared in it — a claim that was false about the figure rather than about the ordering, and the figure was corrected rather than the claim softened. `F1 → F6` and `F2 → F6` sit upstream of gate 2 and are prerequisites of the sharing model rather than gates on FEATURE-001-08. What this sub-section adds beyond the figure is story granularity: an edge says FEATURE-001-06 precedes FEATURE-001-08, while gate 2 says which single story that binds, and a batch table alone can express neither.
@@ -1034,7 +1078,7 @@ The four per-engine end-to-end jobs already exist and require no new infrastruct
 
 **A `tickets/`-only change triggers no substantive work, and the mechanism matters.** It is not simply that no path filter matches. On a push, the workflow's own path filter does exclude such a change, since it lists only the packages tree and three root manifests [.github/workflows/build_and_test.yml:L9-L13]. But on a pull request the trigger carries branch filters and **no** path filter at all [.github/workflows/build_and_test.yml:L14-L18], so the workflow *does* start. What stops it doing anything is a dedicated gate job that diffs the changed paths against the same pattern [.github/workflows/build_and_test.yml:L60] and publishes a false flag when nothing matches [.github/workflows/build_and_test.yml:L63]; every substantive job is then conditioned on that flag [.github/workflows/build_and_test.yml:L73]. The documentation workflow is filtered to the docs tree and so does not fire either [.github/workflows/docs_ci.yml:on], and the reference-generation workflow is filtered to TypeScript sources under the packages tree [.github/workflows/generate_docs.yml:on].
 
-Two consequences follow, and both are load-bearing. **This artifact cannot regress the build.** And **this artifact is validated by nothing in the pipeline** — not its links, not its citations, not its arithmetic — so the local validator set is the only enforcement that exists. That set is not described elsewhere and referred to here; it is written out in full in section 11.10 as sixteen validators and three evidence commands — nineteen steps, every one of them runnable from the repository root and every one of them extracted from this file by the runner rather than re-typed. A step is never relaxed to accommodate content.
+Two consequences follow, and both are load-bearing. **This artifact cannot regress the build.** And **this artifact is validated by nothing in the pipeline** — not its links, not its citations, not its arithmetic — so the local validator set is the only enforcement that exists. That set is not described elsewhere and referred to here; it is written out in full in section 11.10 as twenty validators and three evidence commands — twenty-three steps, every one of them runnable from the repository root under the execution contract of section 11.10, and none of them extracted from this file and executed by anything the artifact itself publishes. A step is never relaxed to accommodate content.
 
 #### 11.4.1 The Dashboard End-To-End Suite Cannot Load This Epic's Plugin, So The Gate Is Named Explicitly
 
@@ -1046,7 +1090,7 @@ The two dashboard jobs named above are the two an epic that ships a dashboard su
 
 **So the gate for a dashboard surface in this epic is one of exactly two things, and a story names which one it takes.** Either **(a)** the plugin package ships its **own** Playwright configuration, its own test directory and its own script, booting a server whose plugin array contains `ReorderPlugin` and building a bundle that contains its routes — the same three parts the dashboard's own configuration has, owned by the package whose surface is under test and invoked by the package's own script so that the root aggregate reaches it [tickets/EPIC-001-reorder-and-replenishment.md:§7.9.2 The Plugin Package Bootstrap Contract]; or **(b)** `ReorderPlugin` is registered in **both** of the two arrays above, which is an edit to `packages/dashboard` and therefore **outside this epic's zero-edit boundary** — so a story choosing it must say so explicitly and record the boundary exception rather than assume the registration already exists. **Option (a) is the one this epic expects**, because it needs no edit to a protected package and because a plugin's dashboard surface tested by the plugin's own suite stays testable when the dashboard package's fixtures change.
 
-**The existing four-shard suite keeps exactly one role and it is named so no story over-credits it: regression evidence.** A green run of it proves that this epic's plugin has not broken the dashboard surfaces that already exist — which is worth asserting and is asserted — and proves nothing about the surfaces this epic adds. **The catalogue-synchronisation job, however, does not check a plugin's catalogue at all, and this epic does not credit it with doing so.** That job [.github/workflows/build_and_test.yml:L107] runs a script whose scope is one directory, the dashboard package's own locales directory [packages/dashboard/scripts/check-i18n-sync.sh:L9], which is the path the dashboard's own Lingui configuration declares [packages/dashboard/lingui.config.js:L37-L38]. A plugin's catalogues are produced by a different configuration over a different path, and **no existing configuration produces this epic's**: the only plugin-scoped one present is a literal include glob naming one unrelated example plugin [packages/dev-server/lingui.config.js:L6-L9], so the plugin ships its own [tickets/EPIC-001-reorder-and-replenishment.md:§11.12 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files]. Running the core job — by dispatch or otherwise — therefore proves nothing about a plugin catalogue, and a green result on it is **not** evidence for these four stories.
+**The existing four-shard suite keeps exactly one role and it is named so no story over-credits it: regression evidence.** A green run of it proves that this epic's plugin has not broken the dashboard surfaces that already exist — which is worth asserting and is asserted — and proves nothing about the surfaces this epic adds. **The catalogue-synchronisation job, however, does not check a plugin's catalogue at all, and this epic does not credit it with doing so.** That job [.github/workflows/build_and_test.yml:L107] runs a script whose scope is one directory, the dashboard package's own locales directory [packages/dashboard/scripts/check-i18n-sync.sh:L9], which is the path the dashboard's own Lingui configuration declares [packages/dashboard/lingui.config.js:L37-L38]. A plugin's catalogues are produced by a different configuration over a different path, and **no existing configuration produces this epic's**: the only plugin-scoped one present is a literal include glob naming one unrelated example plugin [packages/dev-server/lingui.config.js:L6-L9], so the plugin ships its own [tickets/EPIC-001-reorder-and-replenishment.md:§11.13 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files]. Running the core job — by dispatch or otherwise — therefore proves nothing about a plugin catalogue, and a green result on it is **not** evidence for these four stories.
 
 ### 11.5 Public API Documentation Is Generated, Not Hand-Written
 
@@ -1148,9 +1192,9 @@ Each absence below is reported with the search that established it, because a ge
 
 ### 11.10 The Local Validator Suite — The Only Enforcement This Artifact Has
 
-Section 11.4 establishes that nothing in the pipeline inspects this artifact. This subsection is the enforcement that closes that gap, and it is placed here rather than in a file of its own because this ticket set may add no file outside `tickets/` without breaking the count reconciliation in section 12. **Sixteen validators and three evidence commands follow — nineteen steps.** Run all nineteen from the repository root before any file in this set is emitted or changed. **The gate is that all nineteen exit zero; a step is never relaxed to accommodate content.** **The count was ten validators until a review found two defects this suite could not see** — a citation naming a section that does not exist inside a sibling ticket, and a required diagram that did not render — so V6 was made heading-aware for intra-ticket targets and V15 and V16 were added. Both corrections are recorded in their own blocks below rather than folded in silently, because a suite that grows without saying why invites the assumption that it was always sufficient.
+Section 11.4 establishes that nothing in the pipeline inspects this artifact. This subsection is the enforcement that closes that gap, and it is placed here rather than in a file of its own because this ticket set may add no file outside `tickets/` without breaking the count reconciliation in section 12. **Twenty validators and three evidence commands follow — twenty-three steps.** Run all twenty-three from the repository root before any file in this set is emitted or changed. **The gate is that all twenty-three exit zero; a step is never relaxed to accommodate content.** **The count was ten validators until a review found two defects this suite could not see** — a citation naming a section that does not exist inside a sibling ticket, and a required diagram that did not render — so V6 was made heading-aware for intra-ticket targets and V15 and V16 were added. **It moved from sixteen to twenty when a second review found four defect classes that all nineteen then-existing steps passed clean over**: an ambiguous identifier, a GraphQL name declared twice, a stated definition-of-done count that disagreed with its own list, and one settled contract stated two ways in two files. V17 through V20 are those four, and the sub-section that closes this one states what a green suite does and does not establish rather than leaving the reader to assume. Every correction is recorded in its own block rather than folded in silently, because a suite that grows without saying why invites the assumption that it was always sufficient.
 
-**Every one of the eighteen numbered validation rules now has a step that enforces it, and six of the nineteen exist because a review found four rules with no enforcement at all, one required diagram that did not render, and one story-template invariant that nothing parsed.** An earlier revision of this subsection carried ten validators and asserted eighteen rules, which meant the persona invariant (rule 3), the demonstration requirement (rule 9), the nomination conditions (rule 11) and dependency referential integrity (rule 13) were claimed as gated while nothing checked them. V11 through V14 are those four. A rule asserted without a step is worse than an acknowledged gap, because the acknowledged gap gets worked on.
+**Every one of the eighteen numbered validation rules now has a step that enforces it, and ten of the twenty-three exist because a review found something nothing checked:** four rules with no enforcement at all, one required diagram that did not render, one story-template invariant that nothing parsed, and — in a second review — four whole defect classes that lay outside every rule as written, namely identifier ambiguity, duplicate schema declaration, definition-of-done count drift at the feature tier, and one settled contract stated two ways. An earlier revision of this subsection carried ten validators and asserted eighteen rules, which meant the persona invariant (rule 3), the demonstration requirement (rule 9), the nomination conditions (rule 11) and dependency referential integrity (rule 13) were claimed as gated while nothing checked them. V11 through V14 are those four. A rule asserted without a step is worse than an acknowledged gap, because the acknowledged gap gets worked on.
 
 Eight invariants hold across every block below, and each exists because its absence is a way for a check to pass on a defect:
 
@@ -1163,181 +1207,34 @@ Eight invariants hold across every block below, and each exists because its abse
 - **Token-scoped exemptions.** Where a term must be permitted, the exemption applies to the matched token at its matched position — never to the whole line and never to the whole file. A line-wide exemption silently pardons every other occurrence on that line.
 - **Actionable diagnostics.** Every failure names the file, the line and the offending text, so a failing gate is a work list rather than a verdict.
 
-Three scoping facts are stated here rather than left to be discovered:
+Five scoping facts are stated here rather than left to be discovered:
 
 - **V1, V3, V4 and V11 are story-file-scoped**: each inspects the twenty-five story files and reports per-file failures, so each is meaningful against a partial set.
 - **Every step that reads the corpus is satisfied only when all thirty-four files exist.** Run against a partial set they report the shortfall — a link whose target is not yet written, a table row with no file, a count below the declared total, a story file that contributed no acceptance criterion to scan. That output is the intended signal and not a false positive, and it is why the suite is a pre-emission gate for the complete set rather than a per-file check. **V10 is named here deliberately:** an earlier revision of it skipped a table row whose story file was absent and could therefore print success having cross-checked only part of the table, which is the opposite of a gate. It now requires exactly one file per row and asserts that the number of rows cross-checked equals the declared twenty-five.
 - **V15 is satisfied only when all nine diagram-bearing files exist**, for the same reason: it asserts exactly two blocks in this file, at least one in each of the eight feature files and at least ten in total, so a partial set reports the shortfall rather than passing quietly.
-- **V9's exemption is a set of line spans, not a set of fence languages.** It exempts the fenced source blocks of this suite itself, located by extracting them exactly as the runner does, and nothing else. **That is a correction to an earlier revision which skipped every block tagged `bash`, `sh`, `python` or `python3` anywhere in the set** — an exclusion wide enough that a service-level figure written into any shell block in any of the thirty-four files was invisible to the one step that exists to find it. Every other fenced block — Mermaid, GraphQL, SQL, plain text — and all prose is scanned.
+- **V9's exemption is a set of line spans, not a set of fence languages.** It exempts the fenced source blocks of this suite itself, located by the heading-and-fence scan V9 performs over this sub-section's own line range, and nothing else. **That is a scan the step performs as a reader of text; it is not an extraction that is then executed, and no step in this suite executes anything read out of this file** [tickets/EPIC-001-reorder-and-replenishment.md:§11.10 The Local Validator Suite — The Only Enforcement This Artifact Has]. **The exemption is a correction to an earlier revision which skipped every block tagged `bash`, `sh`, `python` or `python3` anywhere in the set** — an exclusion wide enough that a service-level figure written into any shell block in any of the thirty-four files was invisible to the one step that exists to find it. Every other fenced block — Mermaid, GraphQL, SQL, plain text — and all prose is scanned.
 - **V1 scans acceptance criteria, and V9 scans everything.** The forbidden-term rule is a rule about criteria, so V1 parses criterion boundaries and reports only what lies inside one; the invented-metric rule is a rule about the whole artifact, so V9 reads prose and criteria alike. An earlier revision of V1 scanned whole story files, which reported a narrative sentence as a criterion defect while an empty corpus passed it.
 
 #### Running The Suite
 
-The runner extracts each step from this file and executes it. **That is the whole of the identity guarantee, and it replaces a scratch-directory contract that had none.** An earlier revision told the operator to save the steps into a directory outside the repository under thirteen fixed basenames, and then verified the set by asking whether each basename existed, was a regular file and was non-empty — which is satisfied by thirteen unrelated no-op scripts. It printed a digest table immediately before execution and compared those digests against nothing, so the digests were a record of what ran rather than a condition of running it, and it re-opened each path after checking it, so the file executed was not necessarily the file inspected. The form below removes the class rather than patching the instances: there is no external directory to populate, no basename to trust, and no interval between the check and the use, because the runner reads the authoritative text, writes it into a directory it creates itself with restrictive permissions, executes it, and deletes it.
+**Nothing in this document is executable, and no step below may be run by extracting it from this file. That is the security property this sub-section exists to state, and it replaces two earlier forms that both got it wrong in the same direction.** The first told an operator to copy the steps into a scratch directory under thirteen fixed basenames and then checked only that each basename existed, was a regular file and was non-empty — satisfied by thirteen unrelated no-op scripts. The second removed the scratch directory by having a runner block **extract the fenced blocks of this epic and execute them**, printing a digest table immediately before execution and comparing those digests against nothing. **That second form is withdrawn as a vulnerability rather than tidied, and the reason is exactly why it looked safe.** The text it executed was "this document's own text by construction" — and this document is contributor-supplied content on a branch under review, so the property it guaranteed was that a contributor's Bash and Python would run, unreviewed, in whatever context a reviewer or a pipeline invoked it from, with the reviewer's credentials, network and filesystem. A digest printed by the same run that executes the bytes is a receipt, not a control; a comparison exists only where the expected value was fixed **before** the reviewed text was read, and by somebody other than its author.
+
+**So the steps below are a specification, and the specification is the deliverable. Execution is a separate act with its own two conditions, and a reviewer performs exactly one of the two.**
+
+- **Condition A — a reviewer-audited step source held outside the contribution, pinned by digest.** A maintainer reads each step in this file, transcribes it into a validator location that is **not part of this branch and not writable by a contribution** — a maintainer-held checkout, an internal tooling repository or a release artefact — and records the SHA-256 of each step's exact bytes in a manifest held in that same location. Running the suite means running the maintainer's copy, and the manifest is compared **before** anything executes: a step whose digest differs from its pinned value is a step that changed since it was audited, and the run aborts on the mismatch rather than reporting it. Re-auditing is the only way a changed step becomes runnable. **The manifest lives with the runner and never with the reviewed text**, because a digest a contribution can edit is a digest a contribution controls.
+- **Condition B — a credentialless, network-restricted, read-only sandbox that aborts on source mismatch.** Where no audited copy exists yet, a step may be executed only inside an isolated container that (i) carries **no** credential of any kind — no git remote token, no registry token, no cloud identity, no ambient SSH agent; (ii) has **egress disabled**, so a step cannot reach a network even if it tries; (iii) mounts the repository **read-only**, so a step cannot alter the tree it is inspecting; (iv) runs as an unprivileged user with no access to the host filesystem, the Docker socket or the reviewer's home directory; and (v) recomputes each step's digest against the digest recorded by the person who requested the run and **aborts before executing anything on any mismatch**. The gate's verdict is then trustworthy about the *artifact*, which is all it was ever meant to be about.
+- **Neither condition is discharged by reading the steps and finding them harmless.** A reviewer who has read this file has audited **this** revision; the control has to hold for the next one, which is what the digest is for. And neither condition permits a pipeline to run the suite automatically on a contributed branch: an automated gate that executes contributed text is the same defect with a machine holding the credentials instead of a person.
+
+**What follows, therefore, is twenty-three specified steps — twenty validators and three evidence commands — each with its exact source, its exemptions and its verdict rule.** Read them as the contract the artifact is held to. The one command in this sub-section is the digest computation a maintainer uses when populating or re-auditing the manifest of Condition A — it reads bytes and writes nothing, and it executes no step.
 
 ```bash
-# Run from the repository root. This block IS the runner: it needs no scratch directory, no
-# copy-and-paste of the steps, and no trust in a filename. It extracts each step's authoritative
-# source from the fenced blocks of this epic file, writes them into a private directory it creates
-# itself, executes them from there, and deletes them. The steps it runs are therefore this document's
-# own text by construction — a substituted or empty step is not expressible.
-# V15 (diagram structure) and V16 (story-template structure) are last rather than seated beside V10 because the numbering is
-# the execution order and every earlier step is already cited by number; renumbering four steps to
-# seat it earlier would invalidate those citations for no gain.
-set -uo pipefail
-
-EPIC='tickets/EPIC-001-reorder-and-replenishment.md'
-EXPECTED_STEPS=19
-
-
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || {
-    echo 'GATE FAILED: not inside a git repository; run this from the repository root.'
-    exit 1
-}
-cd "$REPO_ROOT" || { echo "GATE FAILED: cannot enter $REPO_ROOT."; exit 1; }
-if [ -L "$EPIC" ] || [ ! -f "$EPIC" ]; then
-    echo "GATE FAILED: $EPIC is missing or is not a regular file, so the steps cannot be read."
-    exit 1
-fi
-echo "GATE: repository $REPO_ROOT"
-echo "GATE: step source $EPIC"
-if ! git diff --quiet -- "$EPIC" 2>/dev/null; then
-    echo 'GATE: note the step source has uncommitted modifications; the executed text is the'
-    echo '      working copy shown above, not the committed one.'
-fi
-
-WORK=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/reorder-gate.XXXXXX") || {
-    echo 'GATE FAILED: could not create a private working directory for the extracted steps.'
-    exit 1
-}
-trap 'rm -rf "$WORK"' EXIT HUP INT TERM
-
-# Extraction is fail-closed: a missing heading, a missing or untagged fenced block, an unterminated
-# fence, an empty body, a duplicated heading or an unexpected step all abort before anything runs.
-python3 - "$EPIC" "$WORK" "$EXPECTED_STEPS" <<'EXTRACT'
-import hashlib, os, re, sys
-
-epic, work, expected = sys.argv[1], sys.argv[2], int(sys.argv[3])
-STEPS = ['V%d' % n for n in range(1, 17)] + ['E1', 'E2', 'E3']
-FENCE = chr(96) * 3
-SUFFIX = {'python': '.py', 'python3': '.py', 'bash': '.sh', 'sh': '.sh'}
-
-try:
-    lines = open(epic, encoding='utf-8').read().split('\n')
-except (OSError, UnicodeDecodeError) as exc:
-    print('GATE FAILED: cannot read %s (%s)' % (epic, exc))
-    sys.exit(1)
-
-problems, found, open_fence, heads = [], {}, False, []
-for index, line in enumerate(lines):
-    if line.startswith(FENCE):
-        open_fence = not open_fence
-        continue
-    if open_fence:
-        continue
-    head = re.match(r'^#### ([VE][0-9]+) \u2014 ', line)
-    if head:
-        heads.append((head.group(1), index))
-if open_fence:
-    problems.append('a fenced block in %s is never closed' % epic)
-
-for step, at in heads:
-    if step in found:
-        problems.append('step %s is declared by more than one heading' % step)
-        continue
-    body, language, cursor = None, None, at + 1
-    while cursor < len(lines):
-        line = lines[cursor]
-        if line.startswith('#### '):
-            break
-        if line.startswith(FENCE):
-            tag = line[len(FENCE):].strip().lower()
-            if tag not in SUFFIX:
-                problems.append('step %s: the first fenced block after its heading is tagged %r, '
-                                'which is not an executable step language' % (step, tag))
-                break
-            language, end = tag, cursor + 1
-            collected = []
-            while end < len(lines) and not lines[end].startswith(FENCE):
-                collected.append(lines[end])
-                end += 1
-            if end >= len(lines):
-                problems.append('step %s: its fenced block is never closed' % step)
-                break
-            body = '\n'.join(collected) + '\n'
-            break
-        cursor += 1
-    if body is None:
-        problems.append('step %s: no fenced source block follows its heading' % step)
-    elif not body.strip():
-        problems.append('step %s: its fenced source block is empty' % step)
-    else:
-        found[step] = (language, body)
-
-declared = {step for step, _ in heads}
-for step in STEPS:
-    if step not in declared:
-        problems.append('step %s: no heading of the form "#### %s \u2014 ..." was found' % (step, step))
-for step in sorted(found):
-    if step not in STEPS:
-        problems.append('step %s is declared but is not one of the %d expected steps'
-                        % (step, expected))
-if len(STEPS) != expected:
-    problems.append('this extractor names %d steps but %d were expected'
-                    % (len(STEPS), expected))
-
-if problems:
-    for problem in problems:
-        print('GATE FAILED: ' + problem)
-    sys.exit(1)
-
-print('GATE: step digests, computed over the exact bytes about to be executed')
-for number, step in enumerate(STEPS, 1):
-    language, body = found[step]
-    target = os.path.join(work, '%02d-%s%s' % (number, step.lower(), SUFFIX[language]))
-    try:
-        with open(target, 'w', encoding='utf-8') as handle:
-            handle.write(body)
-    except OSError as exc:
-        print('GATE FAILED: cannot write step %s (%s)' % (step, exc))
-        sys.exit(1)
-    print('    %s  %s  %s' % (hashlib.sha256(body.encode('utf-8')).hexdigest(),
-                              os.path.basename(target), language))
-sys.exit(0)
-EXTRACT
-if [ $? -ne 0 ]; then
-    echo 'GATE FAILED: the steps could not be extracted from the epic. Nothing was executed.'
-    exit 1
-fi
-
-extracted=$(find "$WORK" -mindepth 1 -maxdepth 1 -type f | wc -l)
-if [ "$extracted" -ne "$EXPECTED_STEPS" ]; then
-    echo "GATE FAILED: $extracted step file(s) were written, expected exactly $EXPECTED_STEPS."
-    exit 1
-fi
-
-fail=0
-for step in "$WORK"/[0-9][0-9]-*; do
-    printf '\n===== %s =====\n' "$(basename "$step")"
-    rc=0
-    case "$step" in
-        *.py) python3 "$step" || rc=$? ;;
-        *.sh) bash "$step" || rc=$? ;;
-        *) echo "STEP FAILED: $(basename "$step") has no known interpreter"; rc=1 ;;
-    esac
-    if [ "$rc" -ne 0 ]; then
-        echo "STEP FAILED: $(basename "$step") exited $rc"
-        fail=$((fail + 1))
-    fi
-done
-
-printf '\n'
-if [ "$fail" -ne 0 ]; then
-    echo "GATE FAILED: $fail of $EXPECTED_STEPS steps reported a failure. Emission is blocked until"
-    echo '     every one passes. A step is never relaxed to accommodate content.'
-    exit 1
-fi
-echo "GATE PASSED: all $EXPECTED_STEPS steps reported success."
+# Run from the MAINTAINER's validator location, never from a contributed branch. This block
+# computes the digest of each audited step file so the value can be pinned in the manifest that
+# Condition A compares against before a run. It executes no step and needs no repository.
+#   usage: sha256sum <audited-step-file> ... > steps.sha256
+#   check: sha256sum --check --status steps.sha256 || { echo 'ABORT: audited step changed'; exit 1; }
+# The check is the control: it must pass BEFORE any step runs, and its expected values must have
+# been recorded by the auditing maintainer rather than derived from the text under review.
 ```
 
 #### V1 — Forbidden Terms Inside Acceptance Criteria, Matched On Word Boundaries
@@ -2013,8 +1910,7 @@ SUBSTANTIVE = re.compile(r'[A-Za-z0-9]{2}')
 # A path is recognised as a repository path when it carries a directory separator, when it is a
 # dotfile, or when it ends in one of the extensions this repository actually uses. The dotfile and
 # separator branches are what bring the three extension-less citations in this set — an editor
-# configuration, a formatter ignore list and a package ignore list — inside the check at all; an
-# earlier revision required a known extension and therefore never scanned them.
+# configuration, a formatter ignore list and a package ignore list — inside the check at all.
 KNOWN_EXTENSIONS = {'.ts', '.tsx', '.graphql', '.json', '.md', '.mdx', '.yml', '.yaml', '.mts',
                     '.mjs', '.cjs', '.js', '.jsx', '.csv', '.sh', '.sql', '.txt', '.lock',
                     '.toml', '.env', '.po'}
@@ -2218,9 +2114,9 @@ for path in sorted(glob.glob('tickets/**/*.md', recursive=True)):
                 if not wanted:
                     failures.append(f'{where}: empty section locator on "{cited}"')
                     continue
-                # The locator must match a heading, not merely appear in the body. An earlier
-                # revision tested the whole file for the substring, so a phrase occurring in
-                # ordinary prose satisfied a citation naming a section that did not exist.
+                # The locator must match a heading, not merely appear in the body: a whole-file
+                # substring test is satisfied by a phrase occurring in ordinary prose, which
+                # would admit a citation naming a section that does not exist.
                 if not heading_resolves(target, wanted):
                     failures.append(f'{where}: no heading in "{cited}" begins with '
                                     f'"{wanted}"')
@@ -2346,10 +2242,10 @@ for index, line in enumerate(lines):
     if match:
         headings.append((index, len(match.group(1)), match.group(2)))
 
-# The row set is read from the delivery-split table's own section, located by its heading. An earlier
-# revision recognised a row by its shape alone, so a correct twenty-five-row table satisfied it
-# wherever that table happened to live — and section 9.2.1 carries a second table keyed by the same
-# identifier, which a shape-only rule has no way to tell apart from the authority.
+# The row set is read from the delivery-split table's own section, located by its heading, rather than
+# by row shape: a shape-only rule is satisfied by a correct twenty-five-row table wherever that table
+# happens to live, and section 9.2.1 carries a second table keyed by the same identifier that such a
+# rule has no way to tell apart from the authority.
 start = next((i for i, level, text in headings if level == 3 and text.startswith(SECTION)), None)
 if start is None:
     print(f'V7: FAIL {epics[0]} has no "### {SECTION} ..." heading, so the delivery-split '
@@ -2422,10 +2318,10 @@ Two further properties are asserted because a count of markdown files would not 
 ```bash
 set -uo pipefail
 
-# The expected hierarchy is compared as an exact set of paths, not as a set of counts that a
-# substituted hierarchy could also satisfy. An earlier revision asserted counts and a naming pattern,
-# so a tree renamed wholesale to EPIC-999, FEATURE-777 and STORY-123 passed it with every count
-# intact — the pattern matched the shape, and nothing checked the identifiers.
+# The expected hierarchy is compared as an exact set of paths, not as a set of counts and a naming
+# pattern that a substituted hierarchy also satisfies: a tree renamed wholesale to EPIC-999,
+# FEATURE-777 and STORY-123 keeps every count intact and matches the shape, so only the identifiers
+# themselves distinguish it from the declared tree.
 EPIC='EPIC-001'
 FEATURES='01 02 03 04 05 06 07 08'
 declare -A STORIES=(
@@ -2588,8 +2484,9 @@ ALLOWED = (
 
 
 def suite_source_spans(path):
-    """Inclusive one-based line spans of this suite's own fenced source blocks, located exactly as
-    the runner locates them. This is the whole of V9's exemption: an earlier revision skipped every
+    """Inclusive one-based line spans of this suite's own fenced source blocks, located by reading
+    this sub-section as text. The spans are used to SKIP those lines while scanning; nothing located
+    here is ever executed. This is the whole of V9's exemption: an earlier revision skipped every
     block tagged bash, sh, python or python3 in any of the thirty-four files, which is wide enough
     that a service-level figure written into any shell block anywhere was invisible to the one step
     that exists to find it."""
@@ -2642,14 +2539,10 @@ for path in sorted(glob.glob('tickets/**/*.md', recursive=True)):
         exempt = [m.span() for pattern in ALLOWED for m in pattern.finditer(line)]
         # A claim is made in prose or in a comment; a command argument is not a claim. So the
         # numeric rule reads prose and comment lines, including comments inside a fenced block,
-        # while a fenced command line is exempt from it — and the named-term rule reads every line
+        # while a fenced command line is exempt from it — and the named-term rules read every line
         # either way, because no command needs to name a service level.
         patterns = [(TERMS_ALWAYS, 'business or service-level term', False),
                     (TERMS_WITH_FIGURE, 'service-level term stated with a quantity', True)]
-        # A claim is made in prose or in a comment; a command argument is not a claim. So the
-        # numeric rule reads prose and comment lines, including comments inside a fenced block,
-        # while a fenced command line is exempt from it — and the named-term rules read every line
-        # either way, because no command needs to name a service level.
         if not inside_fence or COMMENT.match(line):
             patterns.insert(0, (NUMERIC, 'numeric figure with a unit', False))
         for pattern, label, needs_figure in patterns:
@@ -2868,7 +2761,7 @@ for kind, rollup_table, field in (('batch', batch_rollup, 'batch'),
         elif computed != stated:
             note(f'{kind} {name} rollup mismatch: rows sum to {computed}, rollup states {stated}')
     # A rollup row for a group no story belongs to is an invented group, and it inflates the
-    # decomposition without changing any story. An earlier revision never looked for one.
+    # decomposition without changing any story.
     for name in sorted(rollup_table):
         if name not in groups:
             note(f'{seen.get(name, epic_path)}: rollup row for {kind} {name}, which no story row '
@@ -2887,8 +2780,8 @@ checked = 0
 for identifier in order:
     matches = [p for p in glob.glob('tickets/**/*.md', recursive=True)
                if os.path.basename(p).startswith(identifier + '-')]
-    # Exactly one file per row. A row with no file was previously skipped in silence, which is how
-    # this validator could report success having cross-checked only part of the table.
+    # Exactly one file per row, asserted rather than passed over: a row with no file skipped in
+    # silence lets this validator report success having cross-checked only part of the table.
     if len(matches) != 1:
         note(f'{identifier} matches {len(matches)} story files, expected exactly 1'
              + (f': {matches}' if matches else ''))
@@ -3355,7 +3248,7 @@ for path in glob.glob('tickets/EPIC-*.md'):
 failures, checked, inspected = [], 0, 0
 # A dependency section is where a prerequisite is declared, so that is where referential integrity is
 # enforced: every story, feature and epic identifier a dependency section names must exist in this
-# set. Rule 13 was previously asserted with nothing checking it.
+# set.
 for path, prefix in ([(p, '8. ') for p in sorted(stories.values())]
                      + [(p, '4. ') for p in sorted(features.values())]):
     inspected += 1
@@ -3428,23 +3321,35 @@ PLUGIN='ReorderPlugin'
 fail=0
 note() { echo "E1: FAIL $1"; fail=$((fail + 1)); }
 
-# Every git invocation's exit status is checked. An earlier revision captured the output of
-# `git status` into a variable and tested only whether that variable was empty, so a status call that
-# failed — a corrupt index, an unreadable path, a pathspec that matched nothing because the package
-# had been moved — produced an empty string and read as "no changes found".
-git_or_fail() { # description, then the git arguments
+# Every git read whose VALUE this gate decides on goes through the helper below, and the caller tests
+# its status: an emptiness test alone cannot tell "no changes found" from "the status call failed",
+# because a corrupt index, an unreadable path or a pathspec matching nothing because the package moved
+# all yield an empty string. Two properties make the helper's own contract work, and neither is
+# optional. Its diagnostics go to STANDARD ERROR, because its standard output is the value the caller
+# captures — a message printed there is swallowed into the caller's variable instead of being seen.
+# And the caller, not the helper, increments `fail`: the helper always runs inside a command
+# substitution, which is a subshell, so a counter it incremented would be discarded on return. The
+# reads that only PRINT a diagnostic once a verdict is already recorded are the exception, and each is
+# marked where it appears. This block sets `set -uo pipefail` rather than `-e`, so no failure is
+# assumed to abort it; every one is either tested here or reached through this helper.
+git_read() { # description, then the git arguments
     local description="$1"; shift
     local output status
     output=$(git "$@" 2>&1); status=$?
     if [ "$status" -ne 0 ]; then
-        note "$description failed (git exited $status): $output"
+        printf 'E1: FAIL %s failed (git exited %s): %s\n' "$description" "$status" "$output" >&2
         return 1
     fi
     printf '%s' "$output"
     return 0
 }
 
-BASELINE="${BASELINE:-$(git merge-base HEAD "${UPSTREAM:-origin/master}" 2>/dev/null)}"
+if [ -z "${BASELINE:-}" ]; then
+    # The one read whose failure and whose empty answer mean the same thing to this gate — no
+    # baseline — so its status is captured and folded into the emptiness test below rather than
+    # discarded by a redirect.
+    BASELINE=$(git merge-base HEAD "${UPSTREAM:-origin/master}" 2>/dev/null) || BASELINE=''
+fi
 if [ -z "${BASELINE:-}" ]; then
     echo 'E1: FAIL no baseline resolved. Export BASELINE=<commit>, or UPSTREAM=<ref> so that'
     echo '     "git merge-base HEAD $UPSTREAM" resolves. A boundary check without a baseline'
@@ -3455,59 +3360,96 @@ if ! git rev-parse --verify --quiet "${BASELINE}^{commit}" >/dev/null; then
     echo "E1: FAIL BASELINE '$BASELINE' does not name a commit in this repository."
     exit 1
 fi
-BASELINE_SHA=$(git rev-parse --verify "${BASELINE}^{commit}")
-HEAD_SHA=$(git rev-parse --verify 'HEAD^{commit}')
-# The baseline must be a STRICT ancestor of HEAD. An earlier revision accepted any commit that
-# existed, so BASELINE=HEAD satisfied it — and a baseline equal to HEAD makes every commit on the
-# branch invisible, which is the one thing the baseline exists to prevent. It also accepted a commit
-# on an unrelated branch, against which a diff is meaningless rather than empty.
+BASELINE_SHA=$(git_read "resolving BASELINE '$BASELINE' to a commit" \
+    rev-parse --verify "${BASELINE}^{commit}") || exit 1
+HEAD_SHA=$(git_read 'resolving HEAD to a commit' rev-parse --verify 'HEAD^{commit}') || exit 1
+# The baseline must be a STRICT ancestor of HEAD, and the two refusals below are separate because a
+# baseline equal to HEAD makes every commit on the branch invisible, which is the one thing the
+# baseline exists to prevent, while a baseline on an unrelated branch yields a diff that is
+# meaningless rather than empty. The ancestry test's own failure is a third outcome: status 1 is
+# "not an ancestor" and any other non-zero status is the test itself failing, which is refused
+# rather than read as a pass.
 if [ "$BASELINE_SHA" = "$HEAD_SHA" ]; then
     echo "E1: FAIL BASELINE resolves to HEAD ($HEAD_SHA). Every commit on this branch would then be"
     echo '     invisible to this gate. Use the commit this branch diverged from.'
     exit 1
 fi
-if ! git merge-base --is-ancestor "$BASELINE_SHA" "$HEAD_SHA"; then
+git merge-base --is-ancestor "$BASELINE_SHA" "$HEAD_SHA"; ancestry=$?
+if [ "$ancestry" -eq 1 ]; then
     echo "E1: FAIL BASELINE $BASELINE_SHA is not an ancestor of HEAD $HEAD_SHA, so a diff between"
     echo '     them does not describe this branch. Use the commit this branch diverged from.'
+    exit 1
+elif [ "$ancestry" -ne 0 ]; then
+    echo "E1: FAIL the ancestry test between $BASELINE_SHA and $HEAD_SHA failed (git exited"
+    echo "     $ancestry), so the baseline could not be shown to describe this branch."
     exit 1
 fi
 echo "E1: baseline $BASELINE_SHA (strict ancestor of HEAD $HEAD_SHA)"
 
-if ! git diff --quiet "$BASELINE_SHA" -- $PROTECTED; then
+# `git diff --quiet` carries three outcomes and each is acted on separately: 0 is no difference, 1 is
+# a difference, and anything else is the diff itself failing — which is a boundary violation of
+# unknown extent and is refused rather than read as either of the first two.
+git diff --quiet "$BASELINE_SHA" -- $PROTECTED; protected_diff=$?
+if [ "$protected_diff" -eq 1 ]; then
     echo 'E1: FAIL tracked changes exist under the protected packages:'
-    git diff --name-status "$BASELINE_SHA" -- $PROTECTED | sed 's/^/    /'
     fail=$((fail + 1))
+    # Detail only: the verdict above is already recorded, so this read reports its own failure and
+    # changes nothing.
+    if detail=$(git_read 'the protected-package diff listing' \
+            diff --name-status "$BASELINE_SHA" -- $PROTECTED); then
+        printf '%s\n' "$detail" | sed 's/^/    /'
+    fi
+elif [ "$protected_diff" -ne 0 ]; then
+    note "the protected-package diff failed (git exited $protected_diff), so the packages cannot be shown to be untouched."
 fi
-if untracked=$(git_or_fail 'the protected-package status pass' \
+if untracked=$(git_read 'the protected-package status pass' \
         status --porcelain=v1 --untracked-files=all -- $PROTECTED); then
     if [ -n "$untracked" ]; then
         echo 'E1: FAIL uncommitted, staged or untracked paths exist under the protected packages:'
         printf '%s\n' "$untracked" | sed 's/^/    /'
         fail=$((fail + 1))
     fi
+else
+    fail=$((fail + 1))
 fi
 
 bundling_changed=0
 bundling_status=''
-if bundling_status=$(git_or_fail "the status pass over $BUNDLING" \
+if bundling_status=$(git_read "the status pass over $BUNDLING" \
         status --porcelain=v1 --untracked-files=all -- "$BUNDLING"); then
-    if ! git diff --quiet "$BASELINE_SHA" -- "$BUNDLING" || [ -n "$bundling_status" ]; then
+    git diff --quiet "$BASELINE_SHA" -- "$BUNDLING"; bundling_diff=$?
+    if [ "$bundling_diff" -ne 0 ] || [ -n "$bundling_status" ]; then
+        # A failed diff lands here too, deliberately: an unreadable comparison is treated as a change
+        # so that the permit is required rather than bypassed.
         bundling_changed=1
     fi
 else
+    fail=$((fail + 1))
     bundling_changed=1
 fi
 if [ "$bundling_changed" -eq 1 ]; then
     if [ "${PERMIT_VITE:-0}" = '1' ]; then
         echo "E1: note $BUNDLING CHANGED and PERMIT_VITE=1 was set deliberately. Permit audit:"
-        git diff --name-status "$BASELINE_SHA" -- "$BUNDLING" | sed 's/^/    /'
-        git diff --stat "$BASELINE_SHA" -- "$BUNDLING" | sed 's/^/    /'
+        # The audit is evidence rather than a verdict, so each read reports its own failure and the
+        # audit is incomplete rather than silently empty when one fails.
+        if audit=$(git_read "the permit audit listing for $BUNDLING" \
+                diff --name-status "$BASELINE_SHA" -- "$BUNDLING"); then
+            printf '%s\n' "$audit" | sed 's/^/    /'
+        else
+            fail=$((fail + 1))
+        fi
+        if audit=$(git_read "the permit audit summary for $BUNDLING" \
+                diff --stat "$BASELINE_SHA" -- "$BUNDLING"); then
+            printf '%s\n' "$audit" | sed 's/^/    /'
+        else
+            fail=$((fail + 1))
+        fi
         printf '%s\n' "$bundling_status" | sed 's/^/    /'
         # An untracked replacement carries no diff at all, so it is recorded by identity rather than
-        # by content. An earlier revision printed the whole file into the log, which puts whatever a
-        # configuration file happens to contain into build output that is read and archived widely.
-        # A digest identifies the exact bytes without disclosing them, and refusing the untracked
-        # case outright is what keeps the permit an audited exception rather than a blind one.
+        # by content: a digest identifies the exact bytes without putting whatever a configuration
+        # file happens to contain into build output that is read, forwarded and archived widely. The
+        # untracked case is then refused outright, which is what keeps the permit an audited
+        # exception rather than a blind one.
         if printf '%s\n' "$bundling_status" | grep -q '^??'; then
             if command -v sha256sum >/dev/null 2>&1; then
                 echo "    untracked replacement digest: $(sha256sum "$BUNDLING" | cut -d' ' -f1)"
@@ -3527,12 +3469,16 @@ fi
 # judged semantically rather than by line range alone.
 registration_status=''
 registration_changed=0
-if registration_status=$(git_or_fail "the status pass over $REGISTRATION" \
+if registration_status=$(git_read "the status pass over $REGISTRATION" \
         status --porcelain=v1 --untracked-files=all -- "$REGISTRATION"); then
-    if ! git diff --quiet "$BASELINE_SHA" -- "$REGISTRATION" || [ -n "$registration_status" ]; then
+    git diff --quiet "$BASELINE_SHA" -- "$REGISTRATION"; registration_diff=$?
+    if [ "$registration_diff" -ne 0 ] || [ -n "$registration_status" ]; then
+        # As with the bundling file, a failed diff is treated as a change so the exception has to be
+        # bounded explicitly rather than skipped.
         registration_changed=1
     fi
 else
+    fail=$((fail + 1))
     registration_changed=1
 fi
 if [ "$registration_changed" -eq 0 ]; then
@@ -3540,24 +3486,40 @@ if [ "$registration_changed" -eq 0 ]; then
 elif printf '%s\n' "$registration_status" | grep -q '^??'; then
     note "$REGISTRATION is untracked, so the permitted exception cannot be bounded against a baseline."
 else
-    # The array's bounds are read from the BASELINE revision of the file, not from the working copy.
-    # An earlier revision read the working copy, so a change that widened the array to span the whole
-    # file also widened the bounds the change was then checked against — the exception validated
-    # itself. Reading the baseline keeps the permitted window fixed by what was agreed.
-    bounds=$(git show "$BASELINE_SHA:$REGISTRATION" 2>/dev/null | awk '
-        /plugins:[[:space:]]*\[/ && !started { started = 1; first = NR }
-        started {
-            n = gsub(/\[/, "[") - gsub(/\]/, "]")
-            depth += n
-            if (depth <= 0) { print first, NR; exit }
-        }')
+    # The array's bounds are read from the BASELINE revision of the file, not from the working copy,
+    # because a change that widened the array to span the whole file would otherwise widen the bounds
+    # it is then checked against — the exception would validate itself. Reading the baseline keeps
+    # the permitted window fixed by what was agreed. The read goes through the checked helper, so an
+    # unreadable baseline revision is a refusal rather than an empty bounds string.
+    bounds=''
+    if baseline_registration=$(git_read "reading $REGISTRATION at the baseline" \
+            show "$BASELINE_SHA:$REGISTRATION"); then
+        bounds=$(printf '%s\n' "$baseline_registration" | awk '
+            /plugins:[[:space:]]*\[/ && !started { started = 1; first = NR }
+            started {
+                n = gsub(/\[/, "[") - gsub(/\]/, "]")
+                depth += n
+                if (depth <= 0) { print first, NR; exit }
+            }')
+    fi
     if [ -z "$bounds" ]; then
         note "could not locate the plugins array in $BASELINE_SHA:$REGISTRATION, so a change to that file cannot be shown to be confined to it."
     else
         set -- $bounds
         first=$1; last=$2
         echo "E1: plugins array spans ${REGISTRATION}:L${first}-L${last} at the baseline"
-        outside=$(git diff -U0 --no-color "$BASELINE_SHA" -- "$REGISTRATION" |
+        # The hunk listing is read ONCE, through the checked helper, and both judgements below are
+        # made from that one value: a second invocation could disagree with the first, and an
+        # unreadable listing must refuse the change rather than yield an empty offending set.
+        if ! hunks=$(git_read "the hunk listing for $REGISTRATION" \
+                diff -U0 --no-color "$BASELINE_SHA" -- "$REGISTRATION"); then
+            note "the change to $REGISTRATION could not be read, so it cannot be shown to be confined to the plugins array."
+            hunks=''
+            hunks_readable=0
+        else
+            hunks_readable=1
+        fi
+        outside=$(printf '%s\n' "$hunks" |
             awk -v lo="$first" -v hi="$last" '
                 /^@@/ {
                     match($0, /-[0-9]+(,[0-9]+)?/)
@@ -3572,23 +3534,36 @@ else
         if [ -n "$outside" ]; then
             echo "E1: FAIL $REGISTRATION changed outside the plugins array:"
             printf '%s\n' "$outside"
-            git diff --stat "$BASELINE_SHA" -- "$REGISTRATION" | sed 's/^/    /'
             fail=$((fail + 1))
-        else
+            # Detail only, as above: the verdict is recorded whether or not this summary reads.
+            if summary=$(git_read "the change summary for $REGISTRATION" \
+                    diff --stat "$BASELINE_SHA" -- "$REGISTRATION"); then
+                printf '%s\n' "$summary" | sed 's/^/    /'
+            fi
+        elif [ "$hunks_readable" -eq 1 ]; then
             echo "E1: ok   every changed hunk in $REGISTRATION lies inside the plugins array"
         fi
         # Inside the array, the only permitted change is registering this plugin. A removed line and
         # an added line naming anything else are both refused, so the exception cannot be used to
-        # reorder, delete or configure somebody else's plugin.
-        offending=$(git diff -U0 --no-color "$BASELINE_SHA" -- "$REGISTRATION" |
+        # reorder, delete or configure somebody else's plugin. The listing is the one already read
+        # above; where it could not be read, the refusal is already recorded and no line here is
+        # judged, because an empty listing would otherwise read as "nothing offending".
+        offending=$(printf '%s\n' "$hunks" |
             grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' |
             grep -vE "^\+[[:space:]]*${PLUGIN}\b" || true)
-        if [ -n "$offending" ]; then
+        if [ "$hunks_readable" -eq 0 ]; then
+            :
+        elif [ -n "$offending" ]; then
             echo "E1: FAIL the only permitted change to $REGISTRATION is adding ${PLUGIN} to the plugins array; these lines are not that:"
             printf '%s\n' "$offending" | sed 's/^/    /'
             fail=$((fail + 1))
-        elif [ -n "$(git diff --name-only "$BASELINE_SHA" -- "$REGISTRATION")" ]; then
-            echo "E1: ok   the only change to $REGISTRATION is the addition of ${PLUGIN}"
+        elif changed_paths=$(git_read "the changed-path listing for $REGISTRATION" \
+                diff --name-only "$BASELINE_SHA" -- "$REGISTRATION"); then
+            if [ -n "$changed_paths" ]; then
+                echo "E1: ok   the only change to $REGISTRATION is the addition of ${PLUGIN}"
+            fi
+        else
+            fail=$((fail + 1))
         fi
     fi
 fi
@@ -3867,8 +3842,8 @@ def scripts_of(path):
 
 
 # The selected benchmark authority is the shared configuration and the runner that consumes it, so
-# both are asserted by CONTENT rather than by name. An earlier revision checked only that a path
-# existed, which a file containing an echo of that path also satisfies.
+# both are asserted by CONTENT rather than by name: a path-exists check is also satisfied by a
+# file that merely contains an echo of that path.
 config_body = read_text(BENCH_CONFIG)
 if config_body is not None:
     if not re.search(r'include\s*:\s*\[[^\]]*\.bench\.ts', config_body):
@@ -4157,6 +4132,643 @@ for f in failures:
 sys.exit(1 if failures else 0)
 ```
 
+#### V17 — Heading Uniqueness And Ruling-Identifier Uniqueness, In Both Directions
+
+**This step exists because a suite of sixteen validators reported success on a set carrying two sections numbered `11.12` and two rulings numbered `R20`.** Neither defect is visible to any structural check: both files existed, every link resolved, every citation named a path that existed and a heading that was present. What was broken is that a citation could no longer identify **which** heading or **which** ruling it meant. Six sibling files cited `R20` for an obligation the epic states twice under one number, and every title-qualified citation of `11.12` resolved to whichever of the two the reader reached first. An ambiguous identifier is worse than a dangling one, because a dangling reference is reported by V6 while an ambiguous one reads as correct.
+
+**Two classes of identifier are asserted unique, and a third relation is asserted total.** A markdown heading, because a citation of the form `[<path>:§<title>]` resolves against it — and additionally unique on its *number* alone, because a reader navigating a four-thousand-line document finds a section by number before reading its title. A ruling identifier in the settled-rulings table, because sibling files cite rulings by number with no title at all. And every ruling cited by number anywhere in the set must exist in that table, which catches a citation of a ruling that was renumbered out from under it. The stated ruling count is reconciled against the parsed rows in words, so the preamble cannot claim twenty-one over a table of twenty-two.
+
+**What it does not establish.** That two headings with distinct titles describe distinct things, or that a ruling says what a file citing it believes it says. Both are semantic and belong to the review this subsection ends by requiring.
+
+```python
+# V17 asserts that no identifier this set uses as a target of a citation is ambiguous. Two classes of
+# identifier qualify and both produced a real defect: a MARKDOWN HEADING, which a citation of the form
+# [<path>:{SECTION} <title>] resolves against, and a RULING IDENTIFIER in the epic's settled-rulings
+# table, which sibling files cite by number alone. An earlier suite of sixteen steps reported success
+# on a set carrying two headings numbered 11.12 and two rulings numbered R20, so six citations of R20
+# could not be resolved to the obligation they meant and every title-qualified citation of 11.12
+# resolved to whichever of the two the reader happened to read first. Uniqueness is asserted rather
+# than the absence of a duplicate being hoped for, and both directions are reported: the duplicated
+# value and every line that carries it.
+import glob
+import os
+import re
+import sys
+
+FENCE = chr(96) * 3
+SECTION = chr(0xA7)
+TICKETS = 'tickets'
+EPIC = os.path.join(TICKETS, 'EPIC-001-reorder-and-replenishment.md')
+RULING_ROW = re.compile(r'^\|\s*(R\d+)\s*\|')
+HEADING = re.compile(r'^(#{1,6})\s+(.*\S)\s*$')
+
+failures = []
+
+
+def read(path):
+    try:
+        return open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(f'{path}: cannot read ({exc})')
+        return None
+
+
+# Structure is parsed rather than pattern-matched: a heading inside a fenced block is shell or python
+# comment text, and this set's demonstration blocks carry such comments at column zero.
+def headings(lines):
+    found, inside = [], False
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        match = HEADING.match(line)
+        if match:
+            found.append((index, match.group(2)))
+    return found
+
+
+paths = sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True))
+if len(paths) != 34:
+    failures.append(f'expected 34 markdown files under {TICKETS}/, found {len(paths)}')
+
+inspected = 0
+for path in paths:
+    if os.path.islink(path):
+        failures.append(f'{path}: is a symlink; refused rather than followed')
+        continue
+    lines = read(path)
+    if lines is None:
+        continue
+    inspected += 1
+    seen = {}
+    for line_number, title in headings(lines):
+        seen.setdefault(title, []).append(line_number)
+    for title, at in sorted(seen.items()):
+        if len(at) > 1:
+            failures.append(f'{path}: heading {title!r} declared {len(at)} times, at lines '
+                            + ', '.join(str(n) for n in at))
+    # A numbered heading is additionally required to be unique on its NUMBER alone, because a
+    # title-qualified citation is resolved by a reader who navigates by number first.
+    numbered = {}
+    for line_number, title in headings(lines):
+        match = re.match(r'^(\d+(?:\.\d+)*[a-z]?)\s', title)
+        if match:
+            numbered.setdefault(match.group(1), []).append((line_number, title))
+    for number, entries in sorted(numbered.items()):
+        if len(entries) > 1:
+            failures.append(f'{path}: section number {number} used by {len(entries)} headings: '
+                            + '; '.join(f'line {n} {t!r}' for n, t in entries))
+
+if inspected != 34:
+    failures.append(f'inspected {inspected} of 34 files; a partial read cannot establish uniqueness')
+
+epic = read(EPIC)
+if epic is not None:
+    rulings, inside = {}, False
+    for index, line in enumerate(epic, 1):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        match = RULING_ROW.match(line)
+        if match:
+            rulings.setdefault(match.group(1), []).append(index)
+    if not rulings:
+        failures.append(f'{EPIC}: no ruling rows were parsed at all, so nothing was checked')
+    for ruling, at in sorted(rulings.items(), key=lambda pair: int(pair[0][1:])):
+        if len(at) > 1:
+            failures.append(f'{EPIC}: ruling {ruling} declared {len(at)} times, at lines '
+                            + ', '.join(str(n) for n in at))
+    # The stated count is reconciled against the rows, in words, because the preamble states it in words.
+    words = {21: 'twenty-one', 22: 'twenty-two', 23: 'twenty-three', 24: 'twenty-four',
+             25: 'twenty-five', 26: 'twenty-six'}
+    expected = words.get(len(rulings))
+    preamble = next((l for l in epic if 'rulings. They are gathered here' in l), '')
+    if expected is None:
+        failures.append(f'{EPIC}: {len(rulings)} ruling rows is outside the range this step spells')
+    elif expected not in preamble.lower():
+        failures.append(f'{EPIC}: {len(rulings)} ruling rows but the preamble does not state '
+                        f'{expected!r}')
+    # Every ruling cited by number anywhere in the set must exist in the table.
+    known = set(rulings)
+    for path in paths:
+        lines = read(path)
+        if lines is None:
+            continue
+        for index, line in enumerate(lines, 1):
+            for cited in re.findall(r'ruling(?:s)?\s+\*{0,2}(R\d+)\*{0,2}', line):
+                if cited not in known:
+                    failures.append(f'{path}:{index}: cites ruling {cited}, which the epic table '
+                                    f'does not declare')
+
+print(f'V17: files inspected: {inspected}; ruling identifiers: '
+      f'{len(rulings) if epic is not None else 0}; uniqueness failures: {len(failures)}')
+for failure in failures:
+    print('  FAIL ' + failure)
+sys.exit(1 if failures else 0)
+```
+
+#### V18 — Duplicate GraphQL Declaration Detection Across The Whole Set
+
+**This is the step that catches a proposal that could not build.** `FEATURE-001-04` declared `type SubstitutionCandidateState` **twice in one fenced block** with incompatible field sets, and the first of the two carried a required field of its own type — a shape no value can satisfy. Sixteen structural validators reported success on it, because a duplicate declaration breaks nothing a link checker, a citation resolver or a count reconciler looks at. The failure would have been discovered by a schema build during implementation, which is exactly the wrong place for it: by then two features would have been written against two different contracts.
+
+**Three facts make the parse sound rather than approximate, and each is a reason a naive version of this step would report a defect where none exists.** A plugin's `shopApiExtensions` and `adminApiExtensions` are **two separate schema documents** [packages/core/src/api/config/get-final-vendure-schema.ts:L87-L118], so one name declared once on each side is lawful; the exemption is a named allow-list of exactly the five enums section 6.4's inventory declares on both, and a sixth name appearing twice is reported. This set quotes core's own SDL to state what must **not** change, so a declaration counts only inside a block tagged `graphql`, which is how this set writes its own proposals, and names quoted from the platform are listed and excluded. And several blocks **reproduce** a declaration a sibling owns so a reader need not hold two files open — a reproduction is not a declaration, and it is marked machine-checkably with the token `NOT A DECLARATION` in a comment before its first declaration rather than left to the surrounding prose. A reproduction is still checked on the one property that matters about it: the name it reproduces must be authoritatively declared somewhere in this set, so no file can introduce a type by reproducing one that does not exist.
+
+**What it does not establish.** That a declared type is *correct*, that its fields are the right fields, or that two files describing one type describe it the same way in prose. It establishes that the set proposes each name exactly once, which is the precondition for any of those questions being answerable at all.
+
+```python
+# V18 asserts that every GraphQL type, input, enum, union and interface this set proposes to publish is
+# DECLARED exactly once across the whole set. This is the step that would have caught the defect no
+# other step could see: FEATURE-001-04 declared "type SubstitutionCandidateState" twice, in one fenced
+# block, with incompatible field sets, and the first of the two carried a field of its own type -- so
+# the merged schema could not build, while sixteen structural validators reported success. A duplicate
+# declaration is reported wherever it occurs, with every declaring file and line, because the fix is a
+# choice between two texts and a reader needs both.
+#
+# Three facts make this parse sound rather than approximate. FIRST, a plugin's shopApiExtensions and
+# adminApiExtensions are two SEPARATE schema documents, so one name declared once on each side is
+# lawful and is NOT a duplicate -- the epic's own inventory names five enums that are deliberately
+# declared in both. The exemption is therefore a named allow-list of those five, applied to the matched
+# name at its matched position, and a sixth name appearing twice is reported. SECOND, this set quotes
+# core's own SDL to state what must not change; a declaration is counted only where it appears inside a
+# fenced block tagged graphql, which is how this set writes its own proposals. THIRD, several blocks
+# REPRODUCE a declaration a sibling owns so that a reader need not hold two files open, and a
+# reproduction is not a declaration -- those blocks carry the token NOT A DECLARATION in a comment
+# before their first declaration, which is what makes the distinction machine-checkable rather than a
+# matter of reading the surrounding prose. A reproduction is still checked, on the one property that
+# matters about it: the name it reproduces must be authoritatively declared somewhere in this set, so a
+# story cannot introduce a type by reproducing one that does not exist.
+import glob
+import os
+import re
+import sys
+
+FENCE = chr(96) * 3
+TICKETS = 'tickets'
+# extend type Query / extend type Mutation add fields to a type somebody else declared and are not
+# declarations of it. A leading "extend" is therefore excluded rather than matched and filtered later.
+DECLARATION = re.compile(r'^(type|input|enum|union|interface|scalar)\s+([A-Za-z][A-Za-z0-9_]*)')
+EXTEND = re.compile(r'^extend\s')
+# The five names the epic's published-symbol inventory declares on BOTH the Shop and Admin documents,
+# which the two-document split makes lawful. Any other name is expected exactly once.
+DUAL_DOCUMENT = {
+    'ReorderLineOutcomeCode',
+    'ReorderListAccess',
+    'ReorderListCapability',
+    'ReorderSourceType',
+    'ReorderAttemptOutcome',
+}
+# Names this set quotes FROM the platform rather than declaring. A quoted core type is evidence about
+# the baseline, so it is not counted as this set's declaration of it.
+CORE_QUOTED = {
+    'ErrorResult', 'Node', 'PaginatedList', 'DeletionResponse', 'DeletionResult', 'Success',
+    'ProductVariant', 'Order', 'OrderLine', 'Customer', 'CustomerGroup', 'Collection', 'Seller',
+    'Channel', 'ErrorCode', 'Permission', 'LanguageCode', 'CurrencyCode', 'DateTime', 'JSON',
+    'Money', 'InsufficientStockError', 'NegativeQuantityError', 'OrderLimitError',
+    'OrderModificationError', 'NoActiveOrderError', 'OrderInterceptorError', 'Job', 'JobState',
+}
+
+MARKER = 'NOT A DECLARATION'
+
+failures = []
+declarations = {}
+reproductions = {}
+files_with_graphql = 0
+paths = sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True))
+if len(paths) != 34:
+    failures.append(f'expected 34 markdown files under {TICKETS}/, found {len(paths)}')
+
+for path in paths:
+    if os.path.islink(path):
+        failures.append(f'{path}: is a symlink; refused rather than followed')
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(f'{path}: cannot read ({exc})')
+        continue
+    inside, tagged, saw, reproduction = False, False, False, False
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            if inside:
+                inside, tagged, reproduction = False, False, False
+            else:
+                inside = True
+                tagged = line[len(FENCE):].strip().lower() == 'graphql'
+            continue
+        if not (inside and tagged):
+            continue
+        saw = True
+        stripped = line.strip()
+        if stripped.startswith('#') and MARKER in stripped:
+            reproduction = True
+            continue
+        if EXTEND.match(stripped):
+            continue
+        match = DECLARATION.match(stripped)
+        if not match:
+            continue
+        kind, name = match.group(1), match.group(2)
+        if name in CORE_QUOTED:
+            continue
+        if reproduction:
+            reproductions.setdefault(name, []).append((path, index, kind))
+        else:
+            declarations.setdefault(name, []).append((path, index, kind))
+    if saw:
+        files_with_graphql += 1
+
+if not declarations:
+    failures.append('no graphql declaration was parsed at all, so nothing was checked')
+
+for name, sites in sorted(declarations.items()):
+    limit = 2 if name in DUAL_DOCUMENT else 1
+    if len(sites) > limit:
+        where = '; '.join(f'{p}:{n} as {k}' for p, n, k in sites)
+        failures.append(f'{name}: declared {len(sites)} times, expected at most {limit} -- {where}')
+        continue
+    # Two lawful declarations of one dual-document name must still agree on their KIND.
+    kinds = {k for _, _, k in sites}
+    if len(kinds) > 1:
+        where = '; '.join(f'{p}:{n} as {k}' for p, n, k in sites)
+        failures.append(f'{name}: declared with more than one kind {sorted(kinds)} -- {where}')
+
+for name, sites in sorted(reproductions.items()):
+    if name not in declarations:
+        where = '; '.join(f'{p}:{n}' for p, n, _ in sites)
+        failures.append(f'{name}: reproduced as {MARKER} at {where}, but no block in this set '
+                        f'authoritatively declares it')
+
+# A self-referential declaration -- a type carrying a non-list field of its own type -- is the specific
+# shape the withdrawn duplicate had, and it is reported because a required field of a type's own type
+# can never be satisfied.
+for path in paths:
+    if os.path.islink(path):
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError):
+        continue
+    inside, tagged, current, opened_at = False, False, None, 0
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            if inside:
+                inside, tagged, current = False, False, None
+            else:
+                inside = True
+                tagged = line[len(FENCE):].strip().lower() == 'graphql'
+            continue
+        if not (inside and tagged):
+            continue
+        stripped = line.strip()
+        match = DECLARATION.match(stripped)
+        if match and match.group(1) == 'type' and stripped.endswith('{'):
+            current, opened_at = match.group(2), index
+            continue
+        if stripped == '}':
+            current = None
+            continue
+        if current and re.search(r':\s*' + re.escape(current) + r'!?\s*$', stripped):
+            failures.append(f'{path}:{index}: type {current} (opened at line {opened_at}) declares a '
+                            f'non-list field of its own type, which no value can satisfy: '
+                            f'{stripped!r}')
+
+print(f'V18: files carrying graphql blocks: {files_with_graphql}; authoritative declarations: '
+      f'{len(declarations)}; reproductions: {len(reproductions)}; failures: {len(failures)}')
+for failure in failures:
+    print('  FAIL ' + failure)
+sys.exit(1 if failures else 0)
+```
+
+#### V19 — Definition-Of-Done Count Reconciliation At The Feature Tier And The Story Tier
+
+**V16 already asserts that every story file carries exactly ten definition-of-done items, and that is why the feature tier went unchecked for so long.** A review found **five of the eight feature files** stating a count that disagreed with the items present — by one, one, four, three and seven — while every structural step reported success. A stated count that overstates the list is a reader instructed to look for obligations that are not there; one that understates it is a list whose tail nobody is accountable for. Both are silent, because nothing in a markdown document objects.
+
+**The number is parsed from the preamble's own words rather than supplied by this step**, so the file remains the authority and the assertion is only that it agrees with itself. The section is located by its own heading and its span ends at the next heading of the same or shallower depth, never by proximity to a pattern; fenced blocks inside it are skipped, so a checkbox in an illustrative block is not counted as an obligation. The story tier is re-asserted here as well as in V16, because a story preamble that says "ten items" above nine is the same defect at a tier V16 counts but does not read. The step requires exactly thirty-three files to have been reconciled, so a partial run reports the shortfall rather than passing on a subset.
+
+**What it does not establish.** That the items are the *right* items, that none duplicates another in different words, or that a merged item still carries both obligations it merged. Item-level duplication is the semantic reading this subsection requires — this step only guarantees the arithmetic is honest.
+
+```python
+# V19 reconciles every stated definition-of-done count against the items actually present. V16 already
+# asserts the story tier at exactly ten, so this step's new ground is the FEATURE tier, where a review
+# found five of the eight files wrong -- by one, one, four, three and seven items -- while every
+# structural step reported success. It also re-asserts the story tier's stated count in words, because a
+# story preamble that says "ten items" above nine is the same defect at the tier V16 counts but does not
+# read. The number is parsed from the preamble's own words rather than supplied here, so the file
+# remains the authority and this step only requires it to agree with itself.
+import glob
+import os
+import re
+import sys
+
+FENCE = chr(96) * 3
+TICKETS = 'tickets'
+ITEM = re.compile(r'^- \[[ x]\] ')
+WORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8,
+    'nine': 9, 'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14,
+    'fifteen': 15, 'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20,
+    'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24, 'twenty-five': 25,
+    'twenty-six': 26, 'twenty-seven': 27, 'twenty-eight': 28, 'twenty-nine': 29, 'thirty': 30,
+    'thirty-one': 31, 'thirty-two': 32, 'thirty-three': 33, 'thirty-four': 34, 'thirty-five': 35,
+    'thirty-six': 36, 'thirty-seven': 37, 'thirty-eight': 38, 'thirty-nine': 39, 'forty': 40,
+}
+# Longest first, so "twenty-one" is never read as "twenty".
+STATED = re.compile(r'^\*{0,2}(' + '|'.join(sorted(WORDS, key=len, reverse=True))
+                    + r')\*{0,2}\s+(?:top-level\s+)?items\b', re.IGNORECASE)
+
+failures = []
+checked = 0
+
+
+def dod_section(lines, path):
+    # The section is located by its own heading, never by proximity to a pattern.
+    for index, line in enumerate(lines):
+        if line.startswith('#') and 'Definition of Done' in line:
+            end = len(lines)
+            depth = len(line) - len(line.lstrip('#'))
+            for cursor in range(index + 1, len(lines)):
+                candidate = lines[cursor]
+                if candidate.startswith('#'):
+                    if len(candidate) - len(candidate.lstrip('#')) <= depth:
+                        end = cursor
+                        break
+            return index, end
+    failures.append(f'{path}: no "Definition of Done" heading was found')
+    return None
+
+
+for path in sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True)):
+    name = os.path.basename(path)
+    if not (name.startswith('FEATURE-') or name.startswith('STORY-')):
+        continue
+    if os.path.islink(path):
+        failures.append(f'{path}: is a symlink; refused rather than followed')
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(f'{path}: cannot read ({exc})')
+        continue
+    span = dod_section(lines, path)
+    if span is None:
+        continue
+    start, end = span
+    checked += 1
+    actual, inside = 0, False
+    for line in lines[start + 1:end]:
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if ITEM.match(line):
+            actual += 1
+    stated, stated_at = None, None
+    for offset, line in enumerate(lines[start + 1:end], start + 2):
+        match = STATED.match(line.strip())
+        if match:
+            stated, stated_at = WORDS[match.group(1).lower()], offset
+            break
+    if stated is None:
+        failures.append(f'{path}: the definition-of-done preamble states no item count in words, so '
+                        f'the {actual} items present are reconciled against nothing')
+        continue
+    if stated != actual:
+        failures.append(f'{path}:{stated_at}: preamble states {stated} definition-of-done items, '
+                        f'{actual} top-level items are present')
+    if name.startswith('STORY-') and actual != 10:
+        failures.append(f'{path}: story definition-of-done items: {actual}, expected exactly 10')
+
+if checked != 33:
+    failures.append(f'reconciled {checked} of 33 feature and story files; a partial read cannot '
+                    f'establish the tier counts')
+
+print(f'V19: feature and story files reconciled: {checked}; count failures: {len(failures)}')
+for failure in failures:
+    print('  FAIL ' + failure)
+sys.exit(1 if failures else 0)
+```
+
+#### V20 — Cross-File Single Authority And Ledger Uniqueness For Every Settled Contract
+
+**Every rule in this step exists because a review found the same contract stated two ways in two files, and in each of those pairs one form is now withdrawn while an implementer following either paragraph would have built something different.** An error result with two declaring authorities. A permission ledger with two arithmetics, three definitions yielding four members in one place and four yielding five in another. A replay index that was plain in one file and partial in another. A projected-key index that the ruling makes sparse by construction and three consumers described as a dense `0..k-1` sequence. A required argument that was optional four paragraphs later. A project scaffold that was owned and priced in section 7.9 and owned by nobody in eight other places. **None of these is a broken reference, so nothing before this step could see any of them.**
+
+**Each rule is one of two shapes.** A **withdrawn form** must appear nowhere — a superseded column name, index name, constraint name, enum member, encoding or arithmetic. A **settled form** must appear in exactly one declaring place, named by path, which is how a single SDL authority is enforced rather than agreed. Each rule carries the ruling or ledger row that settles it, so a failure is a work list rather than a verdict.
+
+**Two exemptions, both structural, both narrow.** A line that records a form **as withdrawn** is discussing it rather than requiring it — that is how this set documents a correction — so a withdrawal marker on the same line exempts the match at its matched position. And this step's own source states every withdrawn form it looks for, as a literal pattern, so the line spans of this suite's own fenced source blocks are exempt exactly as V9 exempts them, located by step heading and fence-aware. **Nothing else is exempt, and in particular no other fenced block anywhere in the set is skipped** — which matters, because several of the forms this step catches are column names, index names and constraint names that live inside fenced entity and SQL blocks rather than in prose. A report is answered by correcting the text, never by widening a pattern.
+
+**What it does not establish.** That the settled form is the *right* form, or that a contract nobody stated twice is stated correctly once. It establishes that where this epic has settled a contract, the set no longer says two things.
+
+```python
+# V20 asserts that the cross-file contracts section 6.4 settles are single-valued in the text as well as
+# in intent. Every invariant below exists because a review found the SAME contract stated two ways in
+# two files, and a downstream implementer following either paragraph would have built something
+# different: an error result with two declaring authorities, a permission ledger with two arithmetics,
+# a replay index that was plain in one file and partial in another, a projected-key index that was both
+# sparse and dense, a required argument that was optional four paragraphs later, and a project scaffold
+# that was owned and priced in one section and owned by nobody in three others.
+#
+# Each invariant is a WITHDRAWN FORM that must appear nowhere, or a SETTLED FORM that must appear in
+# exactly one declaring place, and each carries the ruling or ledger that settles it so a failure is a
+# work list rather than a verdict. A withdrawn form may still be NAMED as withdrawn -- that is how this
+# set records a correction -- so a line is exempt at the matched position when it also carries one of
+# the withdrawal markers, which keeps the exemption token-scoped rather than line-wide or file-wide.
+#
+# One further exemption is structural rather than editorial, and it is the same one V9 needs for the
+# same reason: this step's own source states every withdrawn form it looks for, as a literal pattern,
+# so a step that scanned its own text would report itself on every rule it enforces. The exempt region
+# is therefore the set of line spans occupied by this suite's own fenced source blocks inside the epic,
+# located BY STEP HEADING and fence-aware -- exactly as the audited step source locates them and as V9
+# exempts them -- and nothing else. Every other fenced block in every file is still scanned, which
+# matters because several of the withdrawn forms this step exists to catch are column names, index
+# names and constraint names that live inside fenced entity and SQL blocks rather than in prose.
+import glob
+import os
+import re
+import sys
+
+TICKETS = 'tickets'
+FENCE = chr(96) * 3
+EPIC = os.path.join(TICKETS, 'EPIC-001-reorder-and-replenishment.md')
+STEP_HEADING = re.compile(r'^#### (?:[VE][0-9]+ \u2014 |Running The Suite)')
+# A line that records a form as withdrawn is discussing it, not requiring it.
+WITHDRAWAL = re.compile(r'earlier (?:revision|version|draft|arrangement|form|position|decision)'
+                        r'|withdraw|WITHDRAWN|is not deployable|not deployable'
+                        r'|rather than left to be reconciled|NOT A DECLARATION'
+                        r'|the defect this|this correction closes|is a correction',
+                        re.IGNORECASE)
+
+# name, pattern, why it is withdrawn and what replaces it
+WITHDRAWN = [
+    # A NEGATED mention is compliance rather than a violation: "needs no partial index" states the
+    # settled contract. The negation is matched immediately before the term so the exemption stays
+    # token-scoped, and a bare or required mention is still reported.
+    ('replay index: partial form',
+     re.compile(r'(?<!no )(?<!needs no )(?<!without a )(?<!not a )'
+                r'partial\s+(?:unique\s+)?index|partial\s+on\s+a?\s*non-null', re.IGNORECASE),
+     'the replay claim is a PLAIN unique index over one NOT NULL digest column '
+     '(UQ_reorder_attempt_replay_claim); a row-predicate index exists on one engine of the four'),
+    ('replay index: withdrawn name',
+     re.compile(r'UQ_reorder_attempt_idempotency'),
+     'the index is named UQ_reorder_attempt_replay_claim'),
+    ('audit lineage column: withdrawn name',
+     re.compile(r'contributingSourceLineIds'),
+     'the attempt-line lineage column is named contributors (ruling R4)'),
+    ('replay digest column: withdrawn name',
+     re.compile(r'idempotencyKeyDigest'),
+     'the replay identity column is named replayClaimDigest'),
+    ('permission ledger: withdrawn arithmetic',
+     re.compile(r'four\s+(?:administrative\s+)?definitions?[^.]{0,80}?five\s+(?:published\s+)?'
+                r'(?:`Permission`\s+)?members|five\s+published\s+members', re.IGNORECASE),
+     'the ledger is three definitions yielding four published Permission members'),
+    ('permission ledger: withdrawn stage total',
+     re.compile(r'one hundred and two', re.IGNORECASE),
+     'the Permission stages are 97 bare-core, 99 after B4 and 101 after B5'),
+    ('bootstrap ownership: withdrawn denial',
+     re.compile(r'no story (?:prices|owns|carries) (?:it|that|the (?:plugin )?scaffold)'
+                r'|priced by (?:none|no story)|estimated by none'
+                r'|belonging to no story', re.IGNORECASE),
+     'STORY-001-01-01 owns the project bootstrap and its section 9.2 row prices it (section 7.9)'),
+    ('projected-key index: dense form',
+     re.compile(r'dense\s+`?0\.\.k-1`?|`0\.\.k-1`\s+projected|contiguous\s+0\.\.k-1',
+                re.IGNORECASE),
+     'requestIndex is the LOWEST source index among a projected key\'s contributors and is '
+     'sparse by construction (ruling R4)'),
+    ('collection scope: optional form',
+     re.compile(r'optional\s+`?collectionId`?|`?collectionId`?\s+is\s+optional'
+                r'|declares an?\s+\*{0,2}optional\*{0,2}\s+`collectionId`', re.IGNORECASE),
+     'recurringDemand declares collectionId: ID! and has no whole-channel form'),
+    ('snooze constraint: withdrawn name',
+     re.compile(r'CHK_purchase_cadence_snooze_expiry_scoped'),
+     'the constraint is CHK_purchase_cadence_snooze_expiry_paired and pairs SNOOZED with a '
+     'non-null expiry in both directions'),
+    ('cadence outcome vocabulary: withdrawn member',
+     re.compile(r'`DERIVED`'),
+     'a completing cadence job carries NO outcome code; the job set is exactly '
+     'SKIPPED_NO_CANDIDATES, DERIVATION_FAILED and CANCELLED_BY_OPERATOR'),
+    ('grantee reference: withdrawn encoding',
+     re.compile(r'Twenty-two characters|22 chars|URL-safe alphabet', re.IGNORECASE),
+     'granteeRef is thirty-two hex characters from sixteen CSPRNG bytes in a varchar(32) column'),
+]
+
+# name, pattern for a DECLARING statement, the exactly-one file that may carry it
+SINGLE_AUTHORITY = [
+    ('ReorderPermissionDeniedError declaration',
+     re.compile(r'^type ReorderPermissionDeniedError implements ErrorResult'),
+     'tickets/EPIC-001/FEATURE-001-02-reorder-from-order-history.md'),
+    ('SubstitutionCandidateState declaration',
+     re.compile(r'^type SubstitutionCandidateState\b'),
+     'tickets/EPIC-001/FEATURE-001-04-unavailable-line-resolution.md'),
+]
+
+
+def suite_source_spans(path):
+    """Inclusive one-based line spans of this suite's own fenced source blocks, located exactly as the
+    runner locates them. This step's own source names every withdrawn form as a literal pattern, so
+    without this exemption it would report itself on every rule it enforces."""
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        print(f'V20: FAIL cannot read {path} to locate this suite\'s own source ({exc})')
+        sys.exit(1)
+    heads, inside = [], False
+    for index, line in enumerate(lines):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if STEP_HEADING.match(line):
+            heads.append(index)
+    spans = []
+    for at in heads:
+        cursor = at + 1
+        while cursor < len(lines) and not lines[cursor].startswith('#### '):
+            if lines[cursor].startswith(FENCE):
+                end = cursor + 1
+                while end < len(lines) and not lines[end].startswith(FENCE):
+                    end += 1
+                spans.append((cursor + 1, end + 1))
+                break
+            cursor += 1
+    if not spans:
+        print(f'V20: FAIL no step source block was located in {path}; the exemption would then be '
+              f'empty and this step would report itself on every rule it enforces')
+        sys.exit(1)
+    return spans
+
+
+EXEMPT_SPANS = suite_source_spans(EPIC)
+
+failures = []
+paths = sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True))
+if len(paths) != 34:
+    failures.append(f'expected 34 markdown files under {TICKETS}/, found {len(paths)}')
+
+authority_sites = {name: [] for name, _, _ in SINGLE_AUTHORITY}
+inspected = 0
+for path in paths:
+    if os.path.islink(path):
+        failures.append(f'{path}: is a symlink; refused rather than followed')
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(f'{path}: cannot read ({exc})')
+        continue
+    inspected += 1
+    spans = EXEMPT_SPANS if path == EPIC else []
+    for index, line in enumerate(lines, 1):
+        if any(first <= index <= last for first, last in spans):
+            continue
+        exempt = bool(WITHDRAWAL.search(line))
+        for name, pattern, remedy in WITHDRAWN:
+            match = pattern.search(line)
+            if not match:
+                continue
+            if exempt:
+                continue
+            failures.append(f'{path}:{index}: {name} -- found {match.group(0)!r}; {remedy}')
+        stripped = line.strip()
+        for name, pattern, owner in SINGLE_AUTHORITY:
+            if pattern.search(stripped):
+                authority_sites[name].append((path, index))
+
+if inspected != 34:
+    failures.append(f'inspected {inspected} of 34 files; a partial read cannot establish single '
+                    f'authority')
+
+for name, pattern, owner in SINGLE_AUTHORITY:
+    sites = authority_sites[name]
+    if len(sites) != 1:
+        where = '; '.join(f'{p}:{n}' for p, n in sites) or 'nowhere'
+        failures.append(f'{name}: declared at {len(sites)} sites, expected exactly 1 in {owner} '
+                        f'-- {where}')
+    elif sites[0][0] != owner:
+        failures.append(f'{name}: declared in {sites[0][0]}:{sites[0][1]}, expected {owner}')
+
+print(f'V20: files inspected: {inspected}; withdrawn-form rules: {len(WITHDRAWN)}; '
+      f'single-authority rules: {len(SINGLE_AUTHORITY)}; exempt suite spans: '
+      f'{len(EXEMPT_SPANS)}; failures: {len(failures)}')
+for failure in failures:
+    print('  FAIL ' + failure)
+sys.exit(1 if failures else 0)
+```
+
+#### What A Green Suite Establishes, And What It Does Not — With The Semantic Review That Is Not Optional
+
+**An earlier revision of this subsection claimed that a green suite meant the artifact reconciled. That claim was false, and it was falsified in the plainest possible way:** every one of the nineteen steps that preceded V17 exited zero on a set that carried two rulings numbered `R20`, a GraphQL type declared twice with incompatible fields and a self-referential field no value could satisfy, an error result with two declaring authorities, five feature files whose stated definition-of-done counts disagreed with their own lists, and a required argument published as optional in the story that consumes it. The suite was not wrong about what it checked. The claim made on its behalf was wrong.
+
+**So the boundary is stated instead of implied. A green suite of twenty validators and three evidence commands establishes exactly this:** the set is thirty-four files named to the convention in nine directories; every relative link resolves and there are thirty-three of them; every citation resolves to a path that exists and a locator that is present in it; no forbidden term appears inside an acceptance criterion; no monetary value is written as a decimal; no invented metric appears anywhere outside the one supplied coverage figure; every story carries its mandated sections, markers, criterion count, scenario count, triplet structure, classified dependencies and exactly ten definition-of-done items; the story-identifier set in section 9 equals the filenames on disk in both directions; every story's four estimate values equal its row and the rollup equals the column sums; every persona is the WHO of a story and every objective clause reaches one; every story names one concrete demonstration; the two nominations are distinct and evidenced; every declared dependency resolves; the diagram accounting holds per tier; no identifier is ambiguous; no GraphQL name is declared twice; every stated definition-of-done count matches its list; and no settled contract is stated two ways. **The three evidence commands additionally establish that the protected packages are untouched against a pinned baseline, that the four engine jobs exist, and that the benchmark tooling the epic relies on is present.**
+
+**What no step here can establish, and what therefore remains a reading obligation on a human or an agent before emission:** that a contract stated once is stated *correctly*; that two paragraphs which pass every pattern nonetheless agree in meaning; that an acceptance criterion asserts the behaviour its title claims; that a definition-of-done item is not a second item in different words; that a citation resolving to a real heading supports the sentence it is attached to; that an estimate is plausible rather than merely consistent; and that a story a reader can build is a story worth building. **A semantic review covering those seven questions is a condition of emission alongside the gate, not an alternative to it**, and this paragraph is the record that the gate does not discharge it.
+
+**One consequence is recorded so that the growth of this suite is read correctly.** The count has moved from ten validators to sixteen to twenty, each time because a review found a defect class no step could see, and each addition is written out in its own block with the defect that motivated it. That history is not evidence that the suite is now sufficient. It is evidence that a suite's sufficiency is only ever established by the next review, which is the reason the semantic obligation above is stated as permanent rather than as a stopgap until the next validator lands.
+
 ### 11.11 The Canonical Local Demonstration Preflight, Destructive-Setup Warning And Administrative Sign-In
 
 **Every story in this set carries a demonstration path, and a review found that those paths had been written ten times rather than once.** Two of them had a thorough prerequisite block; eight had none, so a reader following them met an obscure failure instead of a clear one. Of the two that had one, both printed the pinned tool version without checking it, both terminated the reader's interactive shell on a failed check, and both invoked a Compose command that is not present on a current installation. This sub-section is the single canonical form. **A second review then found that the canonical form itself still named two prerequisites it never tested** — the Node line was quoted in a comment and the Compose plugin was quoted as a command — so a machine on an unsupported Node line, or without the plugin, produced a passing preflight and then failed inside the demonstration. Both are now executable checks, and the two stories that restate this block are kept byte-identical to it. **A story references this sub-section rather than restating it**, and where a story needs a step this block does not cover — a repricing, a fixture insert, a second channel — it adds that step and nothing else.
@@ -4190,10 +4802,10 @@ reorder_preflight() {
         fi
     fi
 
-    # The declared Node range is TESTED, not printed. An earlier form printed `node --version` beside
-    # a comment naming the range, which is satisfied by any version at all — a checkout on 18.x
-    # produced a clean preflight and then failed later, inside a build, for a reason the preflight
-    # had the information to state up front.
+    # The declared Node range is TESTED, not printed: printing `node --version` beside a comment
+    # naming the range asserts nothing, because any version at all satisfies it — a checkout on an
+    # unsupported line produces a clean preflight and then fails later, inside a build, for a reason
+    # this check has the information to state up front.
     if ! grep -qF "$expected_node_range" package.json 2>/dev/null; then
         echo "STALE: package.json no longer declares engines.node as '$expected_node_range', so this"
         echo '       preflight is checking a range the repository has moved off.'
@@ -4220,9 +4832,9 @@ reorder_preflight() {
         esac
     fi
 
-    # Compose is INVOKED rather than assumed. An earlier form quoted `docker compose up -d mariadb`
-    # as step 1 and checked nothing, so a reader without the Compose plugin — or with only the
-    # end-of-life hyphenated binary — met a command-not-found in the middle of a demonstration.
+    # Compose is INVOKED rather than assumed: quoting `docker compose up -d mariadb` as step 1 and
+    # checking nothing leaves a reader without the Compose plugin — or with only the end-of-life
+    # hyphenated binary — meeting a command-not-found in the middle of a demonstration.
     if ! command -v docker >/dev/null 2>&1; then
         echo 'MISSING: docker is not on PATH, so the disposable database cannot be started.'
         problems=$((problems + 1))
@@ -4396,7 +5008,7 @@ Five properties of that block are deliberate, and three of them are corrections 
 
 ---
 
-### 11.12 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files
+### 11.13 The Plugin-Local Localisation Contract — Because The Two Existing Configurations Reach Somebody Else's Files
 
 **Four stories in this set ship a React dashboard extension, and each of them carries a localisation obligation that nothing in this repository can currently discharge for a plugin package.** Section 7.9.2 promises this contract; this is it. It exists because a review found that the acceptance those four stories describe — extracted catalogues, a synchronisation check — is not executable against either of the two Lingui configurations that exist, and an obligation nothing can execute is a gap rather than a requirement.
 
@@ -4418,7 +5030,10 @@ Five properties of that block are deliberate, and three of them are corrections 
 
 ## 12. Definition of Done (Epic-Level)
 
-Twenty-one items. Each is verifiable by a named command, a named specification or a named count — none is a matter of opinion. **The count has grown as reviews of this set closed gaps a green suite would have reported nothing about, and the growth is recorded rather than smoothed over.** The first ten cover the epic's construction constraints. The next three cover the cross-cutting obligations no single feature owns — the bounded-collection contract, the requirement-to-test matrices, and the customer-data lifecycle over every plugin-owned table that names a customer. The fourteenth and fifteenth carry the platform-line security gate of architectural decision 6 and the three decisions that gate sign-off rather than design, so neither can be passed over by a green suite. The sixteenth, seventeenth and eighteenth came from a review of this set's **test** contracts, which found that every absolute count in it was specified without the isolation, the instrument or the engine ruling that would make it assertable. The last three came from a later review still, and share one property worth naming: each closes a gap a completely green suite would have reported nothing about — a knowingly unpatched platform baseline, a plugin package the workspace aggregates silently skip, and a demonstration run against an unvalidated database line.
+Twenty-three items. Each is verifiable by a named command, a named specification or a named count — none is a matter of opinion. **The twenty-second and twenty-third were added by a security review of this set, and each closes a gap that every earlier item together left open: one covers how a request reaches these operations at all, and one covers how this suite is permitted to run.** They are stated first below because both are preconditions for trusting anything the other twenty-one report.
+
+- [ ] **The transport and credential contract of section 7.5.1 is evidenced on every published operation rather than inferred from configuration.** Three gates, each a real request. **Transport:** every one of the nineteen operations refuses a `GET` and refuses a `POST` carrying a browser-simple content type, with the refusal made before any row is read, **and** accepts the same operation sent as `POST` with `content-type: application/json` — the acceptance half is required, because a control that also refuses the legitimate call is a broken gate rather than a strict one. **Credential precedence:** one case per feature holds a valid cookie for one principal while sending a bearer token for another and asserts the request executed as the **cookie's** principal, which is the platform's documented order [packages/core/src/api/common/extract-session-token.ts:L14-L19]; and every authorization negative in this set is issued from an isolated client whose principal was asserted through the existing `me` query [packages/core/src/api/schema/admin-api/auth.api.graphql:L2] immediately beforehand. **Channel token:** one case per feature sends the token only in the query string, and one sends conflicting query and header values and asserts the query value won [packages/core/src/service/helpers/request-context/request-context.service.ts:L124-L134]. **A configuration assertion discharges none of the three**, because the defect each closes is reachable through a request the configuration permits. **One operation pair carries a fourth assertion, because it is the only pair in this epic where a query writes:** the two administrative support reads each record one access-audit entry [tickets/EPIC-001/FEATURE-001-08-recurring-demand-visibility.md:§2.5.2 The One Write These Reads Perform, And The Governance That Makes It Addable], so their refused cross-origin case additionally asserts that **zero entries were written** — a refusal that still wrote would have left the side effect reachable from a cross-site request while the response looked safely refused.
+- [ ] **No step of the validator suite was executed by extracting it from a ticket file, and the execution condition of section 11.10 is recorded as met.** The suite ran either from a reviewer-audited copy held outside this contribution whose per-step digests were compared against a maintainer-held manifest **before** anything ran, or inside a credentialless, egress-disabled, read-only sandbox that recomputed those digests and aborted on mismatch. The record names which condition was used, who audited the steps, and against which revision of this file — because a gate whose verdict is trusted has to be a gate whose execution path was, and a branch that supplies the code which checks it supplies no independent evidence at all. **The count has grown as reviews of this set closed gaps a green suite would have reported nothing about, and the growth is recorded rather than smoothed over.** The first ten cover the epic's construction constraints. The next three cover the cross-cutting obligations no single feature owns — the bounded-collection contract, the requirement-to-test matrices, and the customer-data lifecycle over every plugin-owned table that names a customer. The fourteenth and fifteenth carry the platform-line security gate of architectural decision 6 and the three decisions that gate sign-off rather than design, so neither can be passed over by a green suite. The sixteenth, seventeenth and eighteenth came from a review of this set's **test** contracts, which found that every absolute count in it was specified without the isolation, the instrument or the engine ruling that would make it assertable. The last three came from a later review still, and share one property worth naming: each closes a gap a completely green suite would have reported nothing about — a knowingly unpatched platform baseline, a plugin package the workspace aggregates silently skip, and a demonstration run against an unvalidated database line.
 - [ ] **All twenty-five stories are accepted against their own story-level definitions of done**, with none waived, deferred or partially accepted, and **every acceptance criterion in every story exercised by an automated test** — a unit test co-located with the code under test [CONTRIBUTING.md:§Server Unit Tests] and an end-to-end specification written against `@vendure/testing` [CONTRIBUTING.md:§End-to-end Tests] — together with every edge-case scenario each story declares. A criterion or scenario that no test names is an unmet criterion, whatever the surrounding prose says.
 - [ ] **The protected-path boundary gate E1 exits zero** (section 11.10). Concretely: with `BASELINE` set to the commit this branch diverged from, `git diff --quiet "$BASELINE" -- packages/core packages/admin-ui` exits zero and `git status --porcelain=v1 --untracked-files=all -- packages/core packages/admin-ui` prints nothing. **A summary diff is deliberately not the evidence here**: with no baseline it cannot see a change already committed on the branch, its exit status is zero whether or not it printed anything, and it never reports an untracked file — so a whole new file added under a protected package would pass it. The gate is the pair of commands above, and every feature-level and story-level definition of done in this set references this same gate rather than restating its own variant of it.
 - [ ] **No existing Shop API or Admin API operation signature changed**, evidenced by re-running the existing shop-order and stock-control end-to-end specifications unmodified and by confirming that no `customFields` argument appeared on `addItemToOrder` or `adjustOrderLine` [packages/core/src/api/schema/shop-api/shop.api.graphql:L72] and [packages/core/src/api/schema/shop-api/shop.api.graphql:L80]. **Ruling R1 makes that verifiable rather than hopeful: the dev-server custom-fields object is empty before the plugin is registered [packages/dev-server/dev-config.ts:L116] and is byte-identical afterwards**, and a grep of the plugin package for a custom-field declaration on a core entity returns nothing. Any widening discovered late is reported as a collision under section 6, never accepted silently.
@@ -4428,7 +5043,7 @@ Twenty-one items. Each is verifiable by a named command, a named specification o
 - [ ] **Every new operation is channel-scoped and language-scoped**, naming the channel token it resolves against [packages/core/src/entity/channel/channel.entity.ts:L62] and the language code that governs its translated output, with monetary values expressed as integers in the smallest currency unit alongside their currency code.
 - [ ] **Instrumentation is documented as event names with their payload schemas**, published on the existing event bus [packages/core/src/event-bus/event-bus.ts:L116] and consumable with the existing typed subscribe [packages/core/src/event-bus/event-bus.ts:L130], with no webhook dispatcher, polling table or second message bus introduced.
 - [ ] **A benchmark comparison is run with the tooling that already exists, through the one command form that is executable**, and it covers all four scenarios named in section 7.6.3 — the commit path, the preview path, the cadence recompute, and instrumentation overhead together with the aggregate. The runner is the shared benchmark configuration [e2e-common/vitest.config.bench.ts:L7] invoked by a `bench` script the plugin package declares in the shape core already uses [packages/core/package.json:L30], with the timing library that is already a root development dependency [package.json:L62] and the exemplar's own machine-speed normalisation [packages/core/e2e/default-search-plugin.bench.ts:L78-L79]. **Each scenario reports two measurements and their difference, and asserts no threshold**, because this repository declares no reorder target — the exemplar's hard-coded constant [packages/core/e2e/default-search-plugin.bench.ts:L110] is deliberately not copied. **Neither k6 harness is used or cited**, per the exclusion row in section 5, and no ticket repeats the ten-lines-per-order fixture claim that section 7.6.1 corrects. **It is scoped to what the existing harness can actually observe rather than to what a reader might hope for.** **The strategy is singular by decision rather than by omission:** an earlier version of this item had a second, contradictory benchmark checklist item concatenated onto the end of this one, which required the two k6 harnesses that section 5's exclusion row names as excluded and that this item's own sentence forbids. That second item is removed rather than reconciled, because the two cannot both hold: one k6 path is invoked by no script in this workspace and the other requires an external binary this repository neither vendors nor installs [packages/dev-server/README.md:L48], so a definition-of-done item resting on either is not executable. **What the removed item contributed and this one keeps is its honest scoping**: the comparison covers the four scenarios in section 7.6.3 and nothing else, a run that measures only the pre-existing paths is reported as covering only those, and no target figure is invented in either half because this repository declares none.
-- [ ] **The artifact itself reconciles, and the reconciliation is the validator suite's verdict rather than a reader's impression**: thirty-four files on disk matching the naming convention, thirty-three relative links all resolving, the story-identifier set in section 9 exactly equal to the story filenames on disk in both directions, and every story's four estimate values equal to its row in section 9. **Concretely, all fourteen steps of the suite in section 11.10 exit zero when run from the repository root** — eleven validators and three evidence commands, the runner block asserting the step set by identity before it executes any of them. **V11 is named here because it is the step this item used to be missing:** the ten validators that preceded it reported nothing about section order, the story sentence, the number of demonstrations, the number of Given/When/Then triplets per criterion, the classification of a dependency or the number of definition-of-done items, so a set that failed six of those invariants across nineteen story-level defects passed the whole suite.
+- [ ] **The artifact's structural reconciliation is the validator suite's verdict rather than a reader's impression** — structural being the operative word, since section 11.10 states in full which properties the gate settles and which remain a reading obligation: thirty-four files on disk matching the naming convention, thirty-three relative links all resolving, the story-identifier set in section 9 exactly equal to the story filenames on disk in both directions, and every story's four estimate values equal to its row in section 9. **Concretely, all twenty-three steps of the suite in section 11.10 exit zero when run from the repository root** — **twenty validators and three evidence commands**, the audited step source asserting the step set by digest before any of them is executed, per the two execution conditions section 11.10 states. **An earlier revision of this item said fourteen steps and eleven validators**, which was neither the suite that section 11.10 wrote out nor any suite that ever existed, so the item could be reported satisfied against a count nothing could be run against; the figure here is the extracted suite's own and section 11.10 is its single authority. **Two of the twenty are named here because they are the steps this item used to be missing.** V16 reads the story template — section order, the story sentence, the number of demonstrations, the number of Given/When/Then triplets per criterion, the classification of a dependency and the number of definition-of-done items — none of which the ten validators before it reported on, so a set failing six of those invariants across nineteen story-level defects passed the whole suite. And V20 reads the settled contracts across files, without which a contract stated one way in the feature and another way in the story it governs passed every structural step. **A green suite is not a semantic verdict, and this item does not treat it as one:** section 11.10 states in full what the gate establishes and what remains a reading obligation, and the semantic review it names is a condition of emission alongside the gate rather than an alternative to it.
 - [ ] **Every collection-returning operation and every collection-scale workload in this epic is bounded as section 7.7 requires, and the bound is enforced rather than declared. The requirement splits in two, because the two kinds of read are served by different machinery and an earlier version of this item demanded the entity-oriented helper for both.** **Entity-backed reads** — nine of the ten surfaces enumerated in section 7.7.2 — return a `PaginatedList` [packages/core/src/api/schema/common/common-types.graphql:L9] whose options come from the generator [packages/core/src/api/config/generate-list-options.ts:L31-L60] and are **applied** through `ListQueryBuilder` [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L209]; an over-limit page request is rejected with the platform's own input error and a test proves it [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L638]; and `ignoreQueryLimits` is false everywhere [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L125-L131]. **The grouped aggregate — `recurringDemand`, the tenth surface — cannot use that helper and is not required to, and the reason is a type constraint rather than a preference:** `build` is declared over a type extending the platform's base entity class [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L261] and a grouped projection is a row of no table. **What it is required to do instead is stated as five obligations, each testable:** it maps the generated options onto its own explicit SQL as parameterised predicates and never as interpolated column names; it applies an indexed window predicate to bound its **input** rather than only its output; it orders on an allow-list of its own output columns with a final tie-break that is unique within the grouped result, so the order is total; it computes `totalItems` as a separate count over the same predicate rather than as the length of the page; and its query plan is captured once per engine job showing that window predicate resolved through an index range scan rather than a full table scan. **Both kinds are additionally subject to the same three rules:** every nested collection is itself paginated or capped by a decided bound that is tested at the bound; every derivation bounds its input; and every design that performs one query per line asserts the exact query count at a stated input size. A schema that declares pagination arguments without applying them satisfies neither kind.
 - [ ] **Every feature carries a requirement-to-test matrix, and every promised surface appears in it.** Each of the eight feature files enumerates, row by row, every operation, every plugin-owned table, every permission definition, every event, every scheduled task and every configurable strategy it publishes, naming for each one the owning story, the required unit cases, the required end-to-end cases written against `@vendure/testing` [packages/testing/src/index.ts:L1-L14], the authorisation negatives — unauthenticated, wrong owner or missing permission, and foreign channel — and the named existing specification re-run as its regression. **A feature whose matrix has an unowned row fails this item**, which is how the two list-lifecycle mutations that no story owned were found; and a feature DoD may not discharge this by pointing at child stories, because the gap being closed is precisely a surface no child story claimed. Where database behaviour differs by engine — an aggregate, an upsert, a transaction failure, a concurrency race — the matrix names the engines the case runs on, drawn from the four that already have jobs [.github/workflows/build_and_test.yml:jobs], with native SQLite excluded as unverified.
 - [ ] **Every plugin-owned table that keys data to a named customer has a declared lifecycle, the count of such tables is stated rather than left to a reader to derive, and the declaration is tested rather than asserted.** **Six tables, named:** `ReorderList`, `ReorderListLine`, `ReorderListShare`, `PurchaseCadence`, `ReorderAttempt` and `ReorderAttemptLine`. **An earlier version of this item claimed to cover "every" such table and then listed three of the six**, omitting the two saved-list tables and the share table — the three that hold the buyer's own curated data and the record of who may buy on their behalf, which is to say the most obviously personal three of the six. The omission is recorded rather than quietly repaired, because a definition-of-done item that under-lists its own scope is satisfied by a partial implementation and reports success. **One job covers all six, and its shape is ruling R19's rather than this item's to restate**: the `reorder-customer-data-lifecycle` queue, triggered by `CustomerEvent` with `type` `'deleted'` [packages/core/src/event-bus/events/customer-event.ts:L25] through the typed subscribe [packages/core/src/event-bus/event-bus.ts:L130], owned by STORY-001-07-01, **batched and proved across more than one batch against a configured batch size** because a single-batch fixture cannot distinguish a batched pass from one statement over the whole table, and reporting one count per table so that a zero is distinguishable from a table the pass never reached. **It is not a `ScheduledTask`, and an earlier version of this item called it one** [tickets/EPIC-001-reorder-and-replenishment.md:§6.4 The Settled Rulings]; the published task list therefore carries exactly one entry attributable to this plugin, and that entry is the cadence recompute. The lifecycle's **value** is whatever product decision 3 in section 8.1 settles — the keep period, the customer-deletion behaviour and the aggregate's treatment of purged rows — and until it is settled the tables record identifiers, integer quantities, outcome codes and error type names and nothing else. **The lifecycle's *mechanism* is not deferred with the value, and it is not conditional on any other option.** A finite keep period is a **required** configuration and the plugin refuses to start without one [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.13 Privacy And How Long An Audit Row Is Kept — No Policy Is Declared Anywhere]. **The audit-recording switch is explicitly NOT an escape from it**, which is the second correction to the earlier version of this item: that switch suppresses new attempt rows and reaches neither the four non-audit tables nor any row already written, so "disable recording instead" would leave customer-linked data on disk with no lifecycle over it. The pass itself is the single plugin-owned lifecycle **job** of ruling R19 and **not a second scheduled task**, and it is evidenced through both of the triggers that ruling names: a customer deletion event enqueues the erasure scope, and a recording whose own bounded probe finds a row past the configured keep period enqueues the expiry scope. It is **batched, and proved across more than one batch against a configured batch size**, because a single-batch fixture cannot distinguish a batched pass from one statement over the whole table, and its terminal `JobState` with its counts is the completion signal that is asserted [packages/core/src/api/schema/admin-api/job.api.graphql:L27-L34]. **An earlier version of this item required the purge to be a plugin-owned scheduled task of its own, which contradicted the task count of one that section 6.4’s inventory fixes; that requirement is withdrawn and this sentence is the correction.** **There is no periodic sweep, and this item asserts its absence rather than assuming it**: no `ScheduledTask` other than FEATURE-001-05's `recompute-purchase-cadence` is registered by any feature, so a row whose customer is never soft-deleted is retained until the keep period is set and the pass is run against it. **A deleted customer is a required test case rather than an untested state**, because `Customer` is soft-deletable [packages/core/src/entity/customer/customer.entity.ts:L23] and its rows therefore survive a deletion by default; the erasure assertion is that **no** column on a retained row still resolves to that customer, which is stronger than asserting one nulled column and is the form ruling R19 requires, and it is asserted on both sides of the boundary — the window between the deletion and the erasure job’s terminal state is a state in which the row is unchanged and still resolvable, and the state after it one in which the row is still resolvable by the permission-gated support read, still counted in the attempt and line counts, and excluded from the distinct-customer count. **And the worker topology is asserted rather than assumed**, because `jobQueueOptions.activeQueues` filters processing and not publishing [packages/core/src/config/vendure-config.ts:L1054] and is compared against the prefixed queue name [packages/core/src/job-queue/job-queue.service.ts:L206-L211]: a run with the prefixed lifecycle queue omitted from a restricted worker's list leaves the job `PENDING` with no error, and a run with it present settles. No period is invented anywhere; the absence of a declared one is reported, as product decision 3 in section 8.1 does, and a configured test value is never presented as a product default.

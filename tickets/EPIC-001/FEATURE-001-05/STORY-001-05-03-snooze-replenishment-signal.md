@@ -98,25 +98,91 @@ One path, runnable by a reader holding only this file. It writes one row and rea
 
 ```bash
 # Terminal 2, from the repository root. Writes into the disposable database only. The service
-# name, database, user and password are the ones the compose file declares
-# The client is named "mariadb", not "mysql": this image ships no mysql-named client.
-# [docker-compose.yml:L6-L17]; `-T` is present because the statement is piped rather than typed.
-# Every id is resolved from THIS deployment first and the block refuses to run until each is:
-# CID - the customer id resolved by step 2; <CHID> is the default channel's id; <VID1>,
-# <VID2> and <VID3> are the three variant ids read in step 2. Every time value is relative
-# to the instant this runs, so the rows are due whenever the path is followed.
-docker compose exec -T mariadb mariadb -uvendure -ppassword vendure-dev <<SQL
+# name, database, user and password are the ones the compose file declares [docker-compose.yml:L6-L17].
+# The client is named "mariadb", not "mysql": this image ships no mysql-named client. `-T` is
+# present because the statements arrive on standard input rather than from an interactive session.
+# THE FIVE IDENTIFIERS ARE SUPPLIED ONCE, on the call at the bottom, under one naming convention.
+# The function is the guard: it writes nothing until every identifier is a positive integer, it
+# treats a client failure as a failure rather than as an empty result, and it reads the row count
+# back and returns non-zero unless that count is exactly 3. It never calls `exit`, so pasting it
+# into an interactive terminal cannot end the session.
+# NO SHELL VALUE EVER BECOMES SQL. Every statement below is a QUOTED heredoc or a fixed `-e`
+# string, so the shell expands nothing inside it; the five validated integers reach the server
+# as session variables set by `--init-command`, and the statements reference only those
+# variables. That is what the positive-integer guard protects: what `--init-command` carries is
+# provably a number. An earlier revision used an unquoted heredoc and referenced `$CID` and
+# `$CHID` inside the statement, so an undefined value degenerated the predicate to
+# `WHERE customerId =  AND channelId = ` and a value carrying SQL text would have run verbatim.
+# AS WRITTEN THE CALL PASSES THE FIVE PLACEHOLDER NAMES, which the guard refuses. Replace each with
+# the integer resolved in step 2 — the customer id, the default channel's id, then the three
+# variant ids in ascending order. Every time value is relative to the instant this runs, so the
+# rows are due whenever the path is followed.
+reorder_require_id() { # name, value
+    case "$2" in
+        ''|*[!0-9]*) echo "STOP: $1 is '$2', which is not a positive integer. Resolve it in step 2."
+                     return 1 ;;
+        0)           echo "STOP: $1 is 0, which no seeded row carries."
+                     return 1 ;;
+    esac
+    return 0
+}
+
+reorder_arrange_due_signals() {
+    CID="$1"; CHID="$2"; VID1="$3"; VID2="$4"; VID3="$5"
+    problems=0
+    reorder_require_id CID   "$CID"   || problems=$((problems + 1))
+    reorder_require_id CHID  "$CHID"  || problems=$((problems + 1))
+    reorder_require_id VID1  "$VID1"  || problems=$((problems + 1))
+    reorder_require_id VID2  "$VID2"  || problems=$((problems + 1))
+    reorder_require_id VID3  "$VID3"  || problems=$((problems + 1))
+    if [ "$problems" -ne 0 ]; then
+        echo "STOP: $problems identifier(s) unresolved. Nothing was written."
+        return 1
+    fi
+
+    # The heredoc is QUOTED, so the shell expands NOTHING inside it and no shell variable is
+    # spliced into SQL; the five validated integers arrive as session variables. In batch mode the
+    # client stops at the first error and exits non-zero, so the test below is what makes a refused
+    # insert stop the run instead of reaching the count.
+    if ! docker compose exec -T mariadb mariadb -uvendure -ppassword vendure-dev \
+            --init-command="SET @cid=$CID, @chid=$CHID, @vid1=$VID1, @vid2=$VID2, @vid3=$VID3" <<'SQL'
 INSERT INTO purchase_cadence
   (createdAt, updatedAt, computedAt, customerId, channelId, productVariantId,
    intervalDays, observationCount, lastPurchasedAt, dueAt, state, snoozedUntil)
 VALUES
-  (NOW(), NOW(), NOW(), <CID>, <CHID>, <VID1>, 30, 2, DATE_SUB(NOW(), INTERVAL 31 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 'DUE', NULL),
-  (NOW(), NOW(), NOW(), <CID>, <CHID>, <VID2>, 30, 2, DATE_SUB(NOW(), INTERVAL 31 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 'DUE', NULL),
-  (NOW(), NOW(), NOW(), <CID>, <CHID>, <VID3>, 30, 2, DATE_SUB(NOW(), INTERVAL 31 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 'DUE', NULL);
+  (NOW(), NOW(), NOW(), $CID, $CHID, $VID1, 30, 2, DATE_SUB(NOW(), INTERVAL 31 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 'DUE', NULL),
+  (NOW(), NOW(), NOW(), $CID, $CHID, $VID2, 30, 2, DATE_SUB(NOW(), INTERVAL 31 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 'DUE', NULL),
+  (NOW(), NOW(), NOW(), $CID, $CHID, $VID3, 30, 2, DATE_SUB(NOW(), INTERVAL 31 DAY), DATE_SUB(NOW(), INTERVAL 1 DAY), 'DUE', NULL);
 -- Validate rather than assume: this must print exactly 3 before the operation is sent.
 SELECT COUNT(*) AS due_rows_written FROM purchase_cadence
- WHERE customerId = $CID AND channelId = $CHID AND state = 'DUE';
+ WHERE customerId = @cid AND channelId = @chid AND state = 'DUE';
 SQL
+    then
+        echo 'STOP: the insert did not complete. No count is trusted and the operation is not sent.'
+        return 1
+    fi
+
+    # The count is CAPTURED rather than printed, so the comparison below is the gate and the reader
+    # is not the one comparing. --skip-column-names keeps the value bare.
+    if ! written=$(docker compose exec -T mariadb mariadb -uvendure -ppassword vendure-dev \
+            --batch --skip-column-names \
+            --init-command="SET @cid=$CID, @chid=$CHID" \
+            -e "SELECT COUNT(*) FROM purchase_cadence WHERE customerId = @cid AND channelId = @chid AND state = 'DUE';"); then
+        echo 'STOP: the verification read failed, so the row count is unknown.'
+        return 1
+    fi
+    written=$(printf '%s' "$written" | tr -d '[:space:]')
+    if [ "$written" != '3' ]; then
+        echo "STOP: purchase_cadence holds '$written' due row(s) for that customer and channel, not 3."
+        echo '      Do not send the operation: the drop from exactly 3 to exactly 2 is what this path'
+        echo '      observes, and an empty or over-full table satisfies it for the wrong reason.'
+        return 1
+    fi
+    echo 'OK: exactly 3 due rows written. Step 4 may be sent.'
+    return 0
+}
+
+reorder_arrange_due_signals 'CID' 'CHID' 'VID1' 'VID2' 'VID3'
 ```
 
 **That block is the only direct-insert route in this file, and an earlier revision carried two of them.** The second wrote a different column list, absolute literal timestamps in place of relative ones, and literal identifiers of one, one and one through three, under a second client name — so a reader met two blocks writing the same three rows differently and no statement of which to run. The two are reconciled into the one above rather than both being kept, and the reconciliation resolves each difference in a stated direction.
@@ -124,7 +190,8 @@ SQL
 - **Every column section 2.3 of the parent feature declares non-nullable is supplied, including `computedAt`** [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.3 Named Entities Touched]. **Both earlier blocks omitted it**, and an insert that omits a non-nullable column with no default is refused by the engine before any row is written rather than filled in — so the arrangement step failed and the demonstration stopped at a database error the story did not mention. The table and column names are the ones that section fixes rather than names chosen here, so a divergence between this insert and the migration is a defect in one of the two rather than a mismatch a reader has to resolve.
 - **`createdAt` and `updatedAt` are supplied explicitly** because both are inherited from `VendureEntity` [packages/core/src/entity/base/base.entity.ts:L31] and [packages/core/src/entity/base/base.entity.ts:L33] and a raw insert bypasses the ORM that would otherwise fill them.
 - **Every time value is relative and none is a literal date.** `dueAt` is set one day in the past and `lastPurchasedAt` thirty-one days before the instant the statement runs, so all three rows qualify as due whenever the path is followed — which is what makes the expected `totalItems` of exactly 3 before the snooze, and exactly 2 after it, reproducible rather than a timing accident. The absolute timestamps the removed block carried were due only for as long as they stayed in the past.
-- **Every identifier is a substituted placeholder rather than a literal**, because nothing here may assert how a seeded database numbers its rows: `<CID>` comes from step 2's administrative read, `<CHID>` is the default channel, and `<VID1>` to `<VID3>` are the three variant ids step 2 read in ascending order.
+- **Every identifier is a validated substituted value rather than a literal, and it reaches the statement as a session variable rather than as spliced text**, because nothing here may assert how a seeded database numbers its rows: `CID` comes from step 2's administrative read, `CHID` is the default channel, and `VID1` to `VID3` are the three variant ids step 2 read in ascending order. **Two properties of that arrangement are the point of it rather than housekeeping.** The heredoc is quoted, so the shell performs no expansion inside the statement at all and no shell value can become SQL; and the five values are refused before the client is invoked unless each is a bare decimal integer, so what `--init-command` carries is provably a number. **An earlier revision of this block used an unquoted heredoc and referenced `$CID` and `$CHID` inside the statement**, which the shell expanded — undefined at that point, so the predicate degenerated to `WHERE customerId =  AND channelId = `, and a value carrying SQL text would have been executed verbatim. Both halves of that are withdrawn. They are passed **once**, as the five arguments of the call at the foot of the block, so no identifier appears twice and none can drift between the insert and the count.
+- **The block is fail-closed at four points, and each one is a check that exists rather than an instruction to be careful.** Every identifier is tested for being a positive integer and **nothing is written** unless all five pass — which is why the block as printed, carrying the five placeholder names, refuses itself and reports each unresolved name. The insert's exit status is tested, so a refused statement stops the run instead of falling through to the count. The verification read's exit status is tested, so an unreachable client is distinguished from a wrong answer. And the count is **captured and compared to exactly 3**, so the reader is not the one comparing: any other value, including an empty result, stops the path before the operation is sent. Nothing in the block calls `exit`, so pasting it into a live shell cannot end the session — the same rule the epic's preflight follows [tickets/EPIC-001-reorder-and-replenishment.md:§11.11.1 Step 0 — Preflight, Read-Only, Fail-Closed, And Safe To Paste Into A Live Shell].
 - **The state literals are not placeholders and are written exactly as the column stores them** — `DUE`, and not `due` — because the published vocabulary is `DUE`, `SNOOZED` and `DISMISSED` and this feature declares no database-to-GraphQL case mapping [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.3 Named Entities Touched]. **An earlier revision inserted lowercase `due`**, which either seeds a row no read can classify or silently invents a mapping the contract does not have. `snoozedUntil` is null on every row for the same reason it must be: the table's paired check constraint refuses a row that is not `SNOOZED` while carrying an expiry.
 - **`-T` is present because the statements arrive on standard input rather than from an interactive session**, and the client name, user, password and database are the ones the compose service declares [docker-compose.yml:L6], [docker-compose.yml:L10], [docker-compose.yml:L11] and [docker-compose.yml:L12] — development fixtures for a disposable database, never deployment credentials. Current MariaDB images ship no `mysql`-named client, so `docker compose exec -T mariadb mysql …` fails with an executable-not-found error before a statement is parsed; the floating tag the compose file pins [docker-compose.yml:L7] is what makes `mariadb` the name that works.
 
@@ -156,7 +223,7 @@ mutation SnoozeArrangedVariant($productVariantId: ID!) {
 }
 ```
 
-**The observable proof, with an exact count before and after.** Read `activeCustomerReplenishmentDue` immediately before the mutation and immediately after it. Before, `totalItems` equals exactly three and `items` holds the three arranged variants. The mutation then returns `snoozed` equal to true with `signal.state` reading the snoozed member of `ReplenishmentSignalState` and `signal.productVariantId` equal to the argument. After, `totalItems` equals exactly two and the snoozed variant's identifier appears in no returned entry, while the other two entries are returned unaltered field for field. **That drop from three to two, and nothing vaguer, is the demonstration.** `$productVariantId` in the operation above is bound to `<VID1>` — the first of the three `id` values step 2 read in ascending identifier order, and the same value on every run over the same seed — so no identifier anywhere in this demonstration is invented or stood in for.
+**The observable proof, with an exact count before and after.** Read `activeCustomerReplenishmentDue` immediately before the mutation and immediately after it. Before, `totalItems` equals exactly three and `items` holds the three arranged variants. The mutation then returns `snoozed` equal to true with `signal.state` reading the snoozed member of `ReplenishmentSignalState` and `signal.productVariantId` equal to the argument. After, `totalItems` equals exactly two and the snoozed variant's identifier appears in no returned entry, while the other two entries are returned unaltered field for field. **That drop from three to two, and nothing vaguer, is the demonstration.** `$productVariantId` in the operation above is bound to the value assigned to `VID1` in step 3 — the first of the three `id` values step 2 read in ascending identifier order, and the same value on every run over the same seed — so no identifier anywhere in this demonstration is invented or stood in for.
 
 **The field names are transcribed from the parent feature's published SDL block**, which that file designates as fixed for every argument, field, enum member and nullability [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.5 Named API Surfaces]. `snoozedUntil` is requested above because it is part of what the mutation's success means: it carries the stored expiry in the snoozed state and null in every other state, the pairing being a check constraint rather than a convention [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.8 Figure F5-STATE], and the field is declared nullable for that reason rather way.
 
@@ -166,7 +233,7 @@ This story owns the buyer-caused transition, so the whole lifecycle is restated 
 
 **The lifecycle is one lifecycle, and an earlier revision of this section carried two.** That revision marked every transition below with the reading it belonged to — a fixed-interval reading under which the mutation persists an expiry, and a next-purchase reading under which it persists none — and declared the choice "an open ruling and not this story's to take". The cost of that neutrality was this story's own contract: with the choice open, `snoozedUntil` might or might not be written, the exit from the snoozed state might or might not exist, and a criterion asserting what a second call returns had nothing to assert it against. **The parent feature now builds the fixed-interval reading and this story is written against it without qualification** [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.8 Figure F5-STATE]. Confirmation remains a maintainer's, the bounded delta if it is reversed is enumerated in the epic entry, and **no transition or criterion below is conditional** [tickets/EPIC-001-reorder-and-replenishment.md:§8.1 Product Decisions].
 
-- **Entry into `DUE`.** Cause: a recompute observes that the interval derived from that customer's placed orders has elapsed since the last placed purchase of that variant. Observable: the entry is returned by `activeCustomerReplenishmentDue`, carrying a null `snoozedUntil` because `CHK_purchase_cadence_snooze_expiry_scoped` permits an expiry only on a snoozed row [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.3 Named Entities Touched].
+- **Entry into `DUE`.** Cause: a recompute observes that the interval derived from that customer's placed orders has elapsed since the last placed purchase of that variant. Observable: the entry is returned by `activeCustomerReplenishmentDue`, carrying a null `snoozedUntil` because `CHK_purchase_cadence_snooze_expiry_paired` requires a non-snoozed row to carry none [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.3 Named Entities Touched].
 - **`DUE` to `SNOOZED`.** Cause: the buyer calls `snoozeReplenishmentSignal` naming the variant. Observable: the mutation returns `snoozed` equal to true with the entry's state reading snoozed and a non-null `snoozedUntil`, and the entry is no longer returned by `activeCustomerReplenishmentDue`. **This is the only transition a buyer causes, the only write path this feature exposes, and the transition this story is accepted against.**
 - **`SNOOZED` to `SNOOZED`.** Cause: a second call naming the same variant. Observable: the mutation returns `snoozed` equal to true and the `snoozedUntil` read back is **identical** to the one the first call stored. It is listed as a transition rather than left implicit because it is a criterion — AC-5 — and because the statement that achieves it is the same conditional update rather than a branch taken after a read.
 - **`SNOOZED` to `DUE`.** Cause: a later recompute observes that the stored expiry has passed while the derived interval is still elapsed. Observable: the entry is returned by `activeCustomerReplenishmentDue` again, with `snoozedUntil` back to null.
@@ -345,7 +412,7 @@ Estimation Factors:
 
 ## 10. Definition of Done (Story-Level)
 
-Ten items — the count this ticket set fixes for every story. Each is verifiable by a named command, a named specification or a named count, so none is a matter of opinion, and related evidence is gathered into one item rather than spread across two so that the count stays exact. **Nothing was dropped to reach the count:** an earlier revision of this block listed twelve items and stated no total at all, and every obligation it carried survives inside one of the ten below — the line-coverage target and the end-to-end harness inside the test-evidence item, and the two zero-growth assertions over the surfaces this story leaves untouched — the Shop API operation set and the `ErrorCode` enum — kept as the separate items they were, because each is falsifiable on its own and gathering them would have taken the block below the fixed count rather than to it.
+Ten items — the count this ticket set fixes for every story. Each is verifiable by a named command, a named specification or a named count, so none is a matter of opinion, and each states one falsifiable obligation rather than a bundle. **Nothing was dropped and nothing was split to reach a number:** an earlier revision of this block listed twelve items and stated no total, and every obligation it carried survives below — the line-coverage target and the end-to-end harness now sit inside the test-evidence item because neither can be checked without the other, while the two zero-growth assertions over the surfaces this story leaves untouched, the Shop API operation set and the `ErrorCode` enum, remain separate items because each is falsifiable on its own and each fails for a different reason. **An earlier revision of this preamble justified keeping those two apart on the ground that merging them would take the block below the fixed count; that reasoning is withdrawn** — the count follows from the obligations, not the obligations from the count.
 
 - [ ] Every acceptance criterion in section 5 is covered by an automated test that names the same GraphQL operation the criterion names, with none waived or partially accepted, **and every one of the five scenarios in section 7 is covered by a test as well** — a scenario outside the gate is an untested behaviour whatever the prose around it says. Unit tests are co-located with the files which they test and carry the `.spec.ts` suffix [CONTRIBUTING.md:§Server Unit Tests], and they reach minimum 80% line coverage over the new service method, its conditional update and the resolution of the snooze length from the plugin option. An end-to-end specification lives in the package's own `e2e/` directory [CONTRIBUTING.md:§End-to-end Tests] and is written with the `@vendure/testing` package [packages/testing/src/index.ts:L4], and it exercises every acceptance criterion in section 5, every scenario in section 7, and **every transition in section 4.3 that this story's own mutation causes** — the write from a due state into the snoozed state, that same write applied to an entry in the due-again state, and the idempotent repeat that leaves the stored row unchanged. It arranges its due entries through the named fixture route of section 4.2 rather than through the recompute, so **the specification passes with story 05-02 unmerged**, which is what makes the prerequisite set section 8 states true rather than merely convenient. **The end-to-end specification implements the canonical test lifecycle and isolation contract, and every absolute count in this story rests on it.** The epic states the contract once for all twenty-five stories and this story adds only its own table list [tickets/EPIC-001-reorder-and-replenishment.md:§11.6.1 The Canonical Test Lifecycle And Isolation Contract]. One server is created and initialised in `beforeAll` [packages/testing/src/test-server.ts:L30] under the long setup timeout this repository already declares for that hook [e2e-common/test-config.ts:L28], as the shipped stock-control specification does at its own [packages/core/e2e/stock-control.e2e-spec.ts:L132-L133], and **`afterAll` calls `await server.destroy()` unconditionally** [packages/testing/src/test-server.ts:L61] as that specification does [packages/core/e2e/stock-control.e2e-spec.ts:L159-L160] — a specification that destroys the server only on its success path leaks a listening port into the next file. **`beforeEach` seeds this test’s own fixture and nothing else, and `afterEach` deletes every row this test created, addressing `purchase_cadence` by name, and the placed orders it seeded as history** — child table before parent, so a foreign key is never what fails the cleanup [tickets/EPIC-001-reorder-and-replenishment.md:§7.8 The Seven Plugin-Owned Tables]. **The harness’s wholesale table clear is never used between tests** [packages/testing/src/data-population/clear-all-tables.ts:L10], because it synchronises the schema and drops the populated catalogue every later case reads; it belongs to initialising a disposable database and nowhere else. **No test consumes the state a sibling acceptance criterion left behind.** The exact signal state after a snooze, the exact due-row count before and after, and every statement count this story asserts are asserted from a precondition this test built itself, which is evidenced by running the cases in reverse order and by running any one of them alone and getting the same result in both.
 - [ ] **The recompute-driven transitions are asserted, and asserted where they are reachable rather than here.** Entry into a due state, the move to dismissed on a repeat purchase, the dismissed-to-due-again re-emergence, and the return from the snoozed state to a due state under the fixed-interval reading are each caused by a recompute observing placed orders and by nothing this mutation does [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§2.8 Figure F5-STATE], so they are gated by the feature-level definition of done that spans both stories [tickets/EPIC-001/FEATURE-001-05-purchase-cadence-and-replenishment.md:§5. Definition of Done (Feature-Level)]. **Requiring them in this story's own gate would make story 05-02 a prerequisite of it**, which section 8 declines to assert: an earlier version of this file required the recompute-driven return to a due state here while denying that prerequisite two sections earlier, and this item is where that contradiction is resolved rather than smoothed over.
