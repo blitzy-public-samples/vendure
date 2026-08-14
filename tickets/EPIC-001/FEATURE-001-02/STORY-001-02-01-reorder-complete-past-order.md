@@ -279,6 +279,7 @@ mutation {
       unattributedErrorCodes
       sourceCurrencyCode
       targetCurrencyCode
+      requestOutcome
       correlationId
       replayed
     }

@@ -267,7 +267,7 @@ Estimation Factors:
 
 ## 10. Definition of Done (Story-Level)
 
-Ten items — the count this ticket set fixes for every story. Each is verifiable by a named command, a named specification or a named count, so none is a matter of opinion, and related evidence is gathered into one item rather than split across several.
+Ten items — the count this ticket set fixes for every story. Each is verifiable by a named command, a named specification or a named count, so none is a matter of opinion, and related evidence is gathered into one item rather than split across two or three.
 
 - [ ] Every acceptance criterion in section 5 is covered by an automated test that names the same GraphQL operation the criterion names, with none waived or partially accepted, **and every one of the four scenarios in section 7 is covered by a test as well** — a scenario outside the gate is an untested behaviour whatever the prose around it says.
 - [ ] Unit tests are co-located with the files which they test and carry the `.spec.ts` suffix [CONTRIBUTING.md:L428], and they reach minimum 80% line coverage over the new service read method and the new entity's constraint behaviour.

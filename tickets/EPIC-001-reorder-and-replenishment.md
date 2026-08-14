@@ -223,8 +223,6 @@ The `Permission` enum is declared with no members in source and annotated as pop
 The second half is the ownership caveat, stated in the platform's own source: any resolver using `Permission.Owner` **must** include logic enforcing that only the owner of the resource has access, and if it does not, the effect is equivalent to `Permission.Public` [packages/core/src/api/config/generate-permissions.ts:L32-L34].
 
 **The third half is the one that decides the design, and it was read rather than assumed: a custom permission definition can never be granted to a customer.** Three citations establish it and none of them is an inference:
-
-*Resolution.* Pair the gate with an explicit in-service ownership predicate derived from the authenticated session, and make "a request authenticated as a different customer is refused" a mandatory acceptance criterion rather than an edge case. The wishlist service shows the minimal form of the session guard this must build on [packages/dev-server/example-plugins/wishlist-plugin/service/wishlist.service.ts:L74-L76]. **Which gate is paired with it is settled by C7, not here:** buyer-facing operations use `Permission.Owner`, and the custom permission definitions this epic registers are Admin-only. The enum growth reported above is therefore **three definitions producing four members, all of them administrative** — the count section 6.4's published-symbol inventory fixes and the only count any file in this set may state. **An earlier revision of this sentence said four definitions producing five members**, which was the arithmetic before FEATURE-001-08 separated the seller-unscoped entitlement from the aggregate read and satisfied it with the platform's existing `Permission.ReadSeller` rather than with a definition of its own; that count is withdrawn here rather than left to be reconciled by a reader who found two different figures in one section.
 - **The Customer Role ships holding exactly one permission.** It is created with `permissions: [Permission.Authenticated]` [packages/core/src/service/services/role.service.ts:L443] and it is the special role every customer user is given [packages/core/src/service/services/user.service.ts:L106-L107].
 - **That role cannot be amended.** `RoleService.update` throws `error.cannot-modify-role` when the target is the Customer Role [packages/core/src/service/services/role.service.ts:L290-L291], so there is no Admin API call, no seeding step and no configuration that adds a permission to it. It is assigned to each newly created channel [packages/core/src/api/resolvers/admin/channel.resolver.ts:L65-L67], so the constraint holds on every channel rather than only on the default one.
 - **`Permission.Owner` is not assignable either, and that is deliberate.** It is declared `assignable: false` and `internal: true` [packages/core/src/common/constants.ts:L28-L31]. What makes it usable on a customer-facing resolver is the guard's own arithmetic: `authorizedAsOwnerOnly` is set when the session lacks the required permission and `Permission.Owner` was requested [packages/core/src/service/helpers/request-context/request-context.service.ts:L109], and the access-control strategy admits the request on that basis [packages/core/src/config/auth/default-entity-access-control-strategy.ts:L56]. That is exactly why the platform warns it is equivalent to `Permission.Public` without in-resolver logic — the gate lets everyone through by construction.
@@ -233,7 +231,7 @@ The second half is the ownership caveat, stated in the platform's own source: an
 - **Buyer-facing Shop API operations gate on `Permission.Owner` and enforce ownership in the resolver or the service it delegates to.** This is the shipped pattern rather than a proposal: the wishlist example plugin's three customer-facing operations are each declared `@Allow(Permission.Owner)` [packages/dev-server/example-plugins/wishlist-plugin/api/wishlist.resolver.ts:L11-L12] and its service resolves the acting customer from the session's active user id [packages/dev-server/example-plugins/wishlist-plugin/service/wishlist.service.ts:L74-L76]. Every reorder story therefore carries "a request authenticated as a different customer is refused" and "an unauthenticated request is refused" as mandatory acceptance criteria, because the resolver logic is the only thing enforcing either.
 - **Admin API operations gate on a registered `CrudPermissionDefinition` or `RwPermissionDefinition` permission**, which an administrator role genuinely can be granted through `RoleService.create` and `update` for any role other than the two special ones [packages/core/src/service/services/role.service.ts:L290-L291]. That is where the enum growth in this entry actually comes from, and it is the only place a custom permission is load-bearing.
 Ownership enforcement is consequently load-bearing across FEATURE-001-01, FEATURE-001-02, FEATURE-001-03, FEATURE-001-05 and FEATURE-001-06, and permission-definition registration is load-bearing only in FEATURE-001-04's and FEATURE-001-08's administrative surfaces.
-*One consequence for the enum count, so the arithmetic in this epic stays honest.* The epic proposes **three** permission definitions, all three administrative and none buyer-facing: one read-write definition gating FEATURE-001-04's curation surface, which alone yields two members; and two single-member definitions in FEATURE-001-08 — one for the recurring-demand aggregate read, and a second, narrower one for the customer-support lookup, kept apart so that a seller or category role cannot reach a buyer's lists and attempt history. **The seller-unscoped form of the aggregate read is still entitled explicitly rather than derived, and it costs this epic no definition and no enum member, because the entitlement it uses already ships**: it is the platform's own `Permission.ReadSeller`, generated by the core definition for the `Seller` entity [packages/core/src/common/constants.ts:L71] whose read member is the entity name prefixed with `Read` [packages/core/src/common/permission-definition.ts:L181-L182]. **An earlier revision of this paragraph proposed a fourth definition for that scope**, which separated the entitlement from the read — the right separation, reached by declaring a new member where an existing one already carries exactly the meaning "may see across sellers". The separation is preserved and the definition is withdrawn; deriving "no seller to filter by" and "authorised to see every seller" on one branch still fails open and is still refused. No definition is registered for a buyer-facing operation, because a definition registered for one would gate nothing and refuse everyone. **And no fourth definition is registered for the seller-unscoped form of the aggregate**: that scope is authorised by requiring the narrow read permission together with the platform's own `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71] through `ctx.userHasAllPermissions` [packages/core/src/api/common/request-context.ts:L295-L305], which is ruling R3's AND mechanism rather than a new name.
+*One consequence for the enum count, so the arithmetic in this epic stays honest.* The enum growth reported at the head of this entry is **three definitions producing four published members, all of them administrative** — the count section 6.4's published-symbol inventory fixes and the only count any file in this set may state. **An earlier revision stated four definitions producing five members**, which was the arithmetic before FEATURE-001-08 separated the seller-unscoped entitlement from the aggregate read and satisfied it with the platform's existing `Permission.ReadSeller` rather than with a definition of its own; that count is withdrawn here rather than left to be reconciled by a reader who found two different figures in one section. The four members break down as follows. The epic proposes **three** permission definitions, all three administrative and none buyer-facing: one read-write definition gating FEATURE-001-04's curation surface, which alone yields two members; and two single-member definitions in FEATURE-001-08 — one for the recurring-demand aggregate read, and a second, narrower one for the customer-support lookup, kept apart so that a seller or category role cannot reach a buyer's lists and attempt history. **The seller-unscoped form of the aggregate read is still entitled explicitly rather than derived, and it costs this epic no definition and no enum member, because the entitlement it uses already ships**: it is the platform's own `Permission.ReadSeller`, generated by the core definition for the `Seller` entity [packages/core/src/common/constants.ts:L71] whose read member is the entity name prefixed with `Read` [packages/core/src/common/permission-definition.ts:L181-L182]. **An earlier revision of this paragraph proposed a fourth definition for that scope**, which separated the entitlement from the read — the right separation, reached by declaring a new member where an existing one already carries exactly the meaning "may see across sellers". The separation is preserved and the definition is withdrawn; deriving "no seller to filter by" and "authorised to see every seller" on one branch still fails open and is still refused. No definition is registered for a buyer-facing operation, because a definition registered for one would gate nothing and refuse everyone. **And no fourth definition is registered for the seller-unscoped form of the aggregate**: that scope is authorised by requiring the narrow read permission together with the platform's own `Permission.ReadSeller` [packages/core/src/common/constants.ts:L71] through `ctx.userHasAllPermissions` [packages/core/src/api/common/request-context.ts:L295-L305], which is ruling R3's AND mechanism rather than a new name.
 
 **C4 — This repository's own breaking-change classification collides with "additive migrations only". Verdict: an unresolved process collision that this epic surfaces rather than settles.**
 
@@ -377,7 +375,7 @@ The collisions above settle **twenty-two** rulings. They are gathered here so a 
 
 | Group | Symbols | Owning feature |
 |---|---|---|
-| Plugin and options | `ReorderPlugin`, `ReorderPluginOptions` — **whose twenty-one keys are enumerated once, in section 7.10, and nowhere else** | Epic-level; registered in the dev-server plugin array [packages/dev-server/dev-config.ts:L121-L155] |
+| Plugin and options | `ReorderPlugin`, `ReorderPluginOptions` — **whose twenty-six keys are enumerated once, in section 7.10, and nowhere else** | Epic-level; registered in the dev-server plugin array [packages/dev-server/dev-config.ts:L121-L155] |
 | Shop queries (4) | `activeCustomerReorderLists`, `activeCustomerReorderList`, `reorderPreview`, `activeCustomerReplenishmentDue` | FEATURE-001-01, FEATURE-001-03, FEATURE-001-05 |
 | Shop mutations (10) | `createReorderList`, `updateReorderList`, `deleteReorderList`, `addItemToReorderList`, `adjustReorderListLine`, `removeReorderListLine`, `applyReorderToActiveOrder`, `shareReorderList`, `revokeReorderListShare`, `snoozeReplenishmentSignal` | FEATURE-001-01, FEATURE-001-02, FEATURE-001-05, FEATURE-001-06 |
 | Admin queries (4) | `recurringDemand`, `customerReorderLists`, `reorderAttempts`, `substitutionCandidates` | FEATURE-001-04, FEATURE-001-08 |
@@ -778,7 +776,15 @@ Each line is the repository's own, cited rather than composed:
 
 ## 8. Decisions Required Before Build
 
-Nineteen entries in two groups — twelve product and seven architectural — each group ordered by the number of stories blocked, descending. **The twelfth product entry was added by a review that found FEATURE-001-05's derivation bounding its pages and not its input**, which is the one gap in this section that a reader could not have inferred from the entries around it. **Fifteen of the nineteen are open. Four are recorded as closed in place rather than deleted — product entries 2 and 6, and architectural entries 1 and 7**, each because a closed decision and its reasoning are worth more to a reader than a gap, and because every reference to a numbered entry elsewhere in this set — architectural decision 5 in particular, which four files cite as a sign-off gate — continues to resolve when the numbering does not move. **The tie-break inside each group is stated because two entries can block the same number of stories:** where they do, the one whose earliest blocked story sits in the earlier batch comes first. **A closed entry keeps its rank position and blocks nothing**, which is why the ranks are not contiguous in the count of stories blocked. Every entry is labelled either an *objective ambiguity* or a *decision the codebase forces*, and several were surfaced by a feature file rather than by the objective, each of which says so where it appears.
+Twenty entries in two groups — thirteen product and seven architectural. **Sixteen of the twenty are open. Four are recorded as closed in place rather than deleted — product entries 2 and 6, and architectural entries 1 and 7**, each because a closed decision and its reasoning are worth more to a reader than a gap, and because every reference to a numbered entry elsewhere in this set — architectural decision 5 in particular, which four files cite as a sign-off gate — continues to resolve when the numbering does not move.
+
+**Entry numbers are labels, not ranks, and this section says so for the same reason section 6 does.** Entries were appended as successive reviews found them rather than interleaved into rank order, because thirteen files cite a numbered entry of this section and renumbering would silently re-point every one of them. **The twelfth product entry was added by a review that found FEATURE-001-05's derivation bounding its pages and not its input**, and **the thirteenth by a review that found an administrative route carrying a customer-linked identifier with no decision recorded against it** — the two gaps in this section a reader could not have inferred from the entries around them. **An earlier revision of this preamble claimed each group was itself ordered by stories blocked, descending, which its own contents contradicted**: product entry 12 blocks three stories and sits below entries blocking two and one. The claim is withdrawn and replaced by an explicit ranked order, so a maintainer triaging by consequence reads the order rather than the numbering.
+
+- **Ranked order of the product group, by stories blocked descending: 1, 3, 4, 5, 12, 7, 8, 10, 11, 13.** Three entries carry no rank because none of them blocks a story: entries 2 and 6 are the two counted closed above, and **entry 9 is closed as to its mechanism with one number outstanding**, which is why it is counted among the sixteen open rather than among the four closed while still blocking no story's design.
+- **Ranked order of the architectural group: 2, 3, 4, 5, 6.** Entries 1 and 7 are closed and block nothing.
+- **The tie-break is stated because two entries can block the same number of stories:** where they do, the one whose earliest blocked story sits in the earlier batch comes first. That is what places 5 before 12 before 7 before 8 among the four entries that each block three.
+
+Every entry is labelled either an *objective ambiguity* or a *decision the codebase forces*, and several were surfaced by a feature file rather than by the objective, each of which says so where it appears.
 
 **No entry below supplies the value it asks for.** Several of these decisions are the kind a reader expects a number against — a cap, a window, a keep-period, a page size — and this epic states none of them, because this repository declares none and the constraints forbid inventing one. **The one number this epic does state is the list-name length**, and it is stated precisely because it is not a product value: it is forced by an index key-size limit on two of the four engines already under test, so declining to state it would have been declining to state a repository fact [section 7.10 above]. What each entry does instead is name the exact thing to be decided, the acceptance criterion that cannot be written until it is, and the platform mechanism that already exists in the neighbourhood so that a maintainer decides against evidence rather than in a vacuum.
 
@@ -1078,7 +1084,7 @@ The four per-engine end-to-end jobs already exist and require no new infrastruct
 
 **A `tickets/`-only change triggers no substantive work, and the mechanism matters.** It is not simply that no path filter matches. On a push, the workflow's own path filter does exclude such a change, since it lists only the packages tree and three root manifests [.github/workflows/build_and_test.yml:L9-L13]. But on a pull request the trigger carries branch filters and **no** path filter at all [.github/workflows/build_and_test.yml:L14-L18], so the workflow *does* start. What stops it doing anything is a dedicated gate job that diffs the changed paths against the same pattern [.github/workflows/build_and_test.yml:L60] and publishes a false flag when nothing matches [.github/workflows/build_and_test.yml:L63]; every substantive job is then conditioned on that flag [.github/workflows/build_and_test.yml:L73]. The documentation workflow is filtered to the docs tree and so does not fire either [.github/workflows/docs_ci.yml:on], and the reference-generation workflow is filtered to TypeScript sources under the packages tree [.github/workflows/generate_docs.yml:on].
 
-Two consequences follow, and both are load-bearing. **This artifact cannot regress the build.** And **this artifact is validated by nothing in the pipeline** — not its links, not its citations, not its arithmetic — so the local validator set is the only enforcement that exists. That set is not described elsewhere and referred to here; it is written out in full in section 11.10 as twenty validators and three evidence commands — twenty-three steps, every one of them runnable from the repository root under the execution contract of section 11.10, and none of them extracted from this file and executed by anything the artifact itself publishes. A step is never relaxed to accommodate content.
+Two consequences follow, and both are load-bearing. **This artifact cannot regress the build.** And **this artifact is validated by nothing in the pipeline** — not its links, not its citations, not its arithmetic — so the local validator set is the only enforcement that exists. That set is not described elsewhere and referred to here; it is written out in full in section 11.10 as twenty-two validators and three evidence commands — twenty-five steps, every one of them runnable from the repository root under the execution contract of section 11.10, and none of them extracted from this file and executed by anything the artifact itself publishes. A step is never relaxed to accommodate content.
 
 #### 11.4.1 The Dashboard End-To-End Suite Cannot Load This Epic's Plugin, So The Gate Is Named Explicitly
 
@@ -1192,9 +1198,9 @@ Each absence below is reported with the search that established it, because a ge
 
 ### 11.10 The Local Validator Suite — The Only Enforcement This Artifact Has
 
-Section 11.4 establishes that nothing in the pipeline inspects this artifact. This subsection is the enforcement that closes that gap, and it is placed here rather than in a file of its own because this ticket set may add no file outside `tickets/` without breaking the count reconciliation in section 12. **Twenty validators and three evidence commands follow — twenty-three steps.** Run all twenty-three from the repository root before any file in this set is emitted or changed. **The gate is that all twenty-three exit zero; a step is never relaxed to accommodate content.** **The count was ten validators until a review found two defects this suite could not see** — a citation naming a section that does not exist inside a sibling ticket, and a required diagram that did not render — so V6 was made heading-aware for intra-ticket targets and V15 and V16 were added. **It moved from sixteen to twenty when a second review found four defect classes that all nineteen then-existing steps passed clean over**: an ambiguous identifier, a GraphQL name declared twice, a stated definition-of-done count that disagreed with its own list, and one settled contract stated two ways in two files. V17 through V20 are those four, and the sub-section that closes this one states what a green suite does and does not establish rather than leaving the reader to assume. Every correction is recorded in its own block rather than folded in silently, because a suite that grows without saying why invites the assumption that it was always sufficient.
+Section 11.4 establishes that nothing in the pipeline inspects this artifact. This subsection is the enforcement that closes that gap, and it is placed here rather than in a file of its own because this ticket set may add no file outside `tickets/` without breaking the count reconciliation in section 12. **Twenty-two validators and three evidence commands follow — twenty-five steps.** Run all twenty-three from the repository root before any file in this set is emitted or changed. **The gate is that all twenty-three exit zero; a step is never relaxed to accommodate content.** **The count was ten validators until a review found two defects this suite could not see** — a citation naming a section that does not exist inside a sibling ticket, and a required diagram that did not render — so V6 was made heading-aware for intra-ticket targets and V15 and V16 were added. **It moved from sixteen to twenty when a second review found four defect classes that all nineteen then-existing steps passed clean over**: an ambiguous identifier, a GraphQL name declared twice, a stated definition-of-done count that disagreed with its own list, and one settled contract stated two ways in two files. V17 through V20 are those four, and the sub-section that closes this one states what a green suite does and does not establish rather than leaving the reader to assume. Every correction is recorded in its own block rather than folded in silently, because a suite that grows without saying why invites the assumption that it was always sufficient.
 
-**Every one of the eighteen numbered validation rules now has a step that enforces it, and ten of the twenty-three exist because a review found something nothing checked:** four rules with no enforcement at all, one required diagram that did not render, one story-template invariant that nothing parsed, and — in a second review — four whole defect classes that lay outside every rule as written, namely identifier ambiguity, duplicate schema declaration, definition-of-done count drift at the feature tier, and one settled contract stated two ways. An earlier revision of this subsection carried ten validators and asserted eighteen rules, which meant the persona invariant (rule 3), the demonstration requirement (rule 9), the nomination conditions (rule 11) and dependency referential integrity (rule 13) were claimed as gated while nothing checked them. V11 through V14 are those four. A rule asserted without a step is worse than an acknowledged gap, because the acknowledged gap gets worked on.
+**Every one of the eighteen numbered validation rules now has a step that enforces it, and twelve of the twenty-five exist because a review found something nothing checked:** four rules with no enforcement at all, one required diagram that did not render, one story-template invariant that nothing parsed, and — in a second review — four whole defect classes that lay outside every rule as written, namely identifier ambiguity, duplicate schema declaration, definition-of-done count drift at the feature tier, and one settled contract stated two ways; and — in a third review — two further classes that lay outside all twenty of those steps, namely a stated count anywhere other than a definition-of-done block, and prose severed mid-sentence, which are V21 and V22. An earlier revision of this subsection carried ten validators and asserted eighteen rules, which meant the persona invariant (rule 3), the demonstration requirement (rule 9), the nomination conditions (rule 11) and dependency referential integrity (rule 13) were claimed as gated while nothing checked them. V11 through V14 are those four. A rule asserted without a step is worse than an acknowledged gap, because the acknowledged gap gets worked on.
 
 Eight invariants hold across every block below, and each exists because its absence is a way for a check to pass on a defect:
 
@@ -1225,7 +1231,7 @@ Five scoping facts are stated here rather than left to be discovered:
 - **Condition B — a credentialless, network-restricted, read-only sandbox that aborts on source mismatch.** Where no audited copy exists yet, a step may be executed only inside an isolated container that (i) carries **no** credential of any kind — no git remote token, no registry token, no cloud identity, no ambient SSH agent; (ii) has **egress disabled**, so a step cannot reach a network even if it tries; (iii) mounts the repository **read-only**, so a step cannot alter the tree it is inspecting; (iv) runs as an unprivileged user with no access to the host filesystem, the Docker socket or the reviewer's home directory; and (v) recomputes each step's digest against the digest recorded by the person who requested the run and **aborts before executing anything on any mismatch**. The gate's verdict is then trustworthy about the *artifact*, which is all it was ever meant to be about.
 - **Neither condition is discharged by reading the steps and finding them harmless.** A reviewer who has read this file has audited **this** revision; the control has to hold for the next one, which is what the digest is for. And neither condition permits a pipeline to run the suite automatically on a contributed branch: an automated gate that executes contributed text is the same defect with a machine holding the credentials instead of a person.
 
-**What follows, therefore, is twenty-three specified steps — twenty validators and three evidence commands — each with its exact source, its exemptions and its verdict rule.** Read them as the contract the artifact is held to. The one command in this sub-section is the digest computation a maintainer uses when populating or re-auditing the manifest of Condition A — it reads bytes and writes nothing, and it executes no step.
+**What follows, therefore, is twenty-five specified steps — twenty-two validators and three evidence commands — each with its exact source, its exemptions and its verdict rule.** Read them as the contract the artifact is held to. The one command in this sub-section is the digest computation a maintainer uses when populating or re-auditing the manifest of Condition A — it reads bytes and writes nothing, and it executes no step.
 
 ```bash
 # Run from the MAINTAINER's validator location, never from a contributed branch. This block
@@ -2440,6 +2446,8 @@ echo 'V8: PASS'
 **The named terms are in two classes, because one rule cannot serve both.** Class A terms cannot appear except as a claim about a running system, so they are reported wherever they appear. Class B names a concept the requirements *oblige* this set to declare the absence of — a ticket has to be able to state that no such objective is declared anywhere in this repository — so a class B term is reported only when a quantity sits beside it, which is what turns naming a concept into asserting a figure. Two words are deliberately in neither class: in this set they mean how long a row is kept and how much code moved, so banning them would report the audit-row lifecycle rather than a business claim; their business forms are in class A.
 
 **Two exemptions exist, both scoped to the matched span, and both supplied rather than invented.** The first is the line-coverage figure the requirements themselves supply. The second is the pair of estimation lines carrying generation and review hours, which section 9 declares are artifact-accounting effort figures rather than business or performance figures — without that exemption the widened unit set would report every story's own estimate block, which is the one place in this set where an hour figure is legitimate and is not a claim about the running system. Nothing else is exempt, and the correct response to a report is to reword the explanation, never to widen the exemption.
+
+**This step diverges from the shorter form the requirements state, and the divergence is declared here rather than left for a reader to discover.** That shorter command bans the two bare words the class definition above deliberately places in neither class, and it recognises a narrower unit set. Run literally against this set it therefore prints a substantial number of lines, and **every one of them is a row-lifecycle mention** — how long an audit row is kept, which plugin option sets that period, which definition-of-done item gates it — or a count of executions. Not one is an invented metric, and that was verified three ways: by reading each reported line, by the two-class rule above, and by the three independent greps section 11.8 records. So the requirements' rule is honoured in substance and superseded in form. This step is **wider** than that command on units, on rate spellings and on named service-level terms, and **narrower** on exactly those two words, whose meaning in this set is a row lifecycle rather than a business outcome — while the business forms built on them stay in class A and are reported wherever they appear. **The obligation this creates is stated so it is not lost: a reader who runs the requirements' command verbatim must expect output and must confirm each reported line is a row-lifecycle mention, and it is this step, not that one, whose empty output is the gate.** No count of those lines is quoted here, deliberately: a total stated outside its own authority is the drift this epic has already had to correct once, and a total stated in the sentence that describes it would change the number it reports. **The companion divergence in V1 was closed in the other direction rather than declared** — the four narrative sentences that made the requirements' forbidden-term command print anything have been reworded, so that command and this suite's V1 now both report nothing.
 
 ```python
 import glob, re, sys
@@ -4277,7 +4285,11 @@ sys.exit(1 if failures else 0)
 
 **Three facts make the parse sound rather than approximate, and each is a reason a naive version of this step would report a defect where none exists.** A plugin's `shopApiExtensions` and `adminApiExtensions` are **two separate schema documents** [packages/core/src/api/config/get-final-vendure-schema.ts:L87-L118], so one name declared once on each side is lawful; the exemption is a named allow-list of exactly the five enums section 6.4's inventory declares on both, and a sixth name appearing twice is reported. This set quotes core's own SDL to state what must **not** change, so a declaration counts only inside a block tagged `graphql`, which is how this set writes its own proposals, and names quoted from the platform are listed and excluded. And several blocks **reproduce** a declaration a sibling owns so a reader need not hold two files open — a reproduction is not a declaration, and it is marked machine-checkably with the token `NOT A DECLARATION` in a comment before its first declaration rather than left to the surrounding prose. A reproduction is still checked on the one property that matters about it: the name it reproduces must be authoritatively declared somewhere in this set, so no file can introduce a type by reproducing one that does not exist.
 
-**What it does not establish.** That a declared type is *correct*, that its fields are the right fields, or that two files describing one type describe it the same way in prose. It establishes that the set proposes each name exactly once, which is the precondition for any of those questions being answerable at all.
+**The step now reads FIELDS as well as types, and that extension exists because a review found a contradiction the type-level parse could not see by construction.** `AddItemToReorderListInput` was declared exactly **once**, so every duplicate rule above reported success — while that single declaration published an optional `idempotencyKey` field and two other files asserted, as their definition-of-done evidence, that the generated schema declares that input with **no** such field. One declaration, two mutually exclusive contracts, and a check that counts declarations cannot see it. So the step additionally parses each declared type's own field set and reconciles it against every **absence assertion** the set makes about that type: a statement naming a declared type which, inside a bounded window, negates a backticked field of it. Where the named field is in fact present in that declaration, the contradiction is reported with both sites, because the two cannot both be built.
+
+**The absence-assertion form is matched structurally rather than by keyword, which is what keeps it quiet on this corpus.** A withdrawal narration — "an earlier revision declared `idempotencyKey`" — carries no negation adjacent to the field and is not matched. An absence assertion about a field the type genuinely does not have is satisfied and reports nothing, which is the overwhelmingly common case and is precisely what this set writes deliberately and often. Only the contradiction is reported, so the rule costs a reader nothing until it fires.
+
+**What it does not establish.** That a declared type is *correct*, that its fields are the right fields, or that two files describing one type describe it the same way in prose. It establishes that the set proposes each name exactly once, and that no file asserts the absence of a field that declaration publishes — which together are the precondition for any of those questions being answerable at all.
 
 ```python
 # V18 asserts that every GraphQL type, input, enum, union and interface this set proposes to publish is
@@ -4402,6 +4414,115 @@ for name, sites in sorted(reproductions.items()):
         failures.append(f'{name}: reproduced as {MARKER} at {where}, but no block in this set '
                         f'authoritatively declares it')
 
+# ---------------------------------------------------------------------------
+# FIELD LEVEL. A type declared exactly once still carries a contract, and this set can contradict that
+# contract in prose while every rule above reports success -- which is exactly what happened:
+# AddItemToReorderListInput was declared ONCE, publishing an optional idempotencyKey, while two other
+# files asserted as definition-of-done evidence that the generated schema declares it with NO such
+# field. So each declared type's own field set is parsed, and every ABSENCE ASSERTION the set makes
+# about that type is reconciled against it. An absence assertion is a statement naming a declared type
+# which, within a bounded window, negates a backticked field: the negation must sit immediately before
+# the field, which is what keeps a withdrawal narration ("an earlier revision declared `x`") out of the
+# match while catching "declares `T` with **no** `x` field". An assertion about a field the type does
+# not have is satisfied and reports nothing -- the common, deliberate case -- so only the contradiction
+# is reported, and it is reported with BOTH sites because the fix is a choice between two texts.
+FIELD = re.compile(r'^([a-zA-Z][a-zA-Z0-9_]*)(?:\([^)]*\))?\s*:\s*(.+)$')
+# Negation immediately before a backticked field name. Markdown emphasis around the negation is
+# tolerated because this set bolds it; nothing else may sit between the negation and the field.
+ABSENCE = re.compile(r'(?:\bno\b|\bnot\b|\bwithout\b|\bzero\b)\*{0,2}\s*'
+                     r'(?:\*{0,2}\s*)?`([a-zA-Z][a-zA-Z0-9_]*)`', re.IGNORECASE)
+ABSENCE_WINDOW = 240
+# TWO DISCRIMINATORS separate a SCHEMA assertion from a RUNTIME one, and both were added because the
+# first draft of this rule reported a true statement as a defect. FEATURE-001-02 says of a refused
+# request: "no `ReorderResult` is returned, no `lineOutcomes` array exists" -- a statement about what
+# comes back on an error path, not a claim that the type lacks the field. FIRST, a mention of the type
+# that is ITSELF negated is a statement about the payload rather than about the declaration, so the
+# window is skipped. SECOND, the negated field must be labelled as a schema element -- field, argument,
+# column or member -- or sit in a window that says the type declares or publishes something. A runtime
+# sentence says "array exists" and satisfies neither, so it is not matched.
+TYPE_NEGATED = re.compile(r'(?:\bno\b|\bnot\b|\bwithout\b|\bzero\b)\*{0,2}\s*(?:\*{0,2}\s*)?$',
+                          re.IGNORECASE)
+SCHEMA_LABEL = re.compile(r'^\s*\*{0,2}(?:field|argument|column|member)\b', re.IGNORECASE)
+DECLARATIVE = re.compile(r'\b(?:declar|publish|expos)', re.IGNORECASE)
+
+fields_of = {}
+for path in paths:
+    if os.path.islink(path):
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError):
+        continue
+    inside, tagged, current, reproduction = False, False, None, False
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            if inside:
+                inside, tagged, current, reproduction = False, False, None, False
+            else:
+                inside = True
+                tagged = line[len(FENCE):].strip().lower() == 'graphql'
+            continue
+        if not (inside and tagged):
+            continue
+        stripped = line.strip()
+        if stripped.startswith('#') and MARKER in stripped:
+            reproduction = True
+            continue
+        if reproduction:
+            continue
+        opening = DECLARATION.match(stripped)
+        if opening and not EXTEND.match(stripped) and opening.group(1) in ('type', 'input'):
+            current = opening.group(2) if opening.group(2) not in CORE_QUOTED else None
+            continue
+        if stripped.startswith('}'):
+            current = None
+            continue
+        if current and line.startswith('  ') and not stripped.startswith(('#', '"', '-')):
+            field = FIELD.match(stripped)
+            if field:
+                fields_of.setdefault(current, {})[field.group(1)] = (path, index)
+
+if not fields_of:
+    failures.append('no graphql field was parsed at all, so the field-level rules checked nothing')
+
+declared_names = set(declarations) | set(fields_of)
+for path in paths:
+    if os.path.islink(path):
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError):
+        continue
+    # Every fenced block is skipped, which is what already excludes this suite's own source from the
+    # scan: a step's source is fenced. Only prose is read, because only prose makes an assertion.
+    inside = False
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        for tname in declared_names:
+            if tname not in fields_of:
+                continue
+            for hit in re.finditer(r'`' + tname + r'`', line):
+                if TYPE_NEGATED.search(line[max(0, hit.start() - 24):hit.start()]):
+                    continue
+                window = line[hit.end():hit.end() + ABSENCE_WINDOW]
+                for absent in ABSENCE.finditer(window):
+                    fname = absent.group(1)
+                    if fname not in fields_of[tname]:
+                        continue
+                    trailing = window[absent.end():absent.end() + 20]
+                    leading = window[:absent.start()]
+                    if not (SCHEMA_LABEL.match(trailing) or DECLARATIVE.search(leading)):
+                        continue
+                    where = '%s:%d' % fields_of[tname][fname]
+                    failures.append(
+                        f'{path}:{index}: asserts {tname} has no field {fname!r}, but the '
+                        f'declaration at {where} publishes it -- one declaration, two mutually '
+                        f'exclusive contracts')
+
 # A self-referential declaration -- a type carrying a non-list field of its own type -- is the specific
 # shape the withdrawn duplicate had, and it is reported because a required field of a type's own type
 # can never be satisfied.
@@ -4503,7 +4624,12 @@ def dod_section(lines, path):
 
 for path in sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True)):
     name = os.path.basename(path)
-    if not (name.startswith('FEATURE-') or name.startswith('STORY-')):
+    # THE EPIC IS IN SCOPE, and an earlier revision of this step excluded it. That exclusion was a hole
+    # rather than a scope: this file carries a definition-of-done block of its own, section 12, whose
+    # stated count is exactly as capable of drifting as any feature file's -- and being the file every
+    # other file defers to, a wrong count here is the one a reader is least likely to recount.
+    if not (name.startswith('FEATURE-') or name.startswith('STORY-')
+            or name.startswith('EPIC-')):
         continue
     if os.path.islink(path):
         failures.append(f'{path}: is a symlink; refused rather than followed')
@@ -4543,11 +4669,11 @@ for path in sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True
     if name.startswith('STORY-') and actual != 10:
         failures.append(f'{path}: story definition-of-done items: {actual}, expected exactly 10')
 
-if checked != 33:
-    failures.append(f'reconciled {checked} of 33 feature and story files; a partial read cannot '
-                    f'establish the tier counts')
+if checked != 34:
+    failures.append(f'reconciled {checked} of 34 files; a partial read cannot establish the tier '
+                    f'counts, and the epic is one of the 34 rather than an exception to them')
 
-print(f'V19: feature and story files reconciled: {checked}; count failures: {len(failures)}')
+print(f'V19: files reconciled at all three tiers: {checked}; count failures: {len(failures)}')
 for failure in failures:
     print('  FAIL ' + failure)
 sys.exit(1 if failures else 0)
@@ -4561,7 +4687,11 @@ sys.exit(1 if failures else 0)
 
 **Two exemptions, both structural, both narrow.** A line that records a form **as withdrawn** is discussing it rather than requiring it — that is how this set documents a correction — so a withdrawal marker on the same line exempts the match at its matched position. And this step's own source states every withdrawn form it looks for, as a literal pattern, so the line spans of this suite's own fenced source blocks are exempt exactly as V9 exempts them, located by step heading and fence-aware. **Nothing else is exempt, and in particular no other fenced block anywhere in the set is skipped** — which matters, because several of the forms this step catches are column names, index names and constraint names that live inside fenced entity and SQL blocks rather than in prose. A report is answered by correcting the text, never by widening a pattern.
 
-**What it does not establish.** That the settled form is the *right* form, or that a contract nobody stated twice is stated correctly once. It establishes that where this epic has settled a contract, the set no longer says two things.
+**The withdrawn-form rules are now STRUCTURAL as well as enumerated, and that change is the one this step most needed.** The list of literal patterns below is hand-curated, which means it can only ever catch a withdrawal somebody remembered to add a rule for — and a review proved the cost of that: three withdrawn identifiers (`lastAddIdempotencyKey`, `lastAddRequestFingerprint` and a check constraint pairing them) were still being *required* by five passages in the feature that had withdrawn them, and no rule existed for any of the three, so this step reported success on a contradiction that made one story unbuildable. So a second mechanism now runs beside the list and needs no curation. **This set names its own withdrawals in a recognisable form** — a sentence that says an identifier is withdrawn, and names it in backticks — so the step harvests every identifier the set calls withdrawn, and then asserts that none of them appears in a **declarative fence** (a fenced entity, SQL or SDL block, where an identifier is being defined rather than discussed) or in a **requiring statement** in prose (a sentence that declares, publishes or stores it without also recording the withdrawal). A withdrawal the set announces and then contradicts is reported with both sites.
+
+**The harvest is deliberately narrow, because a wide one would be useless here.** This corpus narrates its own revision history constantly, so an identifier merely appearing near the word "withdrawn" proves nothing; the harvest therefore requires the withdrawal verb and the backticked identifier in the same clause, and the assertion side requires either a fence — where discussion is impossible — or a declarative verb with no withdrawal marker on the line. Both sides are token-scoped at their matched positions rather than line-wide. The enumerated list is retained rather than replaced: it carries the *reason* each form was withdrawn and what replaces it, which a structural rule cannot know and which is what makes a failure a work list rather than a verdict.
+
+**What it does not establish.** That the settled form is the *right* form, or that a contract nobody stated twice is stated correctly once. It establishes that where this epic has settled a contract, the set no longer says two things — and, through the structural rule, that a withdrawal the set announces anywhere is honoured everywhere, including for identifiers no rule was ever written for.
 
 ```python
 # V20 asserts that the cross-file contracts section 6.4 settles are single-valued in the text as well as
@@ -4751,9 +4881,597 @@ for name, pattern, owner in SINGLE_AUTHORITY:
     elif sites[0][0] != owner:
         failures.append(f'{name}: declared in {sites[0][0]}:{sites[0][1]}, expected {owner}')
 
+# ---------------------------------------------------------------------------
+# THE STRUCTURAL RULE, which needs no curation and exists because the curated list above could not.
+# Three withdrawn identifiers -- two claim columns and the check constraint pairing them -- were still
+# being REQUIRED by the very feature that had withdrawn them, and no rule existed for any of the three,
+# so this step reported success on a contradiction that made one story unbuildable. This rule harvests
+# every identifier the set itself calls withdrawn, then asserts none of them is DEFINED in a declarative
+# fence or REQUIRED in prose. The harvest needs the withdrawal verb and the backticked identifier in one
+# clause, because a corpus that narrates its own revision history puts "withdrawn" near everything.
+# THE HARVEST IS THE ADJECTIVAL FORM ONLY, and that narrowness was measured rather than assumed. A
+# first draft harvested any identifier appearing near a withdrawal verb and reported 955 failures on a
+# reconciled corpus -- every one of them noise, because this set narrates its own revision history in
+# almost every paragraph, so "withdrawn" sits near live symbols constantly. The adjectival form
+# "withdrawn `X`" is what this set actually uses when the IDENTIFIER rather than a claim about it is
+# what went, and it occurs a handful of times across the whole corpus. A coordinated continuation --
+# "withdrawn `A` and `B`" -- is harvested with it, because a withdrawn pair is named as a pair.
+ADJECTIVAL = re.compile(r'withdrawn\s+`([A-Za-z_][A-Za-z0-9_]*)`'
+                        r'(?:\s*(?:,|and)\s*`([A-Za-z_][A-Za-z0-9_]*)`)*')
+BACKTICKED = re.compile(r'`([A-Za-z_][A-Za-z0-9_]*)`')
+# A fence tagged as one of these DEFINES; a prose fence (bash, python, text) discusses. An identifier
+# defined in a declarative fence anywhere in the set is a LIVE symbol, so a withdrawal phrase naming it
+# is about a withdrawn claim rather than a withdrawn identifier. That single cross-check is what
+# separates signal from noise: it correctly retains the two claim columns and the two withdrawn type
+# names, and correctly drops a live column that a withdrawn COMPARISON happened to mention.
+DECLARATIVE_FENCE = ('graphql', 'sql', 'ts', 'typescript')
+# A requiring statement declares, publishes, stores or sets the identifier. A line carrying a
+# withdrawal marker is recording the correction and is exempt at that position, as above.
+REQUIRING = re.compile(r'\b(?:declares?|declaring|publish(?:es|ed|ing)?|stores?|storing|carries|'
+                       r'carrying|sets?|setting|creates?|creating)\b', re.IGNORECASE)
+
+named_withdrawn = {}
+live_symbols = set()
+for path in paths:
+    if os.path.islink(path):
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError):
+        continue
+    spans = EXEMPT_SPANS if path == EPIC else []
+    inside, defining = False, False
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            if inside:
+                inside, defining = False, False
+            else:
+                inside = True
+                defining = line[len(FENCE):].strip().lower() in DECLARATIVE_FENCE
+            continue
+        if inside:
+            if defining:
+                live_symbols.update(re.findall(r'\b([A-Za-z_][A-Za-z0-9_]{3,})\b', line))
+            continue
+        if any(first <= index <= last for first, last in spans):
+            continue
+        for found in ADJECTIVAL.finditer(line):
+            for name in BACKTICKED.findall(found.group(0)):
+                named_withdrawn.setdefault(name, (path, index))
+
+gone = {n: v for n, v in named_withdrawn.items() if n not in live_symbols}
+if not named_withdrawn:
+    failures.append('no adjectival withdrawal was harvested at all, so the structural rule checked '
+                    'nothing; this set states its withdrawals and the harvest cannot be empty')
+
+for path in paths:
+    if os.path.islink(path):
+        continue
+    try:
+        lines = open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError):
+        continue
+    spans = EXEMPT_SPANS if path == EPIC else []
+    inside, defining = False, False
+    for index, line in enumerate(lines, 1):
+        if line.startswith(FENCE):
+            if inside:
+                inside, defining = False, False
+            else:
+                inside = True
+                defining = line[len(FENCE):].strip().lower() in DECLARATIVE_FENCE
+            continue
+        if any(first <= index <= last for first, last in spans):
+            continue
+        if WITHDRAWAL.search(line):
+            continue
+        for name, (where, at) in gone.items():
+            if name not in line:
+                continue
+            if inside and defining:
+                failures.append(f'{path}:{index}: {name} is DEFINED in a declarative fence, but '
+                                f'{where}:{at} names it withdrawn')
+            elif not inside and REQUIRING.search(line):
+                failures.append(f'{path}:{index}: {name} is REQUIRED in prose, but {where}:{at} '
+                                f'names it withdrawn')
+
 print(f'V20: files inspected: {inspected}; withdrawn-form rules: {len(WITHDRAWN)}; '
+      f'identifiers named withdrawn: {len(named_withdrawn)}; still withdrawn after the '
+      f'live-symbol cross-check: {len(gone)}; '
       f'single-authority rules: {len(SINGLE_AUTHORITY)}; exempt suite spans: '
       f'{len(EXEMPT_SPANS)}; failures: {len(failures)}')
+for failure in failures:
+    print('  FAIL ' + failure)
+sys.exit(1 if failures else 0)
+```
+
+#### V21 — Stated-Count Reconciliation Outside Definition-Of-Done Blocks, And Cross-Section Pointer Counts
+
+**This step exists because five stated counts were wrong at once and nothing could see any of them.** Four feature files each introduced an exhaustive list with a number above a list of a different length — twelve above thirteen, fifteen above eighteen, seven above eight, and twenty-two above twenty-six labelled readings — and this file pointed at its own option ledger as the single authority for *twenty-one* keys while that ledger carried twenty-six rows. A sixth defect of the same family sat in section 8, whose preamble published nineteen entries in two groups of twelve and seven above thirteen and seven. V19 reads definition-of-done blocks and nothing else, so every one of these lay outside the only step that counted anything. **A stated count that disagrees with its own list is not cosmetic here: this set's whole method is to state a number so that a later addition is visible as an addition rather than absorbed, and a wrong number silently disarms that method.**
+
+**The scope is this set's own exhaustive-enumeration idioms, not every number word, and that narrowness was measured rather than assumed.** A draft of this step reconciled every number-word-introduced line followed by a bullet list: one hundred enumerations and thirteen mismatches, of which **twelve were correct prose the check had misread** — "One open decision bears on this story and two have been closed" above three bullets is right, and a step that reports it is noise a reader learns to ignore, which is worse than no step at all. So three idioms are anchored instead, each measured to zero false positives across the corpus: the phrase this set uses when it means an exhaustive list (**a count, a noun, then "are load-bearing"**), the phrase it uses to designate a single authority (**a count "enumerated once, in section N.N"**, reconciled against that section's ledger rows), and the phrase section 8 uses to state its own size (**a count "in two groups"**, reconciled against both subsections' ordered entries and their sum).
+
+**Two subtleties are handled because the corpus contains both.** A **self-numbering** list states its own reading numbers, and then the count is the *highest label* rather than the bullet total — FEATURE-001-08 carries twenty-six labels across thirty bullets, because unlabelled continuation bullets and trailing notes share the run without being readings; where two or more labels are present the step counts by label and additionally asserts the labels are contiguous with no gap and no repeat, which is the property that makes counting by label sound. And **sibling-list boundary detection** ends a run at the first line that is neither a bullet, nor blank, nor an indented continuation, so a following paragraph, heading or nested list never inflates a count. A line that states a count and is followed by no list at all is enumerating in prose and is skipped rather than reported.
+
+**What it does not establish.** That the list contains the *right* items, that two lists which should agree do, or that a number nobody stated is correct. It establishes that every number this set states about one of its own enumerations agrees with that enumeration.
+
+```python
+# V21 reconciles every STATED COUNT that lies outside a definition-of-done block, which is the whole
+# class V19 cannot reach. A review found four feature files each stating a number above a list of a
+# different length -- twelve above thirteen, fifteen above eighteen, seven above eight and twenty-two
+# above twenty-six -- and one epic pointer citing twenty-one keys at a ledger holding twenty-six, while
+# twenty validators reported success. None of those five is visible to any other step: V19 reads only
+# definition-of-done blocks and excluded the epic, and nothing else counted anything a file said about
+# itself.
+#
+# THE SCOPE IS THE SET'S OWN ENUMERATION IDIOMS, NOT EVERY NUMBER WORD, and that narrowness was measured
+# rather than assumed. A draft of this step reconciled every number-word-introduced line followed by a
+# bullet list: one hundred enumerations, thirteen mismatches, and on inspection twelve of the thirteen
+# were correct prose that the check had misread -- "One open decision bears on this story and two have
+# been closed" above three bullets is right, and a scanner that reports it is noise a reader learns to
+# ignore. So this step anchors on the three forms this set uses when it means an EXHAUSTIVE count, each
+# of which reconciles to zero mismatches on a corpus already known to be consistent.
+import glob
+import os
+import re
+import sys
+
+FENCE = chr(96) * 3
+TICKETS = 'tickets'
+EPIC = os.path.join(TICKETS, 'EPIC-001-reorder-and-replenishment.md')
+STEP_HEADING = re.compile(r'^#### (?:[VE][0-9]+ \u2014 |Running The Suite)')
+WORDS = {
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6, 'seven': 7, 'eight': 8,
+    'nine': 9, 'ten': 10, 'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14,
+    'fifteen': 15, 'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19, 'twenty': 20,
+    'twenty-one': 21, 'twenty-two': 22, 'twenty-three': 23, 'twenty-four': 24, 'twenty-five': 25,
+    'twenty-six': 26, 'twenty-seven': 27, 'twenty-eight': 28, 'twenty-nine': 29, 'thirty': 30,
+    'thirty-one': 31, 'thirty-two': 32, 'thirty-three': 33, 'thirty-four': 34, 'thirty-five': 35,
+    'thirty-six': 36, 'thirty-seven': 37, 'thirty-eight': 38, 'thirty-nine': 39, 'forty': 40,
+}
+# Longest first, so "twenty-six" is never read as "twenty".
+NUM = '|'.join(sorted(WORDS, key=len, reverse=True))
+# RULE 1. The exhaustive-bullet idiom: a count, a noun, then "are load-bearing".
+EXHAUSTIVE = re.compile(r'^\*{0,2}(' + NUM + r')\*{0,2}\s+([a-z][a-z-]+)\b[^.]{0,80}?are load-bearing',
+                        re.IGNORECASE)
+# A self-numbering list states its own reading numbers, and then the COUNT IS THE HIGHEST LABEL rather
+# than the bullet total: unlabelled continuation bullets and trailing notes sit in the same run without
+# being readings. FEATURE-001-08 is exactly this shape -- twenty-six labels across thirty bullets.
+LABEL = re.compile(r'^- \*{0,2}([A-Z][a-z]+)\s+(\d+)\b')
+# RULE 2. The cross-section pointer idiom: a count enumerated once in a named section, which is how this
+# set designates a single authority. The pointer must agree with the table that authority carries.
+POINTER = re.compile(r'(' + NUM + r')\s+([a-z][a-z-]+)\s+are enumerated once, in section\s+([0-9.]+)',
+                     re.IGNORECASE)
+TABLE_ROW = re.compile(r'^\|(?!\s*-{2,})')
+# RULE 3. The two-group ordered-entry idiom, which is how section 8 states its own size.
+GROUPS = re.compile(r'^(' + NUM + r')\s+entries in two groups\s+\u2014\s+(' + NUM + r')\s+([a-z]+)'
+                    r'\s+and\s+(' + NUM + r')\s+([a-z]+)', re.IGNORECASE)
+ORDERED = re.compile(r'^\d+\. ')
+
+failures = []
+reconciled = 0
+
+
+def read(path):
+    try:
+        return open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(f'{path}: cannot read ({exc})')
+        return None
+
+
+def suite_source_spans(path):
+    """Inclusive one-based spans of this suite's own fenced source blocks, located by step heading and
+    fence-aware, exactly as V9 and V20 locate them. This step's own source states every idiom it looks
+    for, so without the exemption it would report itself."""
+    lines = read(path)
+    if lines is None:
+        sys.exit(1)
+    heads, inside = [], False
+    for index, line in enumerate(lines):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if STEP_HEADING.match(line):
+            heads.append(index)
+    spans = []
+    for at in heads:
+        cursor = at + 1
+        while cursor < len(lines) and not lines[cursor].startswith('#### '):
+            if lines[cursor].startswith(FENCE):
+                end = cursor + 1
+                while end < len(lines) and not lines[end].startswith(FENCE):
+                    end += 1
+                spans.append((cursor + 1, end + 1))
+                break
+            cursor += 1
+    if not spans:
+        print(f'V21: FAIL no step source block was located in {path}; the exemption would then be '
+              f'empty and this step would report itself on every idiom it enforces')
+        sys.exit(1)
+    return spans
+
+
+def bullet_run(lines, start):
+    """Top-level bullets from the first bullet at or after `start`, with SIBLING-LIST BOUNDARY
+    DETECTION: the run ends at the first line that is neither a bullet, nor blank, nor an indented
+    continuation. Nested bullets are indented and are therefore not counted, and a fenced block inside
+    the run is skipped rather than read."""
+    cursor = start
+    while cursor < len(lines) and lines[cursor].strip() == '':
+        cursor += 1
+    if cursor >= len(lines) or not lines[cursor].startswith('- '):
+        return None
+    total, labels, inside = 0, [], False
+    while cursor < len(lines):
+        line = lines[cursor]
+        if line.startswith(FENCE):
+            inside = not inside
+            cursor += 1
+            continue
+        if inside:
+            cursor += 1
+            continue
+        if line.startswith('- '):
+            total += 1
+            found = LABEL.match(line)
+            if found:
+                labels.append(int(found.group(2)))
+        elif line.strip() == '' or line.startswith((' ', '\t')):
+            pass
+        else:
+            break
+        cursor += 1
+    return total, labels
+
+
+def section_span(lines, number):
+    """The inclusive body span of a numbered section, located by its own heading."""
+    opening = re.compile(r'^#{2,4}\s+' + re.escape(number) + r'(\s|$)')
+    for index, line in enumerate(lines):
+        if opening.match(line):
+            depth = len(line) - len(line.lstrip('#'))
+            for cursor in range(index + 1, len(lines)):
+                candidate = lines[cursor]
+                if candidate.startswith('#') and \
+                        len(candidate) - len(candidate.lstrip('#')) <= depth:
+                    return index, cursor
+            return index, len(lines)
+    return None
+
+
+paths = sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True))
+if len(paths) != 34:
+    failures.append(f'expected 34 markdown files under {TICKETS}/, found {len(paths)}')
+EXEMPT_SPANS = suite_source_spans(EPIC)
+inspected = 0
+
+for path in paths:
+    if os.path.islink(path):
+        failures.append(f'{path}: is a symlink; refused rather than followed')
+        continue
+    lines = read(path)
+    if lines is None:
+        continue
+    inspected += 1
+    spans = EXEMPT_SPANS if path == EPIC else []
+    inside = False
+    for index, line in enumerate(lines):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if any(first <= index + 1 <= last for first, last in spans):
+            continue
+        stripped = line.strip()
+
+        found = EXHAUSTIVE.match(stripped)
+        if found:
+            run = bullet_run(lines, index + 1)
+            # No bullet list means the sentence enumerates in prose rather than in a list, so there is
+            # no enumeration to reconcile and nothing to report. Treating it as a defect was wrong:
+            # "Two consequences follow, and both are load-bearing" above two paragraphs is correct.
+            if run is not None:
+                total, labels = run
+                # A self-numbering list is counted by its highest label; two labels are enough to
+                # establish the idiom and rule out a coincidence.
+                basis, how = (max(labels), 'highest reading label') if len(labels) >= 2 \
+                    else (total, 'top-level bullets')
+                stated = WORDS[found.group(1).lower()]
+                reconciled += 1
+                if stated != basis:
+                    failures.append(f'{path}:{index + 1}: states {stated} {found.group(2)} '
+                                    f'"are load-bearing", {basis} present by {how} '
+                                    f'({total} bullets in the run)')
+                if labels:
+                    expected = list(range(min(labels), max(labels) + 1))
+                    if sorted(labels) != expected:
+                        missing = sorted(set(expected) - set(labels))
+                        repeated = sorted(n for n in set(labels) if labels.count(n) > 1)
+                        failures.append(f'{path}:{index + 1}: the self-numbering labels are not '
+                                        f'contiguous from {min(labels)} to {max(labels)} -- '
+                                        f'missing {missing or "none"}, repeated '
+                                        f'{repeated or "none"}')
+
+        for point in POINTER.finditer(line):
+            stated = WORDS[point.group(1).lower()]
+            target = section_span(lines, point.group(3))
+            if target is None:
+                failures.append(f'{path}:{index + 1}: points at section {point.group(3)} as the '
+                                f'single authority for {point.group(2)}, but no such section '
+                                f'heading exists in this file')
+                continue
+            first, last = target
+            rows, table = 0, False
+            for candidate in lines[first:last]:
+                if candidate.startswith(FENCE):
+                    table = False
+                    continue
+                if re.match(r'^\|\s*-{2,}', candidate):
+                    table = True
+                    continue
+                if table and TABLE_ROW.match(candidate):
+                    rows += 1
+                elif not candidate.startswith('|'):
+                    table = False
+            reconciled += 1
+            if stated != rows:
+                failures.append(f'{path}:{index + 1}: states {stated} {point.group(2)} enumerated '
+                                f'once in section {point.group(3)}, but that section\'s ledger '
+                                f'carries {rows} rows')
+
+        group = GROUPS.match(stripped)
+        if group:
+            heading = None
+            for cursor in range(index, -1, -1):
+                match = re.match(r'^##\s+(\d+)\.', lines[cursor])
+                if match:
+                    heading = match.group(1)
+                    break
+            if heading is None:
+                failures.append(f'{path}:{index + 1}: states a two-group entry count but sits under '
+                                f'no numbered section heading')
+                continue
+            counts = []
+            for suffix in (1, 2):
+                target = section_span(lines, f'{heading}.{suffix}')
+                if target is None:
+                    counts.append(None)
+                    continue
+                first, last = target
+                counts.append(sum(1 for c in lines[first:last] if ORDERED.match(c)))
+            if None in counts:
+                failures.append(f'{path}:{index + 1}: states two groups, but section {heading} does '
+                                f'not carry both subsections {heading}.1 and {heading}.2')
+                continue
+            reconciled += 1
+            stated_total = WORDS[group.group(1).lower()]
+            stated_first = WORDS[group.group(2).lower()]
+            stated_second = WORDS[group.group(4).lower()]
+            if stated_first != counts[0]:
+                failures.append(f'{path}:{index + 1}: states {stated_first} {group.group(3)} '
+                                f'entries, section {heading}.1 carries {counts[0]}')
+            if stated_second != counts[1]:
+                failures.append(f'{path}:{index + 1}: states {stated_second} {group.group(5)} '
+                                f'entries, section {heading}.2 carries {counts[1]}')
+            if stated_total != counts[0] + counts[1]:
+                failures.append(f'{path}:{index + 1}: states {stated_total} entries in total, the '
+                                f'two groups carry {counts[0]} + {counts[1]} = '
+                                f'{counts[0] + counts[1]}')
+
+if inspected != 34:
+    failures.append(f'inspected {inspected} of 34 files; a partial read cannot establish that every '
+                    f'stated count outside a definition-of-done block agrees with its list')
+if reconciled == 0:
+    failures.append('no stated count was reconciled at all, so this step checked nothing')
+
+print(f'V21: files inspected: {inspected} (expected exactly 34); stated counts reconciled: '
+      f'{reconciled}; count failures: {len(failures)}')
+for failure in failures:
+    print('  FAIL ' + failure)
+sys.exit(1 if failures else 0)
+```
+
+#### V22 — Prose Well-Formedness: Orphaned Sentence Tails, Displaced Enumerations And Collision Block Order
+
+**This is the step for the one defect class in this set that matches no placeholder token, which is why the corpus-wide TODO, FIXME, TBD and stub scan was clean while two instances were present.** The first was a half-applied edit that left a feature file with a closing citation bracket, a period, and then — with no separating space — the two-letter tail of a deleted word followed by the remainder of a sentence about fingerprints and replays: the truncated end of a sentence whose beginning had been removed, ungrammatical and dangling. It was the physical seam of the contradiction that made one story unbuildable, so it was not merely untidy: it was the visible evidence of the review's most serious finding, sitting in plain text that every structural step read and none inspected. The second was a collision entry that promised "Three citations establish it and none of them is an inference:" and then placed a resolution paragraph between that colon and its three citation bullets, ran its blocks in the reverse of the order its siblings use, and carried two competing resolutions for one collision. Every link resolved, every citation resolved and every count agreed.
+
+**Each rule is anchored on a structure this set actually uses, so a violation is a defect rather than a style preference — and each was measured against the corpus before being written down.** Rule one reports a closing citation bracket running straight into a lowercase run, which nothing in this set does legitimately. Rule two does **not** require a colon to be followed by a bullet, because this set discharges that promise several lawful ways — a bullet list, an ordered list, a table, a fence, a blockquote, a run of bold-lead labelled steps, or an inline list wrapped onto the next line; it reports the one thing that is never a discharge, an **italic-lead structural block label** standing between the colon and its list, which is unambiguous because a single-asterisk lead marks a block label in this set while a double-asterisk lead marks emphasised prose. Rule three requires at most one resolution per collision, and requires the Consequence to precede the Resolution **only where an entry states both** — C5 carries its consequence inline and C6 states no resolution, and both are lawful variants the rule leaves alone. Measured: 290 colon-introduced enumerations and all ten collision entries accepted, zero reported.
+
+**What it does not establish.** That a sentence says something true, that a block is in the most useful place, or that prose is clear. It establishes that no sentence is a severed fragment, no promised enumeration is displaced by a structural block, and no collision entry contradicts the order and cardinality its siblings establish.
+
+```python
+# V22 reads PROSE WELL-FORMEDNESS, which is the one defect class in this set that matches no placeholder
+# token and therefore survived every scan built to find one. A review found two instances and neither is
+# reachable by any other step. FIRST, a half-applied edit left a feature file carrying a closing
+# citation bracket, a period, and then -- with no separating space -- the two-letter tail of a deleted
+# word followed by the remainder of a sentence about fingerprints and replays: the truncated end of a
+# sentence whose beginning had been removed. The literal bytes are not reproduced in this
+# comment, because this step reports that shape and a step must not report itself. The
+# corpus-wide TODO, FIXME, TBD and stub scan was clean, because prose corruption is not a placeholder.
+# SECOND, a collision entry promised "Three citations establish it and none of them is an inference:" and
+# then put a resolution paragraph between that colon and its three citation bullets, while running its
+# blocks in the reverse of the order its nine siblings use and carrying two competing resolutions for one
+# collision. Every link resolved, every citation resolved, every count agreed -- and the entry was
+# unreadable in the one place a reader needs it to be exact.
+#
+# Each rule is anchored on a structure this set actually uses, so a violation is a defect rather than a
+# stylistic preference, and each was measured against the corpus before being written down: rule 2 sees
+# 156 colon-terminated prose lines and accepts every one of them, and rule 3 sees the ten collision
+# entries and accepts every one.
+import glob
+import os
+import re
+import sys
+
+FENCE = chr(96) * 3
+TICKETS = 'tickets'
+EPIC = os.path.join(TICKETS, 'EPIC-001-reorder-and-replenishment.md')
+STEP_HEADING = re.compile(r'^#### (?:[VE][0-9]+ \u2014 |Running The Suite)')
+# RULE 1. A closing citation bracket followed immediately by a lowercase run and a space is the signature
+# of a deleted sentence's surviving tail. A legitimate sentence puts a space, a comma or a period after
+# the bracket; nothing in this set legitimately continues "]." straight into a lowercase word.
+ORPHAN = re.compile(r'\]\.[a-z]{1,8}\s')
+# RULE 2. A colon-terminated prose line promises an enumeration, and this set discharges that promise
+# several legitimate ways -- a bullet list, an ordered list, a table, a fence, a blockquote, a run of
+# bold-lead labelled paragraphs, or an inline list wrapped onto the next line. So the rule does NOT
+# require a bullet; it reports the one thing that is never a discharge: an ITALIC-LEAD STRUCTURAL BLOCK
+# LABEL sitting between the colon and its list. That is exactly what displaced C3's three citations, and
+# it is unambiguous because a single-asterisk lead marks a block label in this set while a
+# double-asterisk lead marks emphasised prose. Measured against the corpus: 156 colon-terminated prose
+# lines, zero reported.
+BLOCK_LABEL = re.compile(r'^\*(?!\*)[A-Z][A-Za-z-]*[ ,.]')
+ORDERED = re.compile(r'^\d+[.)] ')
+# RULE 3. Collision entries carry at most ONE resolution, and where an entry states both a Consequence
+# and a Resolution the Consequence comes first. The labels are italic-lead paragraphs, which is how this
+# set marks a structural block inside an entry. An entry may legitimately state one and not the other --
+# C5 carries its consequence inline and C6 states no resolution -- so the ordering rule fires only when
+# both blocks are present, which is what keeps it off the two lawful variants.
+ENTRY = re.compile(r'^\*\*C\d+\s+\u2014')
+CONSEQUENCE = re.compile(r'^\*Consequence\b')
+RESOLUTION = re.compile(r'^\*(?:Recommended resolution|Resolution)\b')
+
+failures = []
+
+
+def read(path):
+    try:
+        return open(path, encoding='utf-8').read().split('\n')
+    except (OSError, UnicodeDecodeError) as exc:
+        failures.append(f'{path}: cannot read ({exc})')
+        return None
+
+
+def suite_source_spans(path):
+    """Inclusive one-based spans of this suite's own fenced source blocks, located by step heading and
+    fence-aware, exactly as V9, V20 and V21 locate them. This step's own source quotes the corrupted
+    string it looks for, so without the exemption it would report itself."""
+    lines = read(path)
+    if lines is None:
+        sys.exit(1)
+    heads, inside = [], False
+    for index, line in enumerate(lines):
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        if STEP_HEADING.match(line):
+            heads.append(index)
+    spans = []
+    for at in heads:
+        cursor = at + 1
+        while cursor < len(lines) and not lines[cursor].startswith('#### '):
+            if lines[cursor].startswith(FENCE):
+                end = cursor + 1
+                while end < len(lines) and not lines[end].startswith(FENCE):
+                    end += 1
+                spans.append((cursor + 1, end + 1))
+                break
+            cursor += 1
+    if not spans:
+        print(f'V22: FAIL no step source block was located in {path}; the exemption would then be '
+              f'empty and this step would report itself')
+        sys.exit(1)
+    return spans
+
+
+paths = sorted(glob.glob(os.path.join(TICKETS, '**', '*.md'), recursive=True))
+if len(paths) != 34:
+    failures.append(f'expected 34 markdown files under {TICKETS}/, found {len(paths)}')
+EXEMPT_SPANS = suite_source_spans(EPIC)
+inspected = colons = entries = 0
+
+for path in paths:
+    if os.path.islink(path):
+        failures.append(f'{path}: is a symlink; refused rather than followed')
+        continue
+    lines = read(path)
+    if lines is None:
+        continue
+    inspected += 1
+    spans = EXEMPT_SPANS if path == EPIC else []
+    inside = False
+    entry_at, entry_label, consequences, resolutions = None, None, [], []
+    for index, line in enumerate(lines):
+        number = index + 1
+        if line.startswith(FENCE):
+            inside = not inside
+            continue
+        if inside:
+            continue
+        exempt = any(first <= number <= last for first, last in spans)
+
+        # RULE 1 -- orphaned sentence tail. Reported even inside an exempt span would be wrong, since
+        # this suite's own prose quotes the shape; the span check keeps the exemption token-scoped.
+        if not exempt:
+            for orphan in ORPHAN.finditer(line):
+                failures.append(f'{path}:{number}: a closing citation bracket runs straight into '
+                                f'{orphan.group(0)!r} with no sentence boundary -- the surviving tail '
+                                f'of a deleted sentence')
+
+        # RULE 2 -- a colon-terminated prose line must be followed by the enumeration it promises.
+        stripped = line.rstrip()
+        if (not exempt and stripped.endswith(':') and stripped
+                and not stripped.startswith(('#', '|', '>', ' ', '\t'))
+                and not ORDERED.match(stripped)):
+            cursor = index + 1
+            while cursor < len(lines) and lines[cursor].strip() == '':
+                cursor += 1
+            if cursor < len(lines):
+                colons += 1
+                if BLOCK_LABEL.match(lines[cursor]):
+                    failures.append(f'{path}:{number}: a colon promises an enumeration, but the next '
+                                    f'line opens the structural block '
+                                    f'{lines[cursor].split(chr(42))[1][:40]!r} -- the promised list is '
+                                    f'displaced below a block that does not discharge it')
+
+        # RULE 3 -- collision entries: Consequence before Resolution, exactly one resolution.
+        if ENTRY.match(line):
+            if entry_at is not None:
+                entries += 1
+                if len(resolutions) > 1:
+                    where = ', '.join(str(n) for n in resolutions)
+                    failures.append(f'{path}:{entry_at}: collision {entry_label} carries '
+                                    f'{len(resolutions)} resolution paragraphs at lines {where}; '
+                                    f'one collision has one resolution')
+                if resolutions and consequences and consequences[0] > resolutions[0]:
+                    failures.append(f'{path}:{entry_at}: collision {entry_label} states its '
+                                    f'resolution at line {resolutions[0]} before its Consequence at '
+                                    f'line {consequences[0]}, inverting the order its siblings use')
+            entry_at, entry_label = number, line.split('\u2014')[0].strip('* ')
+            consequences, resolutions = [], []
+            continue
+        if entry_at is not None:
+            if CONSEQUENCE.match(line):
+                consequences.append(number)
+            elif RESOLUTION.match(line):
+                resolutions.append(number)
+    if entry_at is not None:
+        entries += 1
+        if len(resolutions) > 1:
+            where = ', '.join(str(n) for n in resolutions)
+            failures.append(f'{path}:{entry_at}: collision {entry_label} carries {len(resolutions)} '
+                            f'resolution paragraphs at lines {where}; one collision has one '
+                            f'resolution')
+        if resolutions and consequences and consequences[0] > resolutions[0]:
+            failures.append(f'{path}:{entry_at}: collision {entry_label} states its resolution at '
+                            f'line {resolutions[0]} before its Consequence at line {consequences[0]}, '
+                            f'inverting the order its siblings use')
+
+if inspected != 34:
+    failures.append(f'inspected {inspected} of 34 files; a partial read cannot establish that the '
+                    f'prose is well formed')
+if colons == 0 or entries == 0:
+    failures.append(f'rule coverage collapsed: {colons} colon-introduced enumerations and {entries} '
+                    f'collision entries were seen, so at least one rule checked nothing')
+
+print(f'V22: files inspected: {inspected} (expected exactly 34); colon-introduced enumerations '
+      f'checked: {colons}; collision entries checked: {entries}; well-formedness failures: '
+      f'{len(failures)}')
 for failure in failures:
     print('  FAIL ' + failure)
 sys.exit(1 if failures else 0)
@@ -4763,11 +5481,11 @@ sys.exit(1 if failures else 0)
 
 **An earlier revision of this subsection claimed that a green suite meant the artifact reconciled. That claim was false, and it was falsified in the plainest possible way:** every one of the nineteen steps that preceded V17 exited zero on a set that carried two rulings numbered `R20`, a GraphQL type declared twice with incompatible fields and a self-referential field no value could satisfy, an error result with two declaring authorities, five feature files whose stated definition-of-done counts disagreed with their own lists, and a required argument published as optional in the story that consumes it. The suite was not wrong about what it checked. The claim made on its behalf was wrong.
 
-**So the boundary is stated instead of implied. A green suite of twenty validators and three evidence commands establishes exactly this:** the set is thirty-four files named to the convention in nine directories; every relative link resolves and there are thirty-three of them; every citation resolves to a path that exists and a locator that is present in it; no forbidden term appears inside an acceptance criterion; no monetary value is written as a decimal; no invented metric appears anywhere outside the one supplied coverage figure; every story carries its mandated sections, markers, criterion count, scenario count, triplet structure, classified dependencies and exactly ten definition-of-done items; the story-identifier set in section 9 equals the filenames on disk in both directions; every story's four estimate values equal its row and the rollup equals the column sums; every persona is the WHO of a story and every objective clause reaches one; every story names one concrete demonstration; the two nominations are distinct and evidenced; every declared dependency resolves; the diagram accounting holds per tier; no identifier is ambiguous; no GraphQL name is declared twice; every stated definition-of-done count matches its list; and no settled contract is stated two ways. **The three evidence commands additionally establish that the protected packages are untouched against a pinned baseline, that the four engine jobs exist, and that the benchmark tooling the epic relies on is present.**
+**So the boundary is stated instead of implied. A green suite of twenty-two validators and three evidence commands establishes exactly this:** the set is thirty-four files named to the convention in nine directories; every relative link resolves and there are thirty-three of them; every citation resolves to a path that exists and a locator that is present in it; no forbidden term appears inside an acceptance criterion; no monetary value is written as a decimal; no invented metric appears anywhere outside the one supplied coverage figure; every story carries its mandated sections, markers, criterion count, scenario count, triplet structure, classified dependencies and exactly ten definition-of-done items; the story-identifier set in section 9 equals the filenames on disk in both directions; every story's four estimate values equal its row and the rollup equals the column sums; every persona is the WHO of a story and every objective clause reaches one; every story names one concrete demonstration; the two nominations are distinct and evidenced; every declared dependency resolves; the diagram accounting holds per tier; no identifier is ambiguous; no GraphQL name is declared twice and no file asserts the absence of a field a declaration publishes; every stated definition-of-done count matches its list at all three tiers including this file's own; every count this set states about one of its own enumerations agrees with that enumeration, and every pointer designating a single authority agrees with the ledger it points at; no sentence is a severed fragment, no promised enumeration is displaced by a structural block, and no collision entry contradicts its siblings' order or cardinality; and no settled contract is stated two ways — neither one this suite carries a hand-written rule for, nor one the set merely declares withdrawn in passing. **The three evidence commands additionally establish that the protected packages are untouched against a pinned baseline, that the four engine jobs exist, and that the benchmark tooling the epic relies on is present.**
 
 **What no step here can establish, and what therefore remains a reading obligation on a human or an agent before emission:** that a contract stated once is stated *correctly*; that two paragraphs which pass every pattern nonetheless agree in meaning; that an acceptance criterion asserts the behaviour its title claims; that a definition-of-done item is not a second item in different words; that a citation resolving to a real heading supports the sentence it is attached to; that an estimate is plausible rather than merely consistent; and that a story a reader can build is a story worth building. **A semantic review covering those seven questions is a condition of emission alongside the gate, not an alternative to it**, and this paragraph is the record that the gate does not discharge it.
 
-**One consequence is recorded so that the growth of this suite is read correctly.** The count has moved from ten validators to sixteen to twenty, each time because a review found a defect class no step could see, and each addition is written out in its own block with the defect that motivated it. That history is not evidence that the suite is now sufficient. It is evidence that a suite's sufficiency is only ever established by the next review, which is the reason the semantic obligation above is stated as permanent rather than as a stopgap until the next validator lands.
+**One consequence is recorded so that the growth of this suite is read correctly.** The count has moved from ten validators to sixteen to twenty to twenty-two, each time because a review found a defect class no step could see, and each addition is written out in its own block with the defect that motivated it. **The last two arrived together with an extension of three existing steps, after a review found eight substantive defects on a tree the whole suite had passed — the sharpest evidence yet for the paragraph above, because that suite was not a weak one: it was fail-closed, aggregating, exact-count and fixture-proven, and it was still blind to a stated count outside a definition-of-done block, to a field-level contract contradiction inside a singly-declared input, to a withdrawal it had no hand-written rule for, and to prose that had been severed mid-sentence.** That history is not evidence that the suite is now sufficient. It is evidence that a suite's sufficiency is only ever established by the next review, which is the reason the semantic obligation above is stated as permanent rather than as a stopgap until the next validator lands.
 
 ### 11.11 The Canonical Local Demonstration Preflight, Destructive-Setup Warning And Administrative Sign-In
 
@@ -5043,7 +5761,7 @@ Twenty-three items. Each is verifiable by a named command, a named specification
 - [ ] **Every new operation is channel-scoped and language-scoped**, naming the channel token it resolves against [packages/core/src/entity/channel/channel.entity.ts:L62] and the language code that governs its translated output, with monetary values expressed as integers in the smallest currency unit alongside their currency code.
 - [ ] **Instrumentation is documented as event names with their payload schemas**, published on the existing event bus [packages/core/src/event-bus/event-bus.ts:L116] and consumable with the existing typed subscribe [packages/core/src/event-bus/event-bus.ts:L130], with no webhook dispatcher, polling table or second message bus introduced.
 - [ ] **A benchmark comparison is run with the tooling that already exists, through the one command form that is executable**, and it covers all four scenarios named in section 7.6.3 — the commit path, the preview path, the cadence recompute, and instrumentation overhead together with the aggregate. The runner is the shared benchmark configuration [e2e-common/vitest.config.bench.ts:L7] invoked by a `bench` script the plugin package declares in the shape core already uses [packages/core/package.json:L30], with the timing library that is already a root development dependency [package.json:L62] and the exemplar's own machine-speed normalisation [packages/core/e2e/default-search-plugin.bench.ts:L78-L79]. **Each scenario reports two measurements and their difference, and asserts no threshold**, because this repository declares no reorder target — the exemplar's hard-coded constant [packages/core/e2e/default-search-plugin.bench.ts:L110] is deliberately not copied. **Neither k6 harness is used or cited**, per the exclusion row in section 5, and no ticket repeats the ten-lines-per-order fixture claim that section 7.6.1 corrects. **It is scoped to what the existing harness can actually observe rather than to what a reader might hope for.** **The strategy is singular by decision rather than by omission:** an earlier version of this item had a second, contradictory benchmark checklist item concatenated onto the end of this one, which required the two k6 harnesses that section 5's exclusion row names as excluded and that this item's own sentence forbids. That second item is removed rather than reconciled, because the two cannot both hold: one k6 path is invoked by no script in this workspace and the other requires an external binary this repository neither vendors nor installs [packages/dev-server/README.md:L48], so a definition-of-done item resting on either is not executable. **What the removed item contributed and this one keeps is its honest scoping**: the comparison covers the four scenarios in section 7.6.3 and nothing else, a run that measures only the pre-existing paths is reported as covering only those, and no target figure is invented in either half because this repository declares none.
-- [ ] **The artifact's structural reconciliation is the validator suite's verdict rather than a reader's impression** — structural being the operative word, since section 11.10 states in full which properties the gate settles and which remain a reading obligation: thirty-four files on disk matching the naming convention, thirty-three relative links all resolving, the story-identifier set in section 9 exactly equal to the story filenames on disk in both directions, and every story's four estimate values equal to its row in section 9. **Concretely, all twenty-three steps of the suite in section 11.10 exit zero when run from the repository root** — **twenty validators and three evidence commands**, the audited step source asserting the step set by digest before any of them is executed, per the two execution conditions section 11.10 states. **An earlier revision of this item said fourteen steps and eleven validators**, which was neither the suite that section 11.10 wrote out nor any suite that ever existed, so the item could be reported satisfied against a count nothing could be run against; the figure here is the extracted suite's own and section 11.10 is its single authority. **Two of the twenty are named here because they are the steps this item used to be missing.** V16 reads the story template — section order, the story sentence, the number of demonstrations, the number of Given/When/Then triplets per criterion, the classification of a dependency and the number of definition-of-done items — none of which the ten validators before it reported on, so a set failing six of those invariants across nineteen story-level defects passed the whole suite. And V20 reads the settled contracts across files, without which a contract stated one way in the feature and another way in the story it governs passed every structural step. **A green suite is not a semantic verdict, and this item does not treat it as one:** section 11.10 states in full what the gate establishes and what remains a reading obligation, and the semantic review it names is a condition of emission alongside the gate rather than an alternative to it.
+- [ ] **The artifact's structural reconciliation is the validator suite's verdict rather than a reader's impression** — structural being the operative word, since section 11.10 states in full which properties the gate settles and which remain a reading obligation: thirty-four files on disk matching the naming convention, thirty-three relative links all resolving, the story-identifier set in section 9 exactly equal to the story filenames on disk in both directions, and every story's four estimate values equal to its row in section 9. **Concretely, all twenty-five steps of the suite in section 11.10 exit zero when run from the repository root** — **twenty-two validators and three evidence commands**, the audited step source asserting the step set by digest before any of them is executed, per the two execution conditions section 11.10 states. **An earlier revision of this item said fourteen steps and eleven validators**, which was neither the suite that section 11.10 wrote out nor any suite that ever existed, so the item could be reported satisfied against a count nothing could be run against; the figure here is the extracted suite's own and section 11.10 is its single authority. **Two of the twenty-two are named here because they are the steps this item used to be missing.** V16 reads the story template — section order, the story sentence, the number of demonstrations, the number of Given/When/Then triplets per criterion, the classification of a dependency and the number of definition-of-done items — none of which the ten validators before it reported on, so a set failing six of those invariants across nineteen story-level defects passed the whole suite. And V20 reads the settled contracts across files, without which a contract stated one way in the feature and another way in the story it governs passed every structural step. **A green suite is not a semantic verdict, and this item does not treat it as one:** section 11.10 states in full what the gate establishes and what remains a reading obligation, and the semantic review it names is a condition of emission alongside the gate rather than an alternative to it.
 - [ ] **Every collection-returning operation and every collection-scale workload in this epic is bounded as section 7.7 requires, and the bound is enforced rather than declared. The requirement splits in two, because the two kinds of read are served by different machinery and an earlier version of this item demanded the entity-oriented helper for both.** **Entity-backed reads** — nine of the ten surfaces enumerated in section 7.7.2 — return a `PaginatedList` [packages/core/src/api/schema/common/common-types.graphql:L9] whose options come from the generator [packages/core/src/api/config/generate-list-options.ts:L31-L60] and are **applied** through `ListQueryBuilder` [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L209]; an over-limit page request is rejected with the platform's own input error and a test proves it [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L638]; and `ignoreQueryLimits` is false everywhere [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L125-L131]. **The grouped aggregate — `recurringDemand`, the tenth surface — cannot use that helper and is not required to, and the reason is a type constraint rather than a preference:** `build` is declared over a type extending the platform's base entity class [packages/core/src/service/helpers/list-query-builder/list-query-builder.ts:L261] and a grouped projection is a row of no table. **What it is required to do instead is stated as five obligations, each testable:** it maps the generated options onto its own explicit SQL as parameterised predicates and never as interpolated column names; it applies an indexed window predicate to bound its **input** rather than only its output; it orders on an allow-list of its own output columns with a final tie-break that is unique within the grouped result, so the order is total; it computes `totalItems` as a separate count over the same predicate rather than as the length of the page; and its query plan is captured once per engine job showing that window predicate resolved through an index range scan rather than a full table scan. **Both kinds are additionally subject to the same three rules:** every nested collection is itself paginated or capped by a decided bound that is tested at the bound; every derivation bounds its input; and every design that performs one query per line asserts the exact query count at a stated input size. A schema that declares pagination arguments without applying them satisfies neither kind.
 - [ ] **Every feature carries a requirement-to-test matrix, and every promised surface appears in it.** Each of the eight feature files enumerates, row by row, every operation, every plugin-owned table, every permission definition, every event, every scheduled task and every configurable strategy it publishes, naming for each one the owning story, the required unit cases, the required end-to-end cases written against `@vendure/testing` [packages/testing/src/index.ts:L1-L14], the authorisation negatives — unauthenticated, wrong owner or missing permission, and foreign channel — and the named existing specification re-run as its regression. **A feature whose matrix has an unowned row fails this item**, which is how the two list-lifecycle mutations that no story owned were found; and a feature DoD may not discharge this by pointing at child stories, because the gap being closed is precisely a surface no child story claimed. Where database behaviour differs by engine — an aggregate, an upsert, a transaction failure, a concurrency race — the matrix names the engines the case runs on, drawn from the four that already have jobs [.github/workflows/build_and_test.yml:jobs], with native SQLite excluded as unverified.
 - [ ] **Every plugin-owned table that keys data to a named customer has a declared lifecycle, the count of such tables is stated rather than left to a reader to derive, and the declaration is tested rather than asserted.** **Six tables, named:** `ReorderList`, `ReorderListLine`, `ReorderListShare`, `PurchaseCadence`, `ReorderAttempt` and `ReorderAttemptLine`. **An earlier version of this item claimed to cover "every" such table and then listed three of the six**, omitting the two saved-list tables and the share table — the three that hold the buyer's own curated data and the record of who may buy on their behalf, which is to say the most obviously personal three of the six. The omission is recorded rather than quietly repaired, because a definition-of-done item that under-lists its own scope is satisfied by a partial implementation and reports success. **One job covers all six, and its shape is ruling R19's rather than this item's to restate**: the `reorder-customer-data-lifecycle` queue, triggered by `CustomerEvent` with `type` `'deleted'` [packages/core/src/event-bus/events/customer-event.ts:L25] through the typed subscribe [packages/core/src/event-bus/event-bus.ts:L130], owned by STORY-001-07-01, **batched and proved across more than one batch against a configured batch size** because a single-batch fixture cannot distinguish a batched pass from one statement over the whole table, and reporting one count per table so that a zero is distinguishable from a table the pass never reached. **It is not a `ScheduledTask`, and an earlier version of this item called it one** [tickets/EPIC-001-reorder-and-replenishment.md:§6.4 The Settled Rulings]; the published task list therefore carries exactly one entry attributable to this plugin, and that entry is the cadence recompute. The lifecycle's **value** is whatever product decision 3 in section 8.1 settles — the keep period, the customer-deletion behaviour and the aggregate's treatment of purged rows — and until it is settled the tables record identifiers, integer quantities, outcome codes and error type names and nothing else. **The lifecycle's *mechanism* is not deferred with the value, and it is not conditional on any other option.** A finite keep period is a **required** configuration and the plugin refuses to start without one [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.13 Privacy And How Long An Audit Row Is Kept — No Policy Is Declared Anywhere]. **The audit-recording switch is explicitly NOT an escape from it**, which is the second correction to the earlier version of this item: that switch suppresses new attempt rows and reaches neither the four non-audit tables nor any row already written, so "disable recording instead" would leave customer-linked data on disk with no lifecycle over it. The pass itself is the single plugin-owned lifecycle **job** of ruling R19 and **not a second scheduled task**, and it is evidenced through both of the triggers that ruling names: a customer deletion event enqueues the erasure scope, and a recording whose own bounded probe finds a row past the configured keep period enqueues the expiry scope. It is **batched, and proved across more than one batch against a configured batch size**, because a single-batch fixture cannot distinguish a batched pass from one statement over the whole table, and its terminal `JobState` with its counts is the completion signal that is asserted [packages/core/src/api/schema/admin-api/job.api.graphql:L27-L34]. **An earlier version of this item required the purge to be a plugin-owned scheduled task of its own, which contradicted the task count of one that section 6.4’s inventory fixes; that requirement is withdrawn and this sentence is the correction.** **There is no periodic sweep, and this item asserts its absence rather than assuming it**: no `ScheduledTask` other than FEATURE-001-05's `recompute-purchase-cadence` is registered by any feature, so a row whose customer is never soft-deleted is retained until the keep period is set and the pass is run against it. **A deleted customer is a required test case rather than an untested state**, because `Customer` is soft-deletable [packages/core/src/entity/customer/customer.entity.ts:L23] and its rows therefore survive a deletion by default; the erasure assertion is that **no** column on a retained row still resolves to that customer, which is stronger than asserting one nulled column and is the form ruling R19 requires, and it is asserted on both sides of the boundary — the window between the deletion and the erasure job’s terminal state is a state in which the row is unchanged and still resolvable, and the state after it one in which the row is still resolvable by the permission-gated support read, still counted in the attempt and line counts, and excluded from the distinct-customer count. **And the worker topology is asserted rather than assumed**, because `jobQueueOptions.activeQueues` filters processing and not publishing [packages/core/src/config/vendure-config.ts:L1054] and is compared against the prefixed queue name [packages/core/src/job-queue/job-queue.service.ts:L206-L211]: a run with the prefixed lifecycle queue omitted from a restricted worker's list leaves the job `PENDING` with no error, and a run with it present settles. No period is invented anywhere; the absence of a declared one is reported, as product decision 3 in section 8.1 does, and a configured test value is never presented as a product default.
