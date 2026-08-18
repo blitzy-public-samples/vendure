@@ -22,7 +22,7 @@
  * plugin class registers it, and no consumer constructs it.
  */
 import { ResolveField, Resolver } from '@nestjs/graphql';
-import { InternalServerError, isGraphQlErrorResult } from '@vendure/core';
+import { isGraphQlErrorResult } from '@vendure/core';
 
 import {
     AddItemToReorderListResult,
@@ -34,6 +34,7 @@ import {
     ReorderListLineNotFoundError,
     ReorderListNameConflictError,
     ReorderListNotFoundError,
+    reportReorderListInternalFailure,
     UpdateReorderListResult,
 } from '../service/reorder-list.service';
 
@@ -174,16 +175,31 @@ export class ReorderListResultResolver {
      *
      * No `@Allow` and no parameter decorator appears on any of them, and neither is an oversight. A
      * union's `__resolveType` runs on a payload produced by an operation that has already passed its
-     * own gate, so there is nothing left to authorise. The platform's guard still runs on these
-     * methods — enhancers are disabled only for a handler literally named `__resolveType`
-     * [packages/core/src/api/config/configure-graphql-module.ts:L105] — and it returns immediately,
-     * because a field resolver that declares no permissions is admitted before the request is even
-     * inspected [packages/core/src/api/middleware/auth-guard.ts]. Adding `@Allow` would take that
-     * guard down its session-handling path instead, where a type resolution has no request to offer
-     * it: the executor calls a type resolver as `(value, context, info, abstractType)`, one argument
-     * ahead of the field-resolver shape the platform reads a request from. Leaving the parameters
-     * bare is what keeps the payload in the first position, since Nest passes the executor's own
-     * arguments straight through when a handler decorates none of them.
+     * own gate, so there is nothing left to authorise. The platform's guard does run on these
+     * methods: `configure-graphql-module.ts:L105` sets `fieldResolverEnhancers: ['guards']`, which
+     * ENABLES guards on field resolvers rather than disabling them, and the framework's own exemption
+     * — `{ guards: false, filters: false, interceptors: false }` — is applied only to a handler whose
+     * method name is literally `__resolveType`
+     * [@nestjs/graphql/dist/services/resolvers-explorer.service.js], which none of these six is, for
+     * the reason above.
+     *
+     * What makes the guard harmless is therefore the branch it takes, not an exemption.
+     * `AuthGuard.canActivate` parses the execution context first, asks whether the target is a field
+     * resolver, reads the permissions metadata off the handler, and returns `true` immediately for a
+     * field resolver that declares none — before it extracts a session or resolves a request context
+     * [packages/core/src/api/middleware/auth-guard.ts]. So a permissionless field resolver is admitted
+     * by that early return, having had only its context parsed. Core's own entity field resolvers rely
+     * on the same branch; the handful that do declare `@Allow` — `tax-rate-entity.resolver.ts` among
+     * them — deliberately take the session path instead, which is exactly the difference these six
+     * must not have.
+     *
+     * Adding `@Allow` would put permissions metadata on the handler, which is exactly what steers the
+     * guard past that early return and into its session-handling path — where a type resolution has
+     * no request to offer it: the executor calls a type resolver as
+     * `(value, context, info, abstractType)`, one argument ahead of the field-resolver shape the
+     * platform reads a request from. Leaving the parameters bare is what keeps the payload in the
+     * first position, since Nest passes the executor's own arguments straight through when a handler
+     * decorates none of them.
      * ─────────────────────────────────────────────────────────────────────────────────────────────
      */
 
@@ -286,13 +302,24 @@ export class ReorderListResultResolver {
      * [packages/core/src/api/config/generate-resolvers.ts]. The executor calls a type resolver only
      * for a non-null value, so this is unreachable through the published operations; it is here
      * because the alternative to raising is answering `ReorderList` for something that is not one,
-     * and that surfaces far from its cause. The diagnostic names the union and the shape received and
-     * nothing else: the payload can hold buyer-supplied text, which has no place in a server error.
+     * and that surfaces far from its cause.
+     *
+     * **The diagnostic goes to the log and the caller gets the plugin's one generic internal error.**
+     * That split is what `reportReorderListInternalFailure` exists for, and it closes two things a
+     * locally-constructed error would leave open. The API-visible message carries no part of the
+     * value: the union name says which operation misbehaved, which is server detail, and the payload
+     * itself can hold buyer-supplied text. And the returned error's frame list is replaced, because
+     * this file's own log line is not the last one written about it — the platform's exception filter
+     * logs `exception.stack` for every error a resolver raises, so an error sanitised here and thrown
+     * with its frames intact would still deposit absolute build paths and internal call structure in
+     * the application log. The log line carries a fixed sentence naming the union, the shape received
+     * as one of a closed set of type words, and a fresh correlation id.
      *
      * @param value - The value the operation resolved to.
      * @param successTypeName - The name of the union's single success member.
-     * @param unionTypeName - The union being discriminated, named for the diagnostic.
-     * @throws An `InternalServerError` when the value is not an object.
+     * @param unionTypeName - The union being discriminated, named in the logged diagnostic only.
+     * @throws The plugin's generic, stack-sanitised `InternalServerError` when the value is not an
+     * object.
      */
     private resolveTypeName(
         value: ReorderListResult,
@@ -300,8 +327,10 @@ export class ReorderListResultResolver {
         unionTypeName: ResultUnionName,
     ): ReorderListResultTypeName {
         if (value == null || typeof value !== 'object') {
+            // `typeof` for everything else, so the logged shape is one of a fixed set of words rather
+            // than anything derived from the value itself.
             const received = value === null ? 'null' : typeof value;
-            throw new InternalServerError(
+            throw reportReorderListInternalFailure(
                 `No __resolveType could be determined for the "${unionTypeName}" union: ` +
                     `expected an object payload but received "${received}"`,
             );

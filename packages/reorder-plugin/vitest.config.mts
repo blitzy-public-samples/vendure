@@ -16,15 +16,25 @@ export default defineConfig({
         }),
     ],
     test: {
-        // The unit run is confined to the co-located specs under `src/`, and the e2e tree is excluded
-        // outright. Vitest's default pattern happens to miss the `*.e2e-spec.ts` suffix already,
-        // because it requires a literal `.spec.` and this repository's e2e files spell it `-spec.`
-        // (`e2e-common/vitest.config.mts` is what collects those, under its own timeouts and database
-        // initializers). Relying on that would leave the separation resting on a punctuation detail:
-        // any `*.spec.ts` placed anywhere under `e2e/` — a fixture's own spec, for instance — would
-        // join the unit run and try to reach a database that `bun run test` never starts. Naming the
-        // boundary here makes it structural instead of incidental.
-        include: ['src/**/*.spec.ts'],
-        exclude: ['e2e/**', 'lib/**', 'node_modules/**'],
+        // The unit run collects the co-located specs under `src/` and, deliberately, the specs of the
+        // e2e FIXTURES — and nothing else under `e2e/`.
+        //
+        // The end-to-end SUITES stay out, and the exclusion below states that structurally rather than
+        // leaving it to punctuation. Vitest's pattern happens to miss the `*.e2e-spec.ts` suffix already,
+        // because `*.spec.ts` requires a literal `.spec.` and this repository's e2e files spell it
+        // `-spec.`; but resting the boundary on one character would be fragile, and those suites must
+        // only ever run under `e2e-common/vitest.config.mts`, which supplies the long setup timeout and
+        // the database initializers a server needs. `bun run test` starts no database.
+        //
+        // The fixtures' own specs are a different case, and admitting them is what makes them exist at
+        // all. `e2e/fixtures/query-capture.ts` is a pure module — it imports `typeorm` types only, reaches
+        // no database, starts no server and holds the statement parsers a suite's ownership and
+        // statement-count claims are decided by. Left out of both runners it would have tests that no
+        // command executes, which protects nothing against regression; the e2e runner cannot collect them
+        // because it matches `*.e2e-spec.ts` only, so this is the one run they can belong to. A fixture
+        // spec that ever needed a database would belong in a suite instead, and its absence from here is
+        // therefore also a statement about what a fixture may be.
+        include: ['src/**/*.spec.ts', 'e2e/fixtures/**/*.spec.ts'],
+        exclude: ['e2e/**/*.e2e-spec.ts', 'e2e/__data__/**', 'lib/**', 'node_modules/**'],
     },
 });

@@ -51,12 +51,26 @@
  * a line: a saved list records INTENT rather than availability, so neither `deletedAt` nor `enabled` is
  * projected onto a payload here (surfacing availability is FEATURE-001-03's, resolving it FEATURE-001-04's).
  *
- * TWO CLASSES IN ONE FILE, because a class-level `@Resolver` binds exactly one parent type and two parent
- * types need binding. Seven files under `packages/core/src/api/resolvers/entity/` already do this —
- * `payment-entity.resolver.ts` holds `PaymentEntityResolver` and `PaymentAdminEntityResolver` — so the shape
- * is the repository's own rather than a workaround. BOTH classes must appear in the plugin's
- * `shopApiExtensions.resolvers` array: registering only the first leaves `ReorderListLine.productVariant`
- * falling through to the default resolver, which returns the relation the read never loads.
+ * ONE CLASS, TWO PARENT TYPES, AND THE DECORATOR ORDER THAT MAKES THAT WORK. Three fields across two parent
+ * types are bound here by a single exported class, because the plugin's source graph fixes the resolver count
+ * at three — the Shop operations resolver, this entity resolver and the union `__resolveType` resolver — and a
+ * fourth class would be a fourth registration. A class-level `@Resolver('ReorderList')` binds `lines` and
+ * `viewerAccess`; the `productVariant` method rebinds itself to `ReorderListLine` with a METHOD-level
+ * `@Resolver`, which the framework prefers over the class-level one.
+ *
+ * The mechanism, verified in the pinned `@nestjs/graphql` (`dist/utils/extract-metadata.util.js`): the parent
+ * type is read from the method first and only then from the class
+ * (`getMetadata(RESOLVER_TYPE, callback) || getMetadata(RESOLVER_TYPE, instance.constructor)`), the field name
+ * is `getMetadata(RESOLVER_NAME, callback) || methodName`, and a method is dropped from the resolver map
+ * altogether unless `RESOLVER_PROPERTY` is set, which only `@ResolveField` sets.
+ *
+ * THE HAZARD IS THE ORDER, AND IT FAILS SILENTLY. `@Resolver(name)` in its method form writes BOTH
+ * `RESOLVER_TYPE` and `RESOLVER_NAME` to `name`; `@ResolveField(propertyName)` writes `RESOLVER_NAME` to
+ * `propertyName`. They contend for the same key, decorators apply bottom-up, so the TOPMOST decorator writes
+ * last and wins. `@ResolveField('productVariant')` therefore sits ABOVE `@Resolver('ReorderListLine')`. Reverse
+ * the two and the map becomes `{ ReorderListLine: { ReorderListLine: fn } }` — a field named after the type and
+ * no `productVariant` resolver at all, so the field falls through to the default resolver and returns the
+ * relation this plugin's read never loads. Nothing about that fails at build time.
  *
  * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires new
  * public API to carry a `@since` tag naming what will be the next minor version, and its own literal example
@@ -70,6 +84,7 @@ import { Args, Parent, ResolveField, Resolver } from '@nestjs/graphql';
 import {
     Ctx,
     ID,
+    idsAreEqual,
     ListQueryOptions,
     Logger,
     PaginatedList,
@@ -83,42 +98,50 @@ import {
 import { loggerCtx, REORDER_PLUGIN_OPTIONS } from '../constants';
 import { ReorderListLine } from '../entities/reorder-list-line.entity';
 import { ReorderList } from '../entities/reorder-list.entity';
-import { ReorderListService, ReorderListViewerAccess } from '../service/reorder-list.service';
-import { ReorderPluginOptions } from '../types';
+import {
+    ReorderListLinePage,
+    ReorderListService,
+    ReorderListViewerAccess,
+    reportReorderListInternalFailure,
+} from '../service/reorder-list.service';
+import { ResolvedReorderPluginOptions } from '../types';
 
 /**
- * The page size the nested line collection falls back to where the caller supplied no `take`.
+ * The single request-scoped key under which the set of list objects the single-list read returned is held.
  *
- * It duplicates no validation and it is not a second opinion about the value. `ReorderPlugin.init()`
- * validates every supplied option once, at plugin initialisation, and merges the same declared default for a
- * key a deployment omits — so by the time this resolver reads the option the value is either a validated
- * integer or absent. This fallback exists because every member of {@link ReorderPluginOptions} is optional,
- * and an option resolving to `undefined` here would hand `take: undefined` to the service and silently
- * restore the platform's own much larger substitution. Fifty is stricter than the Shop-side maximum the
- * default configuration sets, which is the property that makes it safe to apply
- * (`packages/core/src/config/default-config.ts` L89).
+ * **It is one key for the whole request rather than one key per identifier, and that is the fix to a real
+ * defect rather than a simplification.** A key built from a list id says only "some list with this id was
+ * asked for singly", and a request may legitimately carry both reads: a document selecting
+ * `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists` produces two *different* objects
+ * for row 7 — one from each read — and an id-keyed licence cannot tell them apart, so the collection's entry
+ * inherits the single read's licence to repair the stored counter, which
+ * FEATURE-001-01 section 2.6.2.1 forbids outright. The value held here is a `WeakSet` of the exact objects
+ * the single-list read returned, so the licence belongs to an object rather than to a number.
+ *
+ * It is exported for one reason only: the Shop resolver marks the objects this file tests, so both sides have
+ * to resolve the same namespace, and a namespace spelled twice is a namespace that can drift. The spelling
+ * names the class that READS the value, which is the shape core's own resolvers use for this cache
+ * (`packages/core/src/api/resolvers/entity/payment-entity.resolver.ts`). Nothing outside this plugin's own
+ * `src/api` should reference it.
+ *
+ * - a document with a single-list root **and** a collection root that happens to include the same id would let
+ *   the collection's own occurrence inherit the licence and repair on the path the contract forbids;
+ * - a request-context-keyed licence can be lost outright, because a field resolver does not always receive the
+ *   same `RequestContext` instance the root resolver did — the platform binds a context per handler and falls
+ *   back to a shared one, so with two roots in flight the field resolver may see the *other* root's context.
+ *
+ * Keying on the object closes both: graphql-js passes a root field's resolved value through as the parent of
+ * its child fields, so the object a field resolver receives IS the object the root returned, and no other
+ * occurrence — not even one carrying the same id — is that object. A `WeakSet` also needs no clearing and
+ * cannot leak between requests, since an entry lives exactly as long as the row object does.
  */
-const DEFAULT_REORDER_LIST_LINES_PAGE_SIZE = 50;
-
-/**
- * The prefix of the request-scoped key under which the single-list read records that it returned a given
- * list. Kept separate from the key builder so that a reader can see there is exactly one namespace, and
- * spelled after the class that reads it, which is the shape core's own resolvers use for this cache
- * (`packages/core/src/api/resolvers/entity/payment-entity.resolver.ts`).
- *
- * It is exported for one reason only: the Shop resolver sets the mark this file reads, so both sides have to
- * resolve the same namespace, and a namespace spelled twice is a namespace that can drift. Nothing outside
- * this plugin's own `src/api` should reference it.
- *
- * @internal
- */
-export const SINGLE_LIST_READ_KEY_PREFIX = 'ReorderListEntityResolver.singleListRead';
+export const SINGLE_LIST_READ_KEY = 'ReorderListEntityResolver.singleListRead';
 
 /** The request-scoped key prefix under which one page's pending line-page batch is held. */
 const LINES_BATCH_KEY_PREFIX = 'ReorderListEntityResolver.linesBatch';
 
 /** The request-scoped key under which one page's pending product-variant batch is held. */
-const VARIANT_BATCH_KEY = 'ReorderListLineEntityResolver.productVariantBatch';
+const VARIANT_BATCH_KEY = 'ReorderListEntityResolver.productVariantBatch';
 
 /**
  * @description
@@ -159,39 +182,24 @@ export interface ReorderListLinesArgs {
 
 /**
  * @description
- * Builds the request-scoped key under which the single-list read records that it returned the list with the
- * given identifier.
+ * Records, for the duration of one request, that the single-list read returned **this exact list object** —
+ * which is the first of the two conjuncts that admit the `lineCount` compare-and-set repair.
  *
- * **Why this is exported rather than private.** It is one half of a contract between two files, and a
- * contract spelled twice is a contract that can disagree with itself. `activeCustomerReorderList` marks the
- * request through {@link markSingleReorderListRead}; {@link ReorderListEntityResolver.lines} reads the same
- * mark through this key. Exporting the builder makes the coordination visible and makes a mismatch a
- * compile-time concern rather than a silent behavioural one.
+ * **This must be called by `activeCustomerReorderList`, with the object that read returned, and by nothing
+ * else.** The collection read must never repair: a page of lists pages no lines, so it has no observed total
+ * to compare against, and repairing there would rewrite a counter from a number the request never
+ * established (FEATURE-001-01 section 2.6.2.1).
  *
- * The identifier is stringified because the configured `EntityIdStrategy` decides at run time whether an id
- * is a number or a string, and a key built from the raw value would not match across the two.
+ * **The licence is bound to object identity rather than to the row's identifier, and the difference is a
+ * bypass.** One request may carry both reads over the same row — a document selecting
+ * `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists` — and each read hydrates its own
+ * object for that row. An identifier-keyed licence is satisfied by both of them, so the collection's entry
+ * would be repaired on a path the contract forbids; a licence held in a `WeakSet` of returned objects is
+ * satisfied by exactly the one object the single read produced. The set additionally holds its members
+ * weakly, so nothing here extends the lifetime of a row beyond the request.
  *
- * @param listId - The identifier of the list the single-list read returned.
- *
- * @docsCategory core plugins/ReorderPlugin
- * @docsPage ReorderListEntityResolver
- * @since 3.8.0
- */
-export function singleReorderListReadCacheKey(listId: ID): string {
-    return `${SINGLE_LIST_READ_KEY_PREFIX}(${String(listId)})`;
-}
-
-/**
- * @description
- * Records, for the duration of one request, that the single-list read returned the list with the given
- * identifier — which is the first of the two conjuncts that admit the `lineCount` compare-and-set repair.
- *
- * **This must be called by `activeCustomerReorderList` and by nothing else.** The collection read must never
- * repair: a page of lists pages no lines, so it has no observed total to compare against, and repairing
- * there would rewrite a counter from a number the request never established (FEATURE-001-01 section 2.6.2.1).
- * The mark is what distinguishes the two reads, and it is deliberately NOT inferred from the batch holding a
- * single parent: a collection read asking for `take: 1` is indistinguishable under that test and would repair
- * on the collection path.
+ * It is deliberately NOT inferred from the batch holding a single parent either: a collection read asking for
+ * `take: 1` is indistinguishable under that test and would repair on the collection path.
  *
  * **The failure mode is safe in one direction only, which is why the mark is opt-in.** A request that never
  * marks simply never repairs — the stored counter is reported as it stands, which is the collection read's
@@ -201,13 +209,14 @@ export function singleReorderListReadCacheKey(listId: ID): string {
  * @param requestContextCache - The platform's request-scoped cache, injected by the calling resolver.
  * @param ctx - The request context the mark is scoped to. The cache is a `WeakMap` keyed on this instance, so
  * the mark is garbage-collected with the request and cannot leak into another.
- * @param listId - The identifier of the list being returned by the single-list read.
+ * @param list - The list object the single-list read is about to return. It must be the object itself; a copy
+ * of it, or another object carrying the same identifier, is not the same licence.
  *
  * @example
  * ```ts
  * const list = await this.reorderListService.getReorderList(ctx, id, includeShared);
  * if (list) {
- *     markSingleReorderListRead(this.requestContextCache, ctx, list.id);
+ *     markSingleReorderListRead(this.requestContextCache, ctx, list);
  * }
  * return list;
  * ```
@@ -219,9 +228,113 @@ export function singleReorderListReadCacheKey(listId: ID): string {
 export function markSingleReorderListRead(
     requestContextCache: RequestContextCacheService,
     ctx: RequestContext,
-    listId: ID,
+    list: ReorderList,
 ): void {
-    requestContextCache.set(ctx, singleReorderListReadCacheKey(listId), true);
+    // `get` with a default both reads and installs, so one call covers the first mark of a request and every
+    // later one. The stored value is truthy, which matters: the cache's getter tests the stored value for
+    // truthiness (`packages/core/src/cache/request-context-cache.service.ts` L34-L36), and an empty `WeakSet`
+    // is an object and therefore truthy — unlike, say, a count of zero.
+    const marked = requestContextCache.get<WeakSet<ReorderList>>(
+        ctx,
+        SINGLE_LIST_READ_KEY,
+        () => new WeakSet<ReorderList>(),
+    );
+    marked.add(list);
+}
+
+/**
+ * @description
+ * Whether **this exact list object** was returned by the single-list read of this request.
+ *
+ * The counterpart of {@link markSingleReorderListRead}, and the only sanctioned way to ask the question: it
+ * tests membership of the marked object set rather than comparing identifiers, so an object the collection
+ * read produced for the same row answers `false` however many times that row appears in the document.
+ *
+ * @param requestContextCache - The platform's request-scoped cache, injected by the calling resolver.
+ * @param ctx - The request context the mark was scoped to.
+ * @param list - The parent object whose provenance is in question.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @docsPage ReorderListEntityResolver
+ * @since 3.8.0
+ */
+export function wasReturnedBySingleReorderListRead(
+    requestContextCache: RequestContextCacheService,
+    ctx: RequestContext,
+    list: ReorderList,
+): boolean {
+    // Read WITHOUT a default, so asking the question cannot install the set: a request that never marked must
+    // answer `false` and leave nothing behind.
+    const marked = requestContextCache.get<WeakSet<ReorderList>>(ctx, SINGLE_LIST_READ_KEY);
+    return marked !== undefined && marked.has(list);
+}
+
+/**
+ * The request-scoped key under which the in-flight counter repairs of this request are held, one entry per
+ * list object.
+ *
+ * **This exists because "exactly one compare-and-set statement" is a claim about a whole request, and a
+ * document may resolve the same field more than once at the same time.** Sibling GraphQL fields — two aliases
+ * of `lines` on the one object `activeCustomerReorderList` returned — are executed concurrently, not in
+ * sequence. Writing the reconciled value back onto the row makes a *later* resolution find stored and observed
+ * in agreement, but it cannot help a *simultaneous* one: both aliases await the same page batch, both then
+ * read the same stale `lineCount`, and the second reaches the service while the first is still suspended on
+ * its own statement. Two conditional updates are issued where the contract permits one. Only one of them can
+ * ever affect a row, because the second finds the guard value already changed — so the counter is correct
+ * either way — but the statement count is not, and that count is the contract.
+ *
+ * The value held is a `WeakMap` from the list object to the promise of its repair, so the gate is keyed by the
+ * same object identity the single-read licence is, and is collected with the request.
+ *
+ * @internal
+ */
+export const LINE_COUNT_REPAIR_KEY = 'ReorderListEntityResolver.lineCountRepair';
+
+/**
+ * @description
+ * Runs `repair` for this exact list object at most once per request, and returns the one result to every
+ * caller.
+ *
+ * **The registration is synchronous and that is the whole mechanism.** `repair` is invoked and its promise is
+ * stored in the same uninterrupted run of statements, so a second caller that arrives while the first is
+ * suspended finds the promise already there and awaits it instead of starting another. Reversing those two
+ * steps — or placing any `await` between the lookup and the store — reopens exactly the window this closes.
+ *
+ * A rejected repair is deliberately left in place rather than evicted. Retrying it would issue the second
+ * statement this gate exists to prevent, and every caller sharing one failure is the truthful outcome of one
+ * attempt having been made.
+ *
+ * @param requestContextCache - The platform's request-scoped cache, injected by the calling resolver.
+ * @param ctx - The request context the gate is scoped to.
+ * @param list - The list object whose repair is being gated, by identity.
+ * @param repair - Starts the repair. Called at most once per list object per request.
+ * @returns The reconciled counter value, shared by every caller for this object.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @docsPage ReorderListEntityResolver
+ * @since 3.8.0
+ */
+export function repairLineCountOnce(
+    requestContextCache: RequestContextCacheService,
+    ctx: RequestContext,
+    list: ReorderList,
+    repair: () => Promise<number>,
+): Promise<number> {
+    const inFlight = requestContextCache.get<WeakMap<ReorderList, Promise<number>>>(
+        ctx,
+        LINE_COUNT_REPAIR_KEY,
+        () => new WeakMap<ReorderList, Promise<number>>(),
+    );
+    const started = inFlight.get(list);
+    if (started !== undefined) {
+        return started;
+    }
+    // No `await` may separate these two statements. `repair()` returns its promise synchronously, so the entry
+    // is installed before control can return to the event loop and before any sibling field can observe the
+    // gate as empty.
+    const pending = repair();
+    inFlight.set(list, pending);
+    return pending;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -365,20 +478,44 @@ function stableStringify(value: unknown): string {
 
 /**
  * @description
- * Resolves the two published fields of `ReorderList` that are not columns of `reorder_list`: the nested
- * `lines` page and the per-requester `viewerAccess`.
+ * Resolves the three published fields of this plugin's two types that are not columns of their own rows: the
+ * nested `ReorderList.lines` page, the per-requester `ReorderList.viewerAccess`, and the catalogue variant a
+ * `ReorderListLine` references.
  *
- * **`lineCount` is deliberately not among them.** It is the stored column, it arrives with the row the page
- * query already selected, and it is the single authority for the published field, the generated filter, the
- * generated sort and the atomic line bound (FEATURE-001-01 section 2.6.2). A resolver for it — counting rows
- * per entry, issuing a grouped count beside the page, or taking the length of a loaded relation — would return
- * the same numbers while making a second source of truth, so there is no such member here and the file header
- * records why each of those three shapes is forbidden.
+ * **One class, two parent types.** `lines` and `viewerAccess` take their parent type from the class-level
+ * `@Resolver('ReorderList')`; `productVariant` declares its own parent type on the method, because a
+ * class-level `@Resolver` binds exactly one. The plugin registers exactly three resolver classes — one Shop,
+ * one Entity, one Result — and this is the Entity one, so every field resolver this plugin owns is here. The
+ * file header records the decorator order that makes the method-level binding work and the silent failure that
+ * reversing it produces.
  *
- * **Both fields cost one page rather than one entry.** `lines` is served by a single batched load per page
- * whose result is partitioned in process, and `viewerAccess` costs no statement at all. Registering this class
- * without its sibling {@link ReorderListLineEntityResolver} leaves `ReorderListLine.productVariant`
- * unresolved, so the plugin's `shopApiExtensions.resolvers` array must carry both.
+ * **One class serves both parent types.** The class-level `@Resolver('ReorderList')` binds the first two
+ * members; {@link ReorderListEntityResolver.productVariant} carries a method-level `@Resolver('ReorderListLine')`
+ * that the framework prefers over the class-level one, and a `@ResolveField('productVariant')` above it that
+ * must stay above it. The file header states the mechanism and the order hazard in full. This class is
+ * therefore the single entity-resolver entry in the plugin's `shopApiExtensions.resolvers` array, which carries
+ * exactly three classes: the Shop operations resolver, this one, and the union `__resolveType` resolver.
+ *
+ * **One class, two parent types, and the mechanism is the same one this plugin's union resolver already
+ * relies on.** The class-level `@Resolver('ReorderList')` binds the two `ReorderList` fields, and
+ * `productVariant` carries its own method-level `@Resolver('ReorderListLine')` beneath a named
+ * `@ResolveField('productVariant')` — a method-level resolver type takes precedence over the class-level one
+ * [@nestjs/graphql/dist/utils/extract-metadata.util.js], which is what lets a single registered class serve
+ * more than one parent type. The decorator ORDER is load-bearing and is documented at the method itself.
+ * Registering this one class therefore leaves nothing unresolved, and the plugin's
+ * `shopApiExtensions.resolvers` array carries exactly three classes: the Shop operations, this file, and the
+ * six `__resolveType` field resolvers.
+ *
+ * **`lineCount` is deliberately not among the resolved fields.** It is the stored column, it arrives with the
+ * row the page query already selected, and it is the single authority for the published field, the generated
+ * filter, the generated sort and the atomic line bound (FEATURE-001-01 section 2.6.2). A resolver for it —
+ * counting rows per entry, issuing a grouped count beside the page, or taking the length of a loaded relation
+ * — would return the same numbers while making a second source of truth, so there is no such member here and
+ * the file header records why each of those three shapes is forbidden.
+ *
+ * **Every field costs one page rather than one entry.** `lines` and `productVariant` are each served by a
+ * single batched load per page whose result is partitioned in process, and `viewerAccess` costs no statement
+ * at all.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage ReorderListEntityResolver
@@ -389,8 +526,9 @@ function stableStringify(value: unknown): string {
 export class ReorderListEntityResolver {
     constructor(
         private reorderListService: ReorderListService,
+        private productVariantService: ProductVariantService,
         private requestContextCache: RequestContextCacheService,
-        @Inject(REORDER_PLUGIN_OPTIONS) private options: ReorderPluginOptions,
+        @Inject(REORDER_PLUGIN_OPTIONS) private options: ResolvedReorderPluginOptions,
     ) {}
 
     /**
@@ -441,7 +579,7 @@ export class ReorderListEntityResolver {
         @Args() args: ReorderListLinesArgs,
     ): Promise<PaginatedList<ReorderListLine>> {
         const options = this.linesPageOptions(args);
-        const batch = openPageBatch<Map<ID, PaginatedList<ReorderListLine>>>(
+        const batch = openPageBatch<Map<ID, ReorderListLinePage>>(
             this.requestContextCache,
             ctx,
             `${LINES_BATCH_KEY_PREFIX}(${stableStringify(options)})`,
@@ -463,7 +601,10 @@ export class ReorderListEntityResolver {
             );
             return { items: [], totalItems: 0 };
         }
-        await this.repairStaleLineCount(ctx, list, page.totalItems);
+        // The UNFILTERED total, and never `page.totalItems`. The service publishes the former only on a
+        // request that narrowed nothing, so a filtered request passes `undefined` here and no repair is
+        // attempted — see {@link ReorderListEntityResolver.repairStaleLineCount}.
+        await this.repairStaleLineCount(ctx, list, page.authoritativeTotalItems);
         return page;
     }
 
@@ -471,26 +612,30 @@ export class ReorderListEntityResolver {
      * @description
      * Resolves the per-requester provenance of the list, at a cost of zero database statements.
      *
-     * The value is derived from the row already loaded and the session already resolved, which is why this
-     * method is synchronous and why it takes no request context: there is nothing to look up. Under this
-     * feature every list that reaches a caller has passed the service's ownership-and-channel predicate, so
-     * `access` is `OWNED` and `grantedCapabilities` is empty — the truthful values while no share row can
-     * exist, rather than placeholders. Both values of the `includeShared` argument therefore return the same
-     * thing, because the shared set is empty by construction rather than withheld.
+     * The value is derived rather than asserted, from three things the request already established: the owner
+     * scope the row was actually read under, the row's own owning customer and channel, and this request's own
+     * active channel and session. All three are already in memory, which is why the derivation costs no
+     * statement — and the request context is passed for exactly that reason, as the third of the three inputs
+     * rather than as something to look anything up with. Under this feature every list that reaches a caller has
+     * passed the service's ownership-and-channel predicate, so `access` is `OWNED` and `grantedCapabilities` is
+     * empty; those are the truthful values while no share row can exist, rather than placeholders, and both
+     * values of the `includeShared` argument return the same thing because the shared set is empty by
+     * construction rather than withheld.
      *
      * **A per-entry access check that issued a statement is forbidden**, and the criterion that guards this is
      * literal: zero statements, asserted as a number rather than as a payload. Sharing makes this conditional
      * in FEATURE-001-06; it is deliberately not anticipated here, so no share table is read and no grant field
      * is declared or populated.
      *
-     * @param list - The list being described. It is the value the derivation reads once sharing makes this
-     * conditional, and it is passed for that reason.
+     * @param ctx - The request context whose active channel and session the row's recorded provenance is checked
+     * against.
+     * @param list - The list being described, and the object its recorded provenance is keyed on.
      *
      * @since 3.8.0
      */
     @ResolveField()
-    viewerAccess(@Parent() list: ReorderList): ReorderListViewerAccess {
-        return this.reorderListService.getViewerAccess(list);
+    viewerAccess(@Ctx() ctx: RequestContext, @Parent() list: ReorderList): ReorderListViewerAccess {
+        return this.reorderListService.getViewerAccess(ctx, list);
     }
 
     /**
@@ -510,35 +655,64 @@ export class ReorderListEntityResolver {
     }
 
     /**
-     * The configured nested page size, with the module's own fallback for the case the option is absent.
+     * The configured nested page size, read straight from the injected options and restating nothing.
      *
-     * Every member of {@link ReorderPluginOptions} is optional, and the plugin merges the declared default for
-     * a key a deployment omits, so this fallback is unreachable through `ReorderPlugin.init()`. It exists
-     * because an option resolving to `undefined` here would hand the service no page size at all and silently
-     * restore the platform's much larger substitution — a bound that quietly becomes a looser bound is worse
-     * than a wrong one, because nothing reports it.
+     * The provider supplies {@link ResolvedReorderPluginOptions}: every key present, validated once at plugin
+     * initialisation, and frozen. A `?? 50` here would be a second executable copy of a number the plugin
+     * already declares — unreachable through `ReorderPlugin.init()`, and therefore untested and free to drift
+     * from the value the server is actually running on. Fifty is stricter than the Shop-side maximum the
+     * default configuration sets, which is the property that makes applying it safe
+     * (`packages/core/src/config/default-config.ts` L89).
      */
     private defaultLinesPageSize(): number {
-        return this.options.defaultReorderListLinesPageSize ?? DEFAULT_REORDER_LIST_LINES_PAGE_SIZE;
+        return this.options.defaultReorderListLinesPageSize;
     }
 
     /**
      * Repairs a stored line counter that disagrees with the total this request actually observed — and only on
-     * the single-list read.
+     * the single-list read, and only from a total that is the list's whole, unfiltered line count.
      *
-     * **Both conjuncts are required, and each rules out a different defect.**
+     * **Three conjuncts are required, and each rules out a different defect.**
      *
-     * The first is that this request reached the list through `activeCustomerReorderList`, which records the
-     * fact through {@link markSingleReorderListRead}. Without it, a collection read that happened to select
-     * `lines` would repair, which FEATURE-001-01 section 2.6.2.1 forbids in as many words: a page of lists has
-     * no observed total to compare against and reports the stored column as it stands. The mark is read rather
-     * than inferred from the batch holding one parent, because a collection read asking for `take: 1` is
+     * The first is that THIS PARENT OBJECT is the one `activeCustomerReorderList` returned, which that read
+     * records through {@link markSingleReorderListRead} and this method tests through
+     * {@link wasReturnedBySingleReorderListRead}. Without it, a collection read that happened to select `lines`
+     * would
+     * repair, which FEATURE-001-01 section 2.6.2.1 forbids in as many words: a page of lists has no observed
+     * total to compare against and reports the stored column as it stands.
+     *
+     * The test is on OBJECT IDENTITY rather than on the row identifier, and that is not a refinement — it is
+     * what makes the conjunct true. One document may select both reads, so the same row can arrive here twice
+     * in one request: once as the single read's object and once as an entry of the collection's page. Those are
+     * two separately loaded objects, so identity admits the first and refuses the second, whereas a marker
+     * keyed on the row identifier would be satisfied by both and would repair from the collection path. It is
+     * equally not inferred from the batch holding one parent, because a collection read asking for `take: 1` is
      * indistinguishable under that test.
      *
-     * The second is that the observed total actually differs from the stored counter. On the overwhelmingly
+     * The second is that a total is available **and unfiltered**. The caller passes
+     * {@link ReorderListLinePage.authoritativeTotalItems}, which the service publishes only for a request that
+     * applied no `filter` and no `filterOperator`; a filtered request therefore passes `undefined` and this
+     * method issues nothing. That is the conjunct that closes a genuine escalation rather than a theoretical
+     * one: the published `totalItems` counts the lines matching the caller's own filter, so filtering a full
+     * list down to nothing and writing that count into `reorder_list.lineCount` would zero the very counter
+     * the atomic line bound is enforced against — after which `maxLinesPerList` bounds nothing, and the list
+     * can be grown without limit by repeating the trick. A filtered single-list read consequently behaves
+     * exactly like the collection read: it reports the stored column as it stands.
+     *
+     * The third is that the observed total actually differs from the stored counter. On the overwhelmingly
      * common path they agree and nothing is issued, which is what makes the repair free where there is nothing
      * to repair. A counter that is not a finite number is left alone as well: it could not have come from the
      * column, and comparing against it would issue a statement whose guard can never match.
+     *
+     * **One consequence of how the platform scopes a request context, stated rather than left to be
+     * discovered.** A field resolver's `@Ctx()` resolves through the shared request key rather than through its
+     * own handler (`packages/core/src/api/decorators/request-context.decorator.ts` passes no execution context
+     * for a field resolver), so in a document selecting several root fields every field resolver reads the
+     * context of whichever root's guard ran last. A document that selects BOTH reads may therefore resolve
+     * `lines` under the collection read's context, in which nothing was ever recorded — and the repair simply
+     * does not run. That is the safe direction and the same direction as an unmarked request: the stored
+     * counter is reported as it stands, exactly as the collection read reports it. What cannot happen in any
+     * ordering is the converse, because a collection entry is never the object that was recorded.
      *
      * **The one path that can drift the counter** is a HARD deletion of a `product_variant` row, whose
      * cascade removes line rows underneath the plugin without the counter being told. The platform's own
@@ -546,11 +720,18 @@ export class ReorderListEntityResolver {
      * database deletion or by a future platform change — stated at its true size, and repaired rather than
      * left to disagree.
      *
-     * **The reconciled value is written back onto the row**, which does two things and is not cosmetic.
-     * It makes the corrected number visible to any consumer that reads the row after this page resolves. And
-     * it makes the repair idempotent within the request: a second resolution of the same list's lines — a
-     * second alias of the field, say — then finds stored and observed in agreement and issues nothing, so
-     * "exactly one compare-and-set statement" holds however many times the field appears in the document.
+     * **The reconciled value is written back onto the row**, so the corrected number is visible to any consumer
+     * that reads the row after this page resolves.
+     *
+     * **"Exactly one compare-and-set statement" is enforced by {@link repairLineCountOnce}, not by that
+     * write-back.** The distinction matters because sibling GraphQL fields run concurrently: two aliases of
+     * `lines` on the same object await the same page batch, then both read the same stale counter, because the
+     * first alias has not reached its write-back by the time the second reads. Sequencing alone therefore
+     * closes the repeat case and not the simultaneous one, and it is the simultaneous one a document can
+     * trigger deliberately. The gate is keyed on this exact object and registers the in-flight repair
+     * synchronously, so every alias of every shape awaits the one statement and observes the one reconciled
+     * value — however many times the field appears in the document, and whether those appearances are
+     * sequential or parallel.
      *
      * The statement itself, its compare-and-set guard and its refusal of a value the column may not hold all
      * belong to the service. Nothing here composes SQL.
@@ -558,17 +739,19 @@ export class ReorderListEntityResolver {
     private async repairStaleLineCount(
         ctx: RequestContext,
         list: ReorderList,
-        observedTotal: number,
+        observedTotal: number | undefined,
     ): Promise<void> {
-        // Conjunct one: this list was returned by the single-list read of THIS request.
-        const isSingleListRead = this.requestContextCache.get<boolean>(
-            ctx,
-            singleReorderListReadCacheKey(list.id),
-        );
-        if (isSingleListRead !== true) {
+        // Conjunct one: THIS OBJECT was returned by the single-list read of this request.
+        if (!wasReturnedBySingleReorderListRead(this.requestContextCache, ctx, list)) {
             return;
         }
-        // Conjunct two: a total is actually known for this parent, and it differs from the stored counter.
+        // Conjunct two: an unfiltered total was established for this parent at all. `undefined` is the
+        // service's way of saying "this request narrowed the collection, so it does not know the list's line
+        // count", and it is answered by leaving the stored column exactly as it stands.
+        if (observedTotal === undefined) {
+            return;
+        }
+        // Conjunct three: the total differs from the stored counter, and both are values the column can hold.
         // Both halves are checked here rather than left to the service. The service does refuse a total the
         // column may not hold, but it refuses it by logging an error — and an error log is the right report for
         // a defect and the wrong one for a value this method could have declined to pass on.
@@ -582,11 +765,11 @@ export class ReorderListEntityResolver {
         if (storedLineCount === observedTotal) {
             return;
         }
-        const reconciled = await this.reorderListService.reconcileLineCount(
-            ctx,
-            list.id,
-            storedLineCount,
-            observedTotal,
+        // Conjunct four, and the last one: no repair for THIS OBJECT is already under way in this request. The
+        // gate both answers that and starts the repair when the answer is no, in one synchronous step — see
+        // {@link repairLineCountOnce} for why the two cannot be separated.
+        const reconciled = await repairLineCountOnce(this.requestContextCache, ctx, list, () =>
+            this.reorderListService.reconcileLineCount(ctx, list.id, storedLineCount, observedTotal),
         );
         if (reconciled !== storedLineCount) {
             Logger.debug(
@@ -597,39 +780,60 @@ export class ReorderListEntityResolver {
         }
         list.lineCount = reconciled;
     }
-}
 
-/**
- * @description
- * Resolves the one published field of `ReorderListLine` that is not a column of `reorder_list_line`: the
- * catalogue variant the line references.
- *
- * **The column and the published field are deliberately not the same nullability, and the pair is what makes a
- * stale line readable.** `reorder_list_line.productVariantId` is `NOT NULL`, because a retained line always
- * references a variant row that still exists; the published `productVariant` field is nullable, because a
- * variant that is no longer resolvable in the active channel must not be exposed and must not null-bubble the
- * whole line out of its page. `productVariantId` stays non-null on both sides, which is what lets a buyer see
- * and remove the line (FEATURE-001-01 section 2.4).
- *
- * This class is the sibling of {@link ReorderListEntityResolver} and must be registered alongside it in the
- * plugin's `shopApiExtensions.resolvers` array. A class-level `@Resolver` binds exactly one parent type, which
- * is why there are two classes; seven files under `packages/core/src/api/resolvers/entity/` do the same.
- *
- * @docsCategory core plugins/ReorderPlugin
- * @docsPage ReorderListEntityResolver
- * @since 3.8.0
- */
-@Resolver('ReorderListLine')
-export class ReorderListLineEntityResolver {
-    constructor(
-        private productVariantService: ProductVariantService,
-        private requestContextCache: RequestContextCacheService,
-    ) {}
+    /*
+     * ─────────────────────────────────────────────────────────────────────────────────────────────────────
+     * THE SECOND PARENT TYPE STARTS HERE. `ReorderListLine.productVariant` is the one published field of
+     * `ReorderListLine` that is not a column of `reorder_list_line`, and it is bound from THIS class rather
+     * than from a second one.
+     *
+     * HOW, AND WHY THE DECORATOR ORDER BELOW MUST NOT BE SWAPPED. `@Resolver(name)` in its method form writes
+     * BOTH the resolver-TYPE metadata and the resolver-NAME metadata
+     * [@nestjs/graphql/dist/decorators/resolvers.utils.js: addResolverMetadata], while
+     * `@ResolveField(propertyName)` writes the resolver-name metadata and the property-resolver flag
+     * [@nestjs/graphql/dist/decorators/resolve-field.decorator.js]. They write the same name key, and
+     * TypeScript applies decorators bottom-up, so the TOPMOST one writes last and wins:
+     *
+     *   @ResolveField('productVariant')   ← applied last  ⇒ name = 'productVariant'   ✔
+     *   @Resolver('ReorderListLine')      ← applied first ⇒ type = the parent type    ✔
+     *
+     * Reversed, the field would be named after the parent type and no `productVariant` resolver would exist:
+     * nothing fails to compile, the server still boots, and the first client to select the field silently
+     * receives whatever the default resolver finds on the row — which for an unloaded relation is null.
+     * Both decorators are required: the method-level `@Resolver` supplies the parent type, taking precedence
+     * over the class-level one [@nestjs/graphql/dist/utils/extract-metadata.util.js], and `@ResolveField`
+     * sets the property-resolver flag without which the explorer drops the method entirely, because the
+     * parent type is neither Query, Mutation nor Subscription
+     * [@nestjs/graphql/dist/services/resolvers-explorer.service.js]. This plugin's union resolver
+     * (`reorder-list-result.resolver.ts`) binds six parent types from one class the same way.
+     *
+     * THE COLUMN AND THE PUBLISHED FIELD ARE DELIBERATELY NOT THE SAME NULLABILITY, and the pair is what
+     * makes a stale line readable. `reorder_list_line.productVariantId` is `NOT NULL`, because a retained
+     * line always references a variant row that still exists; the published `productVariant` field is
+     * nullable, because a variant that is no longer resolvable in the active channel must not be exposed and
+     * must not null-bubble the whole line out of its page. `productVariantId` stays non-null on both sides,
+     * which is what lets a buyer see and remove the line (FEATURE-001-01 section 2.4).
+     * ─────────────────────────────────────────────────────────────────────────────────────────────────────
+     */
 
     /**
      * @description
-     * Resolves the variant a line references, for every line on the page in one load, or `null` where that
-     * variant is no longer resolvable in the active channel.
+     * Resolves the variant a `ReorderListLine` references, for every line on the page in one load, or `null`
+     * where that variant is no longer resolvable in the active channel.
+     *
+     * **This member belongs to a different parent type from the two above it, and its two decorators are what
+     * say so.** The method-level `@Resolver('ReorderListLine')` overrides the class-level `@Resolver('ReorderList')`
+     * for this method alone, and `@ResolveField('productVariant')` must stay ABOVE it: the two decorators write
+     * the same field-name metadata key, decorators apply bottom-up, and the topmost one wins. Reversed, the
+     * field is registered under the parent type's own name and `productVariant` silently has no resolver. The
+     * file header records the verified framework mechanism behind both statements.
+     *
+     * **The column and the published field are deliberately not the same nullability, and the pair is what
+     * makes a stale line readable.** `reorder_list_line.productVariantId` is `NOT NULL`, because a retained line
+     * always references a variant row that still exists; the published `productVariant` field is nullable,
+     * because a variant that is no longer resolvable in the active channel must not be exposed and must not
+     * null-bubble the whole line out of its page. `productVariantId` stays non-null on both sides, which is what
+     * lets a buyer see and remove the line (FEATURE-001-01 section 2.4).
      *
      * **Three cases resolve to `null`, and each is a case the buyer must still be able to act on.** A variant
      * assigned to another channel is not returned by the channel-scoped load. A variant whose row has been
@@ -651,6 +855,13 @@ export class ReorderListLineEntityResolver {
      * accessor. The load returns translated variants with channel prices applied, so nothing is re-translated
      * here: the variant's `name` renders in the language the request resolved from the channel.
      *
+     * **The active channel decides in every case, including the one that skips the load.** An already-hydrated
+     * relation is served only where this request can prove the variant is in the active channel from what was
+     * actually loaded onto it; everything else — a relation that is not hydrated, not translated, not priced,
+     * soft-deleted, or whose channel membership cannot be established — goes through the channel-scoped batch,
+     * which is what makes the short-circuit unable to change an answer. See
+     * {@link ReorderListEntityResolver.hydratedRelation}.
+     *
      * @param ctx - The request context, whose active channel scopes the load and whose language code the
      * returned variant is translated into.
      * @param line - The line whose variant is being resolved.
@@ -658,12 +869,15 @@ export class ReorderListLineEntityResolver {
      *
      * @since 3.8.0
      */
-    @ResolveField()
+    // Order fixed. See the section note above: the top decorator writes the field name last and wins, and the
+    // method-level `@Resolver` is what binds this method to the OTHER parent type.
+    @ResolveField('productVariant')
+    @Resolver('ReorderListLine')
     async productVariant(
         @Ctx() ctx: RequestContext,
         @Parent() line: ReorderListLine,
     ): Promise<Translated<ProductVariant> | null> {
-        const alreadyResolved = this.hydratedRelation(line);
+        const alreadyResolved = this.hydratedRelation(ctx, line);
         if (alreadyResolved) {
             return alreadyResolved;
         }
@@ -691,6 +905,19 @@ export class ReorderListLineEntityResolver {
      *
      * The map is keyed on the stringified identifier because the configured `EntityIdStrategy` decides whether
      * an id is a number or a string, and a lookup by the raw value would miss across the two.
+     *
+     * **The load sits inside a sanitisation boundary, and the collaborator is the reason.** This is the one
+     * place in this file that calls out to a platform service, and that service composes and executes its own
+     * statement: a driver failure raised inside it arrives carrying the SQL it was running, the schema and
+     * column names it touched, sometimes the conflicting values, and a frame list of absolute build paths.
+     * Left unhandled it reaches the platform's exception filter, which publishes the message to the caller
+     * under `INTERNAL_SERVER_ERROR` and logs the stack. So the failure is classified by shape, logged with a
+     * correlation id and nothing of its own, and re-raised as the plugin's one generic internal error with its
+     * frames replaced — the same treatment the service gives every unclassified failure of its own, through
+     * the same helper so there is one message and one log shape rather than two.
+     *
+     * Nothing is swallowed: the request still fails. What changes is that it fails with a sentence that says
+     * nothing about the server.
      */
     private async loadVariantsInChannel(
         ctx: RequestContext,
@@ -703,7 +930,18 @@ export class ReorderListLineEntityResolver {
             // to be certain the empty case cannot become a query for nothing.
             return resolvable;
         }
-        const variants = await this.productVariantService.findByIds(ctx, variantIds);
+        let variants: Array<Translated<ProductVariant>>;
+        try {
+            variants = await this.productVariantService.findByIds(ctx, variantIds);
+        } catch (err: unknown) {
+            // The diagnostic is fixed text plus a count this file computed. The caught value is classified by
+            // the helper and then discarded; none of it is logged and none of it is published.
+            throw reportReorderListInternalFailure(
+                'Resolving the product variants of a reorder list line page failed for a page of ' +
+                    `${String(variantIds.length)} variant identifier(s)`,
+                err,
+            );
+        }
         for (const variant of variants) {
             if (variant.deletedAt == null) {
                 resolvable.set(String(variant.id), variant);
@@ -713,23 +951,41 @@ export class ReorderListLineEntityResolver {
     }
 
     /**
-     * Returns the line's already-loaded variant relation where it is safe to serve, and `undefined` where the
-     * batched load must decide instead.
+     * Returns the line's already-loaded variant relation where **this request can prove it is serveable**, and
+     * `undefined` where the channel-scoped batched load must decide instead.
      *
      * **Presence alone is not enough, and core says so in its own short-circuits**: the order-line resolver
      * tests a hydration marker on the relation rather than merely testing that the object is there. A variant
      * loaded by a bare relation join carries no translation and no channel price, so its `name` would be
      * absent — and `name` is non-null on the published type — while its price fields would silently read zero.
-     * Both markers are therefore checked: a resolved `name` proves the translation ran, and a numeric
-     * `listPrice` proves the price applicator did.
      *
-     * A soft-deleted variant is rejected here on the same terms as in the batched path, so the two paths
-     * cannot disagree about it. What this check cannot establish in memory is channel membership, which is why
-     * it is conservative: this plugin's own read never loads the relation, so the short-circuit is reachable
-     * only for a line handed over already hydrated by a caller that resolved it in the active channel, and
-     * anything less than fully hydrated falls through to the channel-scoped load.
+     * **Active-channel membership is proved here rather than assumed, and that is the whole reason this
+     * method takes a context.** A hydrated relation arrives from whoever loaded it, and "it is loaded" says
+     * nothing about which channel it was loaded in — a plain relation join is not channel-scoped at all. A
+     * short-circuit that trusted hydration alone would therefore return, to a request on channel B, a variant
+     * that belongs only to channel A: an authorization decision taken by the absence of a check
+     * (CWE-863), and one that no payload assertion distinguishes from the correct answer. So the relation is
+     * served only when its **loaded** `channels` collection contains the request's active channel; the
+     * comparison is the platform's own `idsAreEqual`, because the configured `EntityIdStrategy` decides
+     * whether an identifier arrives as a number or a string and `===` is wrong across the two.
+     *
+     * Four conditions consequently have to hold, and failing any of them falls through to
+     * {@link ReorderListEntityResolver.loadVariantsInChannel}, which resolves through the platform's
+     * channel-scoped accessor: the relation is present; it is not soft-deleted (rejected here on the same
+     * terms as in the batched path, so the two cannot disagree); it is translated and priced (a resolved
+     * `name` proves the translation ran and a numeric `listPrice` proves the price applicator did); and its
+     * loaded channel set contains `ctx.channelId`. A relation whose `channels` were never loaded is
+     * *unverifiable* rather than invalid, so it takes the same fall-through — which is what makes this
+     * short-circuit an optimisation that cannot change an answer.
+     *
+     * This plugin's own read never loads the relation, so in practice the short-circuit serves only a line
+     * handed over already hydrated by another integration; the checks are what stop such a line from
+     * publishing something this request may not see.
      */
-    private hydratedRelation(line: ReorderListLine): Translated<ProductVariant> | undefined {
+    private hydratedRelation(
+        ctx: RequestContext,
+        line: ReorderListLine,
+    ): Translated<ProductVariant> | undefined {
         const relation = line.productVariant;
         if (!relation || relation.deletedAt != null) {
             return undefined;
@@ -737,6 +993,26 @@ export class ReorderListLineEntityResolver {
         if (typeof relation.name !== 'string' || typeof relation.listPrice !== 'number') {
             return undefined;
         }
+        if (!this.isLoadedInActiveChannel(ctx, relation)) {
+            return undefined;
+        }
         return relation as Translated<ProductVariant>;
+    }
+
+    /**
+     * Whether a hydrated variant's **loaded** channel set demonstrably contains the request's active channel.
+     *
+     * `false` covers both "loaded, and not in this channel" and "not loaded, so unknown", and the two are
+     * deliberately answered the same way: the caller's only use for this predicate is to decide whether it may
+     * skip the channel-scoped load, and both answers mean it may not. Nothing is inferred from a missing
+     * relation, and no statement is issued to find out — asking the database here would be the per-entry read
+     * the batched path exists to avoid.
+     */
+    private isLoadedInActiveChannel(ctx: RequestContext, variant: ProductVariant): boolean {
+        const channels = variant.channels;
+        if (!Array.isArray(channels) || channels.length === 0) {
+            return false;
+        }
+        return channels.some(channel => channel != null && idsAreEqual(channel.id, ctx.channelId));
     }
 }

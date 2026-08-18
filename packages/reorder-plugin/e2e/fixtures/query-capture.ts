@@ -145,17 +145,29 @@
  * regression is exactly what an assertion of that contract exists to catch, so the helper it is made
  * with matters as much as the assertion:
  *
- *  - **{@link whereRequiresScopedPredicates} is the ownership helper.** It parses the predicate,
- *    resolves every placeholder to its bound value on all four engines, and requires each
- *    column-to-value binding to be a conjunct the predicate cannot be satisfied without. It rejects a
- *    disjunction, a swapped binding and a name supplied only by a subquery. **Name the relation** on each
- *    requirement — `{ column: 'customerId', value: id, relation: 'ReorderList' }` — whenever the
- *    statement qualifies its columns, which every query-builder statement does; a qualified comparison
- *    without a declared relation is refused, because a scope proved on a joined alias is no scope on the
- *    relation whose rows came back, and in a self-join the two are the same table.
+ *  - **{@link whereRequiresScopedPredicates} is the ownership helper for a statement against the table
+ *    that HOLDS the scope** — every statement against `reorder_list`. It parses the predicate, resolves
+ *    every placeholder to its bound value on all four engines, and requires each column-to-value binding
+ *    to be a conjunct the predicate cannot be satisfied without. It rejects a disjunction, a swapped
+ *    binding and a name supplied only by a subquery. **Name the relation** on each requirement —
+ *    `{ column: 'customerId', value: id, relation: 'ReorderList' }` — whenever the statement qualifies its
+ *    columns, which every query-builder statement does; a qualified comparison without a declared relation
+ *    is refused, because a scope proved on a joined alias is no scope on the relation whose rows came back,
+ *    and in a self-join the two are the same table.
+ *  - **{@link whereRequiresCorrelatedOwnership} is the ownership helper for a statement against
+ *    `reorder_list_line`**, and every line-mutation suite must use it. A line row holds neither a customer
+ *    nor a channel, so its writes carry the pair in a correlated `EXISTS` over the parent table — a shape
+ *    the helper above cannot certify and does not claim to, since its leaf recogniser accepts only
+ *    `column <op> placeholder`. This one parses the sub-query instead and requires all of it: the table it
+ *    reads, the correlation that ties it to the row being written, and each scope comparison bound to its
+ *    expected value. Without the correlation the sub-query is satisfied by ANY list the caller owns, which
+ *    is a statement that looks scoped and is not — so a line-write assertion made with anything weaker
+ *    (a parameter scan, a `toContain('EXISTS')`, a name search) is not evidence and must not be written.
  *  - **{@link whereMentionsColumns} is the guard-shape helper.** It asks only that each column is
  *    constrained by a mandatory conjunct, under any operator and against any value — right for a
- *    conditional write's `lineCount < :max`, and not sufficient for an ownership claim.
+ *    conditional write's `lineCount < :max`, and not sufficient for an ownership claim. Use it alongside
+ *    the correlated-ownership helper on a line write, to pin the row's own identifier and its parent
+ *    reference, which that helper deliberately leaves to it.
  *  - **{@link statementCarriesParameterValue} is a carriage check.** It proves a value appears; it
  *    proves nothing about which column carries it. Never present it alone as scope evidence.
  *
@@ -201,7 +213,10 @@
  *
  * The `@since` tag this feature requires on new public API is deliberately absent: that obligation
  * covers the plugin's published surface under `packages/reorder-plugin/src/`, and this is a test
- * fixture rather than published API.
+ * fixture rather than published API. It is absent from EVERY export here without exception — including
+ * the ones added later for the correlated-ownership claim — because a tag on some of them and not
+ * others would read as a statement that those few are published, which none of them is: nothing in
+ * this module is reachable from the package barrel and `tsconfig.build.json` never compiles it.
  */
 import { QueryRunner, Logger as TypeOrmLoggerInterface } from 'typeorm';
 
@@ -246,8 +261,26 @@ export interface CapturedStatement {
      * every `JOIN` form — lower-cased and de-duplicated in first-seen order. Never a substring scan
      * of the statement text; see {@link extractStatementTables} for the two traps that makes
      * unavoidable.
+     *
+     * This is the "which tables does this statement touch" answer, and it includes a table reached
+     * only inside a sub-query. For "which table does this statement change", see
+     * {@link CapturedStatement.targetTables}.
      */
     tables: string[];
+    /**
+     * The table (or tables) this statement **writes**, taken from its own outermost `INSERT INTO` /
+     * `UPDATE` / `DELETE FROM` clause and never from a sub-query — empty for a statement that is not a
+     * row-level write.
+     *
+     * It exists because the two questions have different answers for every one of this plugin's
+     * correlated-`EXISTS` line writes, which reference `reorder_list` while writing only
+     * `reorder_list_line`. {@link QueryCaptureLogger.writesFor} filters on this member so that a write
+     * count against a table counts writes to that table; {@link QueryCaptureLogger.forTables} filters on
+     * {@link CapturedStatement.tables} so that a statement-touching-a-table count still sees them all. See
+     * {@link extractStatementTargetTables}, including why an undeterminable target falls back to every
+     * referenced table rather than to none.
+     */
+    targetTables: string[];
     /** Monotonic index within the current capture window, starting at 0 and contiguous. */
     sequence: number;
     /**
@@ -971,6 +1004,263 @@ export function extractStatementTables(query: string, dialect?: string): string[
         return [];
     }
     return tables;
+}
+
+/**
+ * @description
+ * The table (or tables) a row-level write **actually targets**, as distinct from every table the statement
+ * mentions.
+ *
+ * ★ **Why this had to exist alongside {@link extractStatementTables}.** Three of this plugin's line writes
+ * carry the ownership predicate as a correlated sub-query over the *parent* table:
+ *
+ * ```sql
+ * UPDATE "reorder_list_line" SET "quantity" = "quantity" + $1
+ *  WHERE "id" = $2 AND "reorderListId" = $3
+ *    AND EXISTS (SELECT 1 FROM "reorder_list" "ownedList"
+ *                 WHERE "ownedList"."id" = "reorderListId"
+ *                   AND "ownedList"."customerId" = $4 AND "ownedList"."channelId" = $5)
+ * ```
+ *
+ * That statement *references* `reorder_list` — correctly, and `extractStatementTables` is right to say so,
+ * because a suite counting the statements that touch a table must see it. But it **writes** only
+ * `reorder_list_line`, and a `writesFor('reorder_list')` built on reference attribution counts it as a write
+ * to the parent table: one line update then reads as a list write, an exact write count against
+ * `reorder_list` is inflated by every line write in the window, and an assertion that a read path performed
+ * "no write to `reorder_list`" fails on a statement that wrote nothing there. Hence two attributions, each
+ * exact about a different question: `tables` answers "which tables does this statement touch", and
+ * `targetTables` answers "which table does this statement change".
+ *
+ * **What it returns.** For an `INSERT`/`REPLACE ... INTO t`, an `UPDATE t`, or a `DELETE FROM t` — each
+ * located at parenthesis depth zero, so a sub-query's own `FROM` cannot be mistaken for the target — the
+ * target table name (or the whole comma-separated list, for MySQL's multi-table write forms), lower-cased and
+ * de-duplicated. For a statement that is not a row-level write — a `SELECT`, a transaction-control statement,
+ * DDL — an **empty array**, because such a statement targets no row.
+ *
+ * **Where it cannot be certain it fails LOUD, not quiet**, which is the opposite of what a predicate helper
+ * does and is deliberate. If the statement is a write whose target cannot be located — a CTE-prefixed write,
+ * an unfamiliar dialect form, an unparsable fragment — it returns every table the statement references
+ * instead of nothing. An extra attribution makes an exact count fail, in the suite, with the statement in
+ * hand; a missing one makes "no write happened here" pass over a write that did. Only the second is silent,
+ * so only the first is acceptable.
+ *
+ * The function is total: any input, including a malformed or empty statement, yields an array rather than an
+ * exception.
+ *
+ * @example
+ * ```ts
+ * // The correlated-EXISTS line write: one write, and it is not a write to the parent table.
+ * const update = 'UPDATE "reorder_list_line" SET "quantity" = 2 WHERE "id" = 1 AND EXISTS ' +
+ *     '(SELECT 1 FROM "reorder_list" "ownedList" WHERE "ownedList"."id" = "reorderListId")';
+ * extractStatementTables(update, 'postgres');        // ['reorder_list_line', 'reorder_list']
+ * extractStatementTargetTables(update, 'postgres');  // ['reorder_list_line']
+ * ```
+ *
+ * @example
+ * ```ts
+ * extractStatementTargetTables('INSERT INTO "reorder_list_line"("quantity") VALUES ($1)', 'postgres');
+ * // ['reorder_list_line']
+ * extractStatementTargetTables('DELETE FROM `reorder_list` WHERE `id` = ?', 'mariadb');
+ * // ['reorder_list']
+ * extractStatementTargetTables('UPDATE customer, reorder_list SET lineCount = 0', 'mysql');
+ * // ['customer', 'reorder_list'] — MySQL's multi-table form targets both
+ * extractStatementTargetTables('SELECT * FROM "reorder_list" WHERE "id" = $1', 'postgres');
+ * // [] — a read targets no row
+ * ```
+ */
+export function extractStatementTargetTables(query: string, dialect?: string): string[] {
+    if (typeof query !== 'string' || query.length === 0) {
+        return [];
+    }
+    try {
+        if (WRITE_KINDS.indexOf(classifyStatement(query, dialect)) === -1) {
+            // Not a row-level write: there is no target, and this is the one branch that may return an empty
+            // array without it meaning "could not tell".
+            return [];
+        }
+        const tokens = tokeniseForTableScan(query, lexiconFor(dialect));
+        const targets = writeTargetsFromTokens(tokens);
+        // The loud fallback. A write whose target could not be located is attributed to everything it
+        // references, so a filtered count over-reports rather than under-reports.
+        return targets.length > 0 ? targets : extractStatementTables(query, dialect);
+    } catch {
+        return extractStatementTables(query, dialect);
+    }
+}
+
+/**
+ * Locates the target list of the first row-level write keyword at parenthesis depth zero.
+ *
+ * Depth is what makes this different from {@link extractStatementTables}: a `FROM` inside a sub-query, and an
+ * `INSERT` inside one, are both at depth one or deeper and are skipped, so the target is read from the
+ * statement's own outermost clause. A leading `WITH` yields nothing — a data-modifying common-table expression
+ * puts its write inside a parenthesised body, and locating "the" target of such a statement is not something
+ * this scan claims to do — which sends the caller to its loud fallback.
+ *
+ * `UPDATE` is additionally screened by {@link isNonTableUpdate}, so `FOR UPDATE`, `ON UPDATE`,
+ * `ON DUPLICATE KEY UPDATE` and `ON CONFLICT DO UPDATE` do not introduce a target.
+ *
+ * **A form this scan cannot certify yields nothing rather than a partial answer, and that is the load-bearing
+ * decision here.** MySQL and MariaDB accept multi-table writes — `DELETE a, b FROM a JOIN b ON ...` and
+ * `UPDATE a JOIN b ON ... SET a.x = 1, b.y = 2` — in which more than one table loses or changes rows. Reading
+ * only the first name out of one of those would name a real target and silently omit a real target, and the
+ * omission is the dangerous half: `writesFor('b')` would come back empty for a statement that writes `b`, so a
+ * suite asserting "nothing wrote to `b`" would pass while `b` was being written. Returning nothing instead
+ * routes the caller to its fallback, which attributes the statement to every table it references — so such an
+ * assertion fails loudly and gets looked at. An exact count that fails is a bug report; a zero-write assertion
+ * that passes wrongly is a defect that ships.
+ *
+ * A missing depth-zero `SET` on an `UPDATE` is refused for the same reason. A MySQL write *modifier* is handled
+ * differently — skipped rather than refused — because deferring to the reference scan would not help there:
+ * see {@link WRITE_MODIFIER_WORDS}. Every statement this plugin actually issues is single-target and is
+ * certified exactly; the refusals cover forms it does not currently produce, so the cost of being strict is nil
+ * and the cost of being lax would be invisible.
+ */
+function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
+    let depth = 0;
+    for (let index = 0; index < tokens.length; index++) {
+        const token = tokens[index];
+        if (token.kind === 'other') {
+            if (token.text === '(') {
+                depth++;
+            } else if (token.text === ')') {
+                depth = depth > 0 ? depth - 1 : 0;
+            }
+            continue;
+        }
+        if (token.kind !== 'word' || depth !== 0) {
+            continue;
+        }
+        if (token.text === 'with') {
+            // A CTE-prefixed statement. Refused here, and answered by the caller's fallback.
+            return [];
+        }
+        if (token.text === 'insert' || token.text === 'replace') {
+            // `INSERT INTO t`, and the MySQL forms that put a modifier first — `INSERT IGNORE INTO t`,
+            // `INSERT LOW_PRIORITY INTO t`, `REPLACE DELAYED INTO t`. The target is whatever follows the
+            // depth-zero `INTO`; where the dialect omits `INTO` altogether the name follows the keyword
+            // directly. `INTO` is skipped here rather than through {@link SKIPPABLE_PRE_TABLE_WORDS},
+            // because that list is shared with the reference scan and widening it would change how every
+            // other statement form is read.
+            const intoIndex = depthZeroWordIndex(tokens, index + 1, 'into');
+            return normaliseTableNames(
+                tableTokensAfter(tokens, intoIndex === -1 ? index + 1 : intoIndex + 1),
+            );
+        }
+        if (token.text === 'update' && !isNonTableUpdate(tokens, index)) {
+            // The certifiable shape is `UPDATE <one table> [alias] SET ...`. Recognized MySQL/MariaDB write
+            // modifiers are skipped by {@link skipWriteModifiers} before the target is read. A join, a comma
+            // or multi-target list, a missing depth-zero `SET`, or another uncertifiable structure is refused
+            // so the caller falls back to attributing every referenced table. See
+            // {@link writeTargetsFromTokens}'s own note on why refusing beats guessing here.
+            const setIndex = depthZeroWordIndex(tokens, index + 1, 'set');
+            const updateFrom = skipWriteModifiers(tokens, index + 1);
+            if (setIndex === -1 || depthZeroWordIndexBefore(tokens, updateFrom, setIndex, 'join') !== -1) {
+                return [];
+            }
+            const updateTargets = normaliseTableNames(tableTokensAfter(tokens, updateFrom));
+            return updateTargets.length === 1 ? updateTargets : [];
+        }
+        if (token.text === 'delete') {
+            // The certifiable shape is `DELETE FROM <one table> ...`, which also covers PostgreSQL's
+            // `DELETE FROM a USING b` correctly: `USING` introduces a *source*, and only `a` loses rows.
+            // Recognized MySQL/MariaDB modifiers before `FROM` are skipped by {@link skipWriteModifiers}.
+            // An identifier remaining between those modifiers and `FROM`, a join, a comma or multi-target
+            // list after `FROM`, or another uncertifiable structure is refused to the loud fallback.
+            const fromIndex = depthZeroWordIndex(tokens, index + 1, 'from');
+            if (
+                fromIndex === -1 ||
+                namesIdentifierBetween(tokens, skipWriteModifiers(tokens, index + 1), fromIndex) ||
+                depthZeroWordIndex(tokens, fromIndex + 1, 'join') !== -1
+            ) {
+                return [];
+            }
+            const deleteTargets = normaliseTableNames(tableTokensAfter(tokens, fromIndex + 1));
+            return deleteTargets.length === 1 ? deleteTargets : [];
+        }
+    }
+    return [];
+}
+
+/**
+ * Words MySQL and MariaDB permit between a write keyword and its target table.
+ *
+ * They matter because `UPDATE` and `DELETE` have no `INTO` to anchor the scan the way `INSERT` does, so a
+ * modifier sits exactly where the table name would and a naive scan reads it *as* the table. That failure is
+ * silent in the worst direction — `UPDATE IGNORE t SET ...` would be filed under a table called `ignore`, and
+ * `writesFor('t')` would then come back empty for a statement that writes `t` — and it is not fixed by
+ * deferring to the reference scan, because that scan reads the modifier as the table too. The list is closed
+ * and documented by both engines, so these words are *skipped* to reach the real target rather than refused,
+ * exactly as {@link SKIPPABLE_PRE_TABLE_WORDS} skips `IF NOT EXISTS` and `ONLY`. Genuine multi-target forms are
+ * a different matter and are refused; see {@link writeTargetsFromTokens}.
+ */
+const WRITE_MODIFIER_WORDS = ['low_priority', 'high_priority', 'quick', 'delayed', 'ignore', 'concurrent'];
+
+/** The first index at or after `from` whose token is not a {@link WRITE_MODIFIER_WORDS} entry. */
+function skipWriteModifiers(tokens: ScanToken[], from: number): number {
+    let cursor = from;
+    while (
+        cursor < tokens.length &&
+        tokens[cursor].kind === 'word' &&
+        WRITE_MODIFIER_WORDS.indexOf(tokens[cursor].text) !== -1
+    ) {
+        cursor++;
+    }
+    return cursor;
+}
+
+/**
+ * Whether `[from, to)` contains any identifier — a bare word or a quoted name — at depth zero.
+ *
+ * Used to detect a write-target list, whose presence is what distinguishes MySQL's multi-table
+ * `DELETE a, b FROM ...` from the ordinary `DELETE FROM ...` this scan can certify.
+ */
+function namesIdentifierBetween(tokens: ScanToken[], from: number, to: number): boolean {
+    let depth = 0;
+    for (let index = from; index < to && index < tokens.length; index++) {
+        const token = tokens[index];
+        if (token.kind === 'other') {
+            if (token.text === '(') {
+                depth++;
+            } else if (token.text === ')') {
+                depth = depth > 0 ? depth - 1 : 0;
+            }
+            continue;
+        }
+        if (depth === 0 && (token.kind === 'word' || token.kind === 'quoted')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** {@link depthZeroWordIndex} bounded above by `to`, for scanning one clause rather than the remainder. */
+function depthZeroWordIndexBefore(tokens: ScanToken[], from: number, to: number, word: string): number {
+    const found = depthZeroWordIndex(tokens.slice(from, Math.min(to, tokens.length)), 0, word);
+    return found === -1 ? -1 : from + found;
+}
+
+/**
+ * The index of the next bare `word` token equal to `word` at parenthesis depth zero, starting at `from`, or
+ * `-1`. Depth is tracked from the starting point, so a sub-query opened after it cannot supply the match.
+ */
+function depthZeroWordIndex(tokens: ScanToken[], from: number, word: string): number {
+    let depth = 0;
+    for (let index = from; index < tokens.length; index++) {
+        const token = tokens[index];
+        if (token.kind === 'other') {
+            if (token.text === '(') {
+                depth++;
+            } else if (token.text === ')') {
+                depth = depth > 0 ? depth - 1 : 0;
+            }
+            continue;
+        }
+        if (depth === 0 && token.kind === 'word' && token.text === word) {
+            return index;
+        }
+    }
+    return -1;
 }
 
 /** One lexical token of a statement, as much as the table scan needs to distinguish. */
@@ -1851,6 +2141,19 @@ const LEAF_COLUMN_FIRST = new RegExp(
 /** `operand <op> column`, the same comparison written the other way round. */
 const LEAF_OPERAND_FIRST = new RegExp(
     `^\\s*(${LEAF_OPERAND_SOURCE})\\s*(${LEAF_OPERATOR_SOURCE})\\s*(${LEAF_PATH_SOURCE})\\s*$`,
+);
+
+/**
+ * `column <op> column` — a comparison of two identifier paths and nothing else.
+ *
+ * Deliberately separate from {@link LEAF_COLUMN_FIRST}, which requires a placeholder or a literal on one
+ * side precisely so that a column-to-column comparison is never read as a scope: `customerId = ownerId`
+ * constrains no tenant. The one place a column pair IS the property under test is the **correlation** of a
+ * sub-query to the row the enclosing statement addresses, which is what
+ * {@link whereRequiresCorrelatedOwnership} reads it for.
+ */
+const LEAF_COLUMN_PAIR = new RegExp(
+    `^\\s*(${LEAF_PATH_SOURCE})\\s*(${LEAF_OPERATOR_SOURCE})\\s*(${LEAF_PATH_SOURCE})\\s*$`,
 );
 
 /**
@@ -2744,6 +3047,41 @@ function predicateRequires(
 }
 
 /**
+ * Whether some leaf of the parsed predicate satisfies `test` **as a mandatory conjunct**: present in at least
+ * one operand of every conjunction, and in *every* operand of every disjunction, and never under a `NOT`.
+ *
+ * It is the structural rule of {@link predicateRequires} and {@link predicateMentionsColumn} with the leaf
+ * test supplied by the caller, extracted so that a third kind of requirement cannot accidentally implement a
+ * weaker version of the rule. An `uncertifiable` node answers `false` for the same fail-closed reason the
+ * other two give: a fragment this parser cannot read must never satisfy the conjunction it sits in.
+ */
+function predicateRequiresLeaf(node: PredicateNode, test: (leafText: string) => boolean): boolean {
+    if (node.kind === 'and') {
+        for (const child of node.children) {
+            if (predicateRequiresLeaf(child, test)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (node.kind === 'or') {
+        for (const child of node.children) {
+            if (!predicateRequiresLeaf(child, test)) {
+                return false;
+            }
+        }
+        return node.children.length > 0;
+    }
+    if (node.kind === 'uncertifiable') {
+        return false;
+    }
+    if (node.negated) {
+        return false;
+    }
+    return test(node.text);
+}
+
+/**
  * Blanks the parts of a leaf that must not contribute a column name: string literals, and any
  * parenthesised group containing a `SELECT` — that is, a subquery. A function call such as
  * `LOWER(nameKey)` is deliberately left intact, because the column really is constrained there.
@@ -2899,6 +3237,13 @@ export interface ScopedPredicate {
  *    recognised as a comparison only when it is exactly `column <op> operand`, so this returns
  *    `false`.
  *
+ * That last refusal is correct here and is NOT a gap to work around, but it does mean this helper is the
+ * wrong one for a statement whose scope legitimately lives in a sub-query — every write against
+ * `reorder_list_line`, whose row holds neither a customer nor a channel. Those use
+ * {@link whereRequiresCorrelatedOwnership}, which parses the sub-query and requires its table, its
+ * correlation to the row being written, and each scope comparison bound to its value. Do not reach for a
+ * parameter scan or a name search instead.
+ *
  * **Placeholder resolution covers all four engines.** PostgreSQL renders `$1`, `$2`, … and the others
  * render `?`; a positional `?` is resolved by counting the placeholders that precede the predicate,
  * because MySQL, MariaDB and SQLite bind positionally across the whole statement. An **inline literal**
@@ -2990,6 +3335,640 @@ export function whereRequiresScopedPredicates(
 
 /**
  * @description
+ * One relation named in a sub-query's `FROM` clause, together with the alias it was given.
+ *
+ * `alias` is `undefined` for a relation written without one, in which case its columns are qualified by the
+ * table name or not at all.
+ */
+interface SubqueryRelation {
+    /** The table name, lower-cased, taken as the last segment of a possibly schema-qualified name. */
+    readonly table: string;
+    /** The alias the `FROM` clause introduced, lower-cased, or `undefined` where it introduced none. */
+    readonly alias: string | undefined;
+}
+
+/**
+ * Clauses that decouple a sub-query's row count from the rows its predicate matched, and are therefore
+ * refused outright inside an ownership sub-query.
+ *
+ * `group` and `having` are the load-bearing pair: an empty grouping set — `GROUP BY ()` on the MySQL family,
+ * `GROUP BY GROUPING SETS (())` on PostgreSQL — produces ONE row for the whole input even when the input is
+ * empty, so the enclosing `EXISTS` becomes true for a row nobody owns. `window`, `order`, `limit`, `offset`
+ * and `fetch` cannot manufacture a row but can remove every one of them (`LIMIT 0`), which decouples the
+ * `EXISTS` in the other direction. None appears in the SQL a query builder produces for this plugin, so
+ * refusing all six costs nothing real and removes a whole class of shape this parser would otherwise have to
+ * reason about.
+ */
+const ROW_COUNT_DECOUPLING_WORDS = ['group', 'having', 'window', 'order', 'limit', 'offset', 'fetch'];
+
+/**
+ * Whether a sub-query returns exactly one row per row its predicate matched — the property that makes the
+ * enclosing `EXISTS` mean "a row satisfying this predicate is there".
+ *
+ * ★ **Why an aggregate projection is the bypass this closes.** `EXISTS (SELECT COUNT(*) FROM reorder_list ol
+ * WHERE ol.id = "reorderListId" AND ol.customerId = $1 AND ol.channelId = $2)` names the right table, carries
+ * a real correlation and both scope comparisons bound to the right values — and is true for EVERY row of the
+ * enclosing statement, because an ungrouped aggregate returns one row (`COUNT(*) = 0`) whether or not
+ * anything matched. A verifier that read the `FROM` clause and the predicate but never the projection would
+ * certify it, and the write it guards would reach every line in the table. The same holds for an empty
+ * grouping set with any projection at all, which is why {@link ROW_COUNT_DECOUPLING_WORDS} is refused
+ * alongside.
+ *
+ * The rule is therefore the narrowest one that admits the production SQL and nothing else: the sub-query must
+ * be spelled `SELECT 1 FROM ...`, the projection being the single literal `1`. That is what
+ * `ReorderListService.ownedListExistsClause()` writes, it is row-dependent by construction, and every other
+ * projection — an aggregate, `*`, a column, `DISTINCT` anything, a list — is refused rather than analysed.
+ * Rejecting a row-dependent projection this parser has not modelled costs a false negative, which fails an
+ * assertion loudly; admitting a row-independent one costs a false positive, which is a certified bypass.
+ *
+ * The scan runs over the same tokens {@link extractStatementTables} and {@link subqueryRelation} use, so a
+ * keyword inside a string literal or a comment contributes nothing, and only a bare word acts as syntax. A
+ * bare `1` is punctuation to that tokeniser rather than an identifier, because a digit cannot start one, so
+ * the projection is matched as an `other` token whose text is exactly `1`.
+ */
+function subqueryReturnsOneRowPerMatch(subquery: string, lexicon: DialectLexicon): boolean {
+    const tokens = tokeniseForTableScan(subquery, lexicon);
+    // A sub-query that does not OPEN with `SELECT` is some other statement form — a `WITH` prelude, a
+    // parenthesised expression, a `VALUES` list — and is refused rather than read through.
+    if (tokens.length === 0 || tokens[0].kind !== 'word' || tokens[0].text !== 'select') {
+        return false;
+    }
+    let depth = 0;
+    let fromIndex = -1;
+    for (let index = 0; index < tokens.length; index++) {
+        const token = tokens[index];
+        if (token.kind === 'other' && token.text === '(') {
+            depth++;
+            continue;
+        }
+        if (token.kind === 'other' && token.text === ')') {
+            depth = depth > 0 ? depth - 1 : 0;
+            continue;
+        }
+        if (depth !== 0 || token.kind !== 'word') {
+            continue;
+        }
+        if (ROW_COUNT_DECOUPLING_WORDS.indexOf(token.text) !== -1) {
+            return false;
+        }
+        if (token.text === 'from' && fromIndex === -1) {
+            fromIndex = index;
+        }
+    }
+    // `SELECT`, then exactly one projection token, then `FROM`. A longer projection list, a qualified column,
+    // a function call and `DISTINCT` all put more than one token here.
+    if (fromIndex !== 2) {
+        return false;
+    }
+    const projection = tokens[1];
+    return projection.kind === 'other' && projection.text === '1';
+}
+
+/**
+ * The single relation a sub-query reads, or `undefined` where it reads none, reads more than one, or is
+ * written in a form this scan cannot read.
+ *
+ * ★ **More than one relation is refused rather than analysed, and that is the fail-closed direction.** A
+ * correlated ownership sub-query is a statement over exactly one table: the parent whose columns carry the
+ * scope. Admit a second relation and the guarantee dissolves — `FROM reorder_list ol, reorder_list other`
+ * lets the correlation address `ol` while the customer comparison addresses `other`, which is a predicate
+ * satisfied by any list the caller owns and therefore reaches every line they can name. A join form does the
+ * same. Neither occurs in the SQL a query builder produces for this plugin, so refusing costs nothing real.
+ *
+ * The scan runs over the same tokens {@link extractStatementTables} uses, so a table name written inside a
+ * string literal or a comment contributes nothing, and only a bare word can act as syntax.
+ */
+function subqueryRelation(subquery: string, lexicon: DialectLexicon): SubqueryRelation | undefined {
+    const tokens = tokeniseForTableScan(subquery, lexicon);
+    let depth = 0;
+    let fromIndex = -1;
+    for (let index = 0; index < tokens.length; index++) {
+        const token = tokens[index];
+        if (token.kind === 'other' && token.text === '(') {
+            depth++;
+            continue;
+        }
+        if (token.kind === 'other' && token.text === ')') {
+            depth = depth > 0 ? depth - 1 : 0;
+            continue;
+        }
+        if (depth === 0 && token.kind === 'word' && token.text === 'from') {
+            if (fromIndex !== -1) {
+                // A second depth-zero `FROM` is a second relation source, which this scan does not model.
+                return undefined;
+            }
+            fromIndex = index;
+        }
+    }
+    if (fromIndex === -1) {
+        return undefined;
+    }
+    let cursor = fromIndex + 1;
+    if (cursor >= tokens.length) {
+        return undefined;
+    }
+    // A derived table — `FROM (SELECT ...)` — is punctuation here rather than a name, and is refused.
+    if (tokens[cursor].kind !== 'word' && tokens[cursor].kind !== 'quoted') {
+        return undefined;
+    }
+    // A qualified name is consumed whole and its LAST segment is the table, so `public.reorder_list` is
+    // `reorder_list` rather than `public`.
+    let table = tokens[cursor].text;
+    cursor++;
+    while (
+        cursor + 1 < tokens.length &&
+        tokens[cursor].kind === 'other' &&
+        tokens[cursor].text === '.' &&
+        (tokens[cursor + 1].kind === 'word' || tokens[cursor + 1].kind === 'quoted')
+    ) {
+        table = tokens[cursor + 1].text;
+        cursor += 2;
+    }
+    let alias: string | undefined;
+    if (cursor < tokens.length && tokens[cursor].kind === 'word' && tokens[cursor].text === 'as') {
+        cursor++;
+        if (cursor >= tokens.length || (tokens[cursor].kind !== 'word' && tokens[cursor].kind !== 'quoted')) {
+            return undefined;
+        }
+        alias = tokens[cursor].text.toLowerCase();
+        cursor++;
+    } else if (
+        cursor < tokens.length &&
+        (tokens[cursor].kind === 'quoted' ||
+            (tokens[cursor].kind === 'word' && NON_ALIAS_WORDS.indexOf(tokens[cursor].text) === -1))
+    ) {
+        alias = tokens[cursor].text.toLowerCase();
+        cursor++;
+    }
+    // Only a predicate may follow the single relation. A comma continues a relation list and a join word
+    // introduces a second relation; both are refused, as is anything else this scan has not accounted for.
+    if (cursor < tokens.length) {
+        const next = tokens[cursor];
+        if (next.kind !== 'word' || next.text !== 'where') {
+            return undefined;
+        }
+    }
+    return { table: table.toLowerCase(), alias };
+}
+
+/**
+ * @description
+ * One scope comparison a correlated ownership sub-query must carry: a column, the relation it may be
+ * qualified by, and — unlike {@link ScopedPredicate}, from which this narrows — the value it must be
+ * compared against, **required**.
+ *
+ * ★ **Why the value cannot be optional here.** {@link ScopedPredicate} treats an omitted `value` as
+ * "require only that this column is compared", which is a reasonable weaker claim for a general predicate
+ * assertion. It is not a reasonable claim for an ownership sub-query: `EXISTS (SELECT 1 FROM reorder_list ol
+ * WHERE ol.id = "reorderListId" AND ol.customerId = $1 AND ol.channelId = $2)` has the right SHAPE whichever
+ * way round `$1` and `$2` are bound, and the swapped binding scopes the write to a different tenant. A
+ * column-only ownership requirement would certify it. So the property is required at compile time and
+ * checked again at run time, and `undefined` is not an accepted value for it — the type is written as
+ * "anything but `undefined`" so that both the omission and an explicitly-`undefined` fixture identifier are
+ * compile errors rather than a silently weaker assertion.
+ */
+export interface CorrelatedOwnershipScopePredicate extends ScopedPredicate {
+    /**
+     * The **decoded** value the column must be compared against — not the external `T_n` form, for the
+     * reason {@link statementCarriesParameterValue} documents.
+     *
+     * `NonNullable<unknown>` is `{}`, which admits every value except `null` and `undefined`; `| null` adds
+     * `null` back, since a column compared to a genuinely null-valued identifier is a claim a caller may
+     * legitimately want to make. What is excluded is `undefined`, which is the one value that could only ever
+     * mean "the fixture never assigned this".
+     */
+    value: NonNullable<unknown> | null;
+}
+
+/**
+ * @description
+ * The ownership predicate a statement must carry through a correlated `EXISTS` sub-query.
+ *
+ * Every part is required, because each one is a distinct way the sub-query can be satisfied without scoping
+ * the row the statement is writing. See {@link whereRequiresCorrelatedOwnership}.
+ */
+export interface CorrelatedOwnershipRequirement {
+    /**
+     * The table the sub-query must read — the parent table whose columns carry the scope. Matched
+     * case-insensitively and quote-agnostically against the single relation of the sub-query's `FROM`.
+     */
+    table: string;
+    /**
+     * The correlation that ties the sub-query to the row the enclosing statement addresses, rather than to
+     * the table at large.
+     */
+    correlation: {
+        /** The sub-query column compared — the parent's own identifier. */
+        column: string;
+        /** The enclosing statement's column it must be compared to — the child's reference to its parent. */
+        outerColumn: string;
+        /**
+         * The relation the outer column must be qualified by, where the engine qualifies it.
+         *
+         * Omit it to accept the outer reference written bare **or** qualified by anything other than the
+         * sub-query's own alias — which is what makes one assertion correct on all four engines, since
+         * TypeORM qualifies a written table's columns on some and not on others. What is never accepted is a
+         * reference qualified by the sub-query's alias, because `ol.id = ol.parentId` compares one row of the
+         * sub-query's table with itself and correlates to nothing.
+         */
+        outerRelation?: string;
+    };
+    /**
+     * The scope comparisons the sub-query must additionally require, each a mandatory conjunct of its
+     * predicate — for this plugin, the acting customer and the active channel.
+     *
+     * `value` is **required** on each one, for the reason {@link CorrelatedOwnershipScopePredicate} sets out:
+     * a column-only ownership requirement certifies a sub-query whose tenant parameters are bound the wrong
+     * way round. Supply the **decoded** identifier, for the reason {@link statementCarriesParameterValue}
+     * documents. `relation` may be omitted, in which case a comparison qualified by the sub-query's alias (or
+     * by its table, or unqualified — inside a verified single-relation sub-query those are the same relation)
+     * satisfies it; supplied, it must be the alias the statement actually used.
+     */
+    predicates: CorrelatedOwnershipScopePredicate[];
+}
+
+/**
+ * @description
+ * True when the statement's `WHERE` **requires** a correlated `EXISTS` sub-query that scopes the row being
+ * addressed to its owner — the table, the correlation and every scope comparison all verified, and every
+ * value resolved to its bound parameter.
+ *
+ * ★ **WHY THIS EXISTS, AND WHY THE OTHER TWO HELPERS CANNOT SERVE.** A `reorder_list_line` row stores its
+ * parent's identifier, a variant reference and a quantity — no customer and no channel. So the only way a
+ * line write can satisfy the contract's "one conditional statement whose `WHERE` carries the acting customer
+ * and the active channel, with the affected-row count as the authority" is a sub-query over the parent table
+ * (FEATURE-001-01 §2.11). {@link whereRequiresScopedPredicates} cannot certify that shape and must not
+ * pretend to: its leaf recogniser accepts only `column <op> placeholder`, so an `EXISTS` is not a comparison
+ * at all and the requirement fails closed. {@link whereMentionsColumns} refuses it even more explicitly — it
+ * blanks any parenthesised `SELECT` before looking for a column name, precisely so that
+ * `EXISTS (SELECT 1 FROM x WHERE customerId = ?)` is not mistaken for a predicate on the addressed row.
+ * Both refusals are correct for what those helpers claim. Neither leaves a way to state the claim a line
+ * write actually makes, and a suite reduced to scanning parameters or statement text for the customer's
+ * identifier would be asserting presence rather than scope. This function closes that gap.
+ *
+ * **What it verifies, and the bypass each part refuses.**
+ *
+ *  - **The `EXISTS` is a mandatory conjunct of the outer predicate**, by the same rule the other two helpers
+ *    apply: satisfied by at least one operand of every conjunction, by *every* operand of every disjunction,
+ *    and never under a `NOT`. `WHERE id = $1 OR EXISTS (...)` therefore fails, where a text search passes
+ *    while every row in the table stays reachable.
+ *  - **The sub-query reads the required table, and exactly one relation.** `EXISTS (SELECT 1 FROM
+ *    reorder_list_line ...)` is not an ownership check, and a second relation lets the correlation and the
+ *    scope address different rows — see {@link subqueryRelation}.
+ *  - **The sub-query returns one row per matching row.** `EXISTS (SELECT COUNT(*) FROM reorder_list ol WHERE
+ *    <correlation and both scopes>)` satisfies every other part of this requirement and is true for every row
+ *    of the enclosing statement, because an ungrouped aggregate returns a row whether or not anything matched;
+ *    an empty grouping set does the same with any projection. Both are refused — see
+ *    {@link subqueryReturnsOneRowPerMatch}.
+ *  - **The correlation is present and reaches OUT.** Without it, `EXISTS (SELECT 1 FROM reorder_list ol WHERE
+ *    ol.customerId = $1 AND ol.channelId = $2)` is satisfied by *any* list the caller owns in the channel, so
+ *    a line of any list they own — and, if the outer statement addresses the line by id alone, a line of a
+ *    list they do not own — is reachable. This is the single most important part and the easiest to omit,
+ *    because the statement looks scoped without it.
+ *  - **Each scope comparison is a mandatory conjunct of the sub-query, bound to the expected value.** A
+ *    sub-query whose customer and channel parameters are bound the other way round has the right shape and
+ *    scopes to the wrong tenant. The expected value is consequently **required** on every entry of
+ *    `predicates` — see {@link CorrelatedOwnershipScopePredicate} — and a requirement that omits one, or
+ *    carries `undefined`, is refused instead of falling back to the weaker column-only check that would
+ *    certify exactly that swap.
+ *
+ * **It fails closed, everywhere.** An empty `predicates` list, a predicate with no expected value, a missing
+ * correlation, a projection whose row count does not follow the predicate, a sub-query whose
+ * predicate cannot be read, a dialect-ambiguous construct anywhere in the statement or inside the sub-query, a
+ * depth-zero set operator in the sub-query (`... WHERE 1 = 0 UNION SELECT 1` is satisfied for every row), a
+ * second statement after a separator, an `EXISTS` that is only part of its leaf, or any shape this parser does
+ * not model — all return `false`. The function is total and never throws.
+ *
+ * **Placeholders resolve on all four engines**, because the outer `WHERE` portion is normalised before it is
+ * split: a positional `?` has already been rewritten to its statement-wide `$n` position by the time a leaf is
+ * examined, so a `$n` inside the sub-query resolves against the statement's own `parameters` array. An inline
+ * numeric literal — what the SQLite family writes instead of binding — resolves too.
+ *
+ * @param statement A captured statement, whose bound parameters are used to resolve placeholders, or a raw
+ * statement string, in which case only inline literals can be resolved.
+ * @param requirement The table, correlation and scope comparisons the sub-query must carry.
+ * @param dialect Overrides the statement's own recorded driver type, for a statement captured without one.
+ *
+ * @example
+ * ```ts
+ * // The line-write ownership claim, evidenced rather than approximated. The decoded identifiers come from
+ * // the fixture that created the rows.
+ * const [update] = capture.writesFor('reorder_list_line');
+ * expect(
+ *     whereRequiresCorrelatedOwnership(update, {
+ *         table: 'reorder_list',
+ *         correlation: { column: 'id', outerColumn: 'reorderListId' },
+ *         predicates: [
+ *             { column: 'customerId', value: decodedCustomerId },
+ *             { column: 'channelId', value: decodedChannelId },
+ *         ],
+ *     }),
+ * ).toBe(true);
+ * // And the row itself is still addressed by its own identifier, which this helper does not assert.
+ * expect(whereMentionsColumns(update, ['id', 'reorderListId'])).toBe(true);
+ * ```
+ */
+export function whereRequiresCorrelatedOwnership(
+    statement: CapturedStatement | string,
+    requirement: CorrelatedOwnershipRequirement,
+    dialect?: string,
+): boolean {
+    try {
+        if (!isUsableOwnershipRequirement(requirement)) {
+            return false;
+        }
+        const lexicon = lexiconForStatement(statement, dialect);
+        const predicate = parseStatementPredicate(resolveStatementText(statement), lexicon);
+        if (predicate === undefined) {
+            return false;
+        }
+        const parameters =
+            typeof statement === 'string' || !Array.isArray(statement.parameters) ? [] : statement.parameters;
+        const resolvedDialect =
+            dialect !== undefined ? dialect : typeof statement === 'string' ? undefined : statement.dialect;
+        return predicateRequiresCorrelatedOwnership(predicate, {
+            requirement,
+            parameters,
+            lexicon,
+            dialect: resolvedDialect,
+        });
+    } catch {
+        // A malformed statement or requirement is reported as not satisfying the claim rather than throwing,
+        // so a parse problem can never be mistaken for a verified ownership predicate.
+        return false;
+    }
+}
+
+/** Everything the recursive walk needs, gathered once so the recursion carries one argument. */
+interface OwnershipContext {
+    readonly requirement: CorrelatedOwnershipRequirement;
+    readonly parameters: readonly unknown[];
+    readonly lexicon: DialectLexicon;
+    readonly dialect: string | undefined;
+}
+
+/**
+ * Whether a requirement is well formed enough to be verified at all.
+ *
+ * An empty `predicates` list is refused rather than treated as "no scope comparisons needed": a correlation
+ * alone establishes that the parent row exists, not that the caller owns it, and an assertion that names no
+ * scope asserts nothing. Every string that has to be matched must be a non-empty string.
+ */
+function isUsableOwnershipRequirement(requirement: CorrelatedOwnershipRequirement): boolean {
+    if (requirement === null || typeof requirement !== 'object') {
+        return false;
+    }
+    const correlation = requirement.correlation;
+    if (
+        typeof requirement.table !== 'string' ||
+        requirement.table.length === 0 ||
+        correlation === null ||
+        typeof correlation !== 'object' ||
+        typeof correlation.column !== 'string' ||
+        correlation.column.length === 0 ||
+        typeof correlation.outerColumn !== 'string' ||
+        correlation.outerColumn.length === 0
+    ) {
+        return false;
+    }
+    if (!Array.isArray(requirement.predicates) || requirement.predicates.length === 0) {
+        return false;
+    }
+    for (const predicate of requirement.predicates) {
+        if (
+            predicate === null ||
+            typeof predicate !== 'object' ||
+            typeof predicate.column !== 'string' ||
+            predicate.column.length === 0
+        ) {
+            return false;
+        }
+        // The expected value is required, and re-checked here rather than left to the type. A suite compiled
+        // against an older shape, a value read out of a fixture that never assigned it, or a plain-JavaScript
+        // caller can all present a predicate with no usable value — and {@link predicateRequires} reads an
+        // ABSENT `value` as "require only that this column is compared", which for an ownership claim would
+        // certify a sub-query whose customer and channel parameters are bound the wrong way round. Refusing
+        // here is what keeps the compile-time requirement from being the only thing enforcing it.
+        if (!Object.prototype.hasOwnProperty.call(predicate, 'value') || predicate.value === undefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Whether a satisfying correlated `EXISTS` is a **mandatory** conjunct of the parsed predicate.
+ *
+ * The structural rule is {@link predicateRequires}'s, verbatim and for the same reason: one operand of a
+ * conjunction is enough, every operand of a disjunction is required, an unreadable fragment refuses, and
+ * nothing under a `NOT` counts.
+ */
+function predicateRequiresCorrelatedOwnership(node: PredicateNode, context: OwnershipContext): boolean {
+    if (node.kind === 'and') {
+        for (const child of node.children) {
+            if (predicateRequiresCorrelatedOwnership(child, context)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (node.kind === 'or') {
+        for (const child of node.children) {
+            if (!predicateRequiresCorrelatedOwnership(child, context)) {
+                return false;
+            }
+        }
+        return node.children.length > 0;
+    }
+    if (node.kind === 'uncertifiable' || node.negated) {
+        return false;
+    }
+    return leafIsCorrelatedOwnership(node.text, context);
+}
+
+/**
+ * Whether one leaf is an `EXISTS` sub-query satisfying the whole requirement.
+ *
+ * The leaf must be the `EXISTS` and nothing else: its parenthesised group has to close at the end of the
+ * fragment, so `EXISTS (...) = 1`, `EXISTS (...) IS NULL` and any other construct wrapping it are refused
+ * rather than read through.
+ */
+function leafIsCorrelatedOwnership(leafText: string, context: OwnershipContext): boolean {
+    const trimmed = leafText.replace(/^\s+|\s+$/g, '');
+    const opener = /^exists\s*\(/i.exec(trimmed);
+    if (opener === null) {
+        return false;
+    }
+    const openIndex = trimmed.indexOf('(');
+    const closeIndex = findMatchingParenthesis(trimmed, openIndex, context.lexicon);
+    if (closeIndex !== trimmed.length - 1) {
+        return false;
+    }
+    const subquery = trimmed.slice(openIndex + 1, closeIndex);
+    // The sub-query is re-examined for the refusals the outer statement was already checked for, because a
+    // construct that changes which rows it returns changes whether the `EXISTS` is satisfied — and a
+    // depth-zero set operator inside it does exactly that: `WHERE 1 = 0 UNION SELECT 1` is satisfied for
+    // every row of the outer statement.
+    if (
+        findUncertifiableLexicalForm(subquery, context.lexicon) !== undefined ||
+        findDepthZeroStatementExpansion(subquery, context.lexicon) !== undefined
+    ) {
+        return false;
+    }
+    // The sub-query must return a row PER MATCHING ROW rather than a row per statement, which is what makes
+    // the `EXISTS` mean "such a row is there" at all — see {@link subqueryReturnsOneRowPerMatch}.
+    if (!subqueryReturnsOneRowPerMatch(subquery, context.lexicon)) {
+        return false;
+    }
+    const relation = subqueryRelation(subquery, context.lexicon);
+    if (relation === undefined || relation.table !== context.requirement.table.toLowerCase()) {
+        return false;
+    }
+    // Belt and braces over the same token stream the attribution scan uses: the sub-query must touch the one
+    // table and no other, anywhere in it — including inside a nested group the single-relation scan above
+    // reads past.
+    const tables = extractStatementTables(subquery, context.dialect);
+    if (tables.length !== 1 || tables[0] !== relation.table) {
+        return false;
+    }
+    // Placeholders are NOT re-normalised here. The whole outer `WHERE` portion was normalised before it was
+    // split into leaves, so every `?` inside this sub-query already carries its statement-wide `$n` position;
+    // numbering it again from zero would resolve each one to the wrong parameter.
+    const portion = extractWherePortionWithOffset(subquery, context.lexicon);
+    if (portion === undefined) {
+        return false;
+    }
+    const subPredicate = parsePredicate(portion.text, context.lexicon);
+    if (!predicateRequiresCorrelation(subPredicate, relation, context.requirement.correlation)) {
+        return false;
+    }
+    for (const scoped of context.requirement.predicates) {
+        if (!predicateRequiresScopeWithinSubquery(subPredicate, relation, scoped, context.parameters)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * Whether one scope comparison is a mandatory conjunct of the sub-query's predicate.
+ *
+ * A caller that named a `relation` is held to it exactly. A caller that did not is satisfied by the alias the
+ * sub-query introduced, by its table name, or by an unqualified comparison — inside a sub-query already
+ * verified to read exactly one relation those three name the same relation, and which of them TypeORM writes
+ * depends on the engine and on whether the builder aliased the table.
+ */
+function predicateRequiresScopeWithinSubquery(
+    subPredicate: PredicateNode,
+    relation: SubqueryRelation,
+    scoped: CorrelatedOwnershipScopePredicate,
+    parameters: readonly unknown[],
+): boolean {
+    if (typeof scoped.relation === 'string' && scoped.relation.length > 0) {
+        return predicateRequires(subPredicate, scoped, parameters);
+    }
+    for (const qualifier of relationQualifiers(relation)) {
+        if (predicateRequires(subPredicate, { ...scoped, relation: qualifier }, parameters)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Every spelling by which a column of a single-relation sub-query may legitimately name that relation: the
+ * alias the `FROM` introduced, the table itself, and no qualifier at all.
+ *
+ * Accepting all three is not a weakening. The sub-query has already been verified to read exactly one
+ * relation, so an unqualified column can only be that relation's — the parser's own reasoning for why "an
+ * unqualified comparison needs no relation". Which spelling appears depends on the engine and on whether the
+ * builder aliased the table, and a suite must not have to know which.
+ */
+function relationQualifiers(relation: SubqueryRelation): Array<string | undefined> {
+    const qualifiers: Array<string | undefined> = [undefined, relation.table];
+    if (relation.alias !== undefined && relation.alias !== relation.table) {
+        qualifiers.push(relation.alias);
+    }
+    return qualifiers;
+}
+
+/**
+ * Whether the sub-query's predicate **requires** the correlation to the enclosing statement's row.
+ *
+ * The comparison is column-to-column, which is why {@link parseLeafComparison} cannot be reused: it requires a
+ * placeholder or a literal on one side, deliberately, so that no column pair is ever read as a scope. Here the
+ * pair is the property under test.
+ */
+function predicateRequiresCorrelation(
+    node: PredicateNode,
+    relation: SubqueryRelation,
+    correlation: CorrelatedOwnershipRequirement['correlation'],
+): boolean {
+    if (node.kind === 'and') {
+        for (const child of node.children) {
+            if (predicateRequiresCorrelation(child, relation, correlation)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (node.kind === 'or') {
+        for (const child of node.children) {
+            if (!predicateRequiresCorrelation(child, relation, correlation)) {
+                return false;
+            }
+        }
+        return node.children.length > 0;
+    }
+    if (node.kind === 'uncertifiable' || node.negated) {
+        return false;
+    }
+    const pair = LEAF_COLUMN_PAIR.exec(node.text);
+    if (pair === null || pair[2] !== '=') {
+        return false;
+    }
+    const left = { column: lastPathSegment(pair[1]), qualifier: pathQualifier(pair[1]) };
+    const right = { column: lastPathSegment(pair[3]), qualifier: pathQualifier(pair[3]) };
+    return (
+        isCorrelationPair(left, right, relation, correlation) ||
+        isCorrelationPair(right, left, relation, correlation)
+    );
+}
+
+/** One ordering of a column pair: `inner` read as the sub-query's side and `outer` as the statement's. */
+function isCorrelationPair(
+    inner: { column: string; qualifier: string | undefined },
+    outer: { column: string; qualifier: string | undefined },
+    relation: SubqueryRelation,
+    correlation: CorrelatedOwnershipRequirement['correlation'],
+): boolean {
+    if (
+        inner.column !== correlation.column.toLowerCase() ||
+        outer.column !== correlation.outerColumn.toLowerCase()
+    ) {
+        return false;
+    }
+    // The sub-query's side must belong to the sub-query's relation. An unqualified column inside a verified
+    // single-relation sub-query can only be that relation's, so it is accepted; a column qualified by anything
+    // else is a comparison about some other relation.
+    if (relationQualifiers(relation).indexOf(inner.qualifier) === -1) {
+        return false;
+    }
+    if (typeof correlation.outerRelation === 'string' && correlation.outerRelation.length > 0) {
+        return outer.qualifier === correlation.outerRelation.toLowerCase();
+    }
+    // No outer relation was declared, so the reference may be written bare or qualified by the table the
+    // enclosing statement writes — TypeORM does one on some engines and the other on others. What it may NOT
+    // be is qualified by the sub-query's own relation: `ol.id = ol.reorderListId` compares one row of the
+    // sub-query's table with itself and correlates to nothing outside it.
+    if (outer.qualifier === undefined) {
+        return true;
+    }
+    return outer.qualifier !== relation.alias && outer.qualifier !== relation.table;
+}
+
+/**
+ * @description
  * True when the statement's `WHERE` constrains **every** one of the given columns as a mandatory
  * conjunct, quote-agnostically.
  *
@@ -3022,7 +4001,10 @@ export function whereRequiresScopedPredicates(
  *    while every row in the table remained reachable.
  *  - A name that occurs only inside a **subquery** or inside a **string literal** does not count, so
  *    `EXISTS (SELECT 1 FROM x WHERE customerId = ?)` and `name = 'customerId'` are not evidence. A
- *    function call is left intact, because `LOWER(nameKey) = ?` genuinely constrains `nameKey`.
+ *    function call is left intact, because `LOWER(nameKey) = ?` genuinely constrains `nameKey`. Where the
+ *    sub-query IS the claim — a line write, whose scope can only live there — use
+ *    {@link whereRequiresCorrelatedOwnership}, and use this helper alongside it for the row's own
+ *    identifier and its parent reference.
  *  - Matching is on word boundaries, so `id` cannot match inside `customerId`, `channelId` or
  *    `reorderListId`, and `list_id` cannot match `id`.
  *
@@ -3275,7 +4257,9 @@ function normaliseTableNames(tableNames: readonly string[]): string[] {
  *     at least one table name *at compile time*, because a table-filtered assertion that names no
  *     table would return an empty list and pass silently.
  *  4. **Asserted as equality, with the predicate's shape asserted alongside it** — use
- *     `toBe(1)`/`toBe(0)` with {@link whereRequiresScopedPredicates} for an ownership claim, or
+ *     `toBe(1)`/`toBe(0)` with {@link whereRequiresScopedPredicates} for an ownership claim against
+ *     `reorder_list`, {@link whereRequiresCorrelatedOwnership} for one against `reorder_list_line`, whose
+ *     scope lives in a correlated sub-query the former cannot read, or
  *     {@link whereMentionsColumns} for a guard whose bound is not the claim. Epic §11.6.2 is explicit:
  *     "Never 'at least one', and never 'no more than'."
  *
@@ -3572,11 +4556,53 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
 
     /**
      * @description
-     * The row-level write statements among {@link forTables} — `insert`, `update` and `delete`. This
-     * is how "and none was an `INSERT`, `UPDATE` or `DELETE`" is asserted by name.
+     * The row-level write statements — `insert`, `update` and `delete` — whose **own write target** is one of
+     * the named tables. This is how "and none was an `INSERT`, `UPDATE` or `DELETE`" is asserted by name.
+     *
+     * ★ **The filter is the write TARGET, not every table the statement references, and the difference is a
+     * real number.** Three of this plugin's line writes carry the ownership predicate as a correlated
+     * sub-query over `reorder_list`:
+     *
+     * ```sql
+     * DELETE FROM "reorder_list_line" WHERE "id" = $1 AND "reorderListId" = $2
+     *   AND EXISTS (SELECT 1 FROM "reorder_list" "ownedList" WHERE "ownedList"."id" = "reorderListId" AND …)
+     * ```
+     *
+     * Reference attribution puts that statement in `writesFor('reorder_list')`, where it inflates an exact
+     * write count against the parent table by one for every line write in the window and fails an assertion
+     * that a path performed no write to `reorder_list` — while the statement wrote nothing there. Filtering on
+     * {@link CapturedStatement.targetTables} answers the question the assertion is actually making. The
+     * companion {@link forTables} keeps reference semantics, so a statement-touching-a-table count still sees
+     * every one of these statements.
+     *
+     * A write whose target could not be determined is attributed to every table it references, so such a
+     * statement over-reports here rather than disappearing — see {@link extractStatementTargetTables}.
+     *
+     * @example
+     * ```ts
+     * // One line write, and it is a write to the line table only.
+     * expect(capture.writesFor('reorder_list_line')).toHaveLength(1);
+     * expect(capture.writesFor('reorder_list')).toHaveLength(0);
+     * // Both are still statements against both tables:
+     * expect(capture.forTables('reorder_list')).toHaveLength(1);
+     * ```
      */
     writesFor(...tableNames: [string, ...string[]]): CapturedStatement[] {
-        return this.forTables(...tableNames).filter(entry => WRITE_KINDS.indexOf(entry.kind) !== -1);
+        const wanted = normaliseTableNames(tableNames);
+        if (wanted.length === 0) {
+            return [];
+        }
+        return this.capturedStatements.filter(entry => {
+            if (WRITE_KINDS.indexOf(entry.kind) === -1) {
+                return false;
+            }
+            for (const tableName of wanted) {
+                if (entry.targetTables.indexOf(tableName) !== -1) {
+                    return true;
+                }
+            }
+            return false;
+        });
     }
 
     /**
@@ -3801,6 +4827,7 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
                 kind: classifyStatement(text, dialect),
                 dialect,
                 tables: extractStatementTables(text, dialect),
+                targetTables: extractStatementTargetTables(text, dialect),
                 sequence,
                 runnerId: this.resolveRunnerId(queryRunner),
                 inTransaction: resolveTransactionState(queryRunner),
@@ -3811,6 +4838,7 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
                 parameters: [],
                 kind: 'other',
                 tables: [],
+                targetTables: [],
                 sequence,
                 runnerId: undefined,
                 inTransaction: undefined,

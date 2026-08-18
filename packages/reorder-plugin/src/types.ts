@@ -219,3 +219,31 @@ export interface ReorderPluginOptions {
      */
     defaultReorderListLinesPageSize?: number;
 }
+
+/**
+ * @description
+ * The resolved form of {@link ReorderPluginOptions}: every key present, and none of them writable.
+ *
+ * It is a derived alias of the interface above rather than a second options contract, and it is the type
+ * every consumer of the `REORDER_PLUGIN_OPTIONS` provider names. Both halves of it are load-bearing.
+ *
+ * **Required, because a caller's partial object is not what a consumer receives.** `ReorderPlugin.init()`
+ * merges the declared default for every key a deployment omits and validates the whole result before it is
+ * stored, so what reaches the service and the two API-layer resolvers is always complete. Typing that
+ * hand-over as the optional interface would have obliged each consumer to carry a fallback of its own — a
+ * default restated in three more places, each free to drift from the one the plugin actually merged.
+ *
+ * **Readonly, because the values have already been validated.** A consumer holding a mutable reference
+ * could lower a bound after startup validation had passed on it, which is the one failure mode worse than a
+ * wrong bound: nothing reports it, while the guarantee the bound existed to make is gone. The plugin freezes
+ * the object it hands out, and this type is what makes an attempt to write to it a compile error rather than
+ * a silent no-op or a run-time surprise.
+ *
+ * It is deliberately **not** re-exported from the package root: a deployment configures
+ * {@link ReorderPluginOptions}, and the resolved set is what this plugin's own modules pass between
+ * themselves.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @since 3.8.0
+ */
+export type ResolvedReorderPluginOptions = Readonly<Required<ReorderPluginOptions>>;

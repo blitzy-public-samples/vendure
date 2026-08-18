@@ -768,6 +768,188 @@ describe('reorder list name canonicalisation', () => {
             expect(Array.from(toDisplayName('\uFEFFWeekly Order'))).toContain('\uFEFF');
         });
 
+        it('refuses a name carrying a bidirectional control or isolate character', () => {
+            // The seam the four enumerated ranges above leave open, and the reason the module also tests the
+            // Unicode property classes. A bidirectional control does not render as a glyph: it changes the
+            // direction in which the characters around it are laid out, so `Weekly \u202EOrder` and
+            // `Weekly Order` occupy the same visual space while differing in bytes, and an override left
+            // unterminated changes how every character after it is presented — including text the buyer
+            // never typed. Two names differing only by one of these are indistinguishable to a buyer and
+            // collide with nothing, which is the same defect the zero-width block carries, so they are
+            // refused on the same grounds [FEATURE-001-01:§2.10.1].
+            //
+            // Every case below is driven individually rather than as a range: U+061C sits alone in the
+            // Arabic block, the marks U+200E and U+200F sit immediately beside the zero-width block that is
+            // already refused by its own bound, the embeddings and overrides U+202A to U+202E sit inside the
+            // general punctuation block whose neighbours U+2000 to U+200A are legitimate whitespace, and the
+            // isolates U+2066 to U+2069 sit past the invisible operators. Nothing about their adjacency to
+            // an accepted character is left to inference.
+            const bidiControlCases: NameCase[] = [
+                { label: 'U+061C ARABIC LETTER MARK between two words', input: 'Weekly\u061COrder' },
+                { label: 'U+200E LEFT-TO-RIGHT MARK between two words', input: 'Weekly\u200EOrder' },
+                { label: 'U+200F RIGHT-TO-LEFT MARK leading', input: '\u200FWeekly Order' },
+                { label: 'U+202A LEFT-TO-RIGHT EMBEDDING between two words', input: 'Weekly\u202AOrder' },
+                { label: 'U+202A LEFT-TO-RIGHT EMBEDDING leading', input: '\u202AWeekly Order' },
+                { label: 'U+202A LEFT-TO-RIGHT EMBEDDING trailing', input: 'Weekly Order\u202A' },
+                { label: 'U+202A LEFT-TO-RIGHT EMBEDDING alone', input: '\u202A' },
+                { label: 'U+202B RIGHT-TO-LEFT EMBEDDING between two words', input: 'Weekly\u202BOrder' },
+                { label: 'U+202C POP DIRECTIONAL FORMATTING between two words', input: 'Weekly\u202COrder' },
+                { label: 'U+202D LEFT-TO-RIGHT OVERRIDE between two words', input: 'Weekly\u202DOrder' },
+                { label: 'U+202E RIGHT-TO-LEFT OVERRIDE between two words', input: 'Weekly\u202EOrder' },
+                { label: 'U+202E RIGHT-TO-LEFT OVERRIDE leading', input: '\u202EWeekly Order' },
+                { label: 'U+202E RIGHT-TO-LEFT OVERRIDE trailing', input: 'Weekly Order\u202E' },
+                { label: 'U+202E RIGHT-TO-LEFT OVERRIDE alone', input: '\u202E' },
+                { label: 'U+2066 LEFT-TO-RIGHT ISOLATE between two words', input: 'Weekly\u2066Order' },
+                { label: 'U+2067 RIGHT-TO-LEFT ISOLATE between two words', input: 'Weekly\u2067Order' },
+                { label: 'U+2068 FIRST STRONG ISOLATE between two words', input: 'Weekly\u2068Order' },
+                { label: 'U+2069 POP DIRECTIONAL ISOLATE between two words', input: 'Weekly\u2069Order' },
+                { label: 'U+2069 POP DIRECTIONAL ISOLATE trailing', input: 'Weekly Order\u2069' },
+                { label: 'an isolate opened and popped around one word', input: 'Weekly \u2066Order\u2069' },
+            ];
+
+            for (const bidiControlCase of bidiControlCases) {
+                expectListNameRejection(bidiControlCase.input, bidiControlCase.label);
+            }
+
+            // And the two mechanisms this table depends on, asserted rather than inferred. Neither the
+            // whitespace class nor the language's own definition of whitespace covers any of these, so the
+            // canonical form the character test runs on still carries the character — which is exactly why
+            // the test is reached at all, and why the leading, trailing and alone positions above are the
+            // ones that prove it rather than the interior ones.
+            expect(/\s/.test('\u202E'), 'the language does not call U+202E whitespace').toBe(false);
+            expect('Weekly Order\u202E'.trim(), 'trim() would not have removed it').toBe(
+                'Weekly Order\u202E',
+            );
+            expect(Array.from(toDisplayName('\u202EWeekly Order'))).toContain('\u202E');
+        });
+
+        it('refuses a name carrying a word joiner or an invisible mathematical operator', () => {
+            // U+2060 and the block U+2061 to U+2065. Each is zero-width and semantically invisible — the
+            // operators exist so that mathematical notation can carry structure a renderer understands
+            // without showing a glyph — so a name carrying one presents identically to the same name
+            // without it. U+2060 is the deliberate case: it is the non-deprecated replacement for the byte
+            // order mark used as a word joiner, so an implementation that refused U+FEFF by its own bound
+            // and stopped there would accept the character explicitly recommended in its place.
+            const invisibleOperatorCases: NameCase[] = [
+                { label: 'U+2060 WORD JOINER between two words', input: 'Weekly\u2060Order' },
+                { label: 'U+2060 WORD JOINER leading', input: '\u2060Weekly Order' },
+                { label: 'U+2060 WORD JOINER trailing', input: 'Weekly Order\u2060' },
+                { label: 'U+2060 WORD JOINER alone', input: '\u2060' },
+                { label: 'U+2061 FUNCTION APPLICATION between two words', input: 'Weekly\u2061Order' },
+                { label: 'U+2062 INVISIBLE TIMES between two words', input: 'Weekly\u2062Order' },
+                { label: 'U+2063 INVISIBLE SEPARATOR between two words', input: 'Weekly\u2063Order' },
+                { label: 'U+2064 INVISIBLE PLUS between two words', input: 'Weekly\u2064Order' },
+                {
+                    label: 'U+2065 unassigned default-ignorable between two words',
+                    input: 'Weekly\u2065Order',
+                },
+            ];
+
+            for (const invisibleOperatorCase of invisibleOperatorCases) {
+                expectListNameRejection(invisibleOperatorCase.input, invisibleOperatorCase.label);
+            }
+        });
+
+        it('refuses a name carrying any other default-ignorable character, none of which the enumerated bounds reach', () => {
+            // The remainder of the class, driven individually because each one sits in a different block and
+            // no enumerated range in the module reaches any of them. Two are worth naming for why they are
+            // here rather than for what they are: U+034F COMBINING GRAPHEME JOINER renders nothing yet
+            // participates in normalisation, so a name carrying one can normalise to the same key as a name
+            // without it while remaining a different string; and the Hangul fillers U+115F, U+1160, U+3164
+            // and U+FFA0 render as blank space in most fonts, which makes a name built from them look empty
+            // while passing the emptiness test — the precise shape of defect the emptiness rejection exists
+            // to prevent, arriving through a character the whitespace class does not cover.
+            //
+            // U+180E is asserted deliberately: it was a space separator in earlier Unicode versions and was
+            // reclassified as a format character, so an implementation whose whitespace class was written
+            // against an older table would collapse it instead of refusing it.
+            const defaultIgnorableCases: NameCase[] = [
+                { label: 'U+00AD SOFT HYPHEN between two words', input: 'Weekly\u00ADOrder' },
+                { label: 'U+00AD SOFT HYPHEN trailing', input: 'Weekly Order\u00AD' },
+                { label: 'U+034F COMBINING GRAPHEME JOINER between two words', input: 'Weekly\u034FOrder' },
+                { label: 'U+034F COMBINING GRAPHEME JOINER after a letter', input: 'Weekly Orde\u034Fr' },
+                { label: 'U+180B MONGOLIAN FREE VARIATION SELECTOR ONE', input: 'Weekly\u180BOrder' },
+                { label: 'U+180E MONGOLIAN VOWEL SEPARATOR between two words', input: 'Weekly\u180EOrder' },
+                { label: 'U+180E MONGOLIAN VOWEL SEPARATOR leading', input: '\u180EWeekly Order' },
+                { label: 'U+180E MONGOLIAN VOWEL SEPARATOR alone', input: '\u180E' },
+                { label: 'U+115F HANGUL CHOSEONG FILLER alone', input: '\u115F' },
+                { label: 'U+1160 HANGUL JUNGSEONG FILLER between two words', input: 'Weekly\u1160Order' },
+                { label: 'U+3164 HANGUL FILLER alone', input: '\u3164' },
+                { label: 'U+3164 HANGUL FILLER between two words', input: 'Weekly\u3164Order' },
+                { label: 'U+FFA0 HALFWIDTH HANGUL FILLER alone', input: '\uFFA0' },
+                { label: 'U+FE00 VARIATION SELECTOR-1 after a letter', input: 'Weekly Order\uFE00' },
+                { label: 'U+FE0F VARIATION SELECTOR-16 after a symbol', input: 'Weekly \u2764\uFE0F Order' },
+                { label: 'U+E0001 LANGUAGE TAG leading', input: '\u{E0001}Weekly Order' },
+                { label: 'U+E0020 TAG SPACE between two words', input: 'Weekly\u{E0020}Order' },
+                { label: 'U+E0100 VARIATION SELECTOR-17 after a letter', input: 'Weekly Order\u{E0100}' },
+            ];
+
+            for (const defaultIgnorableCase of defaultIgnorableCases) {
+                expectListNameRejection(defaultIgnorableCase.input, defaultIgnorableCase.label);
+            }
+        });
+
+        it('refuses only the invisible characters, so ordinary text in any script and a bare emoji are still accepted', () => {
+            // The negative control for the three tables above, and the assertion that pins how far the
+            // property classes actually reach. They are broad by construction — every control, format and
+            // default-ignorable character — so the risk they introduce is over-refusal, and this is where
+            // that is bounded: a right-to-left script is accepted although the bidirectional controls that
+            // describe its layout are not, a Han name is accepted although the Hangul fillers are not, and a
+            // bare emoji is accepted although a variation selector is not. None of these carries a code
+            // point in any of the three classes, which is why the character test never sees them.
+            const acceptedCases: Array<NameCase & { expected: CanonicalReorderListName }> = [
+                {
+                    label: 'a Han name',
+                    input: '漢字の注文',
+                    expected: { name: '漢字の注文', nameKey: '漢字の注文' },
+                },
+                {
+                    label: 'an Arabic name, whose script is right-to-left without any bidi control',
+                    input: 'مرحبا بالعالم',
+                    expected: { name: 'مرحبا بالعالم', nameKey: 'مرحبا بالعالم' },
+                },
+                {
+                    label: 'a Hebrew name',
+                    input: 'שלום',
+                    expected: { name: 'שלום', nameKey: 'שלום' },
+                },
+                {
+                    label: 'a bare emoji, carrying no variation selector',
+                    input: '\u{1F600} Weekly Order',
+                    expected: { name: '\u{1F600} Weekly Order', nameKey: '\u{1F600} weekly order' },
+                },
+                {
+                    label: 'a bare symbol in its text presentation',
+                    input: 'Weekly \u2764 Order',
+                    expected: { name: 'Weekly \u2764 Order', nameKey: 'weekly \u2764 order' },
+                },
+                {
+                    label: 'letters outside ASCII, which lower-case rather than being refused',
+                    input: 'Ωmega ß Order',
+                    expected: { name: 'Ωmega ß Order', nameKey: 'ωmega ß order' },
+                },
+            ];
+
+            for (const acceptedCase of acceptedCases) {
+                expectListNameAccepted(acceptedCase.input, acceptedCase.expected, acceptedCase.label);
+            }
+
+            // The one consequence of the class that a caller can observe and would otherwise be surprised
+            // by, asserted here rather than left to the module's own documentation: an emoji written with an
+            // explicit presentation selector is refused, because U+FE0F is a variation selector and every
+            // variation selector is default-ignorable. The same symbol without the selector is accepted, and
+            // that pair is what makes the boundary a fact rather than a claim.
+            expectListNameAccepted(
+                'Weekly \u2764 Order',
+                { name: 'Weekly \u2764 Order', nameKey: 'weekly \u2764 order' },
+                'the symbol alone is accepted',
+            );
+            expectListNameRejection(
+                'Weekly \u2764\uFE0F Order',
+                'the same symbol with an explicit emoji presentation selector is refused',
+            );
+        });
+
         it('refuses rather than repairs, so no call returns the value a stripping implementation would have stored', () => {
             // The contract settles reject-or-strip as rejection, and this is the assertion that tells the
             // two apart. A stripping implementation would have returned `WeeklyOrder` for the first input

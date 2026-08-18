@@ -57,7 +57,7 @@ import { MAX_LIST_NAME_LENGTH } from '../constants';
  *
  * The plugin's translation bundle registers exactly four keys and this is the only one of them about a
  * name. Its registered English text states the whole name contract in one sentence — a length between one
- * and the maximum, measured on the canonical form, with no control or zero-width character — and it
+ * and the maximum, measured on the canonical form, with no invisible or direction-changing character — and it
  * interpolates a `max` variable because the length half of that sentence carries the bound. That is why all
  * three rejections below share it: whichever clause a name broke, the sentence a buyer reads names the rule
  * they have to satisfy. The key's own spelling still says `empty`, which is narrower than what it now
@@ -168,6 +168,44 @@ const ZERO_WIDTH_LAST_CODE_POINT = 0x200d;
 const BYTE_ORDER_MARK_CODE_POINT = 0xfeff;
 
 /**
+ * The general class of characters this module refuses: anything that is a control, a format character, or
+ * default-ignorable.
+ *
+ * **The enumerated bounds above are the documented MINIMUM, and this is the class actually enforced.** The
+ * named constants were chosen because the acceptance criteria name U+0007 and U+200B specifically, but a set
+ * that stops at those blocks leaves a wide seam open. Refused by this class and by no enumerated bound above
+ * are, among others: U+00AD SOFT HYPHEN; U+034F COMBINING GRAPHEME JOINER; U+061C ARABIC LETTER MARK;
+ * U+180E MONGOLIAN VOWEL SEPARATOR; U+200E and U+200F, the left- and right-to-left marks; U+202A to U+202E,
+ * the bidirectional embedding and override controls; U+2060 WORD JOINER and U+2061 to U+2064, the invisible
+ * mathematical operators; U+2066 to U+2069, the bidirectional isolates; the variation selectors U+FE00 to
+ * U+FE0F; the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0; and the tag characters at U+E0000.
+ *
+ * **Why they belong in one class rather than a longer list of ranges.** Each is invisible, or reorders the
+ * visible text around it without being visible itself. A name is displayed to a buyer and read back by them
+ * as the thing that identifies one of their lists, so two names that render identically but store differently
+ * — or one that renders in an order its stored characters do not describe — is a deception vector rather than
+ * a typography preference. `\p{Cc}` covers the control characters, `\p{Cf}` the format characters including
+ * every bidirectional control and every zero-width, and `\p{Default_Ignorable_Code_Point}` closes the
+ * remainder, which is the only class that reaches U+034F (a nonspacing MARK, so neither `Cc` nor `Cf`) and
+ * the variation selectors.
+ *
+ * **The consequence for emoji is stated rather than discovered.** A variation selector is default-ignorable,
+ * so an emoji written with an explicit presentation selector — `U+2764 U+FE0F`, the red heart — is refused,
+ * while the same emoji written without one, and every emoji that has its own code point such as U+1F600, is
+ * accepted. That is the intended reading of "refuse the invisible": a selector is invisible and changes what
+ * renders.
+ *
+ * **It is applied to the canonical form, after trim-and-collapse, for the reason
+ * {@link findDisallowedCharacter} sets out.** `\p{Cc}` matches tab, line feed and carriage return, all three
+ * of which are legitimate whitespace the pipeline has already consumed by the time this runs. Applied to raw
+ * input it would refuse a name pasted with a tab between two words.
+ *
+ * Compiled once at module load. The `u` flag is required for property escapes and is what makes the class
+ * iterate by code point rather than by UTF-16 unit.
+ */
+const DISALLOWED_CHARACTER_CLASS = /[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u;
+
+/**
  * @description
  * The pair of values a reorder list row stores for its name: the display value the buyer sees, and the
  * canonical value uniqueness is evaluated on. They are produced together by
@@ -229,8 +267,8 @@ function countCodePoints(value: string): number {
 }
 
 /**
- * Returns the first control or zero-width character in the supplied value, or `undefined` when it holds
- * none.
+ * Returns the first control, format or default-ignorable character in the supplied value, or `undefined`
+ * when it holds none.
  *
  * **Why this runs after trim-and-collapse, which is the one subtlety in this module.** Three of the
  * characters this function would otherwise reject as C0 controls — tab U+0009, line feed U+000A and
@@ -251,6 +289,14 @@ function countCodePoints(value: string): number {
  * rejection below would be unreachable code, which is why the exclusion and this test are one decision
  * rather than two.
  *
+ * **What is refused is every control, format and default-ignorable character, not only the blocks the
+ * requirements name.** The requirements name U+0007 and U+200B because those are the cases they assert; the
+ * class enforced here also covers the bidirectional controls and isolates, the invisible operators, the soft
+ * hyphen, the combining grapheme joiner and the variation selectors — all of which are invisible or reorder
+ * the visible text around them, and every one of which would otherwise be storable in a name a buyer reads
+ * back as the identity of one of their lists. {@link DISALLOWED_CHARACTER_CLASS} states the class and its
+ * consequences, including the deliberate refusal of an emoji written with a presentation selector.
+ *
  * The offending character is returned rather than a boolean so that the caller can report or log which
  * character was at fault. It is deliberately **not** interpolated into the error message: the registered
  * message carries the length variable and nothing else, and echoing hostile input back into an error string
@@ -269,9 +315,21 @@ function findDisallowedCharacter(value: string): string | undefined {
 /**
  * Whether a single code point is one this module refuses to let reach storage.
  *
- * Four disjoint sets, and each is refused rather than stripped. Stripping would alter what the buyer typed
- * without telling them, and the acceptance criteria settle the choice explicitly: a name carrying U+0007
- * and a name carrying U+200B each write no row and are reported to the caller.
+ * Every one of them is refused rather than stripped. Stripping would alter what the buyer typed without
+ * telling them, and the acceptance criteria settle the choice explicitly: a name carrying U+0007 and a name
+ * carrying U+200B each write no row and are reported to the caller.
+ *
+ * **Two tests, and they are not redundant.** The first four clauses are the enumerated minimum the input
+ * contract names — the C0 block, DELETE with C1, the three contiguous zero-widths, and the byte order mark —
+ * written as explicit bounds so the documented contract is legible in code and does not depend on a Unicode
+ * table for the cases the requirements state by number. The last clause is the general class,
+ * {@link DISALLOWED_CHARACTER_CLASS}, which is what actually closes the seam: without it U+061C, U+180E,
+ * U+202A to U+202E, U+2060, U+2061, U+2066 to U+2069, U+034F, U+00AD and every variation selector are all
+ * storable, each of them invisible or capable of reordering the visible text around it, which is precisely
+ * the deception a name's input contract exists to refuse.
+ *
+ * The general class subsumes the enumerated bounds. Keeping both is deliberate: if a future Unicode revision
+ * moved one of the named characters out of its property class, the enumerated clause would still refuse it.
  */
 function isDisallowedCodePoint(codePoint: number): boolean {
     return (
@@ -284,7 +342,11 @@ function isDisallowedCodePoint(codePoint: number): boolean {
         // The zero-width formatting characters U+200B, U+200C and U+200D.
         (codePoint >= ZERO_WIDTH_FIRST_CODE_POINT && codePoint <= ZERO_WIDTH_LAST_CODE_POINT) ||
         // U+FEFF, the byte order mark, which the whitespace class excludes so that it reaches this test.
-        codePoint === BYTE_ORDER_MARK_CODE_POINT
+        codePoint === BYTE_ORDER_MARK_CODE_POINT ||
+        // Every other control, format and default-ignorable character: bidirectional controls and
+        // isolates, invisible operators, variation selectors, the soft hyphen, the combining grapheme
+        // joiner, the Hangul fillers and the tag characters.
+        DISALLOWED_CHARACTER_CLASS.test(String.fromCodePoint(codePoint))
     );
 }
 
@@ -458,12 +520,16 @@ export function toNameKey(displayName: string): string {
  *    a constant equal to the width of the columns the values are stored in, and there is deliberately no
  *    option to configure it — a value above the column width would turn a rejection a buyer can act on into
  *    an opaque driver error, and a value below it would restrict what no engine restricts.
- * 3. **A control or zero-width character is refused.** Such characters are rejected rather than stripped,
- *    so that nothing reaches storage that the buyer did not knowingly submit and nothing is silently
- *    altered. The C0 block U+0000 to U+001F is refused in full apart from the three members the collapse
- *    step legitimately consumes — tab U+0009, line feed U+000A and carriage return U+000D — so U+000B
- *    vertical tab and U+000C form feed are refused here even though JavaScript's `\s` would call them
- *    whitespace. See {@link findDisallowedCharacter} for why this test necessarily runs last.
+ * 3. **An invisible or direction-changing character is refused.** Such characters are rejected rather than
+ *    stripped, so that nothing reaches storage that the buyer did not knowingly submit and nothing is
+ *    silently altered. The refused class is every control, format and default-ignorable character: the C0
+ *    block U+0000 to U+001F in full apart from the three members the collapse step legitimately consumes —
+ *    tab U+0009, line feed U+000A and carriage return U+000D, so U+000B vertical tab and U+000C form feed
+ *    are refused here even though JavaScript's `\s` would call them whitespace — together with DELETE and
+ *    the C1 block, the zero-widths and the byte order mark, the bidirectional marks, embeddings, overrides
+ *    and isolates, the invisible operators, the soft hyphen, the combining grapheme joiner and the
+ *    variation selectors. See {@link DISALLOWED_CHARACTER_CLASS} for why they are one class rather than a
+ *    list of blocks, and {@link findDisallowedCharacter} for why this test necessarily runs last.
  *
  * All three raise the platform's `UserInputError`, so the caller observes exactly one entry in the
  * response's top-level `errors` array whose `extensions.code` is exactly `USER_INPUT_ERROR`, with the
@@ -490,7 +556,7 @@ export function toNameKey(displayName: string): string {
  * ```
  *
  * @throws A `UserInputError` carrying the code `USER_INPUT_ERROR` when the canonical name is empty, is
- * longer than the maximum, or contains a control or zero-width character.
+ * longer than the maximum, or contains a control, format or default-ignorable character.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage reorder list names

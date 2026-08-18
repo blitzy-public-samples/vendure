@@ -29,13 +29,18 @@ export const loggerCtx = 'ReorderPlugin';
 
 /**
  * @description
- * The dependency-injection token that the validated {@link ReorderPluginOptions} are bound to.
- * `ReorderPlugin.init()` captures and validates the options, the plugin registers them as a provider
- * against this token, and each consumer reads them by injecting it.
+ * The dependency-injection token that the validated options are bound to. `ReorderPlugin.init()` captures
+ * and validates the values a deployment supplied, merges the declared default for every key it omitted, and
+ * the plugin registers the frozen result as a provider against this token; each consumer reads it by
+ * injecting the token.
+ *
+ * The bound value is a `ResolvedReorderPluginOptions` — every key present and validated — rather than the
+ * partial {@link ReorderPluginOptions} a caller passes to `init()`, which is what lets a consumer read a
+ * bound without restating its default.
  *
  * @example
  * ```ts
- * constructor(@Inject(REORDER_PLUGIN_OPTIONS) private options: ReorderPluginOptions) {}
+ * constructor(@Inject(REORDER_PLUGIN_OPTIONS) private options: ResolvedReorderPluginOptions) {}
  * ```
  *
  * It is a `Symbol` rather than a string so that the token cannot collide with one declared by

@@ -17,6 +17,12 @@
  *    core's own e2e specs use — while their result and variables types are written out by hand at
  *    the foot of this file.
  *
+ *    Hand-written does not mean hand-copied. Where a type the PLATFORM publishes is involved —
+ *    `DeletionResult`, `SortOrder`, the baseline half of `ErrorCode` — it is imported from the
+ *    generated SHOP module rather than transcribed, so a member the platform renames or removes
+ *    breaks compilation here instead of drifting silently. Only the plugin's own types, which no
+ *    generated artefact in this repository can ever carry, are written out.
+ *
  * 2. The `options` argument is passed as an INLINE object literal whose leaves are core-typed
  *    variables (`Int` and `SortOrder`), and neither of the two per-row options inputs the platform
  *    derives from `ReorderListList` and `ReorderListLineList` is named anywhere in this file. The
@@ -32,10 +38,20 @@
  *    variable the request did not provide is OMITTED from the coerced object, so
  *    `options: { take: $take }` with `$take` unsupplied coerces to `options: {}` rather than to
  *    `{ take: null }`. Passing no variable is therefore equivalent to passing an empty options
- *    object — but NOT to omitting the argument altogether, which is why the literal-omission
- *    documents below (`GET_ACTIVE_CUSTOMER_REORDER_LISTS` and `GET_ACTIVE_CUSTOMER_REORDER_LIST`)
- *    exist separately: only a document whose text carries no argument at all exercises the plugin's
- *    own default page size and the owner-only `includeShared` default.
+ *    object.
+ *
+ *    **And an empty options object receives the plugin's default page size just as an omitted
+ *    argument does.** The resolvers apply it with `args.options?.take ?? <configured default>`
+ *    [packages/reorder-plugin/src/api/reorder-list-shop.resolver.ts] and
+ *    `supplied?.take ?? <configured default>`
+ *    [packages/reorder-plugin/src/api/reorder-list-entity.resolver.ts], and `{}`, an absent argument
+ *    and an explicit `take: null` all reach that expression with no page size, so all three take the
+ *    default. The literal-omission documents below (`GET_ACTIVE_CUSTOMER_REORDER_LISTS` and
+ *    `GET_ACTIVE_CUSTOMER_REORDER_LIST`) therefore exist for what only a document with NO argument in
+ *    its text can exercise: the SCHEMA-level default of `includeShared: Boolean = false`, which the
+ *    executor supplies only for an absent argument, and the argument-free request shape a client
+ *    that knows nothing of paging actually sends. They are not the only route to the plugin's own
+ *    page-size default, and this file must not claim they are.
  *
  * 3. This module is the single authority for these documents. A contract change must be a one-file
  *    change, so no suite may inline a copy of any document declared here.
@@ -54,7 +70,14 @@
  * makes the invariant "this file contains no such thing" unverifiable by search, so each is
  * described instead and every one of those searches returns nothing over this file.
  */
-import type { DeletionResult, SortOrder } from '@vendure/common/lib/generated-types';
+// The SHOP generated module, not the Admin one. These documents are executed against the Shop API, so the
+// Shop schema is their authority — and the two modules are not interchangeable: their `ErrorCode` enums
+// differ by 47 members between them (16 published only by the Shop API, 31 only by the Admin API), so a
+// document typed against the Admin enum would accept a code the Shop API can never return and reject one it
+// does. `DeletionResult` and `SortOrder` happen to carry identical members in both today, which is exactly
+// why the wrong import survives review: it is right by coincidence rather than by contract, and the
+// coincidence is not a property either schema promises to keep.
+import type { DeletionResult, ErrorCode, SortOrder } from '@vendure/common/lib/generated-shop-types';
 import gql from 'graphql-tag';
 
 // ---------------------------------------------------------------------------------------------
@@ -69,9 +92,19 @@ import gql from 'graphql-tag';
  * code or an availability field here would be the one thing able to falsify the suites' assertion
  * that this feature's payloads carry none.
  *
- * `productVariant` is nullable in the schema while `productVariantId` is not: a line whose variant
- * has been soft-deleted or disabled since it was saved is retained, and the stored identifier
- * survives the variant becoming unresolvable in the active channel.
+ * `productVariant` is nullable in the schema while `productVariantId` is not, and the asymmetry has a
+ * precise reading a future read test must not widen. The line is ALWAYS retained and the stored
+ * identifier is ALWAYS non-null. `productVariant` resolves to `null` in exactly three cases, all of
+ * them "not resolvable in the active channel": the variant is assigned to another channel, its row has
+ * been SOFT-deleted (the platform's own variant deletion, which sets a timestamp and leaves the row in
+ * place), or the channel-scoped load simply does not answer for the identifier.
+ *
+ * A DISABLED variant is NOT one of them and resolves normally. It is still resolvable in the channel
+ * and its `enabled` value is readable on the variant type the platform already publishes, so nulling it
+ * would hide a variant the contract says to return — a test expecting `null` for a disabled variant
+ * would be asserting the opposite of the requirement and would pass only against a defect. Neither the
+ * disabled flag nor the deletion timestamp is selected here in any case: a saved list records intent
+ * rather than availability, and surfacing availability belongs to a later feature.
  */
 export const REORDER_LIST_LINE_FRAGMENT = gql`
     fragment ReorderListLineFields on ReorderListLine {
@@ -141,10 +174,15 @@ export const REORDER_LIST_WITH_LINES_FRAGMENT = gql`
 /**
  * The canonical collection read, with NO arguments in the document text at all.
  *
- * That is the point of it: literal omission of both `options` and `includeShared` is what
- * exercises the plugin's configured default page size and the owner-only visibility default.
- * Passing an empty options object would not, because a supplied-but-empty object is a different
- * request from an absent argument.
+ * That is the point of it, on two counts. It is the request an unpaged client actually sends, so it
+ * exercises the plugin's configured default page size on the path a caller reaches by writing
+ * nothing. And literal omission of `includeShared` is the ONLY way to exercise that argument's
+ * schema-level default of `false`, because the executor substitutes a declared default for an absent
+ * argument and not for one supplied with a value.
+ *
+ * What it is NOT is the only route to the page-size default: an empty `options: {}` object reaches
+ * the resolver's `args.options?.take ?? <configured default>` with no page size and takes the same
+ * default. A suite may use either form for that assertion; it may not claim they differ.
  */
 export const GET_ACTIVE_CUSTOMER_REORDER_LISTS = gql`
     query GetActiveCustomerReorderLists {
@@ -562,8 +600,10 @@ export interface ReorderListLineProductVariantShape {
  * The shape {@link REORDER_LIST_LINE_FRAGMENT} returns.
  *
  * `productVariant` is nullable and `productVariantId` is not, and that asymmetry is the contract: a
- * line whose variant is no longer resolvable in the active channel keeps its stored identifier so a
- * buyer can still see and remove it.
+ * line whose variant is no longer resolvable in the active channel — another channel's, soft-deleted, or
+ * simply unanswered by the channel-scoped load — keeps its stored identifier so a buyer can still see and
+ * remove it. A merely DISABLED variant remains resolvable and arrives populated; see
+ * {@link REORDER_LIST_LINE_FRAGMENT} for why that distinction is load-bearing rather than pedantic.
  */
 export interface ReorderListLineFieldsShape {
     id: ReorderApiId;
@@ -624,24 +664,72 @@ export interface ReorderListSuccessShape extends ReorderListWithLinesShape {
 }
 
 /*
- * `errorCode` is typed as `string` rather than as the platform's generated `ErrorCode` enum, and
- * that is deliberate. That enum is generated from every type implementing `ErrorResult`, so the four
- * members these error results contribute exist only in the rebuilt runtime schema — never in the
- * checked-in snapshot the generated enum comes from. Typing the field as the generated enum would
- * make the very comparison a suite needs to write impossible to express.
+ * The error-code vocabulary, and why it is written out rather than borrowed whole.
+ *
+ * The published field is `errorCode: ErrorCode!`, and the runtime enum is generated from every type
+ * implementing `ErrorResult` — so the four members this plugin's error results contribute exist only in
+ * the rebuilt runtime schema and never in the checked-in snapshot the generated enum comes from. Typing
+ * the field as the imported enum alone would therefore make the very comparison a suite has to write
+ * impossible to express.
+ *
+ * Typing it as bare `string` was the other wrong answer, and it is the one that costs something: it
+ * accepts every misspelling. `expect(result.errorCode).toBe('REORDER_LIST_NOTFOUND_ERROR')` would compile
+ * and fail at run time with a message about a value rather than about a name, and — worse — a suite
+ * asserting the WRONG code on a correct response would compile too and pass, because both sides of the
+ * comparison are just strings.
+ *
+ * So the width is stated exactly: the 32 members the Shop API publishes today, widened by the four this
+ * plugin adds, with each error result pinned to the single literal it can actually carry. A typo is a
+ * compile error, an Admin-only code is a compile error, and an assertion that names another error's code is
+ * a compile error.
  */
+
+/**
+ * The `ErrorCode` each of this plugin's four error results carries, keyed on the `__typename` that carries
+ * it, and spelled as the platform's generator derives them: the declared type name, upper-snake-cased.
+ *
+ * It is one table rather than four independent literals so that each name is written exactly once. The four
+ * error shapes below index into it, the union beneath it is derived from it, and a code paired with the wrong
+ * `__typename` is therefore not expressible — where four loose literals would let a shape carry another
+ * error's code, or a misspelling of its own, with nothing to contradict it.
+ */
+export interface ReorderPluginErrorCodeByTypename {
+    ReorderListNotFoundError: 'REORDER_LIST_NOT_FOUND_ERROR';
+    ReorderListNameConflictError: 'REORDER_LIST_NAME_CONFLICT_ERROR';
+    ReorderListLimitError: 'REORDER_LIST_LIMIT_ERROR';
+    ReorderListLineNotFoundError: 'REORDER_LIST_LINE_NOT_FOUND_ERROR';
+}
+
+/** The four `ErrorCode` members this plugin's SDL contributes, derived from the table above. */
+export type ReorderPluginErrorCode = ReorderPluginErrorCodeByTypename[keyof ReorderPluginErrorCodeByTypename];
+
+/**
+ * Every `ErrorCode` a Shop response can carry once this plugin is registered: the published Shop baseline
+ * plus the four above.
+ *
+ * The arithmetic this expresses is the one the compiler fixtures evidence — 32 published members plus 4
+ * plugin-declared members — and it is additive, so no existing member is removed or renamed.
+ *
+ * The baseline half is written `` `${ErrorCode}` `` rather than `ErrorCode` because these are WIRE values.
+ * The field arrives inside parsed JSON as a plain string, and a string enum member is not assignable from a
+ * plain string in TypeScript, so the bare enum would type-check only against `ErrorCode.MEMBER` references
+ * and would reject the very literal a response carries. The template-literal form widens the enum to the
+ * union of its member VALUES — still exactly the 32 the Shop API publishes, so a member the platform renames
+ * or removes still breaks this type, which is the property worth keeping.
+ */
+export type ReorderShopErrorCode = `${ErrorCode}` | ReorderPluginErrorCode;
 
 /** `ReorderListNotFoundError`: absent, another customer's, another channel's, or not shared. */
 export interface ReorderListNotFoundErrorShape {
     __typename: 'ReorderListNotFoundError';
-    errorCode: string;
+    errorCode: ReorderPluginErrorCodeByTypename['ReorderListNotFoundError'];
     message: string;
 }
 
 /** `ReorderListNameConflictError`, carrying the canonical key that collided. */
 export interface ReorderListNameConflictErrorShape {
     __typename: 'ReorderListNameConflictError';
-    errorCode: string;
+    errorCode: ReorderPluginErrorCodeByTypename['ReorderListNameConflictError'];
     message: string;
     conflictingNameKey: string;
 }
@@ -649,7 +737,7 @@ export interface ReorderListNameConflictErrorShape {
 /** `ReorderListLimitError`, carrying the breached maximum. */
 export interface ReorderListLimitErrorShape {
     __typename: 'ReorderListLimitError';
-    errorCode: string;
+    errorCode: ReorderPluginErrorCodeByTypename['ReorderListLimitError'];
     message: string;
     maxItems: number;
 }
@@ -657,7 +745,7 @@ export interface ReorderListLimitErrorShape {
 /** `ReorderListLineNotFoundError`: the addressed line is absent from the addressed list. */
 export interface ReorderListLineNotFoundErrorShape {
     __typename: 'ReorderListLineNotFoundError';
-    errorCode: string;
+    errorCode: ReorderPluginErrorCodeByTypename['ReorderListLineNotFoundError'];
     message: string;
 }
 
@@ -789,9 +877,17 @@ export interface GetActiveCustomerReorderListsIncludeSharedQuery {
  *
  * Optional, so the same document also covers the variable-unsupplied case, in which the schema
  * default applies.
+ *
+ * **`| null` as well as optional, because the document declares the variable as `Boolean` and not as
+ * `Boolean!`.** These types are handwritten in place of generated ones, so they earn their keep only by
+ * representing exactly what each document accepts: a nullable variable may legitimately be sent as an
+ * explicit `null`, and that is a materially different request from omitting it — an omitted variable lets the
+ * field's declared default apply, while an explicit `null` is a supplied value that does not. A type
+ * admitting only `?: boolean` would make the second case a compile error in a suite that needs to assert it,
+ * which is the one thing these types exist to prevent.
  */
 export interface GetActiveCustomerReorderListsIncludeSharedQueryVariables {
-    includeShared?: boolean;
+    includeShared?: boolean | null;
 }
 
 /** {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_INCLUDE_SHARED}. */
@@ -799,10 +895,16 @@ export interface GetActiveCustomerReorderListIncludeSharedQuery {
     activeCustomerReorderList: ReorderListWithLinesShape | null;
 }
 
-/** Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_INCLUDE_SHARED}. */
+/**
+ * Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_INCLUDE_SHARED}.
+ *
+ * `id` is required and non-nullable because the document declares `$id: ID!`; `includeShared` admits `null`
+ * as well as absence because the document declares it `Boolean`. The asymmetry is the document's, not a
+ * choice made here.
+ */
 export interface GetActiveCustomerReorderListIncludeSharedQueryVariables {
     id: ReorderApiId;
-    includeShared?: boolean;
+    includeShared?: boolean | null;
 }
 
 /** {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_PAGINATED}. */
@@ -815,12 +917,18 @@ export interface GetActiveCustomerReorderListsPaginatedQuery {
  *
  * Every one is optional: an options field whose variable is unsupplied is omitted from the coerced
  * object, so any subset may be sent.
+ *
+ * Every one also admits `null`, all four being declared nullable by the document. The two are not
+ * interchangeable and the difference is visible in the coerced input object: an unsupplied variable causes
+ * its field to be omitted from `options` altogether, whereas a variable supplied as `null` produces the field
+ * present and null — which for `take` is what reaches the plugin's default-page-size fallback and for a sort
+ * key is what leaves the entry ordering unspecified. Both are legitimate requests a suite may need to send.
  */
 export interface GetActiveCustomerReorderListsPaginatedQueryVariables {
-    take?: number;
-    skip?: number;
-    createdAtSort?: SortOrder;
-    idSort?: SortOrder;
+    take?: number | null;
+    skip?: number | null;
+    createdAtSort?: SortOrder | null;
+    idSort?: SortOrder | null;
 }
 
 /** {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_WITH_LINE_PAGES}. */
@@ -828,10 +936,14 @@ export interface GetActiveCustomerReorderListsWithLinePagesQuery {
     activeCustomerReorderLists: PaginatedReorderListsWithLines;
 }
 
-/** Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_WITH_LINE_PAGES}. */
+/**
+ * Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_WITH_LINE_PAGES}.
+ *
+ * Both are optional and both admit `null`, matching the document's two nullable `Int` declarations.
+ */
 export interface GetActiveCustomerReorderListsWithLinePagesQueryVariables {
-    take?: number;
-    linesTake?: number;
+    take?: number | null;
+    linesTake?: number | null;
 }
 
 /** {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_WITH_PAGED_LINES}. */
@@ -839,13 +951,19 @@ export interface GetActiveCustomerReorderListWithPagedLinesQuery {
     activeCustomerReorderList: ReorderListWithLinesShape | null;
 }
 
-/** Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_WITH_PAGED_LINES}. */
+/**
+ * Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_WITH_PAGED_LINES}.
+ *
+ * `id` is required and non-nullable, the document declaring `$id: ID!`. The four nested-window variables are
+ * optional and admit `null`, all four being declared nullable, so a suite can send the nested page window
+ * omitted, explicitly null, or valued.
+ */
 export interface GetActiveCustomerReorderListWithPagedLinesQueryVariables {
     id: ReorderApiId;
-    linesTake?: number;
-    linesSkip?: number;
-    linesCreatedAtSort?: SortOrder;
-    linesIdSort?: SortOrder;
+    linesTake?: number | null;
+    linesSkip?: number | null;
+    linesCreatedAtSort?: SortOrder | null;
+    linesIdSort?: SortOrder | null;
 }
 
 /** {@link CREATE_REORDER_LIST}. */

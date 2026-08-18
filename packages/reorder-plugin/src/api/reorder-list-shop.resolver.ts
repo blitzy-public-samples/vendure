@@ -106,80 +106,73 @@ import {
     UpdateReorderListInput,
     UpdateReorderListResult,
 } from '../service/reorder-list.service';
-import { ReorderPluginOptions } from '../types';
+import { ResolvedReorderPluginOptions } from '../types';
 
 import {
     markSingleReorderListRead,
-    SINGLE_LIST_READ_KEY_PREFIX,
-    singleReorderListReadCacheKey,
+    SINGLE_LIST_READ_KEY,
+    wasReturnedBySingleReorderListRead,
 } from './reorder-list-entity.resolver';
 
 /**
- * The declared default page size for the collection read, applied where a deployment supplies no value.
+ * The one request-scoped key the single-list-read marker is held under.
  *
- * It duplicates no validation. `ReorderPlugin.init()` validates every supplied option once, at plugin
- * initialisation, and merges the same declared default for a key a deployment omits — so by the time this
- * resolver reads the option the value is either a validated integer or absent. The fallback exists purely
- * because every member of the options interface is optional, which would otherwise make this class partial
- * under `strict`: with no fallback, an option resolving to `undefined` would leave `take` unset, and an
- * unset page size is ultimately substituted by the platform's own Shop maximum. That is a *looser* page
- * than the one this feature publishes, and nothing reports the substitution.
+ * It is the entity field resolver's own key, re-exported here rather than restated, because that resolver is
+ * what READS the marker: a marker the two files namespaced independently would never be found, and the repair
+ * it gates would silently never run. Core's convention for a request-scoped cache key names the resolver that
+ * consumes the cached value — `PaymentEntityResolver.refunds(${payment.id})`
+ * (`packages/core/src/api/resolvers/entity/payment-entity.resolver.ts` L28) — so the reader's spelling is also
+ * the conventional one.
  *
- * The value is the same twenty-five the service falls back to for the same option, and that agreement is
- * intentional rather than incidental: both spell the one page size this feature declares for
- * `activeCustomerReorderLists`. Because the resolver decides `take` first, the service's fallback on the
- * same key can only ever be reached by a caller that bypasses this resolver — a unit specification, or a
- * later internal caller — so the two can never disagree about one request.
+ * The marker is the RETURNED OCCURRENCE, not the requested identifier, and it is not held in this file. Both
+ * halves matter and both are the entity field resolver's to own:
+ *
+ * - It is set on the object the service actually returned, after the read resolved, so a read that answered
+ *   `null` — another customer's list, another channel's, or none — licenses nothing, and a *different*
+ *   occurrence of the same identifier reached through the collection read in the same document cannot inherit
+ *   the licence.
+ * - It is not a key in the platform's request-scoped cache, because a field resolver does not always receive
+ *   the same `RequestContext` instance a root resolver did — the platform binds a context per handler and falls
+ *   back to a shared one — so with two roots in flight a context-keyed marker can be looked for under the wrong
+ *   context and silently never found.
+ *
+ * See `markSingleReorderListRead` and `SINGLE_LIST_READ_OCCURRENCES` in `./reorder-list-entity.resolver`.
  */
-const DEFAULT_REORDER_LISTS_PAGE_SIZE = 25;
-
-/**
- * The prefix every single-list-read marker key carries.
- *
- * It is the entity field resolver's own prefix, re-exported here rather than restated, because that resolver
- * is what READS the marker: a marker the two files namespaced independently would never be found, and the
- * repair it gates would silently never run. Core's convention for a request-scoped cache key names the
- * resolver that consumes the cached value — `PaymentEntityResolver.refunds(${payment.id})`
- * (`packages/core/src/api/resolvers/entity/payment-entity.resolver.ts` L28) — so the reader's spelling is
- * also the conventional one.
- *
- * @internal
- */
-export const SINGLE_LIST_READ_MARKER_KEY_PREFIX = SINGLE_LIST_READ_KEY_PREFIX;
+export const SINGLE_LIST_READ_MARKER_KEY = SINGLE_LIST_READ_KEY;
 
 /**
  * @description
- * Derives the request-scoped marker key under which {@link ReorderListShopResolver.activeCustomerReorderList}
- * records that a given list is being read *singly*.
+ * Whether the given list object is the one {@link ReorderListShopResolver.activeCustomerReorderList} returned
+ * on this request — the licence the entity field resolver requires before it may run the `lineCount`
+ * compare-and-set repair.
  *
- * **This function is the coordination point between the two resolvers, and it exists so that the key is
- * derived in one place rather than spelled in two.** The entity field resolver reads the marker to decide
- * whether it may run the `lineCount` compare-and-set repair, because that repair belongs to the single-list
- * read alone: a collection read pages no list's lines, so it has no observed total to compare the stored
- * counter against, and it must never repair (FEATURE-001-01 section 2.6.2.1). A marker key that the two
- * sides spelled independently would fail silently in the direction that looks like success — the reader
- * would simply never find the marker, the repair would never run, and no test that asserts a repaired
- * counter on the single read would be able to say why.
+ * **This function is the coordination point between the two resolvers, and it exists so that the question is
+ * asked in one place rather than answered independently in two.** The repair belongs to the single-list read
+ * alone: a collection read pages no list's lines, so it has no observed total to compare the stored counter
+ * against, and it must never repair (FEATURE-001-01 section 2.6.2.1). A marker the two sides resolved
+ * differently would fail silently in the direction that looks like success — the reader would simply never
+ * find it, the repair would never run, and no test asserting a repaired counter on the single read could say
+ * why.
  *
- * The key is keyed on the list identifier rather than being a single per-request flag, because one request
- * may legitimately carry both reads: a document may select `activeCustomerReorderList(id: 1)` alongside
- * `activeCustomerReorderLists`, and the collection's entries must not inherit the single read's licence to
- * repair.
+ * **The licence is held against the returned OBJECT and not against the row's identifier**, because one
+ * request may legitimately carry both reads: a document may select `activeCustomerReorderList(id: 1)`
+ * alongside `activeCustomerReorderLists`, each read hydrating its own object for row 1. An identifier-keyed
+ * marker is satisfied by both, so the collection's entry would inherit the single read's licence to write —
+ * which is precisely what the contract forbids. Membership of the marked object set is satisfied by exactly
+ * one of them.
  *
- * **It derives the key by delegating to the reader's own builder rather than composing one here**, which is
- * what makes "derived in one place" true across the two files instead of merely stated in each of them. The
- * stringification of the identifier therefore lives with the reader as well: `ID` is `string | number` and
- * the configured id strategy decides which a deployment produces, so the numeric 7 and the string '7' — two
- * spellings of one row — have to produce one key, and they do so because one function spells it.
+ * It delegates to the reader's own predicate rather than reimplementing the lookup, which is what makes
+ * "asked in one place" true across the two files instead of merely stated in each of them.
  *
- * @param id - The identifier of the list being read singly, exactly as it arrived on the operation.
+ * @param requestContextCache - The platform's request-scoped cache.
+ * @param ctx - The request context the marker was scoped to.
+ * @param list - The list object whose provenance is in question.
  *
  * @example
  * ```ts
  * // In the entity field resolver, gating the repair:
- * const readSingly = this.requestContextCache.get<boolean>(ctx, singleListReadMarkerKey(list.id));
- * if (readSingly) {
- *     return this.reorderListService.reconcileLineCount(ctx, list.id, list.lineCount, observedTotal);
+ * if (singleListReadMarked(this.requestContextCache, ctx, list) && unfilteredTotal !== undefined) {
+ *     return this.reorderListService.reconcileLineCount(ctx, list.id, list.lineCount, unfilteredTotal);
  * }
  * return list.lineCount;
  * ```
@@ -187,34 +180,46 @@ export const SINGLE_LIST_READ_MARKER_KEY_PREFIX = SINGLE_LIST_READ_KEY_PREFIX;
  * @docsCategory core plugins/ReorderPlugin
  * @since 3.8.0
  */
-export function singleListReadMarkerKey(id: ID): string {
-    return singleReorderListReadCacheKey(id);
+export function singleListReadMarked(
+    requestContextCache: RequestContextCacheService,
+    ctx: RequestContext,
+    list: ReorderListEntity,
+): boolean {
+    return wasReturnedBySingleReorderListRead(requestContextCache, ctx, list);
 }
 
 /**
  * The arguments of `activeCustomerReorderLists`, as the published document declares them plus the one
  * argument the platform's generator adds.
  *
- * Two things about this shape are deliberate. The page options are typed from the service's own parameter
+ * Three things about this shape are deliberate. The page options are typed from the service's own parameter
  * rather than named as a type, so this file never spells either of the two generated per-row options input
  * names — naming one that the published document does not declare is what fails the schema merge (ruling
  * R10) — and a change to what the service accepts becomes a compile error here rather than a silent
  * mismatch. And `includeShared` is optional in TypeScript even though the document gives it a default,
  * because a default is applied by the GraphQL layer and this type also describes the value a unit
  * specification passes in directly.
+ *
+ * **And both admit explicit `null` as well as absence, which is what the published contract actually
+ * allows.** Neither argument is non-null in the document, so a client may send either as a literal `null` or
+ * as a variable whose value is `null`, and a `null` argument arrives in the args object as `null` — it is not
+ * normalised to `undefined` and does not trigger the declared default, which applies only to an argument that
+ * was omitted. A type declaring these `?: T` alone therefore describes a subset of what the schema accepts,
+ * and every consumer of it is written against a narrower contract than the one clients hold. Admitting `null`
+ * here and normalising at the two call sites below is what keeps the boundary type honest.
  */
 interface ActiveCustomerReorderListsArgs {
-    options?: NonNullable<Parameters<ReorderListService['getReorderLists']>[1]>;
-    includeShared?: boolean;
+    options?: NonNullable<Parameters<ReorderListService['getReorderLists']>[1]> | null;
+    includeShared?: boolean | null;
 }
 
 /**
  * The arguments of `activeCustomerReorderList`: the list identifier, and the same forward-compatible
- * sharing flag the collection read carries.
+ * sharing flag the collection read carries, admitting explicit `null` for the reason above.
  */
 interface ActiveCustomerReorderListArgs {
     id: ID;
-    includeShared?: boolean;
+    includeShared?: boolean | null;
 }
 
 /**
@@ -243,8 +248,9 @@ type ReorderListEntity = NonNullable<Awaited<ReturnType<ReorderListService['getR
  *
  * The one behaviour this class contributes beyond delegation is the pair of *request-shaped* concerns that
  * genuinely belong to the API layer: substituting the configured default page size where the caller supplied
- * no page size on the collection read, and recording a request-scoped marker on the single-list read so the
- * entity field resolver can tell the two reads apart. Both are described on the methods that perform them.
+ * no page size on the collection read, and recording — against the object the single-list read returned, so
+ * that a collection entry for the same row cannot be mistaken for it — that this is the list that was read
+ * singly. Both are described on the methods that perform them.
  *
  * @example
  * ```ts
@@ -269,19 +275,23 @@ export class ReorderListShopResolver {
     constructor(
         private reorderListService: ReorderListService,
         private requestContextCache: RequestContextCacheService,
-        @Inject(REORDER_PLUGIN_OPTIONS) private options: ReorderPluginOptions,
+        @Inject(REORDER_PLUGIN_OPTIONS) private options: ResolvedReorderPluginOptions,
     ) {}
 
     /**
-     * The page size the collection read falls back to where the caller supplied none, resolved against its
-     * declared default. Read by {@link ReorderListShopResolver.activeCustomerReorderLists} and by nothing
-     * else — the nested `lines` field's own default belongs to the entity field resolver.
+     * The page size the collection read applies where the caller supplied none. Read by
+     * {@link ReorderListShopResolver.activeCustomerReorderLists} and by nothing else — the nested `lines`
+     * field's own default belongs to the entity field resolver.
      *
-     * It is a getter rather than a value captured in the constructor so that the option object remains the
-     * single authority: nothing here holds a copy that could outlive a change to it.
+     * It reads the injected option and restates nothing: the provider supplies
+     * {@link ResolvedReorderPluginOptions}, so the key is present, validated and frozen by the time this
+     * class exists. A `?? 25` here would be a second executable copy of a number the plugin already
+     * declares — unreachable through `ReorderPlugin.init()`, and free to drift from the value the server is
+     * running on. It stays a getter rather than a value captured in the constructor so that the injected
+     * object remains the single authority and nothing here holds a copy of it.
      */
     private get defaultReorderListsPageSize(): number {
-        return this.options.defaultReorderListsPageSize ?? DEFAULT_REORDER_LISTS_PAGE_SIZE;
+        return this.options.defaultReorderListsPageSize;
     }
 
     /**
@@ -306,11 +316,11 @@ export class ReorderListShopResolver {
      * an unlimited public list query is a denial-of-service vector, and the configured default of
      * twenty-five is *stricter* than the Shop maximum the platform would otherwise substitute.
      *
-     * The service applies the same fallback defensively for the same option, so this assignment cannot
-     * disagree with it and cannot be applied twice to one request: once `take` carries a value, the
-     * service's own `??` on it does nothing. The 50 that governs the nested `lines` field is not applied
-     * here — that page belongs to the entity field resolver, and neither resolver applies the other's
-     * default.
+     * The service applies the same option for the same purpose on the same path, so this assignment cannot
+     * disagree with it and cannot be applied twice to one request: both read one injected value, and once
+     * `take` carries a value the service's own `??` on it does nothing. The 50 that governs the nested
+     * `lines` field is not applied here — that page belongs to the entity field resolver, and neither
+     * resolver applies the other's default.
      *
      * A caller with no resolvable customer scope receives an empty page rather than an error, which is the
      * shipped read convention (ruling R14). That answer is the service's; this method neither produces nor
@@ -318,7 +328,9 @@ export class ReorderListShopResolver {
      *
      * @param ctx - The request context. Its authenticated session and active channel are the scope, and
      * nothing in the arguments can widen them.
-     * @param args - The generator-supplied page options, and the forward-compatible sharing flag.
+     * @param args - The generator-supplied page options, and the forward-compatible sharing flag. Either may
+     * arrive as an explicit `null` rather than absent — a `null` argument is a distinct value from an omitted
+     * one and does not receive the document's declared default — so both are normalised here.
      *
      * @since 3.8.0
      */
@@ -341,7 +353,11 @@ export class ReorderListShopResolver {
                 // silently turn it into twenty-five and answer a question the caller did not ask.
                 take: args.options?.take ?? this.defaultReorderListsPageSize,
             },
-            args.includeShared,
+            // Normalised at the boundary rather than passed through. A client may send this argument as an
+            // explicit `null`, which is not the same value as an omitted argument and does not receive the
+            // document's declared default, so the service is handed the boolean the contract means in both
+            // cases. `=== true` rather than a coercion, so nothing but the literal true widens the read.
+            args.includeShared === true,
         );
     }
 
@@ -357,28 +373,28 @@ export class ReorderListShopResolver {
      * method adds no error, no warning and no extension that could tell those cases apart. This is why
      * `ReorderListNotFoundError` is a member of the *mutation* unions only.
      *
-     * **The marker.** Before delegating, this method records — for the duration of this request, keyed on
-     * the requested list id — that this list is being read singly. The entity field resolver reads that
-     * marker to decide whether it may run the `lineCount` compare-and-set repair, which belongs to the
-     * single-list read alone (FEATURE-001-01 section 2.6.2.1).
+     * **The marker.** After the read resolves, this method records — for the duration of this request, and
+     * against the **exact object** the service returned — that this list was read singly. The entity field
+     * resolver tests that marker to decide whether it may run the `lineCount` compare-and-set repair, which
+     * belongs to the single-list read alone (FEATURE-001-01 section 2.6.2.1).
      *
      * **The mark is written through the reader's own helper, `markSingleReorderListRead`, rather than by
-     * setting a key composed here.** The two sides of this contract have to agree on one key or the contract
-     * fails in the direction that looks like success: the reader would simply never find the mark, the repair
-     * would never run, and nothing would report that it had not. Calling the reader's setter makes agreement
-     * structural instead of coincidental. {@link singleListReadMarkerKey} exposes the same key for a test
-     * that needs to assert on it, and delegates to that same builder for the same reason.
+     * setting a key composed here.** The two sides of this contract have to agree or it fails in the
+     * direction that looks like success: the reader would simply never find the mark, the repair would never
+     * run, and nothing would report that it had not. Calling the reader's setter makes agreement structural
+     * instead of coincidental. {@link singleListReadMarked} exposes the same question for a test that needs to
+     * assert on it, and delegates to the same predicate for the same reason.
      *
-     * The marker is set unconditionally, before the read rather than after it, and that ordering is
-     * deliberate on both counts. It is set before because a field resolver for this operation's own
-     * selection set can only run after this method resolves, so there is no ordering hazard, whereas a
-     * marker set after an `await` would be a second statement that an early return could skip. It is
-     * unconditional because the marker describes *how this list was asked for*, not what came back: it is
-     * read only while resolving a list the service has already returned, so recording it for a request that
-     * resolves to `null` licences nothing at all. The helper stores `true`, and that matters — the cache's
-     * getter tests the stored value for truthiness
-     * (`packages/core/src/cache/request-context-cache.service.ts` L31-L33), so a falsy marker would be
-     * indistinguishable from an absent one.
+     * **The marker is set AFTER the read and only for a non-null result, and both halves are load-bearing.**
+     * Marking before the read means marking something that has not been returned yet, so the only thing
+     * available to mark is the requested identifier — and an identifier is shared by every object carrying it.
+     * A document may select `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists`, in which
+     * case the collection also hydrates an object for row 7; an identifier-keyed licence is satisfied by that
+     * object too, and the collection's entry then repairs a counter on a path the contract forbids. Awaiting
+     * the result and marking the object itself makes the licence unforgeable: exactly one object in the
+     * request carries it. Nothing is skipped by the reordering, because a field resolver for this operation's
+     * own selection set can only run after this method's promise settles, and a `null` result marks nothing
+     * because there is no object to license.
      *
      * @param ctx - The request context, whose authenticated session and active channel are the scope.
      * @param args - The list identifier, and the forward-compatible sharing flag. `includeShared` is
@@ -389,12 +405,17 @@ export class ReorderListShopResolver {
      */
     @Query()
     @Allow(Permission.Owner)
-    activeCustomerReorderList(
+    async activeCustomerReorderList(
         @Ctx() ctx: RequestContext,
         @Args() args: ActiveCustomerReorderListArgs,
     ): Promise<ReorderListEntity | null> {
-        markSingleReorderListRead(this.requestContextCache, ctx, args.id);
-        return this.reorderListService.getReorderList(ctx, args.id, args.includeShared);
+        // `includeShared` is normalised at the boundary for the reason the collection read states: an
+        // explicitly `null` argument is a distinct value from an omitted one and receives no declared default.
+        const list = await this.reorderListService.getReorderList(ctx, args.id, args.includeShared === true);
+        if (list) {
+            markSingleReorderListRead(this.requestContextCache, ctx, list);
+        }
+        return list;
     }
 
     /**

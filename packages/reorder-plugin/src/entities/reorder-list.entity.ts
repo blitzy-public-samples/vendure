@@ -22,9 +22,10 @@ import { ReorderListLine } from './reorder-list-line.entity';
  * **`utf8mb4_bin` rather than an accent-sensitive-but-case-insensitive collation, deliberately.** The
  * canonical key has already been lower-cased and NFC-normalised by the time it reaches the column, so the
  * only comparison the database still has to perform is exact equality — and a binary collation is the one
- * form of that which means the same thing on both engines and needs no server-version-specific name. It
- * also keeps the *service's* own name pre-check honest, since that query compares the same column under the
- * same collation. The character set is deliberately not overridden, so the column stays `utf8mb4` and its
+ * form of that which means the same thing on both engines and needs no server-version-specific name. Because
+ * the named unique constraint is the *sole* authority for a name collision, this collation is the whole of the
+ * database half of the rule: there is no service-level pre-count whose semantics could drift from it.
+ * The character set is deliberately not overridden, so the column stays `utf8mb4` and its
  * declared length of 191 continues to count characters rather than bytes.
  *
  * @since 3.8.0
@@ -242,8 +243,10 @@ export class ReorderList extends VendureEntity {
      * different behaviour on different engine jobs, which is precisely what the canonical column exists to
      * prevent. The column therefore carries an engine-resolved binary collation on those engines and none on
      * the engines whose default is already binary; see {@link resolveReorderListNameKeyCollation} for the
-     * measurement behind that and for why the value cannot be a literal. The service's own name pre-check
-     * reads this same column and so inherits the same semantics.
+     * measurement behind that and for why the value cannot be a literal. Since
+     * `UQ_reorder_list_customer_channel_name_key` indexes this column and is the only thing that decides a
+     * collision, this clause is not one input to the rule among several — it *is* the comparison the rule
+     * performs.
      *
      * One consequence belongs to whoever writes the migration rather than to this file: the clause is part of
      * this column's declaration, so a table this plugin creates carries it, but TypeORM does not compare
