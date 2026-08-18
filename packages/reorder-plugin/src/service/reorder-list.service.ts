@@ -87,7 +87,7 @@ import {
     VendureEntity,
 } from '@vendure/core';
 import { randomUUID } from 'crypto';
-import { EntityMetadata, In, SelectQueryBuilder } from 'typeorm';
+import { EntityMetadata, In, Not, SelectQueryBuilder } from 'typeorm';
 
 import { loggerCtx, REORDER_PLUGIN_OPTIONS } from '../constants';
 import { ReorderListLine } from '../entities/reorder-list-line.entity';
@@ -767,11 +767,13 @@ export class ReorderListNotFoundError {
  * @description
  * Returned when the canonical form of a supplied list name is already held by this customer in this channel.
  *
- * The **only** authority for the collision is the named database constraint over
- * `(customerId, channelId, nameKey)`. No service-level pre-check is consulted on either the create or the
- * update path: a read followed by an insert loses the race whenever two concurrent creates both read before
- * either writes, and a constraint does not. Both paths therefore reach this result the same way — by
- * attempting the write and translating the one named violation once the platform has unwound the transaction.
+ * **Two layers can produce it and they are indistinguishable to a caller.** The create and update paths each
+ * perform an **advisory** scoped pre-check over `(customerId, channelId, nameKey)`, which answers an ordinary
+ * duplicate before a row is written, and each catches the violation of the named database constraint over the
+ * same three columns once the platform has unwound the transaction. The constraint is the **authority**,
+ * because a read followed by a write loses the race whenever two concurrent requests both read before either
+ * writes, and a constraint does not. Both layers return this same result carrying the same caller-derived
+ * `conflictingNameKey`, so nothing observable depends on which one answered.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage ReorderListService
@@ -2214,19 +2216,19 @@ export class ReorderListService {
      * committed — a lock that is genuinely held and a bound that is still exceeded. See
      * {@link ReorderListService.getLockedOwnerScope}.
      *
-     * **Name uniqueness is decided by the named database constraint, and by nothing else.** There is no
-     * service-level pre-check: the insert is attempted, and a violation of
-     * `UQ_reorder_list_customer_channel_name_key` — matched by that one name and no other — is what becomes
-     * `ReorderListNameConflictError`. That is a correctness requirement rather than an economy, and the reason
-     * is that a pre-check *works*: it would answer every ordinary duplicate before the insert, leaving the
-     * constraint exercised only when two requests interleave, so a deployment whose constraint was never
-     * created (or was created under a different name, which is the same thing to the error mapping) would pass
-     * every duplicate-name test and then admit duplicates under load. Reaching the constraint on every
-     * duplicate makes it demonstrably the authority, and makes its absence a visible failure rather than a
-     * latent one. Comparison remains case-insensitive and accent-preserving because the canonical `nameKey`
-     * the constraint covers is what the pipeline produced — a name differing from a stored one only by case,
-     * surrounding whitespace or Unicode composition therefore collides in the database. A list is created with
-     * a line count of exactly zero.
+     * **Name uniqueness is decided in two layers, and the order of authority between them is fixed.** The
+     * service performs an **advisory** scoped pre-check over `(customerId, channelId, nameKey)` **and** catches
+     * the insert failure, which is what the contract requires of it. The pre-check is advisory in the strict
+     * sense: it answers an ordinary duplicate before a row is written, and it decides nothing a concurrent
+     * request could invalidate — two simultaneous creates may both read before either writes, so a pre-check
+     * cannot be the authority. The authority is `UQ_reorder_list_customer_channel_name_key`, matched by that
+     * one constraint name and no other, and its violation is what becomes `ReorderListNameConflictError`. Both
+     * paths return the identical result carrying the identical `conflictingNameKey`, so a caller cannot tell
+     * which layer answered — and neither can a test, which is why the race is proved at the database rather
+     * than here. Comparison is case-insensitive and accent-preserving in both layers because both compare the
+     * canonical `nameKey` the pipeline produced: a name differing from a stored one only by case, surrounding
+     * whitespace or Unicode composition collides, while "Café" and "Cafe" do not. A list is created with a line
+     * count of exactly zero.
      *
      * @param ctx - The request context, whose active channel and authenticated session become the row's scope.
      * @param input - The submitted name.
@@ -2253,8 +2255,9 @@ export class ReorderListService {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
                 // THE FIRST DATABASE STATEMENT OF THIS TRANSACTION, AND IT IS A LOCKING READ. Resolving the
                 // owning customer and locking that row are one statement, so that no consistent read
-                // precedes the lock and the count below is therefore the read that fixes this transaction's
-                // snapshot — after the lock is held, and so after any competing creator has committed. See
+                // precedes the lock and the bound count below is therefore the read that fixes this
+                // transaction's snapshot — after the lock is held, and so after any competing creator has
+                // committed. The name pre-check that follows it reads under that same snapshot. See
                 // getLockedOwnerScope for why a plain lookup before the lock defeats the bound on MariaDB
                 // and MySQL while leaving the lock itself looking perfectly correct.
                 const scope = await this.getLockedOwnerScope(transactionCtx, 'createReorderList');
@@ -2269,15 +2272,24 @@ export class ReorderListService {
                     return new ReorderListLimitError(this.maxListsPerCustomer);
                 }
 
-                // NO NAME PRE-CHECK. A `SELECT COUNT(*) ... WHERE nameKey = :nameKey` here would answer the
-                // ordinary duplicate before the insert, and it would be wrong in the way a passing test cannot
-                // show: the uniqueness authority is required to BE the named database constraint
-                // `UQ_reorder_list_customer_channel_name_key`, and a pre-check that ordinarily decides first
-                // means the constraint is exercised only under a race — so a deployment whose constraint was
-                // never created, or was created under a different name, behaves indistinguishably from a
-                // correct one until two requests interleave. Letting the insert reach the constraint on EVERY
-                // duplicate makes the constraint the thing that decides, every time, and makes its absence
-                // visible immediately. It costs one statement fewer on the ordinary path as well.
+                // THE ADVISORY HALF OF THE UNIQUENESS RULE. One scoped count over the canonical key, carrying
+                // the same owner conjuncts as every other statement addressing a list, so it can only see rows
+                // this caller owns in this channel. It answers an ordinary duplicate before a row is written —
+                // which is what the contract asks the service to do — and it is deliberately NOT the
+                // authority: two concurrent creates can both reach here before either inserts, so this read
+                // cannot decide the race and does not claim to. The constraint below decides that, and both
+                // layers produce the identical result from the identical canonical key, so nothing observable
+                // depends on which one answered.
+                const conflicting = await listRepository.count({
+                    where: { customerId: scope.customerId, channelId: scope.channelId, nameKey },
+                });
+                if (conflicting > 0) {
+                    // Nothing has been written at this point, so the transaction closes having changed
+                    // nothing. It is RETURNED rather than raised because a duplicate name is a business
+                    // outcome — a raised value here would reach the caller as a request failure instead of as
+                    // this union member.
+                    return new ReorderListNameConflictError(nameKey);
+                }
 
                 // Deliberately NOT wrapped in a try/catch of its own. See the catch below: a constraint
                 // violation has to leave this callback for the transaction to be unwound before it is
@@ -2298,11 +2310,14 @@ export class ReorderListService {
                 return this.recordOwnerScope(created, scope);
             });
         } catch (err: unknown) {
-            // WHERE EVERY DUPLICATE NAME IS DECIDED, AND THE TRANSLATION IS OUTSIDE THE TRANSACTION ON PURPOSE.
+            // WHERE A DUPLICATE NAME IS FINALLY DECIDED, AND THE TRANSLATION IS OUTSIDE THE TRANSACTION ON
+            // PURPOSE.
             //
-            // This is not only the race path: with no pre-check above, an ordinary duplicate reaches here too,
-            // which is what makes `UQ_reorder_list_customer_channel_name_key` the authority in fact rather
-            // than in principle.
+            // This is the race path, and it is the authority. The advisory count above answers the ordinary
+            // duplicate, but it cannot answer a duplicate created between its own read and this insert — two
+            // concurrent creates both pass it — so `UQ_reorder_list_customer_channel_name_key` is what makes
+            // exactly one of them fail, and this catch is what turns that failure into the same result the
+            // pre-check would have returned.
             //
             // Catching the violation *inside* the callback and returning a union member from there is the
             // shape this replaces, and it fails on PostgreSQL rather than merely being untidy. The platform
@@ -2326,10 +2341,19 @@ export class ReorderListService {
      * @description
      * Renames an existing list, and changes nothing else about it.
      *
-     * The rename is a **single conditional statement** whose predicate names the row identifier together with
-     * the acting customer and the active channel, and whose affected-row count is the authority: one means the
-     * rename applied. A read followed by a write would leave a window in which the row is removed by a
-     * concurrent request, and could not tell "applied" from "matched nothing".
+     * **A caller who may not have this row is refused by one scoped read, before any statement that could
+     * write.** The transaction's first statement resolves the addressed row under the full three-conjunct
+     * predicate — the identifier together with the acting customer and the active channel — and a caller for
+     * whom that matches nothing receives the normalised `ReorderListNotFoundError` having issued exactly one
+     * scoped `SELECT` that returned no rows and **no `INSERT`, `UPDATE` or `DELETE` at all**. That is the
+     * published evidence contract for a refused write, and it is a statement-shaped requirement rather than a
+     * response-shaped one: a refusal reached by issuing the `UPDATE` first and asking afterwards produces the
+     * identical payload while having issued DML on behalf of a caller who was not entitled to any.
+     *
+     * **Admission does not move the authority off the write.** The rename is still issued as a **single
+     * conditional statement** carrying the same three conjuncts, and its affected-row count is still what says
+     * whether it applied — because the row can be deleted, or leave this caller's scope, between the read that
+     * admitted it and the write that changes it. The read decides who may ask; the write decides what happened.
      *
      * **Zero is one case short of meaning "no such row", and the shortfall is a driver property.** A
      * connection reporting *changed* rather than *matched* rows reports zero for a row the predicate matched
@@ -2349,22 +2373,17 @@ export class ReorderListService {
      * creation, so this operation can return `ReorderListNameConflictError` — and a blank new name is refused
      * as malformed input rather than stored.
      *
-     * **The conflict is decided by the constraint alone, and the absence of a service-level pre-check here is
-     * a correctness requirement rather than an economy.** A pre-check would have to run before the row is
-     * addressed, since it is a question about *other* rows — and asking it first inverts the order the two
-     * results have to be decided in. A caller renaming a list they do not own, or one that does not exist, to
-     * a name they *do* already hold would then be told the name conflicts: an answer that confirms which
-     * names the caller holds is harmless, but it also confirms that the identifier they guessed was worth
-     * asking about, and it replaces the one normalised `ReorderListNotFoundError` every inaccessible case is
-     * supposed to produce. Addressing the row first removes the question: a row the caller does not own is
-     * matched by nothing, so no constraint can be reached and the answer is the indistinguishable not-found.
-     * A conflict is therefore reachable only for a row the caller does own, which is exactly when it is true.
-     *
-     * The create path reaches the same result by the same means — attempt the write, translate the one named
-     * violation — and carries no pre-check either, for its own reason: a read followed by an insert cannot make
-     * uniqueness unbypassable, because two concurrent creates may both read before either writes. So neither
-     * path consults a count of other rows, and the two arrive at one authority from two directions: ordering
-     * here, and the impossibility of winning the race there.
+     * **The uniqueness re-check runs in two layers here exactly as it does on the create path, and its
+     * position in the sequence is what keeps it from disclosing anything.** The advisory scoped count over
+     * `(customerId, channelId, nameKey)` is a question about *other* rows, so asking it before the addressed
+     * row has been admitted would invert the order the two results have to be decided in: a caller renaming a
+     * list they do not own — or one that does not exist — to a name they *do* already hold would be told the
+     * name conflicts, which both confirms that the identifier they guessed was worth asking about and replaces
+     * the one normalised `ReorderListNotFoundError` every inaccessible case is supposed to produce. It
+     * therefore runs **after** admission and **excludes the addressed row itself**, so a rename that only
+     * changes a list's display casing is not reported as colliding with itself. The final authority remains
+     * `UQ_reorder_list_customer_channel_name_key`, caught outside the transaction callback, which is what
+     * decides a name created concurrently between this pre-check and the write.
      *
      * @param ctx - The request context.
      * @param input - The list identifier and the new name.
@@ -2382,6 +2401,37 @@ export class ReorderListService {
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
+                // THE FIRST STATEMENT OF THIS TRANSACTION, AND IT IS A READ. One scoped `SELECT` carrying the
+                // identifier together with the acting customer and the active channel, so a caller who may not
+                // have this row is refused here — one statement, zero rows, and no DML issued on their behalf.
+                // It is a locking read where the engine supports one, which both keeps this transaction's
+                // parent-before-child lock order identical to every other write in this service and makes the
+                // pre-check below and the write that follows it decide against the same row state.
+                const admitted = await this.findOwnedListForUpdate(transactionCtx, input.id, scope);
+                if (!admitted) {
+                    // Indistinguishable for an unknown identifier, another customer's list and another
+                    // channel's list. Nothing has been read but this row's absence, and nothing written.
+                    return new ReorderListNotFoundError();
+                }
+
+                // The advisory half of the uniqueness rule, positioned AFTER admission so that a caller who
+                // may not have this row can never be told about a name they hold. The addressed row is
+                // excluded, so renaming a list to a value differing from its own only in display casing —
+                // which leaves the canonical key identical — is not reported as colliding with itself.
+                const conflicting = await this.connection.getRepository(transactionCtx, ReorderList).count({
+                    where: {
+                        customerId: scope.customerId,
+                        channelId: scope.channelId,
+                        nameKey,
+                        id: Not(admitted.id),
+                    },
+                });
+                if (conflicting > 0) {
+                    // The same result the named constraint produces, carrying the same canonical key, so the
+                    // two layers are indistinguishable to a caller. Nothing has been written.
+                    return new ReorderListNameConflictError(nameKey);
+                }
+
                 const result = await this.connection
                     .getRepository(transactionCtx, ReorderList)
                     .createQueryBuilder('reorderlist')
@@ -2402,9 +2452,11 @@ export class ReorderListService {
                 return await this.reloadOwnedList(transactionCtx, input.id, scope);
             });
         } catch (err: unknown) {
-            // Same rollback-first translation as the create path, for the same PostgreSQL-savepoint reason,
-            // and reached only when the statement above was refused by the named constraint — which can only
-            // happen for a row this caller owns, because a row they do not own is not matched at all.
+            // Same rollback-first translation as the create path, for the same PostgreSQL-savepoint reason.
+            // It is reached only when the write above was refused by the named constraint, which the advisory
+            // count cannot pre-empt: a competing request may have taken the name between that read and this
+            // write. And it is reachable only for a row this caller owns, because a row they do not own is
+            // refused by the admission read before either statement is issued.
             return this.translateNameConflict(err, nameKey, 'updateReorderList');
         }
     }
@@ -2413,10 +2465,17 @@ export class ReorderListService {
      * @description
      * Deletes a list together with its lines.
      *
-     * The delete is a **single conditional statement** whose predicate names the row identifier together with
-     * the acting customer and the active channel, with the affected-row count as the authority. One means the
-     * list was deleted; zero means there was no such row for this caller, which is both how a foreign or
-     * unknown identifier is refused and how a **repeat delete** is refused rather than reported as a success.
+     * **A caller who may not have this row is refused before any statement that could write.** The
+     * transaction's first statement resolves the addressed row under the full three-conjunct predicate, so a
+     * refused delete issues exactly one scoped `SELECT` returning no rows and **no `DELETE` at all** — the
+     * published evidence contract for a refused write, which a delete issued first and asked about afterwards
+     * would fail while returning the identical payload. A **repeat delete** is refused on that same read,
+     * because the row it addressed is already gone.
+     *
+     * The delete itself remains a **single conditional statement** whose predicate names the row identifier
+     * together with the acting customer and the active channel, with the affected-row count as the authority.
+     * One means the list was deleted; zero means the row left this caller's scope between the read that
+     * admitted it and this statement, and is reported as the same normalised not-found.
      *
      * **The lines go with it through the declared cascade on the line table's parent reference, in the same
      * statement.** Nothing here loops over lines, and nothing deletes them individually: the delete is issued
@@ -2439,6 +2498,15 @@ export class ReorderListService {
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
+                // The scoped admission read, and the transaction's first statement. It carries the same three
+                // conjuncts as the delete below, takes the parent row's write lock where the engine has one —
+                // the same parent-before-child order every write in this service uses — and refuses a caller
+                // who may not have this row with one statement, zero rows and nothing written.
+                const admitted = await this.findOwnedListForUpdate(transactionCtx, id, scope);
+                if (!admitted) {
+                    return new ReorderListNotFoundError();
+                }
+
                 const result = await this.connection
                     .getRepository(transactionCtx, ReorderList)
                     .createQueryBuilder('reorderlist')
@@ -2449,6 +2517,8 @@ export class ReorderListService {
                     .execute();
 
                 if (result.affected !== 1) {
+                    // The row was admitted and is now gone: a concurrent request deleted it, or it left this
+                    // caller's scope, between the two statements. Reported as the same normalised not-found.
                     return new ReorderListNotFoundError();
                 }
                 // No counter maintenance is needed or possible: the counter lived on the row that has just
@@ -2719,18 +2789,26 @@ export class ReorderListService {
      * rather than treated as a removal — removing the line is what expresses "none of this", and there is a
      * published operation for it.
      *
-     * **The ownership predicate is carried by the statement that writes, not by a read before it.** The
-     * update's `WHERE` names the line, its parent list, and — through a correlated `EXISTS` over
-     * `reorder_list` — the acting customer and the active channel, so a single conditional statement decides
-     * whether this caller may change this line and its affected-row count is the authority. Resolving the list
-     * first and then addressing the line by that list's identifier alone would leave a window in which the
-     * list is deleted, or its ownership changes, between the two statements, and the second — holding only an
-     * identifier — would apply anyway.
+     * **A caller who may not have the addressed list is refused by one scoped read, before any statement that
+     * could write.** The transaction's first statement against either plugin table resolves the parent list
+     * under the full three-conjunct predicate, and a caller for whom that matches nothing receives the
+     * normalised `ReorderListNotFoundError` having issued exactly one scoped `SELECT` that returned no rows and
+     * **no `UPDATE` at all**. That is the published evidence contract for a refused write, and it is a
+     * statement-shaped requirement rather than a response-shaped one: classifying a zero affected count after
+     * the fact returns the identical payload while having issued DML for a caller entitled to none. It is also
+     * what keeps the two not-found results honest — a caller who cannot reach the list learns nothing about
+     * which of its lines exist.
      *
-     * **The two not-found results are still distinguished, but by labelling a decided miss rather than by
-     * deciding.** A zero affected-row count means the line was not changed, and minimal scoped reads then say
-     * which reason to report: no accessible list gives `ReorderListNotFoundError` — indistinguishable for an
-     * unknown, foreign or other-channel list — and an accessible list with no such line gives
+     * **Admission does not move the ownership predicate off the statement that writes.** The update's `WHERE`
+     * still names the line, its parent list, and — through a correlated `EXISTS` over `reorder_list` — the
+     * acting customer and the active channel, so the write remains a single conditional statement whose
+     * affected-row count is the authority on what happened. That matters precisely because the two statements
+     * are separate: the list can be deleted, or change hands, between the read that admitted it and the write,
+     * and a write holding only identifiers would apply anyway.
+     *
+     * **A zero affected-row count on an admitted path is labelled rather than decided.** It means the line was
+     * not changed, and minimal scoped reads then say which reason to report: a list that has since become
+     * inaccessible gives `ReorderListNotFoundError`, and an accessible list with no such line gives
      * `ReorderListLineNotFoundError`. Those reads cannot admit a write, because the write has already been
      * refused.
      *
@@ -2761,6 +2839,26 @@ export class ReorderListService {
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
+                // THE SCOPED ADMISSION READ, AND THE FIRST STATEMENT THIS TRANSACTION ISSUES AGAINST EITHER
+                // PLUGIN TABLE. One `SELECT` over `reorder_list` whose `WHERE` carries the addressed list's
+                // identifier together with the acting customer and the active channel, so a caller who may not
+                // have this list is refused here: one statement, zero rows, and no `UPDATE` issued on their
+                // behalf. Asking afterwards instead — reading the affected count and classifying it — returns
+                // the identical payload while having issued DML for a caller entitled to none, which is the
+                // one thing the published evidence contract for a refused write forbids outright.
+                //
+                // It is deliberately NOT a locking read, unlike the rename and delete paths. Holding this row
+                // would serialise concurrent adjustments and accumulations against the same list, which is
+                // exactly the interleaving the contract requires as race evidence — a barrier-released pair
+                // that queued on a parent lock would evidence sequencing rather than the guard.
+                const admitted = await this.findOwnedList(transactionCtx, input.reorderListId, scope);
+                if (!admitted) {
+                    // Indistinguishable for an unknown identifier, another customer's list and another
+                    // channel's list, and deliberately NOT the line-level not-found: a caller who cannot
+                    // reach the list must learn nothing about which of its lines exist.
+                    return new ReorderListNotFoundError();
+                }
+
                 const result = await this.connection
                     .getRepository(transactionCtx, ReorderListLine)
                     .createQueryBuilder('reorderlistline')
@@ -2802,14 +2900,18 @@ export class ReorderListService {
      * @description
      * Removes one line from a list.
      *
-     * The delete is a **single conditional statement carrying the whole ownership predicate**: the line's own
-     * identifier, its parent list's, and — through a correlated `EXISTS` over `reorder_list` — the acting
-     * customer and the active channel. One statement therefore decides both whether the line exists and
-     * whether this caller may remove it, and its affected-row count is the authority: one means the line was
-     * removed, and zero means it was not removed, which is also how a **second remove of the same line** is
-     * refused rather than reported as a success. Resolving the list in an earlier statement and then deleting
-     * by that list's identifier alone would leave the delete unguarded against the list being deleted, or
-     * changing hands, in between.
+     * **A caller who may not have the addressed list is refused by the transaction's first statement**, a
+     * scoped read of the parent under the full three-conjunct predicate. It returns no rows for an unknown,
+     * foreign or other-channel list, so the refusal costs exactly one scoped `SELECT` and issues no `DELETE`
+     * at all — the published evidence contract for a refused write — and it takes the parent's write lock
+     * where the engine has one, which is what gives every transaction in this service one lock order.
+     *
+     * **The delete itself still carries the whole ownership predicate**: the line's own identifier, its parent
+     * list's, and — through a correlated `EXISTS` over `reorder_list` — the acting customer and the active
+     * channel. Its affected-row count is the authority: one means the line was removed, and zero means it was
+     * not, which is also how a **second remove of the same line** is refused rather than reported as a
+     * success. Addressing the line by its parent's identifier alone, on the strength of the read above, would
+     * leave the delete unguarded against the list being deleted, or changing hands, in between.
      *
      * A zero count is then labelled by one minimal scoped read: no accessible list gives
      * `ReorderListNotFoundError`, an accessible list gives `ReorderListLineNotFoundError`. The read explains a
@@ -3102,14 +3204,20 @@ export class ReorderListService {
      * The correlated `EXISTS` fragment that carries the ownership predicate into a statement written against
      * `reorder_list_line`, whose own row holds no customer and no channel.
      *
-     * **Why a sub-query and not a preceding read.** Every write in this service is required to be a single
-     * conditional statement whose `WHERE` carries the acting customer and the active channel beside the row's
-     * identifier, with the affected-row count as the authority. A line row cannot satisfy that on its own — it
-     * stores only its parent's identifier — so resolving the parent first and then addressing the line by its
-     * parent's id splits the decision across two statements. Between them a list can be deleted or its
-     * ownership can change, and the second statement, having only an id to go on, applies anyway. Folding the
+     * **Why a sub-query, and why a preceding scoped read does not replace it.** Every write in this service is
+     * required to be a single conditional statement whose `WHERE` carries the acting customer and the active
+     * channel beside the row's identifier, with the affected-row count as the authority. A line row cannot
+     * satisfy that on its own — it stores only its parent's identifier — so a write addressed by that
+     * identifier alone would have delegated the whole ownership decision to an earlier statement. Between the
+     * two, a list can be deleted or change hands, and a write holding only ids applies anyway. Folding the
      * parent's two columns into the same statement closes that window: the row is matched only while it still
      * belongs to a list this caller owns in this channel.
+     *
+     * The line-addressing paths **also** resolve the parent under the same three conjuncts before they write,
+     * and the two mechanisms answer different questions rather than duplicating one. The read is the refusal
+     * evidence a caller who may not have the list is owed — one scoped `SELECT` returning nothing, and no DML
+     * issued on their behalf — while this fragment is what keeps the write itself the authority on what
+     * happened. Removing either one loses a property the other does not supply.
      *
      * **Why a join is not used instead.** A join in an `UPDATE`/`DELETE` is spelled differently by each of the
      * four engines and is not expressible at all in the SQLite family's `UPDATE` syntax, whereas a correlated

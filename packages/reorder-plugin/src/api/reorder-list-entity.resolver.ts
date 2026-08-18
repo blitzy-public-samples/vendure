@@ -94,6 +94,7 @@ import {
     RequestContextCacheService,
     Translated,
 } from '@vendure/core';
+import { FieldNode, GraphQLResolveInfo, SelectionNode, valueFromASTUntyped } from 'graphql';
 
 import { loggerCtx, REORDER_PLUGIN_OPTIONS } from '../constants';
 import { ReorderListLine } from '../entities/reorder-list-line.entity';
@@ -107,35 +108,34 @@ import {
 import { ResolvedReorderPluginOptions } from '../types';
 
 /**
- * The single request-scoped key under which the set of list objects the single-list read returned is held.
+ * The exact list objects the single-list read returned on the request currently in flight.
  *
- * **It is one key for the whole request rather than one key per identifier, and that is the fix to a real
- * defect rather than a simplification.** A key built from a list id says only "some list with this id was
- * asked for singly", and a request may legitimately carry both reads: a document selecting
- * `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists` produces two *different* objects
- * for row 7 — one from each read — and an id-keyed licence cannot tell them apart, so the collection's entry
- * inherits the single read's licence to repair the stored counter, which
- * FEATURE-001-01 section 2.6.2.1 forbids outright. The value held here is a `WeakSet` of the exact objects
- * the single-list read returned, so the licence belongs to an object rather than to a number.
+ * **It is module-private state keyed on OBJECT IDENTITY, and both halves of that are corrections to defects
+ * rather than preferences.**
  *
- * It is exported for one reason only: the Shop resolver marks the objects this file tests, so both sides have
- * to resolve the same namespace, and a namespace spelled twice is a namespace that can drift. The spelling
- * names the class that READS the value, which is the shape core's own resolvers use for this cache
- * (`packages/core/src/api/resolvers/entity/payment-entity.resolver.ts`). Nothing outside this plugin's own
- * `src/api` should reference it.
+ * *Why identity rather than the row's identifier.* One request may legitimately carry both reads — a document
+ * selecting `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists` — and each read hydrates
+ * its own object for row 7. An identifier-keyed licence is satisfied by both of them, so the collection's
+ * entry would inherit the single read's licence to repair the stored counter, which FEATURE-001-01 section
+ * 2.6.2.1 forbids outright. graphql-js passes a root field's resolved value through as the parent of its child
+ * fields, so the object a field resolver receives IS the object the root returned and no other occurrence —
+ * not even one carrying the same id — is that object.
  *
- * - a document with a single-list root **and** a collection root that happens to include the same id would let
- *   the collection's own occurrence inherit the licence and repair on the path the contract forbids;
- * - a request-context-keyed licence can be lost outright, because a field resolver does not always receive the
- *   same `RequestContext` instance the root resolver did — the platform binds a context per handler and falls
- *   back to a shared one, so with two roots in flight the field resolver may see the *other* root's context.
+ * *Why module-private rather than the platform's request-scoped cache.* That cache is keyed on the
+ * `RequestContext` INSTANCE, and a field resolver does not reliably receive the instance the root resolver
+ * did: the platform binds a context per handler and a field resolver reads the shared request slot
+ * (`packages/core/src/api/decorators/request-context.decorator.ts`), which in a multi-root document can hold
+ * another root's context by the time the field runs. A licence written under one context and looked for under
+ * another is simply absent, and the repair the contract requires would then be silently skipped — a failure in
+ * the direction that looks like success. Keying the licence on the object removes the context from the question
+ * altogether.
  *
- * Keying on the object closes both: graphql-js passes a root field's resolved value through as the parent of
- * its child fields, so the object a field resolver receives IS the object the root returned, and no other
- * occurrence — not even one carrying the same id — is that object. A `WeakSet` also needs no clearing and
- * cannot leak between requests, since an entry lives exactly as long as the row object does.
+ * *Why this cannot leak between requests.* Membership is held weakly, so an entry lives exactly as long as the
+ * row object it describes — which is the request. No clearing is needed and none is possible to forget. The
+ * plugin's own service uses the same shape for the owner scope it records against a row
+ * (`RESOLVED_OWNER_SCOPES`), so this is the established mechanism in this package rather than a new one.
  */
-export const SINGLE_LIST_READ_KEY = 'ReorderListEntityResolver.singleListRead';
+const SINGLE_LIST_READ_OCCURRENCES = new WeakSet<ReorderList>();
 
 /** The request-scoped key prefix under which one page's pending line-page batch is held. */
 const LINES_BATCH_KEY_PREFIX = 'ReorderListEntityResolver.linesBatch';
@@ -182,33 +182,25 @@ export interface ReorderListLinesArgs {
 
 /**
  * @description
- * Records, for the duration of one request, that the single-list read returned **this exact list object** —
- * which is the first of the two conjuncts that admit the `lineCount` compare-and-set repair.
+ * Records that the single-list read returned **this exact list object** — the first of the conjuncts that
+ * admit the `lineCount` compare-and-set repair.
  *
  * **This must be called by `activeCustomerReorderList`, with the object that read returned, and by nothing
  * else.** The collection read must never repair: a page of lists pages no lines, so it has no observed total
- * to compare against, and repairing there would rewrite a counter from a number the request never
- * established (FEATURE-001-01 section 2.6.2.1).
+ * to compare against, and repairing there would rewrite a counter from a number the request never established
+ * (FEATURE-001-01 section 2.6.2.1).
  *
- * **The licence is bound to object identity rather than to the row's identifier, and the difference is a
- * bypass.** One request may carry both reads over the same row — a document selecting
- * `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists` — and each read hydrates its own
- * object for that row. An identifier-keyed licence is satisfied by both of them, so the collection's entry
- * would be repaired on a path the contract forbids; a licence held in a `WeakSet` of returned objects is
- * satisfied by exactly the one object the single read produced. The set additionally holds its members
- * weakly, so nothing here extends the lifetime of a row beyond the request.
- *
- * It is deliberately NOT inferred from the batch holding a single parent either: a collection read asking for
- * `take: 1` is indistinguishable under that test and would repair on the collection path.
+ * The licence is held against the object rather than against the row's identifier or the request context, for
+ * the reasons {@link SINGLE_LIST_READ_OCCURRENCES} sets out: an identifier is shared by every occurrence of the
+ * row in a document, and a context-keyed licence can be written under one handler's context and looked for
+ * under another's. It is deliberately NOT inferred from the page batch holding a single parent either — a
+ * collection read asking for `take: 1` is indistinguishable under that test and would repair on the collection
+ * path.
  *
  * **The failure mode is safe in one direction only, which is why the mark is opt-in.** A request that never
- * marks simply never repairs — the stored counter is reported as it stands, which is the collection read's
- * own documented behaviour. A request that marked wrongly would repair on a path the contract forbids. So the
- * absence of this call degrades to "no repair" and never to "wrong repair".
+ * marks simply never repairs — the stored counter is reported exactly as it stands, which is the collection
+ * read's own documented behaviour. A request that marked wrongly would repair on a path the contract forbids.
  *
- * @param requestContextCache - The platform's request-scoped cache, injected by the calling resolver.
- * @param ctx - The request context the mark is scoped to. The cache is a `WeakMap` keyed on this instance, so
- * the mark is garbage-collected with the request and cannot leak into another.
  * @param list - The list object the single-list read is about to return. It must be the object itself; a copy
  * of it, or another object carrying the same identifier, is not the same licence.
  *
@@ -216,7 +208,7 @@ export interface ReorderListLinesArgs {
  * ```ts
  * const list = await this.reorderListService.getReorderList(ctx, id, includeShared);
  * if (list) {
- *     markSingleReorderListRead(this.requestContextCache, ctx, list);
+ *     markSingleReorderListRead(list);
  * }
  * return list;
  * ```
@@ -225,75 +217,55 @@ export interface ReorderListLinesArgs {
  * @docsPage ReorderListEntityResolver
  * @since 3.8.0
  */
-export function markSingleReorderListRead(
-    requestContextCache: RequestContextCacheService,
-    ctx: RequestContext,
-    list: ReorderList,
-): void {
-    // `get` with a default both reads and installs, so one call covers the first mark of a request and every
-    // later one. The stored value is truthy, which matters: the cache's getter tests the stored value for
-    // truthiness (`packages/core/src/cache/request-context-cache.service.ts` L34-L36), and an empty `WeakSet`
-    // is an object and therefore truthy — unlike, say, a count of zero.
-    const marked = requestContextCache.get<WeakSet<ReorderList>>(
-        ctx,
-        SINGLE_LIST_READ_KEY,
-        () => new WeakSet<ReorderList>(),
-    );
-    marked.add(list);
+export function markSingleReorderListRead(list: ReorderList): void {
+    SINGLE_LIST_READ_OCCURRENCES.add(list);
 }
 
 /**
  * @description
- * Whether **this exact list object** was returned by the single-list read of this request.
+ * Whether **this exact list object** was returned by the single-list read.
  *
  * The counterpart of {@link markSingleReorderListRead}, and the only sanctioned way to ask the question: it
- * tests membership of the marked object set rather than comparing identifiers, so an object the collection
- * read produced for the same row answers `false` however many times that row appears in the document.
+ * tests membership of the marked object set rather than comparing identifiers, so an object the collection read
+ * produced for the same row answers `false` however many times that row appears in the document — and the
+ * answer does not depend on which `RequestContext` instance the asking resolver happened to receive.
  *
- * @param requestContextCache - The platform's request-scoped cache, injected by the calling resolver.
- * @param ctx - The request context the mark was scoped to.
  * @param list - The parent object whose provenance is in question.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage ReorderListEntityResolver
  * @since 3.8.0
  */
-export function wasReturnedBySingleReorderListRead(
-    requestContextCache: RequestContextCacheService,
-    ctx: RequestContext,
-    list: ReorderList,
-): boolean {
-    // Read WITHOUT a default, so asking the question cannot install the set: a request that never marked must
-    // answer `false` and leave nothing behind.
-    const marked = requestContextCache.get<WeakSet<ReorderList>>(ctx, SINGLE_LIST_READ_KEY);
-    return marked !== undefined && marked.has(list);
+export function wasReturnedBySingleReorderListRead(list: ReorderList): boolean {
+    return SINGLE_LIST_READ_OCCURRENCES.has(list);
 }
 
 /**
- * The request-scoped key under which the in-flight counter repairs of this request are held, one entry per
- * list object.
+ * The in-flight counter repairs, one entry per list object.
  *
  * **This exists because "exactly one compare-and-set statement" is a claim about a whole request, and a
- * document may resolve the same field more than once at the same time.** Sibling GraphQL fields — two aliases
- * of `lines` on the one object `activeCustomerReorderList` returned — are executed concurrently, not in
- * sequence. Writing the reconciled value back onto the row makes a *later* resolution find stored and observed
- * in agreement, but it cannot help a *simultaneous* one: both aliases await the same page batch, both then
- * read the same stale `lineCount`, and the second reaches the service while the first is still suspended on
- * its own statement. Two conditional updates are issued where the contract permits one. Only one of them can
- * ever affect a row, because the second finds the guard value already changed — so the counter is correct
- * either way — but the statement count is not, and that count is the contract.
+ * document may reach the repair more than once at the same time.** The root read reconciles before it exposes
+ * the parent, and sibling GraphQL fields — two aliases of `lines` on the one object `activeCustomerReorderList`
+ * returned — are then executed concurrently rather than in sequence. Writing the reconciled value back onto the
+ * row makes a *later* resolution find stored and observed in agreement, but it cannot help a *simultaneous*
+ * one: both aliases would await the same page batch, both would read the same counter, and the second would
+ * reach the service while the first was still suspended on its own statement. Two conditional updates would be
+ * issued where the contract permits one. Only one of them could ever affect a row, because the second finds the
+ * guard value already changed — so the counter is correct either way — but the statement count is not, and that
+ * count is the contract.
  *
- * The value held is a `WeakMap` from the list object to the promise of its repair, so the gate is keyed by the
- * same object identity the single-read licence is, and is collected with the request.
+ * It is keyed on the same object identity the licence is, and held weakly for the same reason, so it is
+ * confined to the request without any clearing step. It is deliberately NOT held in the platform's
+ * request-scoped cache: a gate a field resolver looks for under a different `RequestContext` instance is a gate
+ * that is not there, and the second statement it exists to prevent would then be issued.
  *
  * @internal
  */
-export const LINE_COUNT_REPAIR_KEY = 'ReorderListEntityResolver.lineCountRepair';
+const LINE_COUNT_REPAIRS = new WeakMap<ReorderList, Promise<number>>();
 
 /**
  * @description
- * Runs `repair` for this exact list object at most once per request, and returns the one result to every
- * caller.
+ * Runs `repair` for this exact list object at most once, and returns the one result to every caller.
  *
  * **The registration is synchronous and that is the whole mechanism.** `repair` is invoked and its promise is
  * stored in the same uninterrupted run of statements, so a second caller that arrives while the first is
@@ -304,28 +276,16 @@ export const LINE_COUNT_REPAIR_KEY = 'ReorderListEntityResolver.lineCountRepair'
  * statement this gate exists to prevent, and every caller sharing one failure is the truthful outcome of one
  * attempt having been made.
  *
- * @param requestContextCache - The platform's request-scoped cache, injected by the calling resolver.
- * @param ctx - The request context the gate is scoped to.
  * @param list - The list object whose repair is being gated, by identity.
- * @param repair - Starts the repair. Called at most once per list object per request.
+ * @param repair - Starts the repair. Called at most once per list object.
  * @returns The reconciled counter value, shared by every caller for this object.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage ReorderListEntityResolver
  * @since 3.8.0
  */
-export function repairLineCountOnce(
-    requestContextCache: RequestContextCacheService,
-    ctx: RequestContext,
-    list: ReorderList,
-    repair: () => Promise<number>,
-): Promise<number> {
-    const inFlight = requestContextCache.get<WeakMap<ReorderList, Promise<number>>>(
-        ctx,
-        LINE_COUNT_REPAIR_KEY,
-        () => new WeakMap<ReorderList, Promise<number>>(),
-    );
-    const started = inFlight.get(list);
+export function repairLineCountOnce(list: ReorderList, repair: () => Promise<number>): Promise<number> {
+    const started = LINE_COUNT_REPAIRS.get(list);
     if (started !== undefined) {
         return started;
     }
@@ -333,8 +293,348 @@ export function repairLineCountOnce(
     // is installed before control can return to the event loop and before any sibling field can observe the
     // gate as empty.
     const pending = repair();
-    inFlight.set(list, pending);
+    LINE_COUNT_REPAIRS.set(list, pending);
     return pending;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The single-list read's counter reconciliation, which has to happen BEFORE the parent object is handed
+// to GraphQL. This section is the whole of that mechanism, so it is documented as one.
+// ---------------------------------------------------------------------------------------------------
+
+/**
+ * The name of the nested field this reconciliation reads its observed total from. It is the published field
+ * name and the resolver method name, and the two must agree or the pre-resolved page is never consumed.
+ */
+const LINES_FIELD_NAME = 'lines';
+
+/**
+ * The nested line pages already resolved for a list object, keyed by the options they were resolved under.
+ *
+ * **This is what keeps the reconciliation free of an extra statement.** The single-list read resolves the
+ * nested page itself, before returning the parent, because the reconciled counter has to be on the object
+ * before GraphQL reads the sibling `lineCount` scalar off it. If the field resolver then loaded that same page
+ * again, the request would issue the nested read's two statements twice — so the page is deposited here and the
+ * field resolver serves it from the cache when it asks for the same window.
+ *
+ * The options key is the same {@link stableStringify} rendering the page batch uses, so a field asking for a
+ * *different* window misses the cache and loads its own page, which is correct: a cached page is a cached
+ * answer to one question. The map is keyed on object identity and held weakly, so it is confined to the request
+ * and needs no clearing — and a collection entry for the same row, being a different object, can never read a
+ * page the single read resolved.
+ */
+const PRE_RESOLVED_LINE_PAGES = new WeakMap<ReorderList, Map<string, ReorderListLinePage>>();
+
+/** Deposits a page the single-list read resolved, so the nested field resolver need not load it again. */
+function cacheResolvedLinePage(list: ReorderList, optionsKey: string, page: ReorderListLinePage): void {
+    const pages = PRE_RESOLVED_LINE_PAGES.get(list) ?? new Map<string, ReorderListLinePage>();
+    pages.set(optionsKey, page);
+    PRE_RESOLVED_LINE_PAGES.set(list, pages);
+}
+
+/** The page already resolved for this exact object and this exact window, where there is one. */
+function resolvedLinePage(list: ReorderList, optionsKey: string): ReorderListLinePage | undefined {
+    return PRE_RESOLVED_LINE_PAGES.get(list)?.get(optionsKey);
+}
+
+/**
+ * Normalises the generator-supplied options into the window the service is asked for.
+ *
+ * Only `take` is touched, and only where the caller supplied none — `??` rather than `||` because a caller's
+ * explicit value must survive, including a `take` of zero, and because the generated argument may arrive as
+ * null as well as absent. Every other member — `skip`, `sort`, `filter`, `filterOperator` — is handed through
+ * exactly as it arrived, so the caller's own paging and ordering reach the service unaltered.
+ *
+ * It is a module function rather than a method because **both** callers must produce the identical object: the
+ * field resolver, from its coerced `@Args()`, and the single-list read, from the same argument read off the
+ * document. A second copy of this normalisation could substitute a different default and the two would then
+ * compute different cache keys, silently reloading the page the read had already resolved.
+ */
+function normaliseLinesPageOptions(
+    supplied: ListQueryOptions<ReorderListLine> | null | undefined,
+    defaultPageSize: number,
+): ListQueryOptions<ReorderListLine> {
+    const options = supplied ?? undefined;
+    return {
+        ...options,
+        take: options?.take ?? defaultPageSize,
+    };
+}
+
+/**
+ * Whether these options narrow the collection, in exactly the sense the service uses when it decides whether
+ * to publish {@link ReorderListLinePage.authoritativeTotalItems}.
+ *
+ * A `filter` object with no keys narrows nothing, so it is not narrowing here either — the service treats it
+ * the same way, and the two must agree or the read would skip a reconciliation the service was willing to
+ * support. A `filterOperator` alone counts, because it can only have been sent to combine filters.
+ */
+function narrowsTheLineCollection(options: ListQueryOptions<ReorderListLine>): boolean {
+    const filter = options.filter;
+    const hasFilter = filter != null && Object.keys(filter).length > 0;
+    return hasFilter || options.filterOperator != null;
+}
+
+/**
+ * Reads the `if` argument of a `@skip` or `@include` directive on a selection, and says whether that selection
+ * is excluded from the response.
+ *
+ * It exists so that this reconciliation cannot resolve a page for a field the executor will never run: a
+ * `lines` selection under `@skip(if: true)` is not part of the request, and reading it would issue two
+ * statements nobody asked for and repair a counter from a page the response never carries.
+ */
+function isExcludedByDirective(selection: SelectionNode, variableValues: Record<string, unknown>): boolean {
+    for (const directive of selection.directives ?? []) {
+        const name = directive.name.value;
+        if (name !== 'skip' && name !== 'include') {
+            continue;
+        }
+        const condition = directive.arguments?.find(argument => argument.name.value === 'if');
+        if (!condition) {
+            continue;
+        }
+        const value = valueFromASTUntyped(condition.value, variableValues);
+        if ((name === 'skip' && value === true) || (name === 'include' && value === false)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Finds the `lines` field the document selected on this list, resolving fragment spreads and inline fragments.
+ *
+ * **Both fragment forms are required rather than defensive.** This plugin's own end-to-end documents reach
+ * `lines` through a nested fragment spread — a fragment that spreads a second fragment and then selects the
+ * field — so a walk that only inspected direct field selections would find nothing on the canonical read and
+ * the reconciliation would never run.
+ *
+ * The first matching selection wins. A document carrying two aliases of `lines` with different windows gets its
+ * first window pre-resolved and reconciled from, and the other alias loads its own page: every unfiltered
+ * window reports the same unfiltered total, so which one is chosen cannot change the reconciled value.
+ */
+function findLinesSelection(
+    selections: readonly SelectionNode[],
+    info: GraphQLResolveInfo,
+): FieldNode | undefined {
+    for (const selection of selections) {
+        if (isExcludedByDirective(selection, info.variableValues)) {
+            continue;
+        }
+        if (selection.kind === 'Field') {
+            if (selection.name.value === LINES_FIELD_NAME) {
+                return selection;
+            }
+            continue;
+        }
+        if (selection.kind === 'FragmentSpread') {
+            const fragment = info.fragments[selection.name.value];
+            const inFragment = fragment && findLinesSelection(fragment.selectionSet.selections, info);
+            if (inFragment) {
+                return inFragment;
+            }
+            continue;
+        }
+        const inInlineFragment = findLinesSelection(selection.selectionSet.selections, info);
+        if (inInlineFragment) {
+            return inInlineFragment;
+        }
+    }
+    return undefined;
+}
+
+/**
+ * The window the document asked of `ReorderList.lines` on the field being resolved, or `undefined` where it
+ * selected no `lines` field at all.
+ *
+ * **The argument is read off the document rather than reconstructed.** `valueFromASTUntyped` resolves literals
+ * and variables through the request's own coerced variable values, which is what makes a window written as
+ * `lines(options: { take: $take, sort: { createdAt: $order } })` readable here — the shape this plugin's paged
+ * end-to-end document uses. Where a member's variable was not supplied it reads as absent, exactly as the
+ * coerced argument the field resolver receives does, so the two render to the same cache key.
+ *
+ * A non-object argument value is ignored rather than trusted: the generated input type makes that unreachable
+ * through a valid document, and a resolver is not the place to re-litigate what the schema already refuses.
+ *
+ * @param info - The resolve info of the field whose selection set is being inspected.
+ * @param defaultPageSize - The plugin's configured nested page size, applied where the document supplied no
+ * `take`, so that this window is the same one the field resolver will compute.
+ */
+function selectedLinesPageOptions(
+    info: GraphQLResolveInfo,
+    defaultPageSize: number,
+): ListQueryOptions<ReorderListLine> | undefined {
+    const selections = info.fieldNodes.flatMap(node => node.selectionSet?.selections ?? []);
+    const linesSelection = findLinesSelection(selections, info);
+    if (!linesSelection) {
+        return undefined;
+    }
+    const argument = linesSelection.arguments?.find(node => node.name.value === 'options');
+    const supplied = argument ? valueFromASTUntyped(argument.value, info.variableValues) : undefined;
+    const options =
+        supplied != null && typeof supplied === 'object' && !Array.isArray(supplied)
+            ? (supplied as ListQueryOptions<ReorderListLine>)
+            : undefined;
+    return normaliseLinesPageOptions(options, defaultPageSize);
+}
+
+/**
+ * @description
+ * Reconciles a stale stored `lineCount` on the object the single-list read is about to return, **before** that
+ * object is handed to GraphQL — and leaves the page it read behind for the nested field resolver.
+ *
+ * **The ordering is the whole point of this function, and getting it wrong is invisible in the payload of every
+ * request that has nothing to repair.** GraphQL completes an object's fields by walking its selection set
+ * synchronously: a scalar with no field resolver is read off the source object during that walk, and only the
+ * promises the walk collected are awaited afterwards. So a reconciliation that happens inside the `lines`
+ * resolver — however correctly it then writes the value back onto the row — happens after the executor has
+ * already taken `lineCount`, and the response reports the stale number while the database row has been
+ * corrected. The request that most needs the corrected value is exactly the one that reports the wrong one.
+ * FEATURE-001-01 section 2.6.2.1 requires the **first** single-list read to report the corrected count, so the
+ * reconciliation is performed here, where the parent has not yet been exposed.
+ *
+ * **It reads the page the document asked for, and nothing it was not asked for.** Where the document selects no
+ * `lines` field this function issues nothing at all: without an observed total there is nothing to compare the
+ * stored counter against, which is the same position the collection read is permanently in. Where the document
+ * *narrows* the nested collection, it likewise issues nothing — a filtered total counts the caller's own subset,
+ * and writing it into `reorder_list.lineCount` would replace the number the atomic line bound is enforced
+ * against with one the caller chose.
+ *
+ * **It costs no statement that the request was not going to issue anyway.** The page it resolves is deposited
+ * against the parent object under the window it was resolved for, and the nested field resolver serves that
+ * cached page instead of loading its own — so the nested read's two statements are issued once, here, rather
+ * than once here and once there.
+ *
+ * **A failure to pre-resolve is not a failure of the request.** The read is wrapped, and a failure leaves the
+ * field resolver to load the page as it always could, taking the fallback reconciliation with it. The
+ * alternative — failing a read that would otherwise have succeeded, for the sake of a counter it only meant to
+ * tidy — trades a working response for a maintenance task.
+ *
+ * The platform's own resolvers use this shape: the Shop products resolver inspects its `info`, pre-starts the
+ * query a field resolver will need and caches the result for it
+ * (`packages/core/src/api/resolvers/shop/shop-products.resolver.ts`).
+ *
+ * @param reorderListService - The service that owns both the nested read and the compare-and-set statement.
+ * @param ctx - The request context of the root read.
+ * @param list - The exact object the single-list read is about to return.
+ * @param info - The root field's resolve info, from which the nested window is read.
+ * @param defaultLinesPageSize - The plugin's configured nested page size.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @docsPage ReorderListEntityResolver
+ * @since 3.8.0
+ */
+export async function reconcileSingleReorderListRead(
+    reorderListService: ReorderListService,
+    ctx: RequestContext,
+    list: ReorderList,
+    info: GraphQLResolveInfo,
+    defaultLinesPageSize: number,
+): Promise<void> {
+    const options = selectedLinesPageOptions(info, defaultLinesPageSize);
+    if (!options || narrowsTheLineCollection(options)) {
+        // No observed total is available to this request, so there is nothing to reconcile against and nothing
+        // is read. The stored counter is reported exactly as it stands.
+        return;
+    }
+    try {
+        const pages = await reorderListService.getLinesForLists(ctx, [list.id], options);
+        const page = pages.get(list.id);
+        if (!page) {
+            return;
+        }
+        cacheResolvedLinePage(list, stableStringify(options), page);
+        await repairStaleLineCount(reorderListService, ctx, list, page.authoritativeTotalItems);
+    } catch {
+        // Deliberately not re-raised, and deliberately not bound. Not re-raised, because the nested field
+        // resolver will read the page itself and will fail there if the failure was real, which is where a
+        // failed nested read belongs. Not bound, because the service has already logged this failure,
+        // classified and sanitised, under its own correlation id — so there is nothing here to add that would
+        // not either duplicate that line or copy driver text into it.
+        Logger.warn(
+            `Could not pre-resolve the line page of reorder list ${String(list.id)} for its counter reconciliation`,
+            loggerCtx,
+        );
+    }
+}
+
+/**
+ * Repairs a stored line counter that disagrees with the total this request actually observed — and only for the
+ * object the single-list read returned, and only from a total that is the list's whole, unfiltered line count.
+ *
+ * **Four conjuncts are required, and each rules out a different defect.**
+ *
+ * The first is that THIS PARENT OBJECT is the one `activeCustomerReorderList` returned, recorded through
+ * {@link markSingleReorderListRead} and tested through {@link wasReturnedBySingleReorderListRead}. Without it, a
+ * collection read that happened to select `lines` would repair, which FEATURE-001-01 section 2.6.2.1 forbids in
+ * as many words: a page of lists has no observed total to compare against and reports the stored column as it
+ * stands. The test is on object identity rather than on the row identifier, because one document may select both
+ * reads and the same row then arrives twice in one request as two separately loaded objects.
+ *
+ * The second is that a total is available **and unfiltered**. The caller passes
+ * {@link ReorderListLinePage.authoritativeTotalItems}, which the service publishes only for a request that
+ * applied no `filter` and no `filterOperator`; a filtered request therefore passes `undefined` and nothing is
+ * issued. That conjunct closes a real escalation rather than a theoretical one: the published `totalItems`
+ * counts the lines matching the caller's own filter, so filtering a full list down to nothing and writing that
+ * count into `reorder_list.lineCount` would zero the very counter the atomic line bound is enforced against,
+ * after which `maxLinesPerList` bounds nothing.
+ *
+ * The third is that the observed total actually differs from the stored counter, and that both are values the
+ * column can hold. On the overwhelmingly common path they agree and nothing is issued, which is what makes the
+ * repair free where there is nothing to repair.
+ *
+ * The fourth is that no repair for this object is already under way — {@link repairLineCountOnce} both answers
+ * that and starts the repair when the answer is no, in one synchronous step, so sibling fields awaiting the same
+ * object share one statement.
+ *
+ * **The reconciled value is written back onto the row**, so every consumer that reads the object afterwards —
+ * including the executor, when this runs before the parent is exposed — sees the corrected number. The
+ * statement itself, its compare-and-set guard and its refusal of a value the column may not hold all belong to
+ * the service; nothing here composes SQL.
+ */
+async function repairStaleLineCount(
+    reorderListService: ReorderListService,
+    ctx: RequestContext,
+    list: ReorderList,
+    observedTotal: number | undefined,
+): Promise<void> {
+    // Conjunct one: THIS OBJECT was returned by the single-list read.
+    if (!wasReturnedBySingleReorderListRead(list)) {
+        return;
+    }
+    // Conjunct two: an unfiltered total was established for this parent at all. `undefined` is the service's
+    // way of saying "this request narrowed the collection, so it does not know the list's line count", and it
+    // is answered by leaving the stored column exactly as it stands.
+    if (observedTotal === undefined) {
+        return;
+    }
+    // Conjunct three: the total differs from the stored counter, and both are values the column can hold. Both
+    // halves are checked here rather than left to the service. The service does refuse a total the column may
+    // not hold, but it refuses it by logging an error — and an error log is the right report for a defect and
+    // the wrong one for a value this function could have declined to pass on.
+    const storedLineCount = list.lineCount;
+    if (typeof storedLineCount !== 'number' || !Number.isFinite(storedLineCount)) {
+        return;
+    }
+    if (!Number.isSafeInteger(observedTotal) || observedTotal < 0) {
+        return;
+    }
+    if (storedLineCount === observedTotal) {
+        return;
+    }
+    // Conjunct four: no repair for THIS OBJECT is already under way. The gate both answers that and starts the
+    // repair when the answer is no, in one synchronous step — see {@link repairLineCountOnce}.
+    const reconciled = await repairLineCountOnce(list, () =>
+        reorderListService.reconcileLineCount(ctx, list.id, storedLineCount, observedTotal),
+    );
+    if (reconciled !== storedLineCount) {
+        Logger.debug(
+            `Reconciled lineCount on reorder list ${String(list.id)} from ${String(storedLineCount)} ` +
+                `to ${String(reconciled)}`,
+            loggerCtx,
+        );
+    }
+    list.lineCount = reconciled;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -579,10 +879,20 @@ export class ReorderListEntityResolver {
         @Args() args: ReorderListLinesArgs,
     ): Promise<PaginatedList<ReorderListLine>> {
         const options = this.linesPageOptions(args);
+        const optionsKey = stableStringify(options);
+        const preResolved = resolvedLinePage(list, optionsKey);
+        if (preResolved) {
+            // The single-list read already resolved exactly this window for exactly this object, before it
+            // returned the parent, so that the counter it reconciled from that page was on the object before
+            // GraphQL read the sibling `lineCount` scalar off it. Serving that page here is what keeps the
+            // reconciliation free of a second nested read: the two statements were issued once, there.
+            // Its counter has already been reconciled, so nothing is repaired again.
+            return preResolved;
+        }
         const batch = openPageBatch<Map<ID, ReorderListLinePage>>(
             this.requestContextCache,
             ctx,
-            `${LINES_BATCH_KEY_PREFIX}(${stableStringify(options)})`,
+            `${LINES_BATCH_KEY_PREFIX}(${optionsKey})`,
             listIds => this.reorderListService.getLinesForLists(ctx, listIds, options),
         );
         const parentId = registerInPageBatch(batch, list.id);
@@ -601,10 +911,17 @@ export class ReorderListEntityResolver {
             );
             return { items: [], totalItems: 0 };
         }
-        // The UNFILTERED total, and never `page.totalItems`. The service publishes the former only on a
-        // request that narrowed nothing, so a filtered request passes `undefined` here and no repair is
-        // attempted — see {@link ReorderListEntityResolver.repairStaleLineCount}.
-        await this.repairStaleLineCount(ctx, list, page.authoritativeTotalItems);
+        // THE FALLBACK RECONCILIATION, and it is a fallback rather than the primary path. The single-list read
+        // reconciles before it exposes the parent, which is the only ordering under which the response can
+        // report the corrected counter, and it caches the page it read — so this is reached only where that
+        // read could not resolve the window (a nested selection it did not recognise, or a pre-resolve that
+        // failed). Repairing here still corrects the row for every later reader, which is the outcome
+        // FEATURE-001-01 section 2.6.2.1 asks for; what it cannot correct is the number this response already
+        // reported, and that is precisely why the primary path exists.
+        //
+        // The UNFILTERED total is passed, and never `page.totalItems`. The service publishes the former only on
+        // a request that narrowed nothing, so a filtered request passes `undefined` and no repair is attempted.
+        await repairStaleLineCount(this.reorderListService, ctx, list, page.authoritativeTotalItems);
         return page;
     }
 
@@ -639,19 +956,15 @@ export class ReorderListEntityResolver {
     }
 
     /**
-     * Normalises the generator-supplied options into the page the service is asked for.
+     * Normalises the generator-supplied arguments into the window the service is asked for.
      *
-     * Only `take` is touched, and only where the caller supplied none — `??` rather than `||` because a
-     * caller's explicit value must survive, and because the generated argument may arrive as null as well as
-     * absent. Every other member — `skip`, `sort`, `filter`, `filterOperator` — is handed through exactly as
-     * it arrived, so the caller's own paging and ordering reach the service unaltered.
+     * It delegates to {@link normaliseLinesPageOptions} rather than performing the substitution here, because
+     * the single-list read has to compute the identical window from the same argument read off the document: the
+     * two windows are compared as cache keys, and a second copy of this normalisation could drift from the
+     * first and silently reload a page that had already been resolved.
      */
     private linesPageOptions(args: ReorderListLinesArgs): ListQueryOptions<ReorderListLine> {
-        const supplied = args?.options ?? undefined;
-        return {
-            ...supplied,
-            take: supplied?.take ?? this.defaultLinesPageSize(),
-        };
+        return normaliseLinesPageOptions(args?.options, this.defaultLinesPageSize());
     }
 
     /**
@@ -666,119 +979,6 @@ export class ReorderListEntityResolver {
      */
     private defaultLinesPageSize(): number {
         return this.options.defaultReorderListLinesPageSize;
-    }
-
-    /**
-     * Repairs a stored line counter that disagrees with the total this request actually observed — and only on
-     * the single-list read, and only from a total that is the list's whole, unfiltered line count.
-     *
-     * **Three conjuncts are required, and each rules out a different defect.**
-     *
-     * The first is that THIS PARENT OBJECT is the one `activeCustomerReorderList` returned, which that read
-     * records through {@link markSingleReorderListRead} and this method tests through
-     * {@link wasReturnedBySingleReorderListRead}. Without it, a collection read that happened to select `lines`
-     * would
-     * repair, which FEATURE-001-01 section 2.6.2.1 forbids in as many words: a page of lists has no observed
-     * total to compare against and reports the stored column as it stands.
-     *
-     * The test is on OBJECT IDENTITY rather than on the row identifier, and that is not a refinement — it is
-     * what makes the conjunct true. One document may select both reads, so the same row can arrive here twice
-     * in one request: once as the single read's object and once as an entry of the collection's page. Those are
-     * two separately loaded objects, so identity admits the first and refuses the second, whereas a marker
-     * keyed on the row identifier would be satisfied by both and would repair from the collection path. It is
-     * equally not inferred from the batch holding one parent, because a collection read asking for `take: 1` is
-     * indistinguishable under that test.
-     *
-     * The second is that a total is available **and unfiltered**. The caller passes
-     * {@link ReorderListLinePage.authoritativeTotalItems}, which the service publishes only for a request that
-     * applied no `filter` and no `filterOperator`; a filtered request therefore passes `undefined` and this
-     * method issues nothing. That is the conjunct that closes a genuine escalation rather than a theoretical
-     * one: the published `totalItems` counts the lines matching the caller's own filter, so filtering a full
-     * list down to nothing and writing that count into `reorder_list.lineCount` would zero the very counter
-     * the atomic line bound is enforced against — after which `maxLinesPerList` bounds nothing, and the list
-     * can be grown without limit by repeating the trick. A filtered single-list read consequently behaves
-     * exactly like the collection read: it reports the stored column as it stands.
-     *
-     * The third is that the observed total actually differs from the stored counter. On the overwhelmingly
-     * common path they agree and nothing is issued, which is what makes the repair free where there is nothing
-     * to repair. A counter that is not a finite number is left alone as well: it could not have come from the
-     * column, and comparing against it would issue a statement whose guard can never match.
-     *
-     * **One consequence of how the platform scopes a request context, stated rather than left to be
-     * discovered.** A field resolver's `@Ctx()` resolves through the shared request key rather than through its
-     * own handler (`packages/core/src/api/decorators/request-context.decorator.ts` passes no execution context
-     * for a field resolver), so in a document selecting several root fields every field resolver reads the
-     * context of whichever root's guard ran last. A document that selects BOTH reads may therefore resolve
-     * `lines` under the collection read's context, in which nothing was ever recorded — and the repair simply
-     * does not run. That is the safe direction and the same direction as an unmarked request: the stored
-     * counter is reported as it stands, exactly as the collection read reports it. What cannot happen in any
-     * ordering is the converse, because a collection entry is never the object that was recorded.
-     *
-     * **The one path that can drift the counter** is a HARD deletion of a `product_variant` row, whose
-     * cascade removes line rows underneath the plugin without the counter being told. The platform's own
-     * variant deletion is a soft delete that leaves every line in place, so this is reachable only by a direct
-     * database deletion or by a future platform change — stated at its true size, and repaired rather than
-     * left to disagree.
-     *
-     * **The reconciled value is written back onto the row**, so the corrected number is visible to any consumer
-     * that reads the row after this page resolves.
-     *
-     * **"Exactly one compare-and-set statement" is enforced by {@link repairLineCountOnce}, not by that
-     * write-back.** The distinction matters because sibling GraphQL fields run concurrently: two aliases of
-     * `lines` on the same object await the same page batch, then both read the same stale counter, because the
-     * first alias has not reached its write-back by the time the second reads. Sequencing alone therefore
-     * closes the repeat case and not the simultaneous one, and it is the simultaneous one a document can
-     * trigger deliberately. The gate is keyed on this exact object and registers the in-flight repair
-     * synchronously, so every alias of every shape awaits the one statement and observes the one reconciled
-     * value — however many times the field appears in the document, and whether those appearances are
-     * sequential or parallel.
-     *
-     * The statement itself, its compare-and-set guard and its refusal of a value the column may not hold all
-     * belong to the service. Nothing here composes SQL.
-     */
-    private async repairStaleLineCount(
-        ctx: RequestContext,
-        list: ReorderList,
-        observedTotal: number | undefined,
-    ): Promise<void> {
-        // Conjunct one: THIS OBJECT was returned by the single-list read of this request.
-        if (!wasReturnedBySingleReorderListRead(this.requestContextCache, ctx, list)) {
-            return;
-        }
-        // Conjunct two: an unfiltered total was established for this parent at all. `undefined` is the
-        // service's way of saying "this request narrowed the collection, so it does not know the list's line
-        // count", and it is answered by leaving the stored column exactly as it stands.
-        if (observedTotal === undefined) {
-            return;
-        }
-        // Conjunct three: the total differs from the stored counter, and both are values the column can hold.
-        // Both halves are checked here rather than left to the service. The service does refuse a total the
-        // column may not hold, but it refuses it by logging an error — and an error log is the right report for
-        // a defect and the wrong one for a value this method could have declined to pass on.
-        const storedLineCount = list.lineCount;
-        if (typeof storedLineCount !== 'number' || !Number.isFinite(storedLineCount)) {
-            return;
-        }
-        if (!Number.isSafeInteger(observedTotal) || observedTotal < 0) {
-            return;
-        }
-        if (storedLineCount === observedTotal) {
-            return;
-        }
-        // Conjunct four, and the last one: no repair for THIS OBJECT is already under way in this request. The
-        // gate both answers that and starts the repair when the answer is no, in one synchronous step — see
-        // {@link repairLineCountOnce} for why the two cannot be separated.
-        const reconciled = await repairLineCountOnce(this.requestContextCache, ctx, list, () =>
-            this.reorderListService.reconcileLineCount(ctx, list.id, storedLineCount, observedTotal),
-        );
-        if (reconciled !== storedLineCount) {
-            Logger.debug(
-                `Reconciled lineCount on reorder list ${String(list.id)} from ${String(storedLineCount)} ` +
-                    `to ${String(reconciled)}`,
-                loggerCtx,
-            );
-        }
-        list.lineCount = reconciled;
     }
 
     /*

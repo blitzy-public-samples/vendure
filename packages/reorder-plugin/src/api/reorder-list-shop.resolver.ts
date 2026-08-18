@@ -78,7 +78,7 @@
  */
 
 import { Inject } from '@nestjs/common';
-import { Args, Mutation, Query, Resolver } from '@nestjs/graphql';
+import { Args, Info, Mutation, Query, Resolver } from '@nestjs/graphql';
 import {
     Allow,
     Ctx,
@@ -87,9 +87,9 @@ import {
     PaginatedList,
     Permission,
     RequestContext,
-    RequestContextCacheService,
     Transaction,
 } from '@vendure/core';
+import { GraphQLResolveInfo } from 'graphql';
 
 import { REORDER_PLUGIN_OPTIONS } from '../constants';
 import {
@@ -110,82 +110,62 @@ import { ResolvedReorderPluginOptions } from '../types';
 
 import {
     markSingleReorderListRead,
-    SINGLE_LIST_READ_KEY,
+    reconcileSingleReorderListRead,
     wasReturnedBySingleReorderListRead,
 } from './reorder-list-entity.resolver';
 
-/**
- * The one request-scoped key the single-list-read marker is held under.
- *
- * It is the entity field resolver's own key, re-exported here rather than restated, because that resolver is
- * what READS the marker: a marker the two files namespaced independently would never be found, and the repair
- * it gates would silently never run. Core's convention for a request-scoped cache key names the resolver that
- * consumes the cached value — `PaymentEntityResolver.refunds(${payment.id})`
- * (`packages/core/src/api/resolvers/entity/payment-entity.resolver.ts` L28) — so the reader's spelling is also
- * the conventional one.
- *
- * The marker is the RETURNED OCCURRENCE, not the requested identifier, and it is not held in this file. Both
- * halves matter and both are the entity field resolver's to own:
- *
- * - It is set on the object the service actually returned, after the read resolved, so a read that answered
- *   `null` — another customer's list, another channel's, or none — licenses nothing, and a *different*
- *   occurrence of the same identifier reached through the collection read in the same document cannot inherit
- *   the licence.
- * - It is not a key in the platform's request-scoped cache, because a field resolver does not always receive
- *   the same `RequestContext` instance a root resolver did — the platform binds a context per handler and falls
- *   back to a shared one — so with two roots in flight a context-keyed marker can be looked for under the wrong
- *   context and silently never found.
- *
- * See `markSingleReorderListRead` and `SINGLE_LIST_READ_OCCURRENCES` in `./reorder-list-entity.resolver`.
+/*
+ * WHY THERE IS NO CACHE KEY HERE ANY MORE. The single-list-read licence used to be a key in the platform's
+ * request-scoped cache, re-exported from this file so both resolvers spelled it once. It is now module-private
+ * state in the entity resolver, keyed on the object the read returned, and this file marks it by calling that
+ * resolver's own setter. The change is a correction rather than a tidy-up: the platform's cache is keyed on the
+ * `RequestContext` INSTANCE, and a field resolver does not reliably receive the instance a root resolver did —
+ * the platform binds a context per handler and a field resolver reads the shared request slot
+ * (`packages/core/src/api/decorators/request-context.decorator.ts`), which in a multi-root document can hold
+ * another root's context by the time the field runs. A licence written under one context and looked for under
+ * another is simply absent, and the repair FEATURE-001-01 section 2.6.2.1 requires would then be skipped
+ * silently. Object identity removes the context from the question, and is strictly narrower besides: a
+ * collection entry for the same row is a different object and can never inherit the licence.
  */
-export const SINGLE_LIST_READ_MARKER_KEY = SINGLE_LIST_READ_KEY;
 
 /**
  * @description
  * Whether the given list object is the one {@link ReorderListShopResolver.activeCustomerReorderList} returned
- * on this request — the licence the entity field resolver requires before it may run the `lineCount`
- * compare-and-set repair.
+ * on this request — the licence the `lineCount` compare-and-set repair requires.
  *
  * **This function is the coordination point between the two resolvers, and it exists so that the question is
  * asked in one place rather than answered independently in two.** The repair belongs to the single-list read
  * alone: a collection read pages no list's lines, so it has no observed total to compare the stored counter
- * against, and it must never repair (FEATURE-001-01 section 2.6.2.1). A marker the two sides resolved
- * differently would fail silently in the direction that looks like success — the reader would simply never
- * find it, the repair would never run, and no test asserting a repaired counter on the single read could say
- * why.
+ * against, and it must never repair (FEATURE-001-01 section 2.6.2.1). A licence the two sides resolved
+ * differently would fail silently in the direction that looks like success — the reader would simply never find
+ * it, the repair would never run, and no test asserting a repaired counter on the single read could say why.
  *
- * **The licence is held against the returned OBJECT and not against the row's identifier**, because one
- * request may legitimately carry both reads: a document may select `activeCustomerReorderList(id: 1)`
- * alongside `activeCustomerReorderLists`, each read hydrating its own object for row 1. An identifier-keyed
- * marker is satisfied by both, so the collection's entry would inherit the single read's licence to write —
- * which is precisely what the contract forbids. Membership of the marked object set is satisfied by exactly
- * one of them.
+ * **The licence is held against the returned OBJECT — not against the row's identifier, and not against the
+ * request context.** One request may legitimately carry both reads: a document may select
+ * `activeCustomerReorderList(id: 1)` alongside `activeCustomerReorderLists`, each read hydrating its own object
+ * for row 1, and an identifier-keyed licence is satisfied by both, so the collection's entry would inherit the
+ * single read's licence to write. A context-keyed licence fails the other way: a field resolver does not
+ * reliably receive the `RequestContext` instance the root resolver did, so the licence could be looked for under
+ * another root's context and never found. Membership of a module-private set of returned objects is satisfied by
+ * exactly one object and depends on no context at all.
  *
- * It delegates to the reader's own predicate rather than reimplementing the lookup, which is what makes
- * "asked in one place" true across the two files instead of merely stated in each of them.
+ * It delegates to the reader's own predicate rather than reimplementing the lookup, which is what makes "asked
+ * in one place" true across the two files instead of merely stated in each of them.
  *
- * @param requestContextCache - The platform's request-scoped cache.
- * @param ctx - The request context the marker was scoped to.
  * @param list - The list object whose provenance is in question.
  *
  * @example
  * ```ts
- * // In the entity field resolver, gating the repair:
- * if (singleListReadMarked(this.requestContextCache, ctx, list) && unfilteredTotal !== undefined) {
- *     return this.reorderListService.reconcileLineCount(ctx, list.id, list.lineCount, unfilteredTotal);
- * }
- * return list.lineCount;
+ * // Asserting, from a specification, that the single read licensed the object it returned:
+ * const list = await shopResolver.activeCustomerReorderList(ctx, { id }, info);
+ * expect(singleListReadMarked(list!)).toBe(true);
  * ```
  *
  * @docsCategory core plugins/ReorderPlugin
  * @since 3.8.0
  */
-export function singleListReadMarked(
-    requestContextCache: RequestContextCacheService,
-    ctx: RequestContext,
-    list: ReorderListEntity,
-): boolean {
-    return wasReturnedBySingleReorderListRead(requestContextCache, ctx, list);
+export function singleListReadMarked(list: ReorderListEntity): boolean {
+    return wasReturnedBySingleReorderListRead(list);
 }
 
 /**
@@ -246,11 +226,15 @@ type ReorderListEntity = NonNullable<Awaited<ReturnType<ReorderListService['getR
  * implementation of each invariant to review. The file-level comment above records, for each of the four
  * additions a reader is most likely to want here, why adding it would be a defect.
  *
- * The one behaviour this class contributes beyond delegation is the pair of *request-shaped* concerns that
- * genuinely belong to the API layer: substituting the configured default page size where the caller supplied
- * no page size on the collection read, and recording — against the object the single-list read returned, so
- * that a collection entry for the same row cannot be mistaken for it — that this is the list that was read
- * singly. Both are described on the methods that perform them.
+ * The behaviours this class contributes beyond delegation are the *request-shaped* ones that genuinely belong
+ * to the API layer, and there are three: substituting the configured default page size where the caller
+ * supplied no page size on the collection read; recording — against the object the single-list read returned,
+ * so that a collection entry for the same row cannot be mistaken for it — that this is the list that was read
+ * singly; and reconciling that list's stored line counter **before the object is returned**, because a
+ * reconciliation that lands after the executor has read the sibling scalar corrects the row while the response
+ * still reports the stale number. Each is described on the method that performs it, and none of them decides
+ * anything the service owns: the counter statement, its compare-and-set guard and the nested page they both read
+ * are all the service's.
  *
  * @example
  * ```ts
@@ -274,7 +258,6 @@ type ReorderListEntity = NonNullable<Awaited<ReturnType<ReorderListService['getR
 export class ReorderListShopResolver {
     constructor(
         private reorderListService: ReorderListService,
-        private requestContextCache: RequestContextCacheService,
         @Inject(REORDER_PLUGIN_OPTIONS) private options: ResolvedReorderPluginOptions,
     ) {}
 
@@ -292,6 +275,21 @@ export class ReorderListShopResolver {
      */
     private get defaultReorderListsPageSize(): number {
         return this.options.defaultReorderListsPageSize;
+    }
+
+    /**
+     * The nested page size the single-list read hands to its counter reconciliation, so that the window it
+     * resolves is the window {@link ReorderListEntityResolver.lines} will ask for.
+     *
+     * **This is not a second place the nested default is applied.** The substitution itself lives in the entity
+     * field resolver's own normaliser, which both callers share; this getter only supplies the same injected
+     * value to it. Reading it from {@link ResolvedReorderPluginOptions} rather than restating `50` is what keeps
+     * the two windows identical — a literal here would be unreachable through `ReorderPlugin.init()`, untested,
+     * and free to drift from the value the server is running on, and a drift would silently make the read
+     * resolve one page and the field resolver load another.
+     */
+    private get defaultReorderListLinesPageSize(): number {
+        return this.options.defaultReorderListLinesPageSize;
     }
 
     /**
@@ -373,33 +371,48 @@ export class ReorderListShopResolver {
      * method adds no error, no warning and no extension that could tell those cases apart. This is why
      * `ReorderListNotFoundError` is a member of the *mutation* unions only.
      *
-     * **The marker.** After the read resolves, this method records — for the duration of this request, and
-     * against the **exact object** the service returned — that this list was read singly. The entity field
-     * resolver tests that marker to decide whether it may run the `lineCount` compare-and-set repair, which
-     * belongs to the single-list read alone (FEATURE-001-01 section 2.6.2.1).
+     * **The licence.** After the read resolves, this method records — against the **exact object** the service
+     * returned — that this list was read singly. That is the licence the `lineCount` compare-and-set repair
+     * requires, and the repair belongs to the single-list read alone (FEATURE-001-01 section 2.6.2.1).
      *
      * **The mark is written through the reader's own helper, `markSingleReorderListRead`, rather than by
-     * setting a key composed here.** The two sides of this contract have to agree or it fails in the
-     * direction that looks like success: the reader would simply never find the mark, the repair would never
-     * run, and nothing would report that it had not. Calling the reader's setter makes agreement structural
-     * instead of coincidental. {@link singleListReadMarked} exposes the same question for a test that needs to
+     * composing state here.** The two sides of this contract have to agree or it fails in the direction that
+     * looks like success: the reader would simply never find the mark, the repair would never run, and nothing
+     * would report that it had not. Calling the reader's setter makes agreement structural instead of
+     * coincidental. {@link singleListReadMarked} exposes the same question for a specification that needs to
      * assert on it, and delegates to the same predicate for the same reason.
      *
-     * **The marker is set AFTER the read and only for a non-null result, and both halves are load-bearing.**
+     * **The licence is set AFTER the read and only for a non-null result, and both halves are load-bearing.**
      * Marking before the read means marking something that has not been returned yet, so the only thing
      * available to mark is the requested identifier — and an identifier is shared by every object carrying it.
      * A document may select `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists`, in which
      * case the collection also hydrates an object for row 7; an identifier-keyed licence is satisfied by that
      * object too, and the collection's entry then repairs a counter on a path the contract forbids. Awaiting
-     * the result and marking the object itself makes the licence unforgeable: exactly one object in the
-     * request carries it. Nothing is skipped by the reordering, because a field resolver for this operation's
-     * own selection set can only run after this method's promise settles, and a `null` result marks nothing
-     * because there is no object to license.
+     * the result and marking the object itself makes the licence unforgeable: exactly one object in the request
+     * carries it, and a `null` result licenses nothing because there is no object to license.
+     *
+     * **The counter is reconciled HERE, before the object is returned, and that ordering is a requirement
+     * rather than an optimisation.** GraphQL completes an object's fields by walking its selection set
+     * synchronously, reading a scalar with no field resolver straight off the source object; only the promises
+     * that walk collected are awaited afterwards. A reconciliation performed inside the nested `lines` resolver
+     * therefore lands after the executor has already taken `lineCount`, so the row would be corrected while the
+     * response still reported the stale number — on precisely the first read the contract requires to report the
+     * corrected one. Reconciling before returning removes the race: the value is on the object before the
+     * executor can see it. The nested page this reconciliation reads is cached against the object, so the
+     * `lines` field serves it rather than loading it again, and the request pays for it once.
+     *
+     * **It is driven by the document rather than by an assumption.** `info` is what says whether the caller
+     * selected `lines` at all and with which window — no selection means no observed total and so nothing to
+     * reconcile from, which is the same position the collection read is permanently in. The platform's own
+     * resolvers read `info` for exactly this purpose, pre-starting a query a field resolver will need and
+     * caching the result for it (`packages/core/src/api/resolvers/shop/shop-products.resolver.ts`).
      *
      * @param ctx - The request context, whose authenticated session and active channel are the scope.
      * @param args - The list identifier, and the forward-compatible sharing flag. `includeShared` is
      * accepted at both values and answered identically, because no share row can exist until list sharing
      * ships; the non-default value is therefore forwarded rather than refused.
+     * @param info - The resolve info of this field, read only to discover the nested `lines` window the document
+     * asked for. Nothing is resolved from it and no selection is rewritten.
      *
      * @since 3.8.0
      */
@@ -408,12 +421,25 @@ export class ReorderListShopResolver {
     async activeCustomerReorderList(
         @Ctx() ctx: RequestContext,
         @Args() args: ActiveCustomerReorderListArgs,
+        @Info() info: GraphQLResolveInfo,
     ): Promise<ReorderListEntity | null> {
         // `includeShared` is normalised at the boundary for the reason the collection read states: an
         // explicitly `null` argument is a distinct value from an omitted one and receives no declared default.
         const list = await this.reorderListService.getReorderList(ctx, args.id, args.includeShared === true);
         if (list) {
-            markSingleReorderListRead(this.requestContextCache, ctx, list);
+            // The licence first, because the reconciliation below tests it.
+            markSingleReorderListRead(list);
+            // Then the reconciliation, and BEFORE this method returns — see the note above on why the ordering
+            // is the whole of the fix. It issues nothing where the document selected no `lines` field or
+            // narrowed the nested collection, and it never raises: a failure leaves the nested field resolver to
+            // read the page as it always could.
+            await reconcileSingleReorderListRead(
+                this.reorderListService,
+                ctx,
+                list,
+                info,
+                this.defaultReorderListLinesPageSize,
+            );
         }
         return list;
     }
@@ -422,10 +448,10 @@ export class ReorderListShopResolver {
      * @description
      * `createReorderList`: creates a named list owned by the authenticated customer in the active channel.
      *
-     * The submitted name is canonicalised and validated by the service, and uniqueness is enforced by the
-     * named database constraint over `(customerId, channelId, nameKey)` rather than by a pre-check, so a
-     * race cannot defeat it. A name whose canonical form cannot be stored is refused by a propagating
-     * `UserInputError` and no row is written; a duplicate canonical name resolves to
+     * The submitted name is canonicalised and validated by the service, which pre-checks the canonical key
+     * advisorily and leaves the named database constraint over `(customerId, channelId, nameKey)` as the
+     * authority, so a race cannot defeat it. A name whose canonical form cannot be stored is refused by a
+     * propagating `UserInputError` and no row is written; a duplicate canonical name resolves to
      * `ReorderListNameConflictError`, and a customer already holding the configured maximum resolves to
      * `ReorderListLimitError`.
      *

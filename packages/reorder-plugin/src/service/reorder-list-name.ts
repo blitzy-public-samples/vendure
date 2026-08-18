@@ -19,10 +19,13 @@
  *
  * What this module deliberately does NOT decide. It does not decide uniqueness. Two lists collide when
  * their `nameKey` values are equal for one customer in one channel, and the authority for that is the named
- * database constraint `UQ_reorder_list_customer_channel_name_key` over `(customerId, channelId, nameKey)` —
- * never a service pre-check, because a read followed by an insert loses the race and a constraint does not.
- * This module's entire contribution to that decision is producing the `nameKey` the constraint compares, so
- * there is no lookup here, no cache, and no "does this name already exist" question asked or answered.
+ * database constraint `UQ_reorder_list_customer_channel_name_key` over `(customerId, channelId, nameKey)`,
+ * because a read followed by an insert loses the race and a constraint does not. The service pairs that
+ * constraint with an **advisory** scoped pre-check over the same three columns, which answers an ordinary
+ * duplicate before a row is written; both of those live in `reorder-list.service.ts`, where the connection
+ * and the request scope are. This module's entire contribution to the decision is producing the `nameKey`
+ * that both layers compare, so there is no lookup here, no cache, and no "does this name already exist"
+ * question asked or answered — which is what keeps the module pure rather than what settles the contract.
  *
  * The pipeline order is the contract, and it is stated as an order because it is one:
  *
@@ -536,9 +539,11 @@ export function toNameKey(displayName: string): string {
  * operation's own field null and no row written. None is a member of any result union: a name that cannot
  * be stored is a malformed request, not a business outcome.
  *
- * What this function does not do is decide uniqueness. It produces the `nameKey` that the named database
- * constraint compares, and the constraint decides. There is no lookup here and no pre-check, because a read
- * followed by an insert loses a race that the constraint wins.
+ * What this function does not do is decide uniqueness. It produces the `nameKey` that the service's advisory
+ * pre-check and the named database constraint both compare, and the constraint is what decides — a read
+ * followed by an insert loses a race that the constraint wins. Neither of those lives here: this function
+ * issues no statement, so it holds no lookup, which is a statement about where the database work sits rather
+ * than about whether the service may perform it.
  *
  * @example
  * ```ts

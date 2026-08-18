@@ -22,11 +22,11 @@ import { ReorderListLine } from './reorder-list-line.entity';
  * **`utf8mb4_bin` rather than an accent-sensitive-but-case-insensitive collation, deliberately.** The
  * canonical key has already been lower-cased and NFC-normalised by the time it reaches the column, so the
  * only comparison the database still has to perform is exact equality — and a binary collation is the one
- * form of that which means the same thing on both engines and needs no server-version-specific name. Because
- * the named unique constraint is the *sole* authority for a name collision, this collation is the whole of the
- * database half of the rule: there is no service-level pre-count whose semantics could drift from it.
- * The character set is deliberately not overridden, so the column stays `utf8mb4` and its
- * declared length of 191 continues to count characters rather than bytes.
+ * form of that which means the same thing on both engines and needs no server-version-specific name. It
+ * governs **both** comparisons of the canonical key, which is why one clause is enough: the service's advisory
+ * pre-check reads this column with the same equality the named unique constraint enforces on it, so the two
+ * layers cannot disagree about whether two names collide. The character set is deliberately not overridden, so
+ * the column stays `utf8mb4` and its declared length of 191 continues to count characters rather than bytes.
  *
  * @since 3.8.0
  */
@@ -95,11 +95,14 @@ const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
  *
  * Three characteristics of this entity are load-bearing, and each is easy to undo by accident:
  *
- * 1. Uniqueness of a list name is a *database* constraint and never a service pre-check. It is
- *    enforced by `UQ_reorder_list_customer_channel_name_key` over `(customerId, channelId, nameKey)`.
- *    A "does this name exist yet?" read followed by an insert loses a race; the constraint does not.
- *    And because the constraint is *named*, a violation can be matched precisely and translated into
- *    a specific name-conflict error, instead of leaking a driver message to the caller.
+ * 1. Uniqueness of a list name is *ultimately* a database constraint, and the service's own check
+ *    cannot replace it. `UQ_reorder_list_customer_channel_name_key` over
+ *    `(customerId, channelId, nameKey)` is the authority, because a "does this name exist yet?" read
+ *    followed by an insert loses a race that the constraint wins. The service still performs that
+ *    read as an **advisory** pre-check — it answers an ordinary duplicate before a row is written —
+ *    and then catches the violation for the case no read can cover. Because the constraint is
+ *    *named*, that violation can be matched precisely and translated into the same name-conflict
+ *    error the pre-check returns, instead of leaking a driver message to the caller.
  * 2. Ownership is a pair of columns, not an unguessable identifier. Under the platform's default id
  *    strategy identifiers are sequential and therefore guessable, so `customerId` and `channelId`
  *    taken together with the active session are the whole of the access control. Every read and

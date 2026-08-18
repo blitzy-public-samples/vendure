@@ -632,6 +632,13 @@ interface HarnessPlan {
     lineColumns: string[];
     /** A repository `findOne` against `reorder_list`, answered from the predicate it was handed. */
     listFindOne: (options: Record<string, unknown>) => ReorderList | null;
+    /**
+     * How many rows the **advisory name pre-check** finds — the count whose predicate carries `nameKey`
+     * alongside the owner conjuncts. It is answered from the predicate rather than from a fixed number so a
+     * test can assert what the pre-check actually asked, and it is kept separate from
+     * {@link HarnessPlan.heldListCount} so the list bound and the name rule cannot be satisfied by one value.
+     */
+    conflictingNameCount: (options: Record<string, unknown>) => number;
     /** A builder `getOne` against `reorder_list`. */
     listGetOne: (probe: QueryBuilderProbe) => ReorderList | null;
     listPage: (probe: QueryBuilderProbe) => [ReorderList[], number];
@@ -679,6 +686,7 @@ class ServiceHarness {
         listColumns: [...REORDER_LIST_COLUMNS],
         lineColumns: [...REORDER_LIST_LINE_COLUMNS],
         listFindOne: () => ownedList(),
+        conflictingNameCount: () => 0,
         listGetOne: () => ownedList(),
         listPage: () => [[ownedList()], 1],
         heldListCount: 0,
@@ -1018,9 +1026,18 @@ class ServiceHarness {
                     if (name !== 'ReorderList') {
                         return 0;
                     }
-                    // One count exists on the whole service — the list bound's. There is deliberately no
-                    // `nameKey` branch here, because a name pre-check is exactly what the create path must not
-                    // issue: the named unique object decides every duplicate [FEATURE-001-01:§2.11].
+                    // TWO counts exist on this service and they are answered SEPARATELY, keyed on the
+                    // predicate rather than on call order. One is the list bound's, scoped to the owning
+                    // customer and channel; the other is the advisory name pre-check, which additionally
+                    // carries the canonical `nameKey` — the layer §2.11 requires the service to perform
+                    // alongside catching the constraint violation. Answering both from one configured number
+                    // would make the bound's own tests pass for the wrong reason (a `heldListCount` of one
+                    // would read as a name collision), and answering the pre-check unconditionally with zero
+                    // would let a missing predicate pass [FEATURE-001-01:§2.11].
+                    const where = (options.where ?? {}) as Record<string, unknown>;
+                    if (Object.prototype.hasOwnProperty.call(where, 'nameKey')) {
+                        return this.plan.conflictingNameCount(options);
+                    }
                     return this.plan.heldListCount;
                 }),
             ),
@@ -1188,6 +1205,17 @@ function statementsOfKind(
     operation: StatementOperation,
 ): JournalledStatement[] {
     return statementsAgainst(harness, entity).filter(statement => statement.operation === operation);
+}
+
+/**
+ * The statements that look a ROW up, as distinct from the ones that count rows.
+ *
+ * Both are `SELECT`s, and the distinction matters wherever an assertion is about how many times a row was
+ * addressed: an aggregate reads no row into process memory and answers a different question, so counting it
+ * alongside the lookups would make a claim about disclosure depend on how many bounds an operation checks.
+ */
+function rowLookupsAgainst(harness: ServiceHarness, entity: ProbedEntity): JournalledStatement[] {
+    return statementsOfKind(harness, entity, 'select').filter(statement => statement.terminal !== 'count');
 }
 
 function conditionTextOf(statement: JournalledStatement): string {
@@ -1891,28 +1919,81 @@ describe('ReorderListService', () => {
             expect((result as ReorderList).name).toBe('Pantry top-up');
         });
 
-        it('returns ReorderListNotFoundError when no affected row is reported and the accessible row carries a different name', async () => {
-            harness.plan.listAffected = () => 0;
+        it('refuses a list this caller may not have with ONE scoped select and no DML at all', async () => {
+            // THE REFUSED-WRITE EVIDENCE CONTRACT, ASSERTED AS A STATEMENT SHAPE RATHER THAN AS A PAYLOAD.
+            // A caller who is not the owner, or who carries another channel's token, must be refused by
+            // exactly one scoped `SELECT` that returns no rows, with NO `INSERT`, `UPDATE` or `DELETE` issued
+            // on their behalf. A refusal reached by writing first and classifying the affected count
+            // afterwards produces the identical `ReorderListNotFoundError` while having issued DML for a
+            // caller entitled to none, which is what this assertion exists to fail [FEATURE-001-01:§2.6.1.1].
+            harness.plan.listGetOne = () => null;
+            harness.plan.listFindOne = () => null;
 
             const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
 
             expect(result).toBeInstanceOf(ReorderListNotFoundError);
             expect((result as ReorderListNotFoundError).errorCode).toBe('REORDER_LIST_NOT_FOUND_ERROR');
-            // Nothing was RELOADED — the reload the success path performs never runs. What does run is a
-            // single classification read, and it is the whole of the zero-affected path: the count alone
-            // cannot distinguish "no such row for this caller" from "the row already held this name", so it
-            // is not allowed to decide on its own. The row the harness answers with is named
-            // 'Weekly kitchen restock' while this call renames to 'Pantry top-up', so the requested state
-            // does NOT hold and the conservative not-found stands.
-            const selects = statementsOfKind(harness, 'ReorderList', 'select');
+            const selects = rowLookupsAgainst(harness, 'ReorderList');
             expect(selects).toHaveLength(1);
-            // And it is scoped, not a bare lookup by identifier: the classification read carries the same
-            // three conjuncts as the write it is classifying, so it cannot report on a row the caller could
-            // not have written.
+            expect(writeStatements(harness)).toEqual([]);
+            // And the one statement is scoped, not a bare lookup by identifier: the ownership conjuncts sit in
+            // the same `WHERE` clause as the id, which is what makes the refusal return zero rows rather than
+            // load a row and discard it.
             expect(conditionTextOf(selects[0])).toContain('reorderlist.id = :id');
             expect(conditionTextOf(selects[0])).toContain('reorderlist.customerId = :customerId');
             expect(conditionTextOf(selects[0])).toContain('reorderlist.channelId = :channelId');
             expect(scopeBoundBy(selects[0])).toEqual({ customer: CUSTOMER_ID, channel: CHANNEL_ID });
+        });
+
+        it('reads nothing about another customer, because the scope comes from the session', async () => {
+            // A table holding the addressed row for a DIFFERENT customer. The service binds the customer its
+            // own session resolved, so the admission statement matches nothing and the caller is refused
+            // without a write — and without the foreign row ever reaching process memory.
+            const foreignRow = ownedList({ customerId: FOREIGN_CUSTOMER_ID });
+            harness.plan.listGetOne = probe =>
+                String(probe.parameters.customerId) === String(foreignRow.customerId) ? foreignRow : null;
+            harness.plan.listFindOne = rowMatchingPredicate(foreignRow);
+
+            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            expect(result).toBeInstanceOf(ReorderListNotFoundError);
+            expect(writeStatements(harness)).toEqual([]);
+            expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
+        });
+
+        it('returns ReorderListNotFoundError when the admitted row is gone by the time the write is issued', async () => {
+            // The admitted-path zero, which is a different case from a refusal: the row passed the admission
+            // read and then left this caller's scope — deleted, or moved — before the conditional statement
+            // ran. The write is the authority on what happened, so its zero affected count is what produces
+            // the answer, and the classification read then confirms the row is genuinely gone.
+            harness.plan.listAffected = () => 0;
+            harness.plan.listGetOne = answeringInSequence<ReorderList | null>(ownedList(), null);
+
+            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            expect(result).toBeInstanceOf(ReorderListNotFoundError);
+            expect((result as ReorderListNotFoundError).errorCode).toBe('REORDER_LIST_NOT_FOUND_ERROR');
+            // Two scoped row lookups: the admission read and the classification read. Both carry the same
+            // three conjuncts, and neither of them is a bare lookup by identifier. The name pre-check's
+            // aggregate is a different kind of statement and is asserted separately.
+            const selects = rowLookupsAgainst(harness, 'ReorderList');
+            expect(selects).toHaveLength(2);
+            for (const select of selects) {
+                expect(conditionTextOf(select)).toContain('reorderlist.id = :id');
+                expect(scopeBoundBy(select)).toEqual({ customer: CUSTOMER_ID, channel: CHANNEL_ID });
+            }
+        });
+
+        it('keeps the conservative not-found when the write affected nothing and the row carries a different name', async () => {
+            // The row is accessible and does NOT hold the requested name, so the write both matched and failed
+            // to apply — which no engine does. It stays a not-found rather than claiming a rename that
+            // demonstrably did not happen.
+            harness.plan.listAffected = () => 0;
+
+            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            expect(result).toBeInstanceOf(ReorderListNotFoundError);
+            expect(loggedWarnings.join(' ')).toContain('carries a different name');
         });
 
         it('returns the list rather than a not-found when no affected row is reported because the row already carries the requested name', async () => {
@@ -1938,9 +2019,10 @@ describe('ReorderListService', () => {
             expect(result).not.toBeInstanceOf(ReorderListNotFoundError);
             expect((result as ReorderList).name).toBe('Pantry top-up');
             expect((result as ReorderList).nameKey).toBe('pantry top-up');
-            // One read, not two: the classification read is itself taken after the write and under the full
-            // predicate, so it IS the post-write state and there is nothing for a reload to add.
-            expect(statementsOfKind(harness, 'ReorderList', 'select')).toHaveLength(1);
+            // Two scoped row lookups and no third: the admission read that let this caller through, and the
+            // classification read taken after the write under the same predicate — which IS the post-write
+            // state, so there is nothing for a reload to add.
+            expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(2);
             // And no second write was attempted to force the value that was already there.
             expect(statementsOfKind(harness, 'ReorderList', 'update')).toHaveLength(1);
         });
@@ -1974,17 +2056,55 @@ describe('ReorderListService', () => {
             expect(result).toBeInstanceOf(ReorderListNotFoundError);
         });
 
-        it('returns ReorderListNotFoundError when no affected row is reported and no accessible row exists', async () => {
-            // The other half of the zero path, and the one that must stay indistinguishable: an unknown
-            // identifier, another customer's list and another channel's list all resolve to nothing here and
-            // all produce the one normalised not-found, so no caller can probe for a list that is not theirs.
-            harness.plan.listAffected = () => 0;
-            harness.plan.listGetOne = () => null;
+        it('answers an unknown identifier, a foreign list and a foreign channel with indistinguishable refusals', async () => {
+            // The three refusal reasons must be indistinguishable, because identifiers are sequential under
+            // the default id strategy and a distinguishable refusal would confirm the existence of another
+            // buyer's row to anyone who counts. Each is asserted to produce the same result object AND the same
+            // statement shape: one scoped select, no DML [FEATURE-001-01:§2.6.1.1].
+            const refusals: Array<{ result: unknown; selects: number; writes: number }> = [];
+            const ownedRow = ownedList();
+            for (const shape of [
+                // An identifier no row carries.
+                { listGetOne: () => null, requestCtx: ctx },
+                // A row owned by another customer: the bound customer is this session's, so nothing matches.
+                {
+                    listGetOne: (probe: QueryBuilderProbe) =>
+                        String(probe.parameters.customerId) === String(FOREIGN_CUSTOMER_ID)
+                            ? ownedList({ customerId: FOREIGN_CUSTOMER_ID })
+                            : null,
+                    requestCtx: ctx,
+                },
+                // The caller's own row, addressed under a second channel token.
+                {
+                    listGetOne: (probe: QueryBuilderProbe) =>
+                        String(probe.parameters.channelId) === String(ownedRow.channelId) ? ownedRow : null,
+                    requestCtx: createCtx({ channelId: FOREIGN_CHANNEL_ID }),
+                },
+            ]) {
+                resetRecorders(harness);
+                harness.plan.listGetOne = shape.listGetOne;
+                harness.plan.listFindOne = () => null;
 
-            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+                const result = await service.updateReorderList(shape.requestCtx, {
+                    id: LIST_ID,
+                    name: 'Pantry top-up',
+                });
 
-            expect(result).toBeInstanceOf(ReorderListNotFoundError);
-            expect(statementsOfKind(harness, 'ReorderList', 'select')).toHaveLength(1);
+                refusals.push({
+                    result,
+                    selects: rowLookupsAgainst(harness, 'ReorderList').length,
+                    writes: writeStatements(harness).length,
+                });
+            }
+
+            for (const refusal of refusals) {
+                expect(refusal.result).toBeInstanceOf(ReorderListNotFoundError);
+                expect({ ...(refusal.result as ReorderListNotFoundError) }).toEqual({
+                    ...(refusals[0].result as ReorderListNotFoundError),
+                });
+                expect(refusal.selects).toBe(1);
+                expect(refusal.writes).toBe(0);
+            }
         });
 
         it('addresses the rename by the row identifier together with the acting customer and channel', async () => {
@@ -1996,6 +2116,71 @@ describe('ReorderListService', () => {
             expect(conditionTextOf(updates[0])).toContain('customerId = :customerId');
             expect(conditionTextOf(updates[0])).toContain('channelId = :channelId');
             expect(scopeBoundBy(updates[0])).toEqual({ customer: CUSTOMER_ID, channel: CHANNEL_ID });
+        });
+
+        it('pre-checks the new name against the caller own rows, excluding the row being renamed', async () => {
+            // The advisory half of the uniqueness rule on the rename path. Its predicate carries the canonical
+            // key beside both owner conjuncts — so it can only see the caller's own rows — and excludes the
+            // addressed row, because a rename that changes only display casing leaves the canonical key
+            // identical and must not be reported as colliding with itself [FEATURE-001-01:§2.11].
+            await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            const preChecks = harness.journal.filter(
+                statement => statement.entity === 'ReorderList' && statement.terminal === 'count',
+            );
+            expect(preChecks).toHaveLength(1);
+            const where = (preChecks[0].findOptions?.where ?? {}) as Record<string, unknown>;
+            expect(Object.keys(where).sort()).toEqual(['channelId', 'customerId', 'id', 'nameKey']);
+            expect(where.customerId).toBe(CUSTOMER_ID);
+            expect(where.channelId).toBe(CHANNEL_ID);
+            expect(where.nameKey).toBe('pantry top-up');
+            // The exclusion is expressed as a negated identifier the database evaluates, rather than by
+            // filtering in process, so the count cannot be inflated by the row being renamed.
+            expect(where.id).toBeInstanceOf(FindOperator);
+            expect((where.id as FindOperator<unknown>).type).toBe('not');
+            expect((where.id as FindOperator<unknown>).value).toBe(LIST_ID);
+        });
+
+        it('returns ReorderListNameConflictError from the rename pre-check without writing', async () => {
+            harness.plan.conflictingNameCount = () => 1;
+
+            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            expect(result).toBeInstanceOf(ReorderListNameConflictError);
+            expect((result as ReorderListNameConflictError).conflictingNameKey).toBe('pantry top-up');
+            expect(writeStatements(harness)).toEqual([]);
+        });
+
+        it('never asks about other names for a list this caller may not have', async () => {
+            // ORDER, not merely presence. The pre-check is a question about OTHER rows, so asking it before
+            // admission would tell a caller renaming a list they cannot reach that the name they chose
+            // collides — confirming both that the name is theirs and that the identifier they guessed was
+            // worth asking about, and replacing the one normalised not-found every inaccessible case produces.
+            harness.plan.listGetOne = () => null;
+            harness.plan.conflictingNameCount = () => 1;
+
+            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            expect(result).toBeInstanceOf(ReorderListNotFoundError);
+            expect(result).not.toBeInstanceOf(ReorderListNameConflictError);
+            expect(harness.journal.some(statement => statement.terminal === 'count')).toBe(false);
+        });
+
+        it('still maps the named constraint on the rename path, which the pre-check cannot pre-empt', async () => {
+            // A name taken between the pre-check and the write. The pre-check found nothing, the write was
+            // refused by `UQ_reorder_list_customer_channel_name_key`, and the caller receives the same result
+            // the pre-check would have returned [FEATURE-001-01:§2.11].
+            harness.plan.conflictingNameCount = () => 0;
+            harness.plan.listAffected = () => {
+                throw driverFailure(
+                    `duplicate key value violates unique constraint "${NAME_CONFLICT_CONSTRAINT}"`,
+                );
+            };
+
+            const result = await service.updateReorderList(ctx, { id: LIST_ID, name: 'Pantry top-up' });
+
+            expect(result).toBeInstanceOf(ReorderListNameConflictError);
+            expect((result as ReorderListNameConflictError).conflictingNameKey).toBe('pantry top-up');
         });
 
         it('writes the display name and the canonical key and nothing else, reading no line row', async () => {
@@ -2023,14 +2208,47 @@ describe('ReorderListService', () => {
             expect(Object.keys(response as object).sort()).toEqual(['__typename', 'result']);
         });
 
-        it('returns ReorderListNotFoundError on no affected row, which is how a repeat delete is refused', async () => {
-            harness.plan.listAffected = () => 0;
+        it('refuses a list this caller may not have with ONE scoped select and no DML at all', async () => {
+            // The refused-write evidence contract on the delete path: one scoped `SELECT` returning no rows,
+            // and no `DELETE` issued on behalf of a caller entitled to none. Issuing the delete first and
+            // reading its affected count instead returns the identical payload while having issued DML, which
+            // is what this assertion exists to fail [FEATURE-001-01:§2.6.1.1].
+            harness.plan.listGetOne = () => null;
+            harness.plan.listFindOne = () => null;
+
+            const result = await service.deleteReorderList(ctx, LIST_ID);
+
+            expect(result).toBeInstanceOf(ReorderListNotFoundError);
+            expect(writeStatements(harness)).toEqual([]);
+            const selects = rowLookupsAgainst(harness, 'ReorderList');
+            expect(selects).toHaveLength(1);
+            expect(conditionTextOf(selects[0])).toContain('reorderlist.id = :id');
+            expect(scopeBoundBy(selects[0])).toEqual({ customer: CUSTOMER_ID, channel: CHANNEL_ID });
+        });
+
+        it('refuses a repeat delete on the admission read, the row it addressed being already gone', async () => {
+            // The first call removes the row; the second addresses a row that no longer exists, so it is
+            // refused by the admission read rather than reported as a second success.
+            harness.plan.listAffected = () => 1;
+            harness.plan.listGetOne = answeringInSequence<ReorderList | null>(ownedList(), null);
 
             const first = await service.deleteReorderList(ctx, LIST_ID);
             const second = await service.deleteReorderList(ctx, LIST_ID);
 
-            expect(first).toBeInstanceOf(ReorderListNotFoundError);
+            expect((first as DeletionResponse).result).toBe(DeletionResult.DELETED);
             expect(second).toBeInstanceOf(ReorderListNotFoundError);
+        });
+
+        it('returns ReorderListNotFoundError when the admitted row is deleted before its own statement runs', async () => {
+            // The admitted-path zero: the row passed the admission read and a concurrent request removed it
+            // before this transaction's own delete ran. The affected-row count remains the authority on what
+            // happened, so the operation reports the same normalised not-found rather than a success.
+            harness.plan.listAffected = () => 0;
+
+            const result = await service.deleteReorderList(ctx, LIST_ID);
+
+            expect(result).toBeInstanceOf(ReorderListNotFoundError);
+            expect(statementsOfKind(harness, 'ReorderList', 'delete')).toHaveLength(1);
         });
 
         it('removes the lines through the foreign-key cascade rather than in a loop', async () => {
@@ -2053,8 +2271,13 @@ describe('ReorderListService', () => {
     });
 
     describe('adjustReorderListLine, whose two miss branches must not be conflated', () => {
-        it('returns ReorderListNotFoundError when the list does not resolve under the predicate', async () => {
+        it('refuses a list this caller may not have with ONE scoped select and no DML at all', async () => {
+            // The refused-write evidence contract on the adjust path. The scoped read over `reorder_list` is
+            // this transaction's first statement against either plugin table, so a caller who cannot reach the
+            // list is refused by one `SELECT` returning no rows with no `UPDATE` issued on their behalf — and
+            // learns nothing about which of the list's lines exist [FEATURE-001-01:§2.6.1.1].
             harness.plan.lineAffected = () => 0;
+            harness.plan.listFindOne = () => null;
             harness.plan.listGetOne = () => null;
 
             const result = await service.adjustReorderListLine(ctx, {
@@ -2065,10 +2288,40 @@ describe('ReorderListService', () => {
 
             expect(result).toBeInstanceOf(ReorderListNotFoundError);
             expect(result).not.toBeInstanceOf(ReorderListLineNotFoundError);
+            expect(writeStatements(harness)).toEqual([]);
+            expect(statementsAgainst(harness, 'ReorderListLine')).toEqual([]);
+            const selects = rowLookupsAgainst(harness, 'ReorderList');
+            expect(selects).toHaveLength(1);
+            expect(whereKeysOf(selects[0])).toEqual(
+                expect.arrayContaining(['id', 'customerId', 'channelId']),
+            );
+            expect(selects[0].findOptions?.where).toEqual({
+                id: LIST_ID,
+                customerId: CUSTOMER_ID,
+                channelId: CHANNEL_ID,
+            });
+        });
+
+        it('takes no lock on the admission read, so two adjustments can still interleave', async () => {
+            // The rename and delete paths lock the parent row; this one deliberately does not. Holding it would
+            // serialise concurrent adjustments and accumulations against the same list, and a barrier-released
+            // pair that queued on a parent lock would evidence sequencing rather than the guard the contract
+            // asks to be proved [FEATURE-001-01:§2.11].
+            harness.plan.engine = 'postgres';
+
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 2,
+            });
+
+            expect(pluginStatements(harness).every(statement => statement.locks.length === 0)).toBe(true);
         });
 
         it('returns ReorderListLineNotFoundError when the list resolves and the line statement misses', async () => {
             harness.plan.lineAffected = () => 0;
+            // Admitted by the scoped read, and still accessible when the miss is classified.
+            harness.plan.listFindOne = rowMatchingPredicate(ownedList());
             harness.plan.listGetOne = () => ownedList();
             // No line row exists to have been the no-op case, which is what leaves the miss a genuine miss.
             harness.plan.lineGetOne = () => null;
@@ -2120,7 +2373,12 @@ describe('ReorderListService', () => {
             // scoped only by its parent's identifier is not ownership-scoped; the parent read is what
             // establishes the scope, and it is also what keeps the two not-found results distinct. A list
             // that does not resolve therefore ends the classification before any line is read at all.
+            //
+            // The list was ACCESSIBLE when the operation was admitted — `listFindOne` answers the admission
+            // read — and has become inaccessible by the time the refusal is classified, which is the concurrent
+            // deletion this branch exists for.
             harness.plan.lineAffected = () => 0;
+            harness.plan.listFindOne = rowMatchingPredicate(ownedList());
             harness.plan.listGetOne = () => null;
             harness.plan.lineGetOne = () => ownedLine({ quantity: 4 });
 
@@ -3047,10 +3305,12 @@ describe('ReorderListService', () => {
             expect((failure as InternalServerError).message).toBe(UNCLASSIFIED_FAILURE_MESSAGE);
         });
 
-        it('decides every duplicate at the named constraint, issuing no name pre-check of its own', async () => {
-            // An ordinary duplicate — not a race — and the insert is still attempted, because the named unique
-            // object is required to BE the uniqueness authority rather than a backstop behind a service
-            // pre-check that ordinarily decides first [FEATURE-001-01:§2.11].
+        it('decides the race at the named constraint, which the advisory pre-check cannot pre-empt', async () => {
+            // THE LAYER THE PRE-CHECK CANNOT REPLACE. The pre-check found nothing — which is exactly the state
+            // two concurrent creates are both in — and the row was then refused by the named unique object.
+            // §2.11 requires the service to perform the pre-check AND catch the insert failure, and this is the
+            // half no read can supply [FEATURE-001-01:§2.11].
+            harness.plan.conflictingNameCount = () => 0;
             harness.plan.saveList = () => {
                 throw driverFailure(
                     `duplicate key value violates unique constraint "${NAME_CONFLICT_CONSTRAINT}"`,
@@ -3065,16 +3325,47 @@ describe('ReorderListService', () => {
             expect(statementsOfKind(harness, 'ReorderList', 'insert')).toHaveLength(1);
         });
 
-        it('issues no nameKey count anywhere on the create path', async () => {
+        it('answers both uniqueness layers with the identical result, so a caller cannot tell them apart', async () => {
+            // The two layers are indistinguishable by construction: both carry the caller's own canonical key
+            // and neither discloses anything about the row that already holds the name. That is what makes the
+            // pre-check advisory rather than a second contract [FEATURE-001-01:§2.11].
+            harness.plan.conflictingNameCount = () => 1;
+            const fromPreCheck = await service.createReorderList(ctx, { name: SUBMITTED_NAME });
+
+            resetRecorders(harness);
+            harness.plan.conflictingNameCount = () => 0;
+            harness.plan.saveList = () => {
+                throw driverFailure(
+                    `duplicate key value violates unique constraint "${NAME_CONFLICT_CONSTRAINT}"`,
+                );
+            };
+            const fromConstraint = await service.createReorderList(ctx, { name: SUBMITTED_NAME });
+
+            expect(fromPreCheck).toBeInstanceOf(ReorderListNameConflictError);
+            expect(fromConstraint).toBeInstanceOf(ReorderListNameConflictError);
+            expect({ ...(fromPreCheck as ReorderListNameConflictError) }).toEqual({
+                ...(fromConstraint as ReorderListNameConflictError),
+            });
+        });
+
+        it('issues exactly one nameKey pre-check on the create path, scoped to the caller', async () => {
             await service.createReorderList(ctx, { name: SUBMITTED_NAME });
 
             const counts = harness.journal.filter(statement => statement.terminal === 'count');
-            // Exactly one count is issued, and it is the list bound's — a count whose predicate carried
-            // `nameKey` would be the pre-check this path must not have.
-            expect(counts).toHaveLength(1);
-            expect(Object.keys((counts[0].findOptions?.where ?? {}) as object).sort()).toEqual([
+            // Two counts: the list bound's, and the advisory name pre-check. The pre-check's predicate carries
+            // the canonical key beside both owner conjuncts, so it can only ever see the caller's own rows.
+            expect(counts).toHaveLength(2);
+            const preChecks = counts.filter(statement =>
+                Object.prototype.hasOwnProperty.call(
+                    (statement.findOptions?.where ?? {}) as object,
+                    'nameKey',
+                ),
+            );
+            expect(preChecks).toHaveLength(1);
+            expect(Object.keys((preChecks[0].findOptions?.where ?? {}) as object).sort()).toEqual([
                 'channelId',
                 'customerId',
+                'nameKey',
             ]);
         });
     });
@@ -3830,15 +4121,22 @@ describe('ReorderListService', () => {
     // ---------------------------------------------------------------------------------------------------
 
     describe('createReorderList and the list bound', () => {
-        it('counts and inserts inside one transaction', async () => {
+        // A submitted display name and the canonical key the pipeline produces from it, so the name-rule tests
+        // below assert against the value the constraint actually compares rather than against the raw input.
+        const SUBMITTED_LIST_NAME = '  Pantry   Top-Up  ';
+        const CANONICAL_LIST_NAME_KEY = 'pantry top-up';
+
+        it('counts, pre-checks the name and inserts inside one transaction', async () => {
             await service.createReorderList(ctx, { name: 'Pantry' });
 
             const counts = harness.journal.filter(statement => statement.terminal === 'count');
             const saves = harness.journal.filter(statement => statement.terminal === 'save');
             expect(harness.transactionsOpened).toBe(1);
-            // ONE count: the list bound's. The name is not pre-checked — the named unique object decides every
-            // duplicate [FEATURE-001-01:§2.11].
-            expect(counts).toHaveLength(1);
+            // TWO counts, and both are required. One is the list bound's; the other is the advisory name
+            // pre-check §2.11 requires the service to perform *and* back with the constraint catch. Everything
+            // shares the one transaction, so a bound or a name decided in a transaction the insert did not join
+            // would be decided against a state the insert never saw [FEATURE-001-01:§2.11].
+            expect(counts).toHaveLength(2);
             expect(saves).toHaveLength(1);
             expect(counts[0].transaction).toBeGreaterThan(0);
             for (const statement of [...counts, ...saves]) {
@@ -3846,18 +4144,72 @@ describe('ReorderListService', () => {
             }
         });
 
-        it('scopes the one count to the acting customer and the active channel', async () => {
+        it('scopes the bound count to the acting customer and the active channel', async () => {
             await service.createReorderList(ctx, { name: 'Pantry' });
 
             const counts = harness.journal.filter(statement => statement.terminal === 'count');
-            expect(counts).toHaveLength(1);
-            expect(counts[0].findOptions?.where).toEqual({
+            const boundCounts = counts.filter(
+                statement =>
+                    !Object.prototype.hasOwnProperty.call(
+                        (statement.findOptions?.where ?? {}) as object,
+                        'nameKey',
+                    ),
+            );
+            expect(boundCounts).toHaveLength(1);
+            expect(boundCounts[0].findOptions?.where).toEqual({
                 customerId: CUSTOMER_ID,
                 channelId: CHANNEL_ID,
             });
-            // And no count anywhere carries the canonical key, which is what a name pre-check would look like.
+        });
+
+        it('scopes the advisory name pre-check to the acting customer, the active channel and the canonical key', async () => {
+            // The pre-check is a question about the caller's OWN rows, so its predicate carries all three
+            // conjuncts. Dropping the owner or the channel would let one buyer's name collide with another's,
+            // and comparing the display name rather than the canonical key would make the comparison
+            // case-sensitive where the contract requires it to be case-insensitive and accent-preserving
+            // [FEATURE-001-01:§2.11].
+            await service.createReorderList(ctx, { name: SUBMITTED_LIST_NAME });
+
+            const preChecks = harness.journal.filter(
+                statement =>
+                    statement.terminal === 'count' &&
+                    Object.prototype.hasOwnProperty.call(
+                        (statement.findOptions?.where ?? {}) as object,
+                        'nameKey',
+                    ),
+            );
+            expect(preChecks).toHaveLength(1);
+            expect(preChecks[0].findOptions?.where).toEqual({
+                customerId: CUSTOMER_ID,
+                channelId: CHANNEL_ID,
+                nameKey: CANONICAL_LIST_NAME_KEY,
+            });
+        });
+
+        it('returns ReorderListNameConflictError from the pre-check without attempting an insert', async () => {
+            // The advisory layer, answering an ordinary duplicate before a row is written. It carries the
+            // caller's own canonical key and nothing about the row that already holds it.
+            harness.plan.conflictingNameCount = () => 1;
+
+            const result = await service.createReorderList(ctx, { name: SUBMITTED_LIST_NAME });
+
+            expect(result).toBeInstanceOf(ReorderListNameConflictError);
+            expect((result as ReorderListNameConflictError).conflictingNameKey).toBe(CANONICAL_LIST_NAME_KEY);
+            expect(harness.journal.some(statement => statement.terminal === 'save')).toBe(false);
+        });
+
+        it('consults the list bound before the name, so a full list is refused for the bound it breached', async () => {
+            // Both layers would refuse this call, and the order decides which reason the caller is told. The
+            // bound is the one that is true of the request as a whole, so it is asked first and the name
+            // pre-check is never issued.
+            harness.plan.heldListCount = MAX_LISTS_PER_CUSTOMER;
+            harness.plan.conflictingNameCount = () => 1;
+
+            const result = await service.createReorderList(ctx, { name: SUBMITTED_LIST_NAME });
+
+            expect(result).toBeInstanceOf(ReorderListLimitError);
             expect(
-                counts.some(statement =>
+                harness.journal.some(statement =>
                     Object.prototype.hasOwnProperty.call(
                         (statement.findOptions?.where ?? {}) as object,
                         'nameKey',
@@ -4010,12 +4362,13 @@ describe('ReorderListService', () => {
                 // creators at the bound would both count one below the maximum and both insert, with nothing
                 // about the lock looking wrong. So the transaction's opening statement must itself be the
                 // locking read, there must be no other customer statement to have fixed the view ahead of it,
-                // and the count must follow it inside the same transaction.
+                // and both counts must follow it inside the same transaction.
                 //
-                // ONE count follows it, not two: the list bound's. The name is deliberately NOT pre-counted,
-                // because the named unique object is the sole duplicate authority and a pre-check cannot be
-                // made race-free [FEATURE-001-01:§2.11].
-                expect(counts).toHaveLength(1);
+                // TWO counts follow it — the list bound's and the advisory name pre-check — and the ordering
+                // matters for the same reason for both: each is a consistent read whose answer must be taken
+                // after the lock is held, so that it sees a competing creator's committed row rather than a
+                // snapshot from before it [FEATURE-001-01:§2.11].
+                expect(counts).toHaveLength(2);
                 expect(statementsAgainst(harness, 'Customer')).toHaveLength(1);
                 expect(harness.journal[0].entity).toBe('Customer');
                 expect(harness.journal[0].locks).toEqual(['pessimistic_write']);
