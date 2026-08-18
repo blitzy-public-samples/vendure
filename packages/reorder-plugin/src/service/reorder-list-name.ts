@@ -194,9 +194,20 @@ export interface CanonicalReorderListName {
      * @description
      * The canonical value, stored in `reorder_list.nameKey` and never shown to the buyer. It is
      * {@link CanonicalReorderListName.name} normalised to Unicode NFC and then lower-cased, and it is the
-     * column the named unique constraint over `(customerId, channelId, nameKey)` compares. Uniqueness is
-     * therefore case-insensitive and accent-preserving on every database engine, without depending on a
-     * column collation.
+     * column the named unique constraint over `(customerId, channelId, nameKey)` compares.
+     *
+     * **Two layers decide whether two names collide, and this value is only the first of them.** This module
+     * decides which two names *ought* to be one list: trim, collapse, NFC and lower-case fold away the
+     * differences that are not differences — surrounding and repeated whitespace, letter case, and whether an
+     * accent arrived precomposed or decomposed — and it folds them here, in the value, rather than leaving
+     * them to a collation that varies by engine and by server version. The database decides which two stored
+     * keys *are* equal, and it decides that under the collation of the column the constraint indexes. Those
+     * two responsibilities are separate and both are required: `reorder_list.nameKey` therefore declares an
+     * explicit binary collation on MySQL and MariaDB, whose own defaults are accent-*insensitive* and would
+     * otherwise make `café` collide with `cafe` there while the same two names stayed distinct on PostgreSQL
+     * — see `resolveReorderListNameKeyCollation` in `reorder-list.entity.ts` for the measurement behind that
+     * clause and for why its value cannot be a literal. Taken together, the canonical value and that column
+     * declaration are what make uniqueness case-insensitive and accent-preserving on every supported engine.
      *
      * @since 3.8.0
      */
@@ -406,7 +417,10 @@ export function toDisplayName(input: string): string {
  *   producing two lists a buyer cannot tell apart.
  * - Not stripping accents means `Café` and `Cafe` remain two distinct lists, because they are two
  *   different words rather than two spellings of one. Stripping, or applying a compatibility form such as
- *   NFKC, would silently merge them.
+ *   NFKC, would silently merge them. This function is one half of that guarantee and the schema is the
+ *   other: it produces two different keys, and the explicit binary collation `reorder_list.nameKey` carries
+ *   on MySQL and MariaDB — whose default collations compare accents as equal — is what makes the database
+ *   agree that the two keys differ. Neither half is sufficient alone.
  *
  * @example
  * ```ts

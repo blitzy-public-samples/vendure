@@ -878,8 +878,9 @@ interface ReorderListOwnerScope {
 
 /**
  * The window a nested page of lines resolves to, after the platform's builder has validated and clamped the
- * caller's request. Held as a value so that one batched statement can serve every parent on a page and each
- * parent's own window can then be taken from the partitioned result.
+ * caller's request. Held as a value because the window has to be taken *off* the built query — a statement
+ * serving every parent on a page must not carry one parent's `LIMIT` — and then applied per parent inside the
+ * ranking predicate that cuts each parent's own window in the database.
  */
 interface ResolvedLinesWindow {
     take: number;
@@ -1356,8 +1357,8 @@ export class ReorderListService {
 
     /**
      * @description
-     * Returns one page of lines for each list on a page of lists, resolved by a single batched statement over
-     * the page's identifier set.
+     * Returns one page of lines for each list on a page of lists, resolved by a fixed pair of statements over
+     * the page's identifier set: one for the rows and one for the per-parent totals.
      *
      * **This method exists because the alternative satisfies every row-count criterion while being wrong.** A
      * page of a hundred lists whose `lines` field is resolved per entry issues a hundred and one statements:
@@ -1366,21 +1367,31 @@ export class ReorderListService {
      * matters is non-growth — a page of three lists and a page of six lists issue the same number of
      * statements against the plugin's tables.
      *
-     * **How the single statement is achieved, and why the window is applied in process.** A per-parent window
-     * cannot be expressed in one portable statement across every supported engine, so the permitted
-     * alternative is taken: one statement reads the union of the parents' lines, the result is partitioned by
-     * parent identifier, and each parent's own window is then taken from its partition. Two properties follow
-     * for free. Each parent's `totalItems` is the exact size of its partition, so no second grouped-count
-     * statement is issued at all — one statement serves the whole page. And the read is bounded rather than
-     * unbounded, because the number of lines a list may hold is itself capped at write time by the configured
-     * line maximum, and the number of parents is capped by the outer page.
+     * **What the two statements are, and why each parent's window is cut in the database.** The first reads
+     * the rows: a single statement over the whole identifier set whose predicate embeds a ranking subquery —
+     * `ROW_NUMBER() OVER (PARTITION BY reorderListId ORDER BY <the page's own order>)`, filtered one level out
+     * to the half-open rank range the resolved window describes — so each parent contributes exactly its own
+     * window rather than all of its lines. The second reads the totals: one grouped `COUNT(*)` keyed on
+     * `reorderListId`, cloned from the same scoped query before the window predicate is added, which is what
+     * gives each parent a `totalItems` describing its whole collection rather than the size of the page
+     * returned. Two statements is what the contract permits and is deliberately not one: partitioning an
+     * unwindowed union in process would load every line of every parent on the page — ten lists holding two
+     * hundred lines each is two thousand rows to return twenty — and taking each `totalItems` from the size of
+     * such a partition is only correct while the whole collection has been loaded, which is precisely the read
+     * this shape refuses to issue.
+     *
+     * **Neither statement's count depends on the page size, which is the property that matters.** Both are
+     * issued exactly once per parent page, whatever number of parents that page holds, so the statement count
+     * against the plugin's tables is constant as the page grows — which is the non-growth assertion above,
+     * stated as a pair rather than as a single statement. The rows read are bounded too: the window bounds
+     * each parent's contribution, and the number of parents is bounded by the outer page.
      *
      * **Clamping and the over-limit refusal are the platform's.** The builder is asked for the caller's
      * window first, which is what raises the platform's own input error — with the platform's own message key
      * — when the requested page size exceeds the configured Shop maximum; the clamped values are then read
      * back off the built query and applied per parent. Building a query issues no statement, so this costs
-     * nothing. The window is cleared from the query before it executes precisely because a single statement
-     * serving many parents must not carry one parent's `LIMIT`.
+     * nothing. The window is cleared from the query before either statement executes precisely because a
+     * statement serving many parents must not carry one parent's `LIMIT`.
      *
      * Every identifier passed in appears in the returned map, with an empty page where that list has no lines,
      * so a caller never has to distinguish "no lines" from "not resolved".
@@ -1456,10 +1467,10 @@ export class ReorderListService {
                 // The parent scope is carried in the SAME `WHERE` clause as the identifier set, expressed as a
                 // condition on the parent relation. The identifiers reaching this method always come from a
                 // page this service already resolved under the predicate, so this conjunct is defence in depth
-                // — but it is defence that costs nothing: a relation condition is realised as a join inside the
-                // one statement rather than as a second statement, so the per-page count is unchanged. It also
-                // makes the method safe in its own right rather than safe by virtue of its caller, which
-                // matters for a member the api layer reaches directly.
+                // — but it is defence that costs nothing: a relation condition is realised as a join inside
+                // each of the two statements below rather than as a further statement, so the per-page count
+                // is unchanged. It also makes the method safe in its own right rather than safe by virtue of
+                // its caller, which matters for a member the api layer reaches directly.
                 where: {
                     reorderListId: In(parentIds),
                     reorderList: { customerId: scope.customerId, channelId: scope.channelId },
@@ -1633,15 +1644,27 @@ export class ReorderListService {
      * **Why compare-and-set rather than a plain assignment.** The statement's `WHERE` names the stale value it
      * expects to find, so it is idempotent and two concurrent repairs cannot fight: whichever runs second
      * finds the guard value already changed and affects no row. A `lineCount` that a competing writer moved in
-     * the meantime is therefore left alone rather than clobbered with a total observed before that write. The
-     * non-negative check constraint on the column is what stops a defective repair writing a negative value.
+     * the meantime is therefore left alone rather than clobbered with a total observed before that write.
+     *
+     * **What keeps the written value non-negative, and why it is not the check constraint.**
+     * `CHK_reorder_list_line_count_non_negative` is real defence in depth on PostgreSQL and the SQLite family
+     * and is simply *absent* on MySQL and MariaDB, because TypeORM skips check constraints silently for that
+     * family — the same limitation {@link ReorderList.lineCount} records on the column itself. So the
+     * constraint cannot be what makes the invariant hold, and two things that are portable are. The first is
+     * provenance: the total this method is given is, on the flow the single-list read composes, the grouped
+     * `COUNT(*)` this service reads over `reorder_list_line`, which no engine can answer with a negative or
+     * fractional number. The second is the guard below, which refuses a value that is not a non-negative safe
+     * integer outright: nothing is written, no statement is issued, and the stored counter is reported
+     * instead, so a defective caller cannot put in the column a value that only two of the four engines would
+     * have rejected.
      *
      * @param ctx - The request context.
      * @param listId - The list whose counter is being reconciled.
      * @param storedLineCount - The counter value that arrived with the row, and the guard the update compares.
-     * @param observedTotal - The line total this request actually observed.
+     * @param observedTotal - The line total this request actually observed. A value that is not a non-negative
+     * safe integer is a defect in the caller, and is refused rather than written.
      * @returns The value the caller should report: the observed total when the two disagreed, and the stored
-     * value when they agreed.
+     * value when they agreed or when the observed total was refused.
      *
      * @since 3.8.0
      */
@@ -1653,6 +1676,22 @@ export class ReorderListService {
     ): Promise<number> {
         if (storedLineCount === observedTotal) {
             // The overwhelmingly common path: zero statements.
+            return storedLineCount;
+        }
+        if (!Number.isSafeInteger(observedTotal) || observedTotal < 0) {
+            // The portable half of the column's non-negative invariant, since the check constraint that would
+            // otherwise refuse this value does not exist on MySQL or MariaDB. A total the column may not hold
+            // is a defect in this service rather than anything the request did, so it is logged as one — the
+            // list identifier and the offending number are the only values named, and neither describes the
+            // caller — and the stored value is reported unchanged, which is the counter as it actually stands.
+            // Nothing is written and no statement is issued. It is not raised, because a read that has already
+            // produced the buyer's page must not be turned into a failure by a counter it only meant to
+            // reconcile.
+            Logger.error(
+                `Refused a lineCount repair on reorder list ${String(listId)} because the observed total ` +
+                    `${String(observedTotal)} is not a non-negative integer`,
+                loggerCtx,
+            );
             return storedLineCount;
         }
         let result;
