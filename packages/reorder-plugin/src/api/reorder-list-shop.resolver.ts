@@ -1,6 +1,6 @@
 /*
  * -------------------------------------------------------------------------------------------------------
- * The eight Shop API operations of FEATURE-001-01, and the one thing this file is for.
+ * The eight Shop API operations of FEATURE-001-01, and the narrow set of things this file is for.
  * -------------------------------------------------------------------------------------------------------
  * Attribution. No user-specified rules were provided for this project: the rules document was read and
  * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
@@ -10,18 +10,36 @@
  * such wherever it is stated. The absence of a rules document has not been treated as licence to lower the
  * bar anywhere in this file.
  *
- * WHAT THIS FILE IS. A gated, transactional delegation layer over `ReorderListService`, plus one
- * request-shaped concern that cannot live anywhere else. Seven of the eight methods do nothing but decorate
- * a call and forward its result, and the whole of their correctness is in the decorators and in what they do
- * NOT do. The eighth, `activeCustomerReorderList`, additionally reconciles the returned list's stored
- * `lineCount` against the total this request observes — marking the object it returns, pre-resolving the
- * unfiltered `lines` window the document selected, repairing the row and writing the reconciled value onto
- * the object — all BEFORE it forwards that object. It is not delegation and it is not a convenience: GraphQL
- * takes a sibling scalar off the source object during its synchronous selection-set walk, so a reconciliation
- * performed anywhere later corrects the row while the response still reports the stale number. See that
- * method's own documentation for why the ordering is the requirement and for the mechanism it borrows from
- * `ReorderListEntityResolver`. Nothing about it weakens the rule below: no ownership decision, no error
- * translation and no payload assembly happens in this file.
+ * WHAT THIS FILE IS. A gated, transactional boundary over `ReorderListService`. It divides cleanly, and the
+ * division is worth stating precisely because the rule below is easier to check against a specific claim than
+ * against a general one.
+ *
+ * The SIX MUTATIONS are pure delegates. Each decorates a call, forwards its arguments to the identically named
+ * service method and returns that result untouched; the whole of their correctness is in the decorators and in
+ * what they do NOT do.
+ *
+ * The TWO QUERIES each additionally carry one request-shaped concern, because each concern is a property of the
+ * request rather than of the domain and so has nowhere else to live:
+ *
+ *   - `activeCustomerReorderLists` normalises its two arguments at the boundary before delegating. It
+ *     substitutes the configured default page size where the caller supplied none — distinguishing an
+ *     explicitly null `take` from a `take` of zero, which are different requests — and resolves
+ *     `includeShared` to the boolean the published default means, since an explicit null receives no declared
+ *     default. Every other member of the generated options argument is passed through exactly as it arrived.
+ *   - `activeCustomerReorderList` reconciles the returned list's stored `lineCount` against the total this
+ *     request observes: it marks the object it is about to return, pre-resolves the unfiltered `lines` window
+ *     the document selected, repairs the row and writes the reconciled value onto the object — all BEFORE it
+ *     returns that object. The ordering is a requirement rather than a convenience, because GraphQL takes a
+ *     sibling scalar off the source object during its synchronous selection-set walk, so a reconciliation
+ *     landing any later corrects the row while the response still reports the stale number. See that method's
+ *     own documentation, and the mechanism it borrows from `ReorderListEntityResolver`.
+ *
+ * Neither query weakens the rule below, and that is the point of naming exactly what they do: **no ownership
+ * decision, no domain validation, no ordering, no clamping, no error translation and no payload assembly
+ * happens anywhere in this file.** Page-size substitution decides a default the plugin declares, not a limit —
+ * a `take` above the Shop-side maximum is still refused by the platform, because `ignoreQueryLimits` is left
+ * false. And the counter statement, its compare-and-set guard and the nested page both of them read all belong
+ * to the service.
  *
  * FOUR HELPFUL-LOOKING ADDITIONS THAT WOULD EACH BE A DEFECT HERE. Every one of them is the kind of change
  * a reviewer might ask for, so each is named with the reason it is refused:
@@ -228,22 +246,34 @@ type ReorderListEntity = NonNullable<Awaited<ReturnType<ReorderListService['getR
  * Quantities": the two paginated read queries and the six mutations declared by this plugin's own
  * `shopApiExtensions` document.
  *
- * Every method here is a delegation. Each one is gated with `@Allow(Permission.Owner)`, each mutation runs
- * inside a transaction, and each forwards its arguments to the identically named {@link ReorderListService}
- * method and returns that result unchanged. **No access control, no validation, no ordering, no clamping and
- * no error translation lives in this class** — the service owns all of it, so that there is exactly one
- * implementation of each invariant to review. The file-level comment above records, for each of the four
- * additions a reader is most likely to want here, why adding it would be a defect.
+ * Every method is gated with `@Allow(Permission.Owner)`, every mutation runs inside a transaction, and every
+ * method calls the identically named {@link ReorderListService} method. **No access control, no domain
+ * validation, no ordering, no clamping, no error translation and no payload assembly lives in this class** —
+ * the service owns all of it, so that there is exactly one implementation of each invariant to review. The
+ * file-level comment above records, for each of the four additions a reader is most likely to want here, why
+ * adding it would be a defect.
  *
- * The behaviours this class contributes beyond delegation are the *request-shaped* ones that genuinely belong
- * to the API layer, and there are three: substituting the configured default page size where the caller
- * supplied no page size on the collection read; recording — against the object the single-list read returned,
- * so that a collection entry for the same row cannot be mistaken for it — that this is the list that was read
- * singly; and reconciling that list's stored line counter **before the object is returned**, because a
- * reconciliation that lands after the executor has read the sibling scalar corrects the row while the response
- * still reports the stale number. Each is described on the method that performs it, and none of them decides
- * anything the service owns: the counter statement, its compare-and-set guard and the nested page they both read
- * are all the service's.
+ * **The six mutations are pure delegates**: each forwards its arguments and returns the service's result
+ * untouched.
+ *
+ * **The two queries each carry one request-shaped behaviour in addition to delegating**, because each is a
+ * property of the request rather than of the domain:
+ *
+ *   - {@link ReorderListShopResolver.activeCustomerReorderLists} normalises its arguments before delegating —
+ *     substituting the configured default page size where the caller supplied none, and resolving
+ *     `includeShared` to the boolean the published default means. Both matter because an explicitly null
+ *     argument is a distinct value from an omitted one and receives no declared default. Every other member of
+ *     the generated options argument reaches the service exactly as it arrived, and the substituted default is
+ *     stricter than the Shop-side maximum the platform still enforces.
+ *   - {@link ReorderListShopResolver.activeCustomerReorderList} records — against the object it is returning,
+ *     so that a collection entry for the same row cannot be mistaken for it — that this list was read singly,
+ *     and then reconciles that list's stored line counter **before the object is returned**. A reconciliation
+ *     landing after the executor has taken the sibling scalar corrects the row while the response still reports
+ *     the stale number, which is why the ordering rather than the arithmetic is what this method contributes.
+ *
+ * Each behaviour is described in full on the method that performs it, and neither decides anything the service
+ * owns: the counter statement, its compare-and-set guard and the nested page they both read are all the
+ * service's.
  *
  * @example
  * ```ts
