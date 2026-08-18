@@ -402,50 +402,57 @@ function isExcludedByDirective(selection: SelectionNode, variableValues: Record<
 }
 
 /**
- * Finds the `lines` field the document selected on this list, resolving fragment spreads and inline fragments.
+ * Collects **every** executable `lines` field the document selected on this list, in document order,
+ * resolving fragment spreads and inline fragments.
  *
  * **Both fragment forms are required rather than defensive.** This plugin's own end-to-end documents reach
  * `lines` through a nested fragment spread — a fragment that spreads a second fragment and then selects the
  * field — so a walk that only inspected direct field selections would find nothing on the canonical read and
  * the reconciliation would never run.
  *
- * The first matching selection wins. A document carrying two aliases of `lines` with different windows gets its
- * first window pre-resolved and reconciled from, and the other alias loads its own page: every unfiltered
- * window reports the same unfiltered total, so which one is chosen cannot change the reconciled value.
+ * **Every occurrence is collected rather than the first one returned, and that is a correctness requirement
+ * rather than completeness for its own sake.** GraphQL aliases let one document select `lines` more than once
+ * with different arguments, and the two may disagree about whether they narrow the collection:
+ * `filtered: lines(options: { filter: … }) { … }` followed by `all: lines { … }` is a valid document. A walk
+ * that stopped at the first match would hand the caller of this function a filtered window, the pre-parent
+ * reconciliation would decline it — correctly, since a filtered total counts the caller's own subset — and the
+ * *unfiltered* alias would then reach the field resolver's fallback, repairing the row only after the executor
+ * had already taken the sibling `lineCount` scalar. That is precisely the stale-first-response defect the
+ * pre-parent reconciliation exists to remove, reintroduced through an alias. So the whole selection set is
+ * walked and {@link selectedUnfilteredLinesPageOptions} picks from what it finds.
+ *
+ * A field reached through two spreads of the same fragment is collected twice. That is harmless: the caller
+ * only ever uses the first window it accepts, and two spreads of one fragment describe the identical window.
  */
-function findLinesSelection(
+function collectLinesSelections(
     selections: readonly SelectionNode[],
     info: GraphQLResolveInfo,
-): FieldNode | undefined {
+    collected: FieldNode[],
+): void {
     for (const selection of selections) {
         if (isExcludedByDirective(selection, info.variableValues)) {
             continue;
         }
         if (selection.kind === 'Field') {
             if (selection.name.value === LINES_FIELD_NAME) {
-                return selection;
+                collected.push(selection);
             }
             continue;
         }
         if (selection.kind === 'FragmentSpread') {
             const fragment = info.fragments[selection.name.value];
-            const inFragment = fragment && findLinesSelection(fragment.selectionSet.selections, info);
-            if (inFragment) {
-                return inFragment;
+            if (fragment) {
+                collectLinesSelections(fragment.selectionSet.selections, info, collected);
             }
             continue;
         }
-        const inInlineFragment = findLinesSelection(selection.selectionSet.selections, info);
-        if (inInlineFragment) {
-            return inInlineFragment;
-        }
+        collectLinesSelections(selection.selectionSet.selections, info, collected);
     }
-    return undefined;
 }
 
 /**
- * The window the document asked of `ReorderList.lines` on the field being resolved, or `undefined` where it
- * selected no `lines` field at all.
+ * The window one `lines` selection asked for, normalised to the object the field resolver will compute for the
+ * same selection.
  *
  * **The argument is read off the document rather than reconstructed.** `valueFromASTUntyped` resolves literals
  * and variables through the request's own coerced variable values, which is what makes a window written as
@@ -455,20 +462,12 @@ function findLinesSelection(
  *
  * A non-object argument value is ignored rather than trusted: the generated input type makes that unreachable
  * through a valid document, and a resolver is not the place to re-litigate what the schema already refuses.
- *
- * @param info - The resolve info of the field whose selection set is being inspected.
- * @param defaultPageSize - The plugin's configured nested page size, applied where the document supplied no
- * `take`, so that this window is the same one the field resolver will compute.
  */
-function selectedLinesPageOptions(
+function linesSelectionPageOptions(
+    linesSelection: FieldNode,
     info: GraphQLResolveInfo,
     defaultPageSize: number,
-): ListQueryOptions<ReorderListLine> | undefined {
-    const selections = info.fieldNodes.flatMap(node => node.selectionSet?.selections ?? []);
-    const linesSelection = findLinesSelection(selections, info);
-    if (!linesSelection) {
-        return undefined;
-    }
+): ListQueryOptions<ReorderListLine> {
     const argument = linesSelection.arguments?.find(node => node.name.value === 'options');
     const supplied = argument ? valueFromASTUntyped(argument.value, info.variableValues) : undefined;
     const options =
@@ -476,6 +475,44 @@ function selectedLinesPageOptions(
             ? (supplied as ListQueryOptions<ReorderListLine>)
             : undefined;
     return normaliseLinesPageOptions(options, defaultPageSize);
+}
+
+/**
+ * The window of an executable, **unfiltered** `lines` selection on the field being resolved, or `undefined`
+ * where the document selected no such window.
+ *
+ * **It searches for an unfiltered window rather than inspecting one candidate**, because whether the request
+ * can reconcile the counter at all is a property of the whole selection set and not of whichever occurrence
+ * appears first. A document may narrow one alias and leave another whole; if any executable occurrence is
+ * unfiltered then this request does establish the list's true line count, and the reconciliation must therefore
+ * happen here, before the parent is exposed. Returning `undefined` — which suppresses the reconciliation
+ * entirely — is reserved for the two cases where no such total exists: no `lines` field is selected at all, or
+ * every occurrence of it narrows the collection.
+ *
+ * The first unfiltered occurrence in document order is the one returned. Which one that is cannot change the
+ * reconciled value, because every unfiltered window reports the same unfiltered total whatever its `take`,
+ * `skip` or `sort`; it only decides which page is pre-resolved and therefore which alias is served from the
+ * cache. A second unfiltered alias asking for a different window loads its own page and then finds stored and
+ * observed already in agreement, so it issues no second compare-and-set.
+ *
+ * @param info - The resolve info of the field whose selection set is being inspected.
+ * @param defaultPageSize - The plugin's configured nested page size, applied where the document supplied no
+ * `take`, so that this window is the same one the field resolver will compute.
+ */
+function selectedUnfilteredLinesPageOptions(
+    info: GraphQLResolveInfo,
+    defaultPageSize: number,
+): ListQueryOptions<ReorderListLine> | undefined {
+    const selections = info.fieldNodes.flatMap(node => node.selectionSet?.selections ?? []);
+    const linesSelections: FieldNode[] = [];
+    collectLinesSelections(selections, info, linesSelections);
+    for (const linesSelection of linesSelections) {
+        const options = linesSelectionPageOptions(linesSelection, info, defaultPageSize);
+        if (!narrowsTheLineCollection(options)) {
+            return options;
+        }
+    }
+    return undefined;
 }
 
 /**
@@ -499,6 +536,15 @@ function selectedLinesPageOptions(
  * *narrows* the nested collection, it likewise issues nothing — a filtered total counts the caller's own subset,
  * and writing it into `reorder_list.lineCount` would replace the number the atomic line bound is enforced
  * against with one the caller chose.
+ *
+ * **"Narrows" is decided over the whole selection set, not over one occurrence of the field.** GraphQL aliases
+ * let a document select `lines` twice with different arguments — `filtered: lines(options: { filter: … })`
+ * beside `all: lines` — and if the first occurrence were taken as the answer, a filtered alias written first
+ * would suppress the reconciliation while the unfiltered alias behind it went on to establish the true total.
+ * The row would then be repaired in the field resolver's fallback, after the executor had taken `lineCount`,
+ * which is the stale-first-response defect this function exists to remove. So
+ * {@link selectedUnfilteredLinesPageOptions} searches every executable occurrence and this function declines
+ * only when none of them is unfiltered.
  *
  * **It costs no statement that the request was not going to issue anyway.** The page it resolves is deposited
  * against the parent object under the window it was resolved for, and the nested field resolver serves that
@@ -531,10 +577,13 @@ export async function reconcileSingleReorderListRead(
     info: GraphQLResolveInfo,
     defaultLinesPageSize: number,
 ): Promise<void> {
-    const options = selectedLinesPageOptions(info, defaultLinesPageSize);
-    if (!options || narrowsTheLineCollection(options)) {
-        // No observed total is available to this request, so there is nothing to reconcile against and nothing
-        // is read. The stored counter is reported exactly as it stands.
+    const options = selectedUnfilteredLinesPageOptions(info, defaultLinesPageSize);
+    if (!options) {
+        // No UNFILTERED window is selected anywhere in this field's selection set — either no `lines` field at
+        // all, or every occurrence of it narrows the collection — so no observed total is available to this
+        // request, there is nothing to reconcile against and nothing is read. The stored counter is reported
+        // exactly as it stands. Note that the search is over EVERY occurrence, not the first: an alias that
+        // narrows must not be allowed to suppress a reconciliation a sibling alias entitles this request to.
         return;
     }
     try {

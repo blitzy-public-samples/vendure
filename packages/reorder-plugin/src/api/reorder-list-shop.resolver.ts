@@ -10,9 +10,18 @@
  * such wherever it is stated. The absence of a rules document has not been treated as licence to lower the
  * bar anywhere in this file.
  *
- * WHAT THIS FILE IS. A gated, transactional delegation layer over `ReorderListService`, and deliberately
- * nothing more: eight methods, each of which decorates a call and forwards its result. The whole of this
- * file's correctness is in the decorators and in what it does NOT do.
+ * WHAT THIS FILE IS. A gated, transactional delegation layer over `ReorderListService`, plus one
+ * request-shaped concern that cannot live anywhere else. Seven of the eight methods do nothing but decorate
+ * a call and forward its result, and the whole of their correctness is in the decorators and in what they do
+ * NOT do. The eighth, `activeCustomerReorderList`, additionally reconciles the returned list's stored
+ * `lineCount` against the total this request observes — marking the object it returns, pre-resolving the
+ * unfiltered `lines` window the document selected, repairing the row and writing the reconciled value onto
+ * the object — all BEFORE it forwards that object. It is not delegation and it is not a convenience: GraphQL
+ * takes a sibling scalar off the source object during its synchronous selection-set walk, so a reconciliation
+ * performed anywhere later corrects the row while the response still reports the stale number. See that
+ * method's own documentation for why the ordering is the requirement and for the mechanism it borrows from
+ * `ReorderListEntityResolver`. Nothing about it weakens the rule below: no ownership decision, no error
+ * translation and no payload assembly happens in this file.
  *
  * FOUR HELPFUL-LOOKING ADDITIONS THAT WOULD EACH BE A DEFECT HERE. Every one of them is the kind of change
  * a reviewer might ask for, so each is named with the reason it is refused:
@@ -480,9 +489,16 @@ export class ReorderListShopResolver {
      *
      * The new name is subject to the identical canonicalisation and the identical uniqueness rule that
      * governs creation, so a rename can resolve to `ReorderListNameConflictError` and a blank rename is
-     * refused as malformed input rather than stored. A list the caller does not own in the active channel
-     * resolves to `ReorderListNotFoundError`, produced by the affected-row count of a statement whose
-     * predicate already carried the ownership conjuncts — never by loading the row and inspecting it.
+     * refused as malformed input rather than stored.
+     *
+     * A list the caller does not own in the active channel resolves to `ReorderListNotFoundError`, and the
+     * service produces it in two distinct places for two distinct reasons — neither of which is a row loaded
+     * and then inspected. A caller who may not have the row is refused by the transaction's FIRST statement, a
+     * scoped `SELECT` carrying the identifier together with the acting customer and the active channel, so the
+     * refusal issues no `UPDATE` at all. Only once that read has admitted the row is the conditional write
+     * issued, still carrying the same ownership conjuncts, and its affected-row count is then the authority for
+     * the admitted path: zero means the row left this caller's scope between the two statements, and is
+     * reported as the same normalised not-found.
      *
      * The union carries no limit result: a rename creates no row, so no bound can be breached.
      *
@@ -508,8 +524,11 @@ export class ReorderListShopResolver {
      * **This operation takes a bare `id` rather than an input object**, exactly as the published document
      * declares it, and it succeeds with the platform's own `DeletionResponse` — reused verbatim rather than
      * replaced by a plugin-owned deletion payload, because its `result` and nullable `message` are already
-     * what a deletion has to report. A list the caller does not own in the active channel resolves to
-     * `ReorderListNotFoundError` on the same affected-row-count authority as every other addressed write.
+     * what a deletion has to report. A list the caller does not own in the active channel — and a list already
+     * deleted by an earlier request — resolves to `ReorderListNotFoundError`, refused by the transaction's
+     * first statement: a scoped `SELECT` carrying the identifier, the acting customer and the active channel,
+     * which returns no rows and leaves no `DELETE` issued on that caller's behalf. The delete itself runs only
+     * on the admitted path, still fully scoped, and its affected-row count remains the authority there.
      *
      * **The return type is the service's own union rather than an {@link ErrorResultUnion}, and that is a
      * deliberate, reported divergence from the shape the other five mutations use.** `ErrorResultUnion`
