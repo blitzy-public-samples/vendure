@@ -1,7 +1,87 @@
-import { Channel, Customer, DeepPartial, EntityId, ID, VendureEntity } from '@vendure/core';
-import { Check, Column, Entity, Index, ManyToOne, OneToMany, Unique } from 'typeorm';
+import { Channel, Customer, DeepPartial, EntityId, getConfig, ID, VendureEntity } from '@vendure/core';
+import { Check, Column, ColumnOptions, Entity, Index, ManyToOne, OneToMany, Unique } from 'typeorm';
 
 import { ReorderListLine } from './reorder-list-line.entity';
+
+/**
+ * The collation each engine needs on {@link ReorderList.nameKey} for the *database* to compare canonical
+ * keys the same way the canonicalisation pipeline defines them — case-insensitively but
+ * accent-*preservingly* — keyed by the TypeORM engine identifier.
+ *
+ * **Only the MySQL family appears here, and its absence elsewhere is a fact rather than an oversight.**
+ * PostgreSQL and the SQLite family compare `varchar` byte for byte by default, so a canonical key that
+ * differs only by an accent is already two distinct values there and no clause is needed. The MySQL family
+ * does not: the server default is an accent-*insensitive* collation on both engines the existing engine
+ * jobs exercise — `utf8mb4_0900_ai_ci` on MySQL 8 and `utf8mb4_uca1400_ai_ci` on MariaDB 11.5 — under which
+ * `café` and `cafe` compare equal, so the unique constraint refuses the second of the two as a duplicate.
+ * That is measured rather than inferred: creating a database on the MariaDB 11.5 image with no collation
+ * override, giving a `varchar(191)` column a unique index and inserting `cafe` then `café` fails with
+ * `ERROR 1062 Duplicate entry 'café'`, while the same table with `COLLATE "utf8mb4_bin"` on that column
+ * accepts both rows.
+ *
+ * **`utf8mb4_bin` rather than an accent-sensitive-but-case-insensitive collation, deliberately.** The
+ * canonical key has already been lower-cased and NFC-normalised by the time it reaches the column, so the
+ * only comparison the database still has to perform is exact equality — and a binary collation is the one
+ * form of that which means the same thing on both engines and needs no server-version-specific name. It
+ * also keeps the *service's* own name pre-check honest, since that query compares the same column under the
+ * same collation. The character set is deliberately not overridden, so the column stays `utf8mb4` and its
+ * declared length of 191 continues to count characters rather than bytes.
+ *
+ * @since 3.8.0
+ */
+const ACCENT_SENSITIVE_NAME_KEY_COLLATIONS: ReadonlyMap<string, string> = new Map([
+    ['mysql', 'utf8mb4_bin'],
+    ['mariadb', 'utf8mb4_bin'],
+]);
+
+/**
+ * @description
+ * Returns the collation {@link ReorderList.nameKey} must carry on the given database engine for the named
+ * unique constraint over it to be accent-preserving, or `undefined` where the engine's own default already
+ * is. It is exported so that the migration which creates the table — and any test asserting the shape of
+ * that table — derives the value from this one declaration rather than restating it.
+ *
+ * @param engine - The TypeORM engine identifier. Defaults to the configured one, read through the
+ * platform's own pre-bootstrap config accessor.
+ *
+ * @since 3.8.0
+ */
+export function resolveReorderListNameKeyCollation(
+    engine: string = getConfig().dbConnectionOptions.type,
+): string | undefined {
+    return ACCENT_SENSITIVE_NAME_KEY_COLLATIONS.get(engine);
+}
+
+/**
+ * The column declaration for {@link ReorderList.nameKey}, held as a named object because its collation
+ * cannot be a literal: the correct value depends on the configured engine, and an entity class is defined
+ * when its module is imported, which is long before any engine is known.
+ *
+ * **The `collation` accessor is what closes that gap, and it is load-bearing rather than clever.** TypeORM's
+ * `@Column` decorator stores the options object it is given **by reference** rather than copying it
+ * (`node_modules/typeorm/decorator/columns/Column.js`, which pushes `options: options` onto the metadata
+ * args storage), and the value is read from that object only when column metadata is built
+ * (`node_modules/typeorm/metadata/ColumnMetadata.js`, `if (options.args.options.collation)`) — which happens
+ * during `DataSource` initialisation. Every platform entry point resolves the configuration *before* that
+ * point: `bootstrap` calls `setConfig` and runs the plugin configuration hooks before the ORM module is
+ * created, and both migration entry points call `preBootstrapConfig` before opening their connection. So by
+ * the time this accessor is consulted the configured engine is known, and it is consulted once per column
+ * rather than per query.
+ *
+ * Should the configuration somehow not have been resolved, the platform's accessor answers with its own
+ * default, whose engine is `mysql` — which errs towards *applying* the clause rather than silently dropping
+ * it, and dropping it is the failure this declaration exists to prevent.
+ *
+ * @since 3.8.0
+ */
+const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
+    type: 'varchar',
+    length: 191,
+    nullable: false,
+    get collation(): string | undefined {
+        return resolveReorderListNameKeyCollation();
+    },
+};
 
 /**
  * @description
@@ -120,9 +200,14 @@ export class ReorderList extends VendureEntity {
      * lives in the plugin's own name helper alongside the length and emptiness checks, so that the one
      * service owning this table applies it before any uniqueness comparison.
      *
-     * The declared width of 191 is an engine constraint rather than a product choice: this column and
-     * `nameKey` both participate in a composite index, and 191 four-byte UTF-8 characters is the
-     * length that keeps such an index inside the key-size limit on the MySQL and MariaDB engines.
+     * The declared width of 191 is an engine constraint rather than a product choice, and the
+     * constraint is inherited rather than direct: it is `nameKey` — and only `nameKey` — that
+     * participates in `UQ_reorder_list_customer_channel_name_key`, and 191 four-byte UTF-8
+     * characters is the length that keeps that composite index inside the key-size limit on the
+     * MySQL and MariaDB engines. This column participates in no index at all; it is held at the
+     * same width because it stores the same buyer input as the value `nameKey` is derived from, so
+     * a width that admitted a longer display name than its own canonical form could be stored under
+     * would make the pair unstorable rather than merely asymmetric.
      * The plugin's `MAX_LIST_NAME_LENGTH` constant is the same number by requirement and not by
      * coincidence — the two must be changed together or not at all, and there is deliberately no
      * option to configure either. It is not imported here, because an entity must not depend on the
@@ -149,9 +234,25 @@ export class ReorderList extends VendureEntity {
      * Stored at the same 191-character width as {@link ReorderList.name} because it is the column
      * that actually participates in `UQ_reorder_list_customer_channel_name_key`.
      *
+     * **Canonicalising the value is only half of what makes the comparison engine-independent, and the other
+     * half is this column's collation.** The pipeline decides which two names *ought* to collide; the
+     * database decides which two stored values *do*, and it decides that under the collation of the column
+     * the constraint indexes. On the MySQL family the server default is accent-insensitive, so without an
+     * explicit collation `café` and `cafe` would collide there and not on PostgreSQL — the same buyer getting
+     * different behaviour on different engine jobs, which is precisely what the canonical column exists to
+     * prevent. The column therefore carries an engine-resolved binary collation on those engines and none on
+     * the engines whose default is already binary; see {@link resolveReorderListNameKeyCollation} for the
+     * measurement behind that and for why the value cannot be a literal. The service's own name pre-check
+     * reads this same column and so inherits the same semantics.
+     *
+     * One consequence belongs to whoever writes the migration rather than to this file: the clause is part of
+     * this column's declaration, so a table this plugin creates carries it, but TypeORM does not compare
+     * column collations when it diffs an *existing* MySQL-family table, so a table created before this
+     * declaration existed would keep its old collation until altered explicitly.
+     *
      * @since 3.8.0
      */
-    @Column({ type: 'varchar', length: 191, nullable: false })
+    @Column(NAME_KEY_COLUMN_OPTIONS)
     nameKey: string;
 
     /**
@@ -188,8 +289,15 @@ export class ReorderList extends VendureEntity {
      * on-delete behaviour of its own: the cascade that removes a list's lines is declared on the
      * owning side, which lets a list deletion remove its lines in one statement rather than in a loop.
      *
-     * The relation is lazy, and reads of it are paginated rather than loaded wholesale, so consumers
-     * should not assume this array is populated on an arbitrarily obtained instance.
+     * The relation is **not eager**, so it is not loaded by default and this array is undefined on an
+     * arbitrarily obtained instance: it is populated only where a query explicitly asks for it — by
+     * naming the relation in a find operation or joining it in a query builder. Every read the plugin
+     * publishes resolves it explicitly, as its own bounded page, by the service member the published
+     * `lines` field is served from, rather than loading it wholesale. Note that "not eager" is not the
+     * same as a TypeORM *lazy* relation, which would require the relation to be configured as lazy and
+     * this property to be typed as a `Promise`; it is neither, and describing it as lazy would tell a
+     * reader to await something that is simply absent. Consumers must therefore not assume it is
+     * populated, and in particular must not derive {@link ReorderList.lineCount} from its length.
      *
      * @since 3.8.0
      */

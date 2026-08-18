@@ -1,8 +1,8 @@
 {
-  "error": {
-    "reorder-list-line-quantity-above-maximum": "The resulting quantity for this reorder list line would exceed the maximum of { max }",
-    "reorder-list-line-quantity-must-be-positive": "The quantity for a reorder list line must be a positive integer",
-    "reorder-list-name-empty": "The reorder list name cannot be empty and cannot be longer than { max } characters",
-    "reorder-list-variant-not-found": "No ProductVariant with the id \"{ id }\" could be found in the active Channel"
-  }
+    "error": {
+        "reorder-list-line-quantity-above-maximum": "The resulting quantity for this reorder list line would exceed the maximum of { max }",
+        "reorder-list-line-quantity-must-be-positive": "The quantity for a reorder list line must be a positive integer",
+        "reorder-list-name-empty": "The reorder list name must be between 1 and { max } characters once surrounding whitespace is removed, and must not contain control or zero-width characters",
+        "reorder-list-variant-not-found": "No ProductVariant with the id \"{ id }\" could be found in the active Channel"
+    }
 }

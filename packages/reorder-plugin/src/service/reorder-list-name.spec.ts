@@ -12,8 +12,10 @@
  *
  * Where this file lives, and why. It sits beside the module it tests and carries the `.spec.ts` suffix,
  * which is this repository's stated convention for a unit test [CONTRIBUTING.md:L428]. The package's Vitest
- * configuration declares no `include`, so the runner's default `*.spec.ts` discovery is what finds it, and
- * the package's `test` script is what runs it.
+ * configuration confines unit discovery to `src/**&#47;*.spec.ts` and excludes `e2e/**` outright, so this
+ * file is found by that pattern and the package's `test` script is what runs it. The e2e suites are
+ * collected separately, by the shared `*.e2e-spec.ts` configuration under `e2e-common/`, which is what
+ * supplies their database initializers and their far longer timeouts — none of which this file needs.
  *
  * Why this specification carries more weight than its subject's size suggests. The whole of the list-name
  * contract is decided by string arithmetic, and it was extracted into pure functions precisely so that
@@ -182,16 +184,30 @@ describe('reorder list name canonicalisation', () => {
             expect(toDisplayName('Weekly   grocery     restock')).toBe('Weekly grocery restock');
         });
 
-        it('treats a tab, a line feed, a carriage return, a vertical tab and a form feed as whitespace', () => {
-            // These five are C0 control characters as well as whitespace, and the pipeline consumes them
-            // rather than refusing them. That ordering is what stops a name pasted with a tab between two
-            // words from being reported as carrying a control character, and it is asserted from the other
-            // direction further down, where a control character that is not whitespace is refused.
+        it('treats exactly three C0 characters as whitespace — tab, line feed and carriage return', () => {
+            // These three are C0 control characters as well as whitespace, and they are the only members of
+            // that block the pipeline consumes rather than refusing. That ordering is what stops a name
+            // pasted with a tab between two words from being reported as carrying a control character, and
+            // it is asserted from the other direction further down, where every other C0 character —
+            // U+000B vertical tab and U+000C form feed included — is refused.
             expect(toDisplayName('Weekly\tOrder')).toBe('Weekly Order');
             expect(toDisplayName('Weekly\nOrder')).toBe('Weekly Order');
             expect(toDisplayName('Weekly\rOrder')).toBe('Weekly Order');
-            expect(toDisplayName('Weekly\u000BOrder')).toBe('Weekly Order');
-            expect(toDisplayName('Weekly\u000COrder')).toBe('Weekly Order');
+        });
+
+        it('leaves a vertical tab and a form feed in place, because they are controls rather than whitespace', () => {
+            // The negative half of the assertion above, and the mechanism behind the U+000B/U+000C
+            // rejections further down. JavaScript's `\s` — and therefore `String.prototype.trim()` —
+            // classifies both as whitespace; this module's own whitespace class deliberately excludes them,
+            // so they survive trim-and-collapse and reach the disallowed-character test. Were they
+            // collapsed here, that rejection would be unreachable code and two invisible control characters
+            // would reach storage inside a name the caller was told had been accepted.
+            expect(toDisplayName('Weekly\u000BOrder')).toBe('Weekly\u000BOrder');
+            expect(toDisplayName('Weekly\u000COrder')).toBe('Weekly\u000COrder');
+            expect(toDisplayName('\u000BWeekly Order')).toBe('\u000BWeekly Order');
+            expect(toDisplayName('Weekly Order\u000C')).toBe('Weekly Order\u000C');
+            expect(Array.from(toDisplayName('Weekly\u000BOrder'))).toContain('\u000B');
+            expect(Array.from(toDisplayName('Weekly\u000COrder'))).toContain('\u000C');
         });
 
         it('collapses a mixed run of several whitespace kinds to one single space', () => {
@@ -283,6 +299,46 @@ describe('reorder list name canonicalisation', () => {
             expect(toNameKey(decomposed)).toBe('caf\u00E9');
         });
 
+        it('normalises to NFC before lower-casing, proved on an input whose result differs between the two orders', () => {
+            // ★ The assertion that makes the pipeline's step order falsifiable rather than merely stated.
+            //
+            // Every other case/normalisation assertion in this file is order-blind: for `CAFE\u0301`,
+            // normalising and then lower-casing and lower-casing and then normalising both yield
+            // `caf\u00E9`, so a module that inverted steps three and four would pass all of them. Two
+            // characters do distinguish the orders, and both are driven here.
+            //
+            // `J` followed by U+030C COMBINING CARON is the first. Unicode has no precomposed capital J with
+            // caron, so NFC leaves the pair alone; the case mapping then yields `j` followed by the same
+            // combining caron — two code points. Invert the two steps and the case mapping runs first,
+            // producing `j` + caron, which NFC *can* compose, collapsing it into the single code point
+            // U+01F0. So the two orders disagree in code-point count as well as in content.
+            //
+            // What this pins is the contract's order — trim, collapse, NFC, lower-case — and nothing more.
+            // It deliberately makes no claim that either result is the better key: the order is fixed by
+            // the feature contract, so the module's job is to implement that order observably, and this
+            // test's job is to fail if it ever stops doing so.
+            const capitalJWithCaron = 'J\u030C';
+            const invertedOrderKey = capitalJWithCaron.toLowerCase().normalize('NFC');
+
+            // First, that the two orders genuinely differ for this input — without this, the assertion
+            // below would prove nothing, which is exactly the hole a same-result fixture leaves.
+            expect(invertedOrderKey).toBe('\u01F0');
+            expect(Array.from(invertedOrderKey)).toHaveLength(1);
+
+            // Then, that the module took the contract's order.
+            expect(toNameKey(capitalJWithCaron)).toBe('j\u030C');
+            expect(Array.from(toNameKey(capitalJWithCaron))).toHaveLength(2);
+            expect(toNameKey(capitalJWithCaron)).not.toBe(invertedOrderKey);
+
+            // A second character with the same property, so the evidence does not rest on one code point:
+            // `T` followed by U+0308 COMBINING DIAERESIS. NFC first leaves `t` + diaeresis; lower-casing
+            // first composes to U+1E97, LATIN SMALL LETTER T WITH DIAERESIS.
+            const capitalTWithDiaeresis = 'T\u0308';
+            expect(capitalTWithDiaeresis.toLowerCase().normalize('NFC')).toBe('\u1E97');
+            expect(toNameKey(capitalTWithDiaeresis)).toBe('t\u0308');
+            expect(toNameKey(capitalTWithDiaeresis)).not.toBe('\u1E97');
+        });
+
         it('produces different keys for an accented and an unaccented name, because accents are never stripped', () => {
             // The single most likely defect in an implementation of this contract, and the reason this
             // assertion is stated on its own rather than folded into the case above. A pipeline that
@@ -312,15 +368,36 @@ describe('reorder list name canonicalisation', () => {
             expect(toNameKey('  Weekly   Order  ')).toBe('  weekly   order  ');
         });
 
-        it('is idempotent, so re-canonicalising a stored key cannot drift', () => {
-            // A rename reads a stored value and canonicalises again. If the transform were not idempotent,
-            // the key a row was inserted with and the key a later comparison computed could differ, and the
-            // named unique constraint would stop matching the rows it exists to match.
+        it('is stable under a second pass for these inputs, which is not a general property', () => {
+            // Narrowly scoped on purpose. Each input below is already in its own image, so a second pass
+            // changes nothing — useful to pin, because these are the shapes a stored key actually takes.
             for (const input of ['Weekly Order', 'Caf\u00E9', 'Cafe\u0301', '\uFB01le', '\uFF21\uFF22']) {
                 expect(toNameKey(toNameKey(input)), `${input} is stable under a second pass`).toBe(
                     toNameKey(input),
                 );
             }
+        });
+
+        it('is NOT idempotent in general, which the mandated step order makes unavoidable', () => {
+            // ★ Stated as a fact about the contract rather than hidden behind a selective input list.
+            // The order is fixed at trim, collapse, normalise (NFC), lower-case
+            // [FEATURE-001-01:section 2.11], so NFC runs on the *cased* text and the lower-casing that
+            // follows can expose a new composition. `J` + U+030C lower-cases to `j` + U+030C, which NFC
+            // would have composed to U+01F0 had it run afterwards — so a second pass composes it.
+            const once = toNameKey('J\u030C');
+            expect(once).toBe('j\u030C');
+            expect(toNameKey(once)).toBe('\u01F0');
+            expect(toNameKey(once)).not.toBe(once);
+
+            // Why this is a correctness statement and not a defect to fix here. The pipeline order is
+            // frozen and is asserted three ways above; changing it to gain idempotence would break the
+            // accent-preserving, case-insensitive comparison the feature specifies. What follows from it
+            // is a constraint on *callers*: a stored `nameKey` is a canonical form already and must be
+            // compared as it stands, never re-canonicalised. The service satisfies this — it derives the
+            // key from the submitted display name on every write and never feeds a stored key back
+            // through — and the named unique constraint therefore keeps matching the rows it exists to
+            // match. Re-canonicalising a stored key would be the bug.
+            expect(canonicaliseReorderListName('J\u030C').nameKey).toBe('j\u030C');
         });
     });
 
@@ -348,6 +425,22 @@ describe('reorder list name canonicalisation', () => {
             // input, which is what fixes the order of the four steps rather than merely their membership.
             expect(result.nameKey).toBe('caf\u00E9 order');
             expect(result.nameKey).toBe(toNameKey(toDisplayName(input)));
+
+            // ★ The input above fixes the *membership* of the four steps and the position of trim and
+            // collapse, but it cannot distinguish step three from step four: `CAFE\u0301` yields
+            // `caf\u00E9` whichever of normalise and lower-case runs first. This second input can. `J`
+            // followed by U+030C COMBINING CARON has no precomposed capital form, so normalising first
+            // leaves the pair and the case mapping then gives `j` + caron; lower-casing first gives `j` +
+            // caron, which NFC composes into the single code point U+01F0. The two orders therefore produce
+            // different keys, and the module is asserted to have produced the contract's one.
+            const orderSensitiveInput = '  J\u030C   Order  ';
+            const orderSensitiveResult = canonicaliseReorderListName(orderSensitiveInput);
+            const invertedOrderKey = toDisplayName(orderSensitiveInput).toLowerCase().normalize('NFC');
+
+            expect(orderSensitiveResult.name).toBe('J\u030C Order');
+            expect(orderSensitiveResult.nameKey).toBe('j\u030C order');
+            expect(invertedOrderKey).toBe('\u01F0 order');
+            expect(orderSensitiveResult.nameKey).not.toBe(invertedOrderKey);
         });
 
         it('returns a name carrying markup-significant characters byte-identical to the value submitted', () => {
@@ -477,16 +570,16 @@ describe('reorder list name canonicalisation', () => {
 
         it('accepts ordinary whitespace, which the collapse step handles rather than the character test refusing', () => {
             // The negative control for the refused-character tables below, and the assertion that pins the
-            // one ordering subtlety in the module: five of the characters refused as C0 controls are also
-            // whitespace, so the character test must run on the canonical form rather than on the raw input.
-            // Without this control, an implementation that refused every control character before collapsing
-            // would pass every rejection test in this file while refusing a perfectly reasonable name.
+            // one ordering subtlety in the module: three of the characters that would otherwise be refused
+            // as C0 controls are also whitespace, so the character test must run on the canonical form
+            // rather than on the raw input. Without this control, an implementation that refused every
+            // control character before collapsing would pass every rejection test in this file while
+            // refusing a perfectly reasonable name. The three are tab, line feed and carriage return and
+            // nothing else — U+000B and U+000C are driven in the rejection table instead.
             const whitespaceCases: NameCase[] = [
                 { label: 'a tab between two words', input: 'Weekly\tOrder' },
                 { label: 'a line feed between two words', input: 'Weekly\nOrder' },
                 { label: 'a carriage return between two words', input: 'Weekly\rOrder' },
-                { label: 'a vertical tab between two words', input: 'Weekly\u000BOrder' },
-                { label: 'a form feed between two words', input: 'Weekly\u000COrder' },
                 { label: 'a no-break space between two words', input: 'Weekly\u00A0Order' },
                 { label: 'a mixed whitespace run between two words', input: 'Weekly \t\n Order' },
             ];
@@ -553,8 +646,8 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('refuses a name carrying a C0 control character', () => {
-            // The block U+0000 to U+001F, less the five members that are whitespace and are consumed by the
-            // collapse step instead — those five are the negative control asserted above. Each character is
+            // The block U+0000 to U+001F, less the three members that are whitespace and are consumed by the
+            // collapse step instead — those three are the negative control asserted above. Each character is
             // driven in an interior, a leading and a trailing position, because a trim step that reached
             // beyond whitespace would remove it at the edges and leave the rejection unreachable there.
             const controlCases: NameCase[] = [
@@ -571,6 +664,47 @@ describe('reorder list name canonicalisation', () => {
             for (const controlCase of controlCases) {
                 expectListNameRejection(controlCase.input, controlCase.label);
             }
+        });
+
+        it('refuses a name carrying a vertical tab or a form feed, which the C0 block does not carve out', () => {
+            // The two C0 characters JavaScript's `\s` calls whitespace and the input contract does not. The
+            // contract carves exactly three members out of U+0000 to U+001F as whitespace the pipeline
+            // handles — tab U+0009, line feed U+000A and carriage return U+000D — and refuses the rest, so
+            // U+000B VERTICAL TAB and U+000C FORM FEED are invisible control characters rather than spacing.
+            // They are asserted separately from the table above because their refusal depends on a decision
+            // that is easy to lose: this module defines its own whitespace class instead of using `\s`, and
+            // an implementation built on `\s` or on `String.prototype.trim()` would collapse both of these
+            // into an ordinary space and store them, passing every other test in this file.
+            //
+            // The leading and trailing positions carry most of the weight, because those are exactly the
+            // positions a `trim()`-based implementation would silently clear. The alone case is driven too:
+            // under such an implementation the name would collapse to the empty string and be refused for
+            // emptiness instead, which would look like the right answer for the wrong reason — so the
+            // display transform is asserted above to leave both characters in place.
+            const verticalAndFormFeedCases: NameCase[] = [
+                { label: 'U+000B VERTICAL TAB between two words', input: 'Weekly\u000BOrder' },
+                { label: 'U+000B VERTICAL TAB leading', input: '\u000BWeekly Order' },
+                { label: 'U+000B VERTICAL TAB trailing', input: 'Weekly Order\u000B' },
+                { label: 'U+000B VERTICAL TAB alone', input: '\u000B' },
+                { label: 'U+000C FORM FEED between two words', input: 'Weekly\u000COrder' },
+                { label: 'U+000C FORM FEED leading', input: '\u000CWeekly Order' },
+                { label: 'U+000C FORM FEED trailing', input: 'Weekly Order\u000C' },
+                { label: 'U+000C FORM FEED alone', input: '\u000C' },
+                {
+                    label: 'both, inside an otherwise ordinary whitespace run',
+                    input: 'Weekly \u000B\u000C Order',
+                },
+            ];
+
+            for (const verticalOrFormFeedCase of verticalAndFormFeedCases) {
+                expectListNameRejection(verticalOrFormFeedCase.input, verticalOrFormFeedCase.label);
+            }
+
+            // And the mechanism, asserted rather than inferred: `\s` and `trim()` disagree with this module
+            // about both characters, which is precisely why neither is used to build the whitespace class.
+            expect(/\s/.test('\u000B'), 'the language calls U+000B whitespace').toBe(true);
+            expect(/\s/.test('\u000C'), 'the language calls U+000C whitespace').toBe(true);
+            expect('Weekly Order\u000B'.trim(), 'trim() would have removed it').toBe('Weekly Order');
         });
 
         it('refuses a name carrying DELETE or a C1 control character', () => {

@@ -15,12 +15,26 @@ import { ReorderList } from './reorder-list.entity';
  *
  * 1. De-duplication is a *database* constraint and not a service convention. At most one row may
  *    exist for a given list-and-variant pair, and `UQ_reorder_list_line_list_variant` over
- *    `(reorderListId, productVariantId)` is what makes the rule unbypassable. Note what follows from
- *    that: adding a variant already present on the list is not an error and never reaches the
- *    constraint at all, because the add path resolves the existing row and accumulates onto its
- *    quantity instead of inserting a second one. The constraint therefore exists to make the rule
- *    enforceable rather than to produce a buyer-visible outcome, and a violation of it arriving at
- *    the service is an internal defect rather than something a caller can provoke.
+ *    `(reorderListId, productVariantId)` is what makes the rule unbypassable. Two consequences
+ *    follow, and the second is the one that is easy to remove by mistake. In the ordinary case —
+ *    adding a variant the list already holds — nothing reaches the constraint: the add path resolves
+ *    the existing row and accumulates onto its quantity instead of inserting a second one, so the add
+ *    succeeds and no violation occurs. But two ordinary callers adding the *same* variant to a list
+ *    that holds neither of them can both find no existing row and both insert, and then the loser
+ *    reaches this constraint — legitimately, provoked by nothing more than simultaneity. That
+ *    violation is an **expected signal rather than a fault**: `ReorderListService` recognises this one
+ *    named object, lets the failure unwind its transaction, and retries the whole add against the
+ *    winner's now-committed row, accumulating onto it instead of inserting. Exactly one row survives
+ *    either way — that part is unconditional, and it is what the constraint guarantees. What the
+ *    retry's *outcome* depends on is the quantity that results: where the two increments together stay
+ *    within `maxQuantityPerLine` the loser succeeds as well, the surviving row holds the sum, and no
+ *    error reaches either buyer; where they do not, the retry re-validates against the winner's
+ *    committed value and refuses the loser with the same top-level `UserInputError` that a single
+ *    over-maximum add receives — two adds of 600 against a maximum of 999 leave the winner's 600
+ *    intact and refuse the second, because a resulting quantity of 1200 cannot be stored and being
+ *    concurrent does not make it storable. Treating a violation of this constraint as an internal
+ *    defect — or removing the reconciliation because "the add path already checks first" —
+ *    reintroduces a buyer-visible failure in the one case the constraint exists to arbitrate.
  * 2. Quantity is guarded twice, deliberately, and the database is the *second* guard rather than the
  *    first. See {@link ReorderListLine.quantity}.
  * 3. The stored variant reference and the published one deliberately disagree on nullability. This is
@@ -145,10 +159,14 @@ export class ReorderListLine extends VendureEntity {
      *
      * Two guards apply, and which of them comes first matters. The service is the primary guard: a
      * non-positive value, or a *resulting* value above the configured `maxQuantityPerLine`, is a
-     * malformed request and is refused with the platform's own input error before any statement is
-     * issued — which is why such a request surfaces as a single top-level error entry rather than as
-     * a member of an operation's result union. `CHK_reorder_list_line_quantity_positive` is the
-     * second guard, so that a further code path cannot bypass the first. Treat that check as defence
+     * malformed request and is refused with the platform's own input error before any write is issued
+     * — which is why such a request surfaces as a single top-level error entry rather than as a
+     * member of an operation's result union. Before that refusal the service does read: it resolves
+     * who is asking, and on the add path the list, the variant and any line the variant already has,
+     * because a bound on the *resulting* quantity cannot be applied without knowing the current one.
+     * The guarantee is that no row is written on a refused path, not that no statement is
+     * issued. `CHK_reorder_list_line_quantity_positive` is the second guard, so that a further code
+     * path cannot bypass the first. Treat that check as defence
      * in depth rather than as a portable guarantee: TypeORM emits check constraints on PostgreSQL and
      * the SQLite family but skips them silently on MySQL and MariaDB, so the invariant has to be
      * upheld by the service on every write path whatever the engine.

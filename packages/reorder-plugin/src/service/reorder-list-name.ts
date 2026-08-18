@@ -56,10 +56,15 @@ import { MAX_LIST_NAME_LENGTH } from '../constants';
  * rule is structurally true rather than merely observed.
  *
  * The plugin's translation bundle registers exactly four keys and this is the only one of them about a
- * name. It reads as a combined statement — a name may be neither empty nor longer than the maximum — and
- * interpolates a `max` variable precisely because it covers the length bound as well as emptiness. That is
- * why all three rejections below share it. Inventing a fifth key would surface to the caller as the raw key
- * text, because nothing would register a translation for it.
+ * name. Its registered English text states the whole name contract in one sentence — a length between one
+ * and the maximum, measured on the canonical form, with no control or zero-width character — and it
+ * interpolates a `max` variable because the length half of that sentence carries the bound. That is why all
+ * three rejections below share it: whichever clause a name broke, the sentence a buyer reads names the rule
+ * they have to satisfy. The key's own spelling still says `empty`, which is narrower than what it now
+ * describes; it is kept exactly as registered because the key is the published identifier and renaming it
+ * would break every caller matching on it, while the text behind it is free to state the contract in full.
+ * Inventing a fifth key would surface to the caller as the raw key text, because nothing would register a
+ * translation for it.
  */
 const LIST_NAME_REJECTED_MESSAGE_KEY = 'error.reorder-list-name-empty';
 
@@ -75,21 +80,32 @@ const MAX_LENGTH_VARIABLE = 'max';
  * class so that the set is declared exactly once and the trim and collapse patterns below cannot drift
  * apart.
  *
- * The set is JavaScript's own `\s` **minus U+FEFF**, and that single subtraction is load-bearing rather
- * than fastidious. `\s` — and therefore `String.prototype.trim()`, which is defined in terms of it —
+ * The set is JavaScript's own `\s` **minus U+FEFF, U+000B and U+000C**, and every one of those three
+ * subtractions is load-bearing rather than fastidious.
+ *
+ * **U+FEFF.** `\s` — and therefore `String.prototype.trim()`, which is defined in terms of it —
  * classifies the byte order mark U+FEFF as whitespace. Were this module to use either of them, a name
  * carrying a byte order mark would have it silently trimmed or collapsed into an ordinary space, and the
  * rejection of that character further down would become unreachable code: the test could never fire
  * because the character would already be gone. So `\s` is not used, `trim()` is not used, and U+FEFF is
  * left in the input for the disallowed-character test to find.
  *
+ * **U+000B VERTICAL TAB and U+000C FORM FEED.** `\s` classifies both as whitespace, and both are also C0
+ * control characters. The input contract carves exactly three members out of the C0 block as whitespace
+ * the pipeline handles — U+0009 tab, U+000A line feed and U+000D carriage return — and refuses the rest of
+ * U+0000 to U+001F outright. Vertical tab and form feed are therefore *not* whitespace here: they are
+ * invisible controls that a buyer cannot see and cannot have meant, and collapsing them would let them
+ * reach storage inside a name the caller was told had been accepted. They are excluded from this class for
+ * the same reason U+FEFF is — so that they survive trim-and-collapse and arrive at the
+ * disallowed-character test, which refuses them.
+ *
  * The set likewise excludes U+0085 NEL, which `\s` also excludes: it is a C1 control character and is
  * rejected rather than collapsed.
  *
- * Included, in order: the ASCII whitespace run U+0009 tab, U+000A line feed, U+000B vertical tab, U+000C
- * form feed and U+000D carriage return; U+0020 space; then the Unicode space separators U+00A0 no-break
- * space, U+1680, U+2000 to U+200A, U+202F narrow no-break space, U+205F and U+3000 ideographic space; and
- * finally the U+2028 line and U+2029 paragraph separators.
+ * Included, in order: the three whitespace members of the C0 block, U+0009 tab, U+000A line feed and
+ * U+000D carriage return; U+0020 space; then the Unicode space separators U+00A0 no-break space, U+1680,
+ * U+2000 to U+200A, U+202F narrow no-break space, U+205F and U+3000 ideographic space; and finally the
+ * U+2028 line and U+2029 paragraph separators.
  *
  * Treating the non-ASCII separators as whitespace is deliberate and follows from the same reasoning that
  * puts NFC normalisation on the canonical form: a name separated by a no-break space and the same name
@@ -98,7 +114,7 @@ const MAX_LENGTH_VARIABLE = 'max';
  * consisting only of such separators is consequently blank, and is rejected as blank.
  */
 const WHITESPACE_CHARACTER_CLASS =
-    '\\t\\n\\v\\f\\r \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000';
+    '\\t\\n\\r \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000';
 
 /**
  * Matches one leading and one trailing run of whitespace — step one of the pipeline, `trim`. Built from the
@@ -122,9 +138,11 @@ const INTERNAL_WHITESPACE_RUN = new RegExp(`[${WHITESPACE_CHARACTER_CLASS}]+`, '
 const COLLAPSED_WHITESPACE_REPLACEMENT = ' ';
 
 /**
- * Upper bound of the C0 control block, U+0000 to U+001F. Note that five of its members — tab, line feed,
- * vertical tab, form feed and carriage return — are whitespace and have already been consumed by the time
- * this bound is applied; see {@link findDisallowedCharacter} for why that ordering matters.
+ * Upper bound of the C0 control block, U+0000 to U+001F. Note that three of its members — tab U+0009, line
+ * feed U+000A and carriage return U+000D — are whitespace and have already been consumed by the time this
+ * bound is applied; see {@link findDisallowedCharacter} for why that ordering matters. The other two
+ * characters `\s` would have called whitespace, U+000B vertical tab and U+000C form feed, are deliberately
+ * *not* consumed and are refused by this bound like any other control character.
  */
 const C0_CONTROL_LAST_CODE_POINT = 0x1f;
 
@@ -203,18 +221,24 @@ function countCodePoints(value: string): number {
  * Returns the first control or zero-width character in the supplied value, or `undefined` when it holds
  * none.
  *
- * **Why this runs after trim-and-collapse, which is the one subtlety in this module.** Five of the
- * characters this function rejects as C0 controls — tab U+0009, line feed U+000A, vertical tab U+000B, form
- * feed U+000C and carriage return U+000D — are also ordinary whitespace, and whitespace is something the
- * pipeline legitimately handles rather than refuses. Were this test applied to the raw input, a perfectly
+ * **Why this runs after trim-and-collapse, which is the one subtlety in this module.** Three of the
+ * characters this function would otherwise reject as C0 controls — tab U+0009, line feed U+000A and
+ * carriage return U+000D — are also ordinary whitespace, and whitespace is something the pipeline
+ * legitimately handles rather than refuses. Were this test applied to the raw input, a perfectly
  * reasonable name pasted with a tab between two words would be reported as carrying a control character.
- * Applying it to the canonical form instead means those five have already been consumed: the trim step
+ * Applying it to the canonical form instead means those three have already been consumed: the trim step
  * removed them at the edges and the collapse step turned any interior run of them into a single U+0020
  * space. Whatever control characters remain are therefore genuinely control characters and not whitespace,
  * and U+0007 — the case the acceptance criteria name — is exactly one of them.
  *
- * The reverse ordering is what makes the byte order mark work too, from the other direction: U+FEFF is
- * excluded from the whitespace class precisely so that it survives trim-and-collapse and arrives here.
+ * **Three characters that survive to be refused here, and the mechanism is the same for all three.**
+ * U+000B vertical tab, U+000C form feed and U+FEFF the byte order mark are each classified as whitespace by
+ * JavaScript's `\s`, and each is deliberately excluded from {@link WHITESPACE_CHARACTER_CLASS} precisely so
+ * that it survives trim-and-collapse and arrives here. The first two are C0 controls that the input
+ * contract does not carve out — it carves out tab, line feed and carriage return and nothing else — and the
+ * third is a zero-width formatting character. Had any of the three been left in the whitespace class its
+ * rejection below would be unreachable code, which is why the exclusion and this test are one decision
+ * rather than two.
  *
  * The offending character is returned rather than a boolean so that the caller can report or log which
  * character was at fault. It is deliberately **not** interpolated into the error message: the registered
@@ -240,7 +264,9 @@ function findDisallowedCharacter(value: string): string | undefined {
  */
 function isDisallowedCodePoint(codePoint: number): boolean {
     return (
-        // C0 controls, U+0000 to U+001F, less the five that are whitespace and already consumed.
+        // C0 controls, U+0000 to U+001F, less the three that are whitespace and already consumed —
+        // tab, line feed and carriage return. Vertical tab U+000B and form feed U+000C are not
+        // consumed and are refused by this range.
         codePoint <= C0_CONTROL_LAST_CODE_POINT ||
         // U+007F DELETE together with the C1 control block U+0080 to U+009F, one contiguous range.
         (codePoint >= DELETE_CODE_POINT && codePoint <= C1_CONTROL_LAST_CODE_POINT) ||
@@ -269,11 +295,41 @@ function isDisallowedCodePoint(codePoint: number): boolean {
  *
  * The declared return type is `never`, which lets a caller write `return rejectListName()` and keeps
  * TypeScript's reachability analysis correct at every call site.
+ *
+ * The captured frame list is replaced before the error is thrown, for the reason set out on
+ * {@link withoutStackFrames} below: the platform's exception filter logs `exception.stack` for every error a
+ * resolver raises, and a V8 stack is a list of absolute source paths from the running build. The message and
+ * the interpolated bound are what a buyer needs; the build layout of the server is not, and an application log
+ * is not the place to leave it.
  */
 function rejectListName(): never {
-    throw new UserInputError(LIST_NAME_REJECTED_MESSAGE_KEY, {
-        [MAX_LENGTH_VARIABLE]: MAX_LIST_NAME_LENGTH,
-    });
+    throw withoutStackFrames(
+        new UserInputError(LIST_NAME_REJECTED_MESSAGE_KEY, {
+            [MAX_LENGTH_VARIABLE]: MAX_LIST_NAME_LENGTH,
+        }),
+    );
+}
+
+/**
+ * Replaces an error's captured frame list with a fixed, information-free line, and returns the same instance.
+ *
+ * The platform's `ExceptionLoggerFilter` (`packages/core/src/api/middleware/exception-logger.filter.ts`) is
+ * the final sink for every error a resolver raises, and it logs `exception.stack` — unconditionally as a debug
+ * line for any `I18nError` carrying one, and as the trace argument of an error line for anything logged at
+ * error level. A V8 stack lists absolute source paths from the running build together with the internal frames
+ * that led to the throw, so an error whose message is perfectly safe still deposits build paths and call
+ * structure in a log that outlives the request. The replacement keeps the shape a formatter expects — the
+ * `Name: message` line a real stack begins with — so nothing downstream has to cope with an absent value, and
+ * the two things it carries are the error's own class and its already-safe message.
+ *
+ * It is duplicated here rather than shared with the service that consumes this module: this module is a leaf
+ * that the service imports, so exporting the helper from the service would make the two mutually dependent,
+ * and a two-line guard is the smaller cost. The reasoning behind it is stated in full in both places for the
+ * same reason — a reader of either file can see why the frames go without having to find the other.
+ */
+function withoutStackFrames<T extends Error>(error: T): T {
+    error.stack = `${error.name}: ${error.message}`;
+    return error;
 }
 
 /**
@@ -293,16 +349,24 @@ function rejectListName(): never {
  * {@link toNameKey}, which is the value uniqueness is decided on, and applying it here would alter what
  * the buyer typed to no purpose.
  *
+ * What counts as whitespace is {@link WHITESPACE_CHARACTER_CLASS} and deliberately not JavaScript's `\s`:
+ * U+000B vertical tab, U+000C form feed and U+FEFF the byte order mark are left in place here so that
+ * {@link canonicaliseReorderListName} can refuse them. Three C0 members are treated as whitespace and
+ * collapsed — tab U+0009, line feed U+000A and carriage return U+000D — and no other control character is.
+ *
  * This function validates nothing and throws nothing: it can legitimately return the empty string, for a
- * name that was entirely whitespace. Deciding what is acceptable is {@link canonicaliseReorderListName}'s
- * job, and callers wanting both the display value and its validation should use that entry point instead of
- * composing the steps themselves.
+ * name that was entirely whitespace, and it legitimately returns a value still carrying a control
+ * character. Deciding what is acceptable is {@link canonicaliseReorderListName}'s job, and callers wanting
+ * both the display value and its validation should use that entry point instead of composing the steps
+ * themselves.
  *
  * @example
  * ```ts
- * toDisplayName('  Weekly   Order  '); // 'Weekly Order'
- * toDisplayName('Weekly\tOrder');      // 'Weekly Order'
- * toDisplayName('   ');                // ''
+ * toDisplayName('  Weekly   Order  ');   // 'Weekly Order'
+ * toDisplayName('Weekly\tOrder');        // 'Weekly Order'
+ * toDisplayName('   ');                  // ''
+ * toDisplayName('Weekly\u000BOrder');    // 'Weekly\u000BOrder' — a control character, left for the
+ *                                        // entry point to refuse rather than collapsed away
  * ```
  *
  * @docsCategory core plugins/ReorderPlugin
@@ -312,7 +376,8 @@ function rejectListName(): never {
 export function toDisplayName(input: string): string {
     // Step one, trim; then step two, collapse. Performed in the order the contract states, each in exactly
     // one place. Note that `String.prototype.trim()` is deliberately not used for step one: it treats
-    // U+FEFF as whitespace, which would make the byte order mark unrejectable further down the pipeline.
+    // U+FEFF, U+000B and U+000C as whitespace, which would make all three unrejectable further down the
+    // pipeline.
     const trimmed = input.replace(LEADING_AND_TRAILING_WHITESPACE, '');
     return trimmed.replace(INTERNAL_WHITESPACE_RUN, COLLAPSED_WHITESPACE_REPLACEMENT);
 }
@@ -381,7 +446,10 @@ export function toNameKey(displayName: string): string {
  *    an opaque driver error, and a value below it would restrict what no engine restricts.
  * 3. **A control or zero-width character is refused.** Such characters are rejected rather than stripped,
  *    so that nothing reaches storage that the buyer did not knowingly submit and nothing is silently
- *    altered. See {@link findDisallowedCharacter} for why this test necessarily runs last.
+ *    altered. The C0 block U+0000 to U+001F is refused in full apart from the three members the collapse
+ *    step legitimately consumes — tab U+0009, line feed U+000A and carriage return U+000D — so U+000B
+ *    vertical tab and U+000C form feed are refused here even though JavaScript's `\s` would call them
+ *    whitespace. See {@link findDisallowedCharacter} for why this test necessarily runs last.
  *
  * All three raise the platform's `UserInputError`, so the caller observes exactly one entry in the
  * response's top-level `errors` array whose `extensions.code` is exactly `USER_INPUT_ERROR`, with the
@@ -403,6 +471,8 @@ export function toNameKey(displayName: string): string {
  * canonicaliseReorderListName('   ');            // throws UserInputError
  * canonicaliseReorderListName('Order\u0007');    // throws UserInputError
  * canonicaliseReorderListName('Order\u200B');    // throws UserInputError
+ * canonicaliseReorderListName('Order\u000B');    // throws UserInputError — a C0 control, not whitespace
+ * canonicaliseReorderListName('Order\u000C');    // throws UserInputError — a C0 control, not whitespace
  * ```
  *
  * @throws A `UserInputError` carrying the code `USER_INPUT_ERROR` when the canonical name is empty, is

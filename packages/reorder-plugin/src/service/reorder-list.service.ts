@@ -73,6 +73,7 @@ import { PaginatedList } from '@vendure/common/lib/shared-types';
 import {
     Customer,
     ForbiddenError,
+    I18nError,
     ID,
     InternalServerError,
     ListQueryBuilder,
@@ -82,8 +83,10 @@ import {
     RequestContext,
     TransactionalConnection,
     UserInputError,
+    VendureEntity,
 } from '@vendure/core';
-import { In } from 'typeorm';
+import { randomUUID } from 'crypto';
+import { EntityMetadata, In, QueryResult, SelectQueryBuilder } from 'typeorm';
 
 import { loggerCtx, REORDER_PLUGIN_OPTIONS } from '../constants';
 import { ReorderListLine } from '../entities/reorder-list-line.entity';
@@ -109,14 +112,80 @@ const DEFAULT_REORDER_LISTS_PAGE_SIZE = 25;
 const DEFAULT_REORDER_LIST_LINES_PAGE_SIZE = 50;
 
 /**
- * The ONE database constraint name this service translates into a buyer-visible outcome.
+ * How one named database object is identified in a driver failure, so that a violation of *that* object can
+ * be recognised without widening to "any unique violation".
+ *
+ * It carries the columns as well as the name because the four supported engines do not agree on what they
+ * put in the message. MySQL, MariaDB and PostgreSQL all name the object — `Duplicate entry '…' for key
+ * 'UQ_…'` and `duplicate key value violates unique constraint "UQ_…"` respectively — while the SQLite family
+ * names the **columns** instead: `UNIQUE constraint failed: reorder_list.customerId,
+ * reorder_list.channelId, reorder_list.nameKey`. A match on the name alone therefore fails on the engine the
+ * project's default end-to-end job actually runs, turning a promised conflict result into an internal error
+ * there and nowhere else. Matching the exact qualified column list as the alternative keeps the test
+ * object-specific rather than error-class-specific: it is still one named object being recognised, spelled
+ * the way that engine spells it.
+ */
+interface ReorderListConstraintDescriptor {
+    /** The exact name the entity declaration and the additive migration give the object. */
+    name: string;
+    /** The table the object is declared on. */
+    table: string;
+    /** The object's columns, which is how the SQLite family reports it. */
+    columns: string[];
+}
+
+/**
+ * The ONE database object this service translates into a buyer-visible outcome.
  *
  * The match is narrow by requirement rather than by caution. `reorder_list_line` carries its own uniqueness
  * constraint, `UQ_reorder_list_line_list_variant`, and mapping "any unique-violation code" would report a
- * duplicate *line* as a duplicate *name* — a wrong answer that reads like a right one. The two constraints
- * are separate and are named separately, so the translation matches this name and nothing else.
+ * duplicate *line* as a duplicate *name* — a wrong answer that reads like a right one. The two objects are
+ * separate, are named separately and carry different columns, so neither descriptor can match the other's
+ * failure under either spelling.
  */
-const NAME_CONFLICT_CONSTRAINT = 'UQ_reorder_list_customer_channel_name_key';
+const NAME_CONFLICT_CONSTRAINT_DESCRIPTOR: ReorderListConstraintDescriptor = {
+    name: 'UQ_reorder_list_customer_channel_name_key',
+    table: 'reorder_list',
+    columns: ['customerId', 'channelId', 'nameKey'],
+};
+
+/**
+ * The per-variant uniqueness object on `reorder_list_line`, recognised so that a losing concurrent insert can
+ * be RETRIED rather than reported.
+ *
+ * It is not translated into a buyer-visible error and it never reaches the caller: a duplicate line means a
+ * competing request created the very row this one was creating, and the contract's answer to that is an
+ * accumulation onto the winner's row. Recognising the object is what lets the loser tell that state apart
+ * from a genuine failure, and it is described here — separately from the name-conflict descriptor, with its
+ * own name, table and columns — so that neither object's failure can ever be mistaken for the other's under
+ * either the named or the column-list spelling.
+ */
+const LINE_DEDUPLICATION_CONSTRAINT_DESCRIPTOR: ReorderListConstraintDescriptor = {
+    name: 'UQ_reorder_list_line_list_variant',
+    table: 'reorder_list_line',
+    columns: ['reorderListId', 'productVariantId'],
+};
+
+/**
+ * How many whole transactions one add is allowed to take before the failure is reported rather than retried.
+ *
+ * A retry here is not a hopeful re-run of something that failed: each one is entered knowing that a competing
+ * request has *committed* the line this call was creating, so the next attempt reads that committed row and
+ * accumulates onto it — a path that cannot itself hit the same duplicate. Two attempts are therefore enough
+ * for any single competitor, and the third exists so that a pathological interleaving (the winner's row
+ * removed again before the loser's retry reads it) still converges instead of failing. The bound is small and
+ * explicit because an unbounded loop against a database is a way to turn a defect into an outage: once it is
+ * exhausted the failure is sanitised and reported like any other.
+ */
+const MAX_ADD_RECONCILIATION_ATTEMPTS = 3;
+
+/**
+ * The SQLite family's own wording for a uniqueness violation, required alongside the qualified column list so
+ * that the column form of the match in {@link ReorderListService.violatesConstraint} cannot be satisfied by a
+ * message that merely happens to mention those columns — a check-constraint failure or a not-null failure on
+ * the same table names columns too, and neither is a uniqueness violation.
+ */
+const SQLITE_UNIQUE_VIOLATION_TEXT = 'unique constraint failed';
 
 /**
  * The plugin-owned message keys this service raises, spelled exactly as the translation bundle registers
@@ -151,14 +220,159 @@ const ID_VARIABLE = 'id';
 const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: string[] = ['postgres', 'mysql', 'mariadb'];
 
 /**
+ * The alias the owner-scope `EXISTS` sub-query gives the parent list table.
+ *
+ * It is deliberately unlike any alias the query builder generates from an entity name, so that the fragment
+ * cannot shadow the alias of the statement it is embedded in on any engine.
+ */
+/**
+ * The alias and column names the nested-lines read gives its per-parent ranking subquery, and the two
+ * parameter names it binds the resolved window to.
+ *
+ * They are declared here, once, because each appears in more than one place in a raw SQL fragment — the
+ * subquery that produces the rank and the predicate that filters on it — and a fragment that disagreed with
+ * itself about a name would fail at the engine rather than at compile time. The names are prefixed so that
+ * they cannot collide with a column of either plugin table or with a parameter the platform's own builder
+ * generates.
+ */
+const LINE_WINDOW_ALIAS = 'reorder_line_window';
+const LINE_WINDOW_ID_COLUMN = 'reorder_line_window_id';
+const LINE_WINDOW_RANK_COLUMN = 'reorder_line_window_rank';
+const LINE_WINDOW_SKIP_PARAM = 'reorderLineWindowSkip';
+const LINE_WINDOW_UPPER_PARAM = 'reorderLineWindowUpper';
+
+/**
+ * The column names the nested-lines read gives its per-parent grouped count, for the same reason.
+ */
+const LINE_TOTALS_PARENT_COLUMN = 'reorder_line_totals_parent_id';
+const LINE_TOTALS_COUNT_COLUMN = 'reorder_line_totals_count';
+
+const OWNED_LIST_SUBQUERY_ALIAS = 'owned_list_scope';
+
+/**
  * The generic, driver-free message a database failure this service cannot classify is re-raised with.
  *
  * A driver message can carry the schema, the column list, a SQL fragment and sometimes the conflicting
- * values, and a buyer-facing response is not a place to put any of them. The original is logged at error
- * level against the plugin's logger context instead, so the detail is retained server-side and is never
- * leaked, and nothing is ever swallowed.
+ * values, and a buyer-facing response is not a place to put any of them. It is deliberately identical for
+ * every operation and every failure class, because a message that varied by cause would be a channel for
+ * exactly the detail it exists to withhold.
  */
-const UNCLASSIFIED_WRITE_FAILURE_MESSAGE = 'The reorder list could not be saved';
+const UNCLASSIFIED_FAILURE_MESSAGE = 'The reorder list request could not be completed';
+
+/**
+ * The one other internal failure this service raises deliberately: an authenticated session whose user has
+ * no `Customer` row. Declared rather than written inline at its two throw sites because
+ * {@link ReorderListService.rethrowSanitisedFailure} has to be able to recognise this service's own internal
+ * errors, and recognising them by a shared constant is checkable in a way that recognising them by a repeated
+ * string literal is not.
+ */
+const NO_CUSTOMER_FOR_USER_MESSAGE = 'The authenticated user has no associated Customer';
+
+/**
+ * The complete set of internal-error messages this module authors.
+ *
+ * An `INTERNAL_SERVER_ERROR` arriving at the sanitiser is forwarded only if its message is one of these. The
+ * distinction is not pedantry: this service calls into platform collaborators, and an internal error raised
+ * inside one of them was written for a boundary that is not this one — it can name a table, a column, a
+ * configuration key or a strategy class. Forwarding it unchanged would publish that wording to the caller and
+ * log it, which is exactly what the surrounding sanitisation exists to prevent, so an internal error this
+ * module did not write is reported as this module's own generic failure instead.
+ */
+const OWN_INTERNAL_MESSAGES: ReadonlySet<string> = new Set([
+    UNCLASSIFIED_FAILURE_MESSAGE,
+    NO_CUSTOMER_FOR_USER_MESSAGE,
+]);
+
+/**
+ * The platform error code an internal failure carries, matched rather than imported because the platform
+ * exports the code as a string on the error instance and not as an enum member reachable from its package
+ * root.
+ */
+const INTERNAL_SERVER_ERROR_CODE = 'INTERNAL_SERVER_ERROR';
+
+/**
+ * Replaces an error's captured frame list with a fixed, information-free line, and returns the same instance.
+ *
+ * **This closes the last leg of the disclosure boundary, and the leg is not this file's own logging.** The
+ * platform's `ExceptionLoggerFilter` (`packages/core/src/api/middleware/exception-logger.filter.ts`) is the
+ * final sink for every error a resolver raises, and it logs `exception.stack` — as the trace argument of a
+ * `Logger.error` call for any error whose log level is `Error`, and unconditionally as a `Logger.debug` line
+ * for every `I18nError` that carries a stack at all. A V8 stack is a list of absolute source paths from the
+ * running build together with the internal frames that led to the throw, so an error this service sanitises
+ * perfectly and then throws with its frames intact still deposits build paths and internal call structure in
+ * the application log. Sanitising the message and leaving the frames would be a boundary that looks closed
+ * from inside this file and is open one layer out.
+ *
+ * The replacement keeps the shape a reader and a log formatter expect — `Name: message` on one line, which is
+ * exactly what a real stack's first line is — so nothing downstream has to cope with an absent or malformed
+ * value, and the two pieces of information it carries are the error's own class and its already-sanitised
+ * message. It is applied to every error this module raises or forwards, rather than only to the generic
+ * internal one, so that no single throw site has to be remembered as the exception.
+ *
+ * What is deliberately NOT removed is the error's code or its interpolation variables: a caller branches on
+ * the code and a buyer reads the interpolated message, and neither carries anything about the running build.
+ */
+function withoutStackFrames<T extends Error>(error: T): T {
+    error.stack = `${error.name}: ${error.message}`;
+    return error;
+}
+
+/**
+ * The fixed set of operation codes a sanitised failure is logged under.
+ *
+ * They are a closed union of literals rather than free text at each call site, which is what makes the log
+ * line's content *decidable*: an operator can grep for one of exactly ten values, and no future edit can
+ * interpolate a caught error's own words into the position an operation code occupies. That second property
+ * is the point — this is the only identifying information a sanitised log line carries about what failed,
+ * and it has to be information this file chose rather than information the driver supplied.
+ */
+type ReorderListOperation =
+    | 'getReorderLists'
+    | 'getReorderList'
+    | 'getLinesForLists'
+    | 'reconcileLineCount'
+    | 'createReorderList'
+    | 'updateReorderList'
+    | 'deleteReorderList'
+    | 'addItemToReorderList'
+    | 'adjustReorderListLine'
+    | 'removeReorderListLine';
+
+/**
+ * The fixed classifications a sanitised failure is logged as.
+ *
+ * Each is a string this file owns. Nothing is copied out of the caught value — not its message, not its
+ * class name, not the failing statement and not its parameters — because a driver failure carries the SQL
+ * it was executing, the schema and column names it touched, sometimes the conflicting values themselves,
+ * and on some drivers a filesystem path; an application log is a place all of that outlives the request and
+ * is read by people and tools that were never entitled to it. What an operator gets instead is the shape of
+ * the failure, which is enough to tell a database outage from a defect in this file, plus a correlation id
+ * that distinguishes one occurrence from the next.
+ */
+type ReorderListFailureClass = 'a database query failure' | 'an unexpected error' | 'a non-error value';
+
+/**
+ * An internal signal, never a reported error: one add attempt discovered that a concurrent request had already
+ * created the line for the variant it was about to insert.
+ *
+ * It exists because that state is reached in two different ways and both need the same response. The database
+ * can refuse the insert on `UQ_reorder_list_line_list_variant`, or the capacity claim that runs before the
+ * insert can see the duplicate first — and in the second case there is no driver failure to recognise, so
+ * something has to be thrown for the retry to key on. Throwing rather than returning is essential rather than
+ * stylistic: the attempt has already claimed a line's worth of the list's counter, and only leaving the
+ * transaction lets the platform's wrapper roll that claim back before the next attempt runs. Returning a
+ * status would commit the claim and permanently overstate the list's size.
+ *
+ * It is module-private and is always consumed by
+ * {@link ReorderListService.addItemToReorderList}'s retry loop. Should the retry budget ever be exhausted it
+ * falls through to the same sanitiser every other unclassified failure does, so it can no more reach a caller
+ * than a driver error can.
+ */
+class ConcurrentLineInsertDetected extends Error {
+    constructor() {
+        super('A concurrent request created the reorder list line this request was creating');
+    }
+}
 
 /**
  * @description
@@ -696,8 +910,11 @@ type AppendedReorderListLineOrder = { createdAt?: 'ASC'; id?: 'ASC' };
  * the resulting row count as the authority on what happened.
  *
  * The two conventions the platform's shipped saved-list plugin establishes are followed exactly, and they
- * differ from each other on purpose. A **read** whose guard fails returns an empty page or `null`, never an
- * error, which is what makes a single-list read non-enumerable. A **write** whose guard fails lets
+ * differ from each other on purpose. A **read** whose guard *refuses* returns an empty page or `null`, never
+ * an error, which is what makes a single-list read non-enumerable — and it is the refusal alone that is
+ * normalised that way: a read whose guard fails for any other reason reports the failure rather than
+ * answering "you have nothing", because an empty page a caller cannot distinguish from the truth is worse
+ * than an error they can act on. A **write** whose guard fails lets
  * `ForbiddenError` propagate, so the caller observes one top-level error entry carrying the code `FORBIDDEN`
  * with the operation's own field null.
  *
@@ -805,25 +1022,106 @@ export class ReorderListService {
      * **The `customer` lookup below is outside the counted boundary, and that is not an oversight to
      * "optimise" away.** The statement-count contract this service is held to filters captured statements to
      * `reorder_list` and `reorder_list_line` *by table name*, precisely so that an unrelated session, channel
-     * or customer statement can neither inflate nor mask the number. The lookup is narrowed to the id column
-     * so that no relation is loaded and no customer field beyond the identifier reaches process memory —
-     * which is a data-minimisation choice on top of a correctness one, since the only thing needed from the
-     * row is the value the two plugin tables store.
+     * or customer statement can neither inflate nor mask the number.
+     *
+     * **The lookup is narrowed twice over, and the second narrowing is the one that is easy to miss.**
+     * `select` restricts the columns of the `customer` row to its identifier, but it does nothing about
+     * relations the core entity declares *eager* — and `Customer.user` is one, so the default behaviour is
+     * to join and hydrate the whole `User` row, and its own eager relations with it, for a lookup whose
+     * entire output is one identifier. `loadEagerRelations: false` is what declines that. The result is that
+     * no customer or user field beyond the identifier reaches process memory, which is a data-minimisation
+     * choice on top of a correctness one: personal data that is never loaded cannot reach a log line, an
+     * error message or a serialised context.
      */
-    private async getOwnerScope(ctx: RequestContext): Promise<ReorderListOwnerScope> {
-        if (!ctx.activeUserId) {
-            throw new ForbiddenError();
+    private async getOwnerScope(
+        ctx: RequestContext,
+        operation: ReorderListOperation,
+    ): Promise<ReorderListOwnerScope> {
+        this.requireActiveUser(ctx);
+        let customer: Customer | null;
+        try {
+            customer = await this.connection.getRepository(ctx, Customer).findOne({
+                where: { user: { id: ctx.activeUserId } },
+                select: { id: true },
+                // The second narrowing, and the one that is easy to miss. `select` restricts the columns of
+                // the `customer` row to its identifier, but it says nothing about relations the core entity
+                // declares *eager* — and `Customer.user` is one, so the default behaviour is to join and
+                // hydrate the whole `User` row, and its own eager relations with it, for a lookup whose
+                // entire output is one identifier. This declines that. The relation is still joined for the
+                // predicate above: declining eager loading declines the hydration of the joined row's
+                // columns, not the ability to filter on it. The result is that no customer or user field
+                // beyond the identifier reaches process memory, which is data minimisation on top of
+                // correctness — personal data that is never loaded cannot reach a log line, an error
+                // message or a serialised context.
+                loadEagerRelations: false,
+            });
+        } catch (err: unknown) {
+            // The lookup is a database read like any other, so its failure is sanitised like any other and
+            // is attributed to the operation that asked for it. Without this the one statement every
+            // operation issues before its own would be the one statement outside the disclosure boundary.
+            return this.rethrowSanitisedFailure(err, operation);
         }
-        const customer = await this.connection.getRepository(ctx, Customer).findOne({
-            where: { user: { id: ctx.activeUserId } },
-            select: { id: true },
-        });
         if (!customer) {
             // An active user with no customer row is a broken invariant rather than a caller error: the
             // session authenticated successfully, so something upstream created a user without its customer.
             // Reported as an internal error rather than a refusal, so it is not mistaken for a permission
             // problem, and carrying no identifier so nothing about the session is echoed to the caller.
-            throw new InternalServerError('The authenticated user has no associated Customer');
+            throw withoutStackFrames(new InternalServerError(NO_CUSTOMER_FOR_USER_MESSAGE));
+        }
+        return { customerId: customer.id, channelId: ctx.channelId };
+    }
+
+    /**
+     * Resolves the same scope as {@link ReorderListService.getOwnerScope}, but by a **locking** read on the
+     * owning customer row — and it is the ordering rather than the lock that makes it a separate member.
+     *
+     * **Why the list bound needs this, and why taking the lock as a second statement is not enough.** The
+     * bound is enforced by counting `reorder_list` rows and inserting inside one transaction, which is only
+     * correct if the count observes a competing creator's committed row. On MariaDB and MySQL, whose default
+     * isolation level is REPEATABLE READ, InnoDB builds a transaction's consistent-read view at its **first
+     * consistent read** and every later plain `SELECT` in that transaction answers from that view. A locking
+     * read is a *current* read and does not build the view, so the order that works is: take the lock first,
+     * and let the count be the first consistent read — by which time the predecessor has committed and
+     * released the lock, so the count sees its row.
+     *
+     * Resolving the scope with an ordinary `findOne` before the lock is what breaks that, and it breaks it
+     * invisibly. Every mutation resolver carries `@Transaction()`, so the request's transaction is already
+     * open when this service is entered; a plain customer lookup issued there builds the read view *before*
+     * the lock is taken, and the later count then answers from a snapshot older than the predecessor's
+     * commit. Two creators at the bound both count one below the maximum and both insert. Nothing about the
+     * lock looks wrong in that code — it is acquired, it is held, it serialises the two transactions — and
+     * the bound is still exceeded. So the scope resolution and the lock are the same statement here, and it
+     * is the first statement the transaction issues.
+     *
+     * The join is an INNER join written explicitly rather than the relation condition a find-options `where`
+     * would produce, because PostgreSQL refuses `FOR UPDATE` on the nullable side of an outer join and
+     * TypeORM realises a relation condition as a LEFT join. Only the id column is selected, so no customer
+     * field beyond the identifier reaches process memory. On the SQLite family the lock is skipped, which is
+     * required rather than an optimisation: that driver serves a single connection, so two transactions
+     * cannot interleave, and asking it for a lock raises rather than degrades.
+     */
+    private async getLockedOwnerScope(
+        ctx: RequestContext,
+        operation: ReorderListOperation,
+    ): Promise<ReorderListOwnerScope> {
+        this.requireActiveUser(ctx);
+        let customer: Customer | null;
+        try {
+            const queryBuilder = this.connection
+                .getRepository(ctx, Customer)
+                .createQueryBuilder('customer')
+                .select(['customer.id'])
+                .innerJoin('customer.user', 'user')
+                .where('user.id = :userId', { userId: ctx.activeUserId });
+            if (this.supportsPessimisticLocking) {
+                queryBuilder.setLock('pessimistic_write');
+            }
+            customer = await queryBuilder.getOne();
+        } catch (err: unknown) {
+            return this.rethrowSanitisedFailure(err, operation);
+        }
+        if (!customer) {
+            throw withoutStackFrames(new InternalServerError(NO_CUSTOMER_FOR_USER_MESSAGE));
         }
         return { customerId: customer.id, channelId: ctx.channelId };
     }
@@ -849,14 +1147,58 @@ export class ReorderListService {
      * refusal that would confirm the existence of another buyer's row to anyone who counts, given that
      * identifiers are sequential under the default id strategy.
      */
-    private async findOwnedList(
+    private findOwnedList(
         ctx: RequestContext,
         id: ID,
         scope: ReorderListOwnerScope,
     ): Promise<ReorderList | null> {
+        // Declared without `async` deliberately. The body is one repository call whose promise is the
+        // method's entire result, so an `async` wrapper would add a second promise around it and would
+        // report as an async function with no `await` — the return type still states the contract.
         return this.connection.getRepository(ctx, ReorderList).findOne({
             where: { id, customerId: scope.customerId, channelId: scope.channelId },
         });
+    }
+
+    /**
+     * Resolves one list under the full predicate exactly as {@link ReorderListService.findOwnedList} does, and
+     * additionally takes a pessimistic write lock on the row where the engine supports one.
+     *
+     * **It exists for lock ORDER rather than for the lock itself.** A transaction that deletes a line and then
+     * decrements its parent's counter touches the child before the parent, while a transaction that deletes a
+     * list touches the parent and then — through the cascade — its children. Two transactions taking the same
+     * two rows in opposite orders deadlock, and the engine resolves that by killing one of them, which a buyer
+     * observes as an operation that failed for no reason they can see. Locking the parent first gives every
+     * transaction in this service one order.
+     *
+     * The predicate is unchanged and still one statement: the acting customer and the active channel remain
+     * conjuncts of the same `WHERE` clause as the identifier, so a row the caller may not have is still refused
+     * by returning no rows rather than by loading and discarding it. A lock on a row that does not match locks
+     * nothing.
+     *
+     * The lock is skipped on the in-process SQLite engine, which serves a single connection: two transactions
+     * cannot interleave there, so there is no order to impose, and asking that driver for a lock raises rather
+     * than degrades.
+     *
+     * The add and adjust paths deliberately take NO parent lock, because serialising them would destroy the
+     * concurrent-accumulate interleaving the contract requires as race evidence.
+     */
+    private findOwnedListForUpdate(
+        ctx: RequestContext,
+        id: ID,
+        scope: ReorderListOwnerScope,
+    ): Promise<ReorderList | null> {
+        if (!this.supportsPessimisticLocking) {
+            return this.findOwnedList(ctx, id, scope);
+        }
+        return this.connection
+            .getRepository(ctx, ReorderList)
+            .createQueryBuilder('reorderlist')
+            .setLock('pessimistic_write')
+            .where('reorderlist.id = :id', { id })
+            .andWhere('reorderlist.customerId = :customerId', { customerId: scope.customerId })
+            .andWhere('reorderlist.channelId = :channelId', { channelId: scope.channelId })
+            .getOne();
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -906,40 +1248,52 @@ export class ReorderListService {
     ): Promise<PaginatedList<ReorderList>> {
         let scope: ReorderListOwnerScope;
         try {
-            scope = await this.getOwnerScope(ctx);
+            scope = await this.getOwnerScope(ctx, 'getReorderLists');
         } catch (err: unknown) {
-            // The read convention: an unauthenticated or unresolvable caller gets the empty page. Only the
-            // guard is inside the try, so a genuine query failure below is never absorbed by this branch. A
-            // refusal is the expected path and is not logged; anything else is a broken invariant and is,
-            // because a silently empty page would otherwise be the only symptom.
-            if (!(err instanceof ForbiddenError)) {
-                Logger.warn(
-                    `Returning an empty reorder list page because the owner scope could not be resolved: ${
-                        err instanceof Error ? err.message : String(err)
-                    }`,
-                    loggerCtx,
-                );
+            // The read convention, and it is narrowed to the ONE error the convention is about. A refusal
+            // is the expected path for an unauthenticated or non-customer caller and is answered with the
+            // empty page at a cost of zero statements against either plugin table. Anything else — a
+            // database outage, a broken schema, an unresolvable session invariant — is NOT normalised into
+            // an empty page: reporting "you have no lists" for "the database is unreachable" is a wrong
+            // answer that reads like a right one, and it is indistinguishable from the truthful empty page
+            // by every assertion a client can make.
+            if (err instanceof ForbiddenError) {
+                return { items: [], totalItems: 0 };
             }
-            return { items: [], totalItems: 0 };
+            return this.rethrowSanitisedFailure(err, 'getReorderLists');
         }
-        return this.listQueryBuilder
-            .build(
-                ReorderList,
-                {
-                    ...options,
-                    // The plugin's stricter fallback. The platform substitutes its own Shop maximum for an
-                    // absent page size, so merging the configured default here is the only place it can be
-                    // applied without reimplementing the clamp that follows it.
-                    take: options?.take ?? this.defaultReorderListsPageSize,
-                },
-                {
-                    ctx,
-                    where: { customerId: scope.customerId, channelId: scope.channelId },
-                    orderBy: this.appendedListOrder(options?.sort),
-                },
-            )
-            .getManyAndCount()
-            .then(([items, totalItems]) => ({ items, totalItems }));
+        try {
+            // Reduced to the keys that actually order something BEFORE the builder sees it, and the appended
+            // tie-break is derived from that same sanitised value so the two cannot disagree. See
+            // {@link ReorderListService.effectiveSort}.
+            const sort = this.effectiveSort<ReorderList>(options?.sort);
+            return await this.listQueryBuilder
+                .build(
+                    ReorderList,
+                    {
+                        ...options,
+                        sort,
+                        // The plugin's stricter fallback. The platform substitutes its own Shop maximum for
+                        // an absent page size, so merging the configured default here is the only place it
+                        // can be applied without reimplementing the clamp that follows it.
+                        take: options?.take ?? this.defaultReorderListsPageSize,
+                    },
+                    {
+                        ctx,
+                        where: { customerId: scope.customerId, channelId: scope.channelId },
+                        orderBy: this.appendedListOrder(sort),
+                    },
+                )
+                .getManyAndCount()
+                .then(([items, totalItems]) => ({ items, totalItems }));
+        } catch (err: unknown) {
+            // The whole statement-issuing body is inside the sanitiser, not just the parts that were
+            // expected to fail. A caller-supplied sort or filter reaching the builder is caller-controlled
+            // input arriving at a query, so its failure mode is a driver error carrying the fragment it
+            // could not build — which is exactly the disclosure this wrapper exists to stop. The platform's
+            // own over-limit refusal passes through untouched, being a classified input error.
+            return this.rethrowSanitisedFailure(err, 'getReorderLists');
+        }
     }
 
     /**
@@ -978,21 +1332,22 @@ export class ReorderListService {
     ): Promise<ReorderList | null> {
         let scope: ReorderListOwnerScope;
         try {
-            scope = await this.getOwnerScope(ctx);
+            scope = await this.getOwnerScope(ctx, 'getReorderList');
         } catch (err: unknown) {
-            // Same convention as the collection read, and the same reason: a null that is indistinguishable
-            // from every other inaccessible case, at the cost of zero statements against either plugin table.
-            if (!(err instanceof ForbiddenError)) {
-                Logger.warn(
-                    `Returning null for a reorder list because the owner scope could not be resolved: ${
-                        err instanceof Error ? err.message : String(err)
-                    }`,
-                    loggerCtx,
-                );
+            // Same convention as the collection read, and narrowed the same way: a refusal becomes the
+            // indistinguishable `null` at a cost of zero statements against either plugin table, while any
+            // other failure is reported rather than disguised as "no such list". A caller cannot act on a
+            // null they were given because the database was down, and an operator cannot see it at all.
+            if (err instanceof ForbiddenError) {
+                return null;
             }
-            return null;
+            return this.rethrowSanitisedFailure(err, 'getReorderList');
         }
-        return this.findOwnedList(ctx, id, scope);
+        try {
+            return await this.findOwnedList(ctx, id, scope);
+        } catch (err: unknown) {
+            return this.rethrowSanitisedFailure(err, 'getReorderList');
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1052,25 +1407,47 @@ export class ReorderListService {
 
         let scope: ReorderListOwnerScope;
         try {
-            scope = await this.getOwnerScope(ctx);
+            scope = await this.getOwnerScope(ctx, 'getLinesForLists');
         } catch (err: unknown) {
-            // The read convention again: every requested identifier keeps its pre-seeded empty page, and no
-            // statement is issued against either plugin table.
-            if (!(err instanceof ForbiddenError)) {
-                Logger.warn(
-                    `Returning empty reorder list line pages because the owner scope could not be resolved: ${
-                        err instanceof Error ? err.message : String(err)
-                    }`,
-                    loggerCtx,
-                );
+            // The read convention again, narrowed the same way: a refusal leaves every requested identifier
+            // holding its pre-seeded empty page and issues no statement against either plugin table, while
+            // any other failure is reported. A page of lists whose lines silently came back empty because a
+            // query failed would render as "these lists have no lines", which is a false statement about
+            // the buyer's own data.
+            if (err instanceof ForbiddenError) {
+                return pages;
             }
-            return pages;
+            return this.rethrowSanitisedFailure(err, 'getLinesForLists');
         }
 
+        try {
+            return await this.readLinesForLists(ctx, parentIds, pages, scope, options);
+        } catch (err: unknown) {
+            return this.rethrowSanitisedFailure(err, 'getLinesForLists');
+        }
+    }
+
+    /**
+     * The statement-issuing half of {@link ReorderListService.getLinesForLists}, extracted so that the
+     * public method's guard and its query body each sit inside exactly one sanitiser and neither can grow a
+     * path that bypasses it.
+     *
+     * It receives the pre-seeded page map rather than building one, so every identifier the caller asked
+     * about is present in the result whatever this method finds.
+     */
+    private async readLinesForLists(
+        ctx: RequestContext,
+        parentIds: ID[],
+        pages: Map<ID, PaginatedList<ReorderListLine>>,
+        scope: ReorderListOwnerScope,
+        options?: ListQueryOptions<ReorderListLine>,
+    ): Promise<Map<ID, PaginatedList<ReorderListLine>>> {
+        const sort = this.effectiveSort<ReorderListLine>(options?.sort);
         const queryBuilder = this.listQueryBuilder.build(
             ReorderListLine,
             {
                 ...options,
+                sort,
                 // The same stricter fallback as the collection read, applied to the nested collection.
                 take: options?.take ?? this.defaultReorderListLinesPageSize,
             },
@@ -1087,21 +1464,68 @@ export class ReorderListService {
                     reorderListId: In(parentIds),
                     reorderList: { customerId: scope.customerId, channelId: scope.channelId },
                 },
-                orderBy: this.appendedLineOrder(options?.sort),
+                orderBy: this.appendedLineOrder(sort),
             },
         );
         // Read the window the platform resolved — which is where an over-limit request has already been
-        // refused — and then clear it, so the one statement below is not limited to a single parent's page.
+        // refused — and then clear it, because the statements below serve every parent on the page and neither
+        // may carry one parent's `LIMIT`.
         const window: ResolvedLinesWindow = {
             take: queryBuilder.expressionMap.take ?? this.defaultReorderListLinesPageSize,
             skip: queryBuilder.expressionMap.skip ?? 0,
         };
         queryBuilder.take(undefined).skip(undefined);
 
-        const rows = await queryBuilder.getMany();
+        // Cloned BEFORE the window predicate is added, so the totals count the collection rather than the page.
+        // A clone carries the built query's joins, predicate, filter and parameters — the same names bound to
+        // the same values — which is also why the ranking subquery below can be embedded in its own parent
+        // without any possibility of a parameter-name collision.
+        const totalsQueryBuilder = queryBuilder.clone();
 
-        // Partition by parent. Keyed on the stringified identifier because the configured id strategy decides
-        // whether an id is a number or a string, and a map keyed on the raw value would miss across the two.
+        const lineIdColumn = this.qualifiedLineColumn(queryBuilder.alias, 'id');
+        const parentIdColumn = this.qualifiedLineColumn(queryBuilder.alias, 'reorderListId');
+        const rankingQueryBuilder = queryBuilder
+            .clone()
+            // The order belongs inside the window function rather than on the subquery, where it would be both
+            // meaningless and, on some engines, discarded.
+            .orderBy()
+            .select(lineIdColumn, LINE_WINDOW_ID_COLUMN)
+            .addSelect(
+                `ROW_NUMBER() OVER (PARTITION BY ${parentIdColumn} ORDER BY ${this.windowOrderExpression(
+                    queryBuilder,
+                )})`,
+                LINE_WINDOW_RANK_COLUMN,
+            );
+
+        const windowAlias = this.escapeColumn(LINE_WINDOW_ALIAS);
+        const rankColumn = `${windowAlias}.${this.escapeColumn(LINE_WINDOW_RANK_COLUMN)}`;
+        // The rank is a window function, so it cannot be filtered where it is computed — hence the ranking
+        // query becomes a derived table and the rank is filtered one level out. `skip` and `take` are a
+        // half-open range over one-based ranks: rank > skip and rank <= skip + take.
+        //
+        // Cutting each parent's window in the DATABASE rather than in memory is the whole point. Slicing a
+        // union read that carried every line of every parent on the page would load a page of ten lists
+        // holding two hundred lines each — two thousand rows — to return twenty, while a write transaction
+        // holds its connection.
+        const rankedLineIds =
+            `SELECT ${this.escapeColumn(LINE_WINDOW_ID_COLUMN)} ` +
+            `FROM (${rankingQueryBuilder.getQuery()}) ${windowAlias} ` +
+            `WHERE ${rankColumn} > :${LINE_WINDOW_SKIP_PARAM} AND ${rankColumn} <= :${LINE_WINDOW_UPPER_PARAM}`;
+        queryBuilder.andWhere(`${lineIdColumn} IN (${rankedLineIds})`, {
+            [LINE_WINDOW_SKIP_PARAM]: window.skip,
+            [LINE_WINDOW_UPPER_PARAM]: window.skip + window.take,
+        });
+
+        const rows = await queryBuilder.getMany();
+        const totals = await totalsQueryBuilder
+            .orderBy()
+            .select(parentIdColumn, LINE_TOTALS_PARENT_COLUMN)
+            .addSelect('COUNT(*)', LINE_TOTALS_COUNT_COLUMN)
+            .groupBy(parentIdColumn)
+            .getRawMany<Record<string, unknown>>();
+
+        // Both maps are keyed on the stringified identifier because the configured id strategy decides whether
+        // an id is a number or a string, and a map keyed on the raw value would miss across the two.
         const partitions = new Map<string, ReorderListLine[]>();
         for (const row of rows) {
             const key = String(row.reorderListId);
@@ -1112,16 +1536,81 @@ export class ReorderListService {
                 partitions.set(key, [row]);
             }
         }
+        const totalsByParent = new Map<string, number>();
+        for (const total of totals) {
+            // The engines disagree about whether a count comes back as a number or as a string, so it is
+            // coerced once here rather than trusted to arrive as either.
+            totalsByParent.set(
+                String(total[LINE_TOTALS_PARENT_COLUMN]),
+                Number(total[LINE_TOTALS_COUNT_COLUMN]),
+            );
+        }
         for (const listId of parentIds) {
-            const partition = partitions.get(String(listId)) ?? [];
+            const key = String(listId);
             pages.set(listId, {
-                items: partition.slice(window.skip, window.skip + window.take),
-                // Exact, and free: the union read carries every line of every parent on the page, so the
-                // partition's length IS the parent's total and no counting statement is needed.
-                totalItems: partition.length,
+                items: partitions.get(key) ?? [],
+                // The parent's whole collection under the caller's filter, which is deliberately NOT the size
+                // of the window: a caller paging past the last line must still be told how many there are.
+                totalItems: totalsByParent.get(key) ?? 0,
             });
         }
         return pages;
+    }
+
+    /**
+     * Renders one of this line table's columns as a fully qualified, engine-escaped identifier, for use inside
+     * a raw SQL fragment.
+     *
+     * The physical name is read from the entity's own metadata rather than assumed to equal the property name,
+     * so a naming strategy that transformed it could not silently produce a fragment naming a column that does
+     * not exist. Both halves are escaped, which additionally keeps the fragment away from the query builder's
+     * `alias.property` substitution: an already-quoted identifier is not a property reference.
+     */
+    private qualifiedLineColumn(alias: string, propertyPath: string): string {
+        const column = this.connection.rawConnection
+            .getMetadata(ReorderListLine)
+            .findColumnWithPropertyPath(propertyPath);
+        if (!column) {
+            // Unreachable for a property this file names literally, and reported rather than papered over
+            // because the alternative is a raw fragment that fails at the engine with a driver message.
+            throw withoutStackFrames(new InternalServerError(UNCLASSIFIED_FAILURE_MESSAGE));
+        }
+        return `${this.escapeColumn(alias)}.${this.escapeColumn(column.databaseName)}`;
+    }
+
+    /**
+     * Renders the ordering the platform composed for a built lines query as the `ORDER BY` of a window
+     * function, so that each parent's window is cut in exactly the order the page is returned in.
+     *
+     * Reading the order back off the built query rather than rebuilding it is what keeps the two identical:
+     * the caller's own sort, the appended identifier tie-break and the platform's own translation of both are
+     * already resolved there, and a second derivation could drift from it. Each key arrives as the query's
+     * alias followed by a property path, which is translated to the same escaped physical form the rest of
+     * these fragments use; a key that is already a SQL expression — which is how the platform represents a
+     * calculated column — is passed through unchanged.
+     */
+    private windowOrderExpression(queryBuilder: SelectQueryBuilder<ReorderListLine>): string {
+        const alias = queryBuilder.alias;
+        const terms: string[] = [];
+        for (const [key, value] of Object.entries(queryBuilder.expressionMap.orderBys)) {
+            const direction = typeof value === 'string' ? value : value.order;
+            const propertyPath = key.startsWith(`${alias}.`) ? key.slice(alias.length + 1) : undefined;
+            const column = propertyPath
+                ? this.connection.rawConnection
+                      .getMetadata(ReorderListLine)
+                      .findColumnWithPropertyPath(propertyPath)
+                : undefined;
+            const reference = column
+                ? `${this.escapeColumn(alias)}.${this.escapeColumn(column.databaseName)}`
+                : key;
+            terms.push(`${reference} ${direction === 'DESC' ? 'DESC' : 'ASC'}`);
+        }
+        // The declared default is a total order, and this service always appends the identifier tie-break, so
+        // the list is never empty in practice. The fallback exists so that a future change which stopped
+        // appending would produce a deterministic window rather than an engine-defined one.
+        return terms.length
+            ? terms.join(', ')
+            : `${this.qualifiedLineColumn(alias, 'createdAt')} ASC, ${this.qualifiedLineColumn(alias, 'id')} ASC`;
     }
 
     /**
@@ -1166,14 +1655,19 @@ export class ReorderListService {
             // The overwhelmingly common path: zero statements.
             return storedLineCount;
         }
-        const result = await this.connection
-            .getRepository(ctx, ReorderList)
-            .createQueryBuilder('reorderlist')
-            .update()
-            .set({ lineCount: observedTotal })
-            .where('id = :id', { id: listId })
-            .andWhere('lineCount = :storedLineCount', { storedLineCount })
-            .execute();
+        let result;
+        try {
+            result = await this.connection
+                .getRepository(ctx, ReorderList)
+                .createQueryBuilder('reorderlist')
+                .update()
+                .set({ lineCount: observedTotal })
+                .where('id = :id', { id: listId })
+                .andWhere('lineCount = :storedLineCount', { storedLineCount })
+                .execute();
+        } catch (err: unknown) {
+            return this.rethrowSanitisedFailure(err, 'reconcileLineCount');
+        }
         if (!result.affected) {
             // A competing writer moved the counter between the read and this statement. The observed total is
             // still the truthful answer for what this request saw, and the writer's own value now stands in
@@ -1265,6 +1759,41 @@ export class ReorderListService {
         return sort != null && Object.values(sort).some(direction => direction != null);
     }
 
+    /**
+     * Reduces a caller's sort parameter to the keys that actually order something, as a NEW object, and
+     * answers `undefined` where nothing is left.
+     *
+     * **Both halves of this are corrections to a real defect rather than tidying, and both come from the same
+     * property of the generated input: every position in it is nullable.**
+     *
+     * The first half is validity. A direction of `null` is not "no direction" to the platform's sort parser —
+     * it copies every entry it is given straight into the ORM's order map, so a `null` direction becomes a
+     * literal `ORDER BY <column> null` and the statement fails at the engine. A caller can send such an object
+     * legitimately, most obviously a generated client that fills every field of the sort input, so it is
+     * removed here rather than trusted to be absent.
+     *
+     * The second half is *position*, and it is the subtler one. The builder merges the two sorts with
+     * `Object.assign`, which overwrites an existing key's value while leaving that key where it already was.
+     * So a caller sort of `{ id: null, createdAt: 'ASC' }` merged with an appended `{ id: 'DESC' }` would order
+     * by the identifier FIRST and the caller's own key second — the identifier promoted from tie-break to
+     * primary sort, which is a substitution wearing the shape of an append. Dropping the null-directioned key
+     * here removes it from the merge entirely, so the appended key lands last, which is what "appended" means.
+     *
+     * The caller's own object is never mutated: the sort travels on to the builder as a fresh object, so an
+     * argument the api layer may reuse is left exactly as it arrived.
+     */
+    private effectiveSort<T extends VendureEntity>(
+        sort: ListQueryOptions<T>['sort'],
+    ): ListQueryOptions<T>['sort'] {
+        if (sort == null) {
+            return undefined;
+        }
+        const ordering = Object.entries(sort as Record<string, unknown>).filter(
+            ([, direction]) => direction != null,
+        );
+        return ordering.length ? (Object.fromEntries(ordering) as ListQueryOptions<T>['sort']) : undefined;
+    }
+
     // ---------------------------------------------------------------------------------------------------
     // Writes over the list itself. A failed guard propagates, so an unauthenticated write is FORBIDDEN.
     // ---------------------------------------------------------------------------------------------------
@@ -1286,7 +1815,12 @@ export class ReorderListService {
      *
      * **The list bound is enforced by counting and inserting inside one transaction, under a row lock on the
      * owning customer where the engine supports one** — so a second concurrent creator waits and then counts
-     * the first one's row, rather than both reading a count below the maximum and both inserting.
+     * the first one's row, rather than both reading a count below the maximum and both inserting. **The lock
+     * is taken by the transaction's first statement, which is also the one that resolves the owning
+     * customer**, because a plain read issued before it would fix this transaction's consistent-read snapshot
+     * on MariaDB and MySQL and the later count would then answer from a moment before the predecessor
+     * committed — a lock that is genuinely held and a bound that is still exceeded. See
+     * {@link ReorderListService.getLockedOwnerScope}.
      *
      * **The name-uniqueness rule has two halves and both are needed.** The pre-check produces the precise
      * conflict result on the ordinary path, including for a name that differs from a stored one only along a
@@ -1307,35 +1841,45 @@ export class ReorderListService {
         ctx: RequestContext,
         input: CreateReorderListInput,
     ): Promise<CreateReorderListResult> {
-        // Not wrapped in try/catch: an unauthenticated write must surface the propagated FORBIDDEN error.
-        const scope = await this.getOwnerScope(ctx);
+        // The session guard is evaluated here, before any statement and before any transaction, so that an
+        // unauthenticated write surfaces the propagated FORBIDDEN error without opening one. It costs no
+        // database read: it is the third conjunct of the predicate and reads the session alone.
+        this.requireActiveUser(ctx);
         // Canonicalisation and its three rejections live in one place, so no second code path can disagree
-        // about what a stored name is. This throws for a name that cannot be stored.
+        // about what a stored name is. This throws for a name that cannot be stored, again before any
+        // statement, so a refused name never takes a lock.
         const { name, nameKey } = canonicaliseReorderListName(input.name);
 
-        return this.connection.withTransaction(ctx, async transactionCtx => {
-            // The lock comes first, inside this transaction, so the count below observes any competing
-            // creator's committed row rather than racing it.
-            await this.acquireCustomerLock(transactionCtx, scope.customerId);
-            const listRepository = this.connection.getRepository(transactionCtx, ReorderList);
+        try {
+            return await this.connection.withTransaction(ctx, async transactionCtx => {
+                // THE FIRST DATABASE STATEMENT OF THIS TRANSACTION, AND IT IS A LOCKING READ. Resolving the
+                // owning customer and locking that row are one statement, so that no consistent read
+                // precedes the lock and the count below is therefore the read that fixes this transaction's
+                // snapshot — after the lock is held, and so after any competing creator has committed. See
+                // getLockedOwnerScope for why a plain lookup before the lock defeats the bound on MariaDB
+                // and MySQL while leaving the lock itself looking perfectly correct.
+                const scope = await this.getLockedOwnerScope(transactionCtx, 'createReorderList');
+                const listRepository = this.connection.getRepository(transactionCtx, ReorderList);
 
-            const heldLists = await listRepository.count({
-                where: { customerId: scope.customerId, channelId: scope.channelId },
-            });
-            if (heldLists >= this.maxListsPerCustomer) {
-                // At the maximum as well as over it: holding exactly the maximum means there is no room for
-                // one more. Nothing has been written at this point.
-                return new ReorderListLimitError(this.maxListsPerCustomer);
-            }
+                const heldLists = await listRepository.count({
+                    where: { customerId: scope.customerId, channelId: scope.channelId },
+                });
+                if (heldLists >= this.maxListsPerCustomer) {
+                    // At the maximum as well as over it: holding exactly the maximum means there is no room
+                    // for one more. Nothing has been written at this point.
+                    return new ReorderListLimitError(this.maxListsPerCustomer);
+                }
 
-            const conflicting = await listRepository.count({
-                where: { customerId: scope.customerId, channelId: scope.channelId, nameKey },
-            });
-            if (conflicting > 0) {
-                return new ReorderListNameConflictError(nameKey);
-            }
+                const conflicting = await listRepository.count({
+                    where: { customerId: scope.customerId, channelId: scope.channelId, nameKey },
+                });
+                if (conflicting > 0) {
+                    return new ReorderListNameConflictError(nameKey);
+                }
 
-            try {
+                // Deliberately NOT wrapped in a try/catch of its own. See the catch below: a constraint
+                // violation has to leave this callback for the transaction to be unwound before it is
+                // translated.
                 return await listRepository.save(
                     new ReorderList({
                         customerId: scope.customerId,
@@ -1347,12 +1891,26 @@ export class ReorderListService {
                         lineCount: 0,
                     }),
                 );
-            } catch (err: unknown) {
-                // The race the pre-check above cannot win. Only the one named constraint is translated; every
-                // other database failure is re-raised, sanitised, by the helper.
-                return this.translateNameConflict(err, nameKey);
-            }
-        });
+            });
+        } catch (err: unknown) {
+            // THE RACE THE PRE-CHECK CANNOT WIN, AND THE TRANSLATION IS OUTSIDE THE TRANSACTION ON PURPOSE.
+            //
+            // Catching the violation *inside* the callback and returning a union member from there is the
+            // shape this replaces, and it fails on PostgreSQL rather than merely being untidy. The platform
+            // runs this callback through a wrapper that COMMITs whatever the callback returns
+            // (`packages/core/src/connection/transaction-wrapper.ts`), and because every mutation resolver
+            // carries `@Transaction()`, that wrapper is nested: it opens a SAVEPOINT rather than a
+            // transaction and its commit is therefore `RELEASE SAVEPOINT`. PostgreSQL puts a subtransaction
+            // whose statement failed into an aborted state in which the only legal moves are `ROLLBACK TO
+            // SAVEPOINT` and ending the transaction — so the `RELEASE` raises, and the buyer receives an
+            // internal error in place of the conflict result the contract promises.
+            //
+            // Letting the violation escape hands the wrapper an error instead, so it issues `ROLLBACK TO
+            // SAVEPOINT` (or `ROLLBACK` when this is the outermost transaction), leaving a usable
+            // transaction and nothing written. Only then is the error inspected, and only the one named
+            // constraint is translated; every other database failure is re-raised sanitised.
+            return this.translateNameConflict(err, nameKey, 'createReorderList');
+        }
     }
 
     /**
@@ -1373,6 +1931,18 @@ export class ReorderListService {
      * creation, so this operation can return `ReorderListNameConflictError` — and a blank new name is refused
      * as malformed input rather than stored.
      *
+     * **The conflict is decided by the constraint alone, and the absence of a service-level pre-check here is
+     * a correctness requirement rather than an economy.** A pre-check would have to run before the row is
+     * addressed, since it is a question about *other* rows — and asking it first inverts the order the two
+     * results have to be decided in. A caller renaming a list they do not own, or one that does not exist, to
+     * a name they *do* already hold would then be told the name conflicts: an answer that confirms which
+     * names the caller holds is harmless, but it also confirms that the identifier they guessed was worth
+     * asking about, and it replaces the one normalised `ReorderListNotFoundError` every inaccessible case is
+     * supposed to produce. Addressing the row first removes the question: a row the caller does not own is
+     * matched by nothing, so no constraint can be reached and the answer is the indistinguishable not-found.
+     * A conflict is therefore reachable only for a row the caller does own, which is exactly when it is true.
+     * The create path keeps its pre-check because it addresses no existing row and so has no order to invert.
+     *
      * @param ctx - The request context.
      * @param input - The list identifier and the new name.
      * @throws A `ForbiddenError` when the request carries no authenticated session, and a `UserInputError`
@@ -1384,36 +1954,13 @@ export class ReorderListService {
         ctx: RequestContext,
         input: UpdateReorderListInput,
     ): Promise<UpdateReorderListResult> {
-        const scope = await this.getOwnerScope(ctx);
+        const scope = await this.getOwnerScope(ctx, 'updateReorderList');
         const { name, nameKey } = canonicaliseReorderListName(input.name);
 
-        return this.connection.withTransaction(ctx, async transactionCtx => {
-            const listRepository = this.connection.getRepository(transactionCtx, ReorderList);
-
-            // The pre-check, for the same reason as on the create path: it produces the precise conflict
-            // result for a name that collides only under the canonical comparison. It excludes the row being
-            // renamed, so renaming a list to the name it already holds is not reported as a conflict with
-            // itself. The named constraint remains the authority for the race.
-            const conflicting = await listRepository.count({
-                where: { customerId: scope.customerId, channelId: scope.channelId, nameKey },
-            });
-            if (conflicting > 0) {
-                const alreadyOwnsThisName = await listRepository.count({
-                    where: {
-                        id: input.id,
-                        customerId: scope.customerId,
-                        channelId: scope.channelId,
-                        nameKey,
-                    },
-                });
-                if (!alreadyOwnsThisName) {
-                    return new ReorderListNameConflictError(nameKey);
-                }
-            }
-
-            let affected: number | null | undefined;
-            try {
-                const result = await listRepository
+        try {
+            return await this.connection.withTransaction(ctx, async transactionCtx => {
+                const result = await this.connection
+                    .getRepository(transactionCtx, ReorderList)
                     .createQueryBuilder('reorderlist')
                     .update()
                     .set({ name, nameKey })
@@ -1421,16 +1968,18 @@ export class ReorderListService {
                     .andWhere('customerId = :customerId', { customerId: scope.customerId })
                     .andWhere('channelId = :channelId', { channelId: scope.channelId })
                     .execute();
-                affected = result.affected;
-            } catch (err: unknown) {
-                return this.translateNameConflict(err, nameKey);
-            }
 
-            if (affected !== 1) {
-                return new ReorderListNotFoundError();
-            }
-            return this.reloadOwnedList(transactionCtx, input.id, scope);
-        });
+                if (result.affected !== 1) {
+                    return new ReorderListNotFoundError();
+                }
+                return await this.reloadOwnedList(transactionCtx, input.id, scope);
+            });
+        } catch (err: unknown) {
+            // Same rollback-first translation as the create path, for the same PostgreSQL-savepoint reason,
+            // and reached only when the statement above was refused by the named constraint — which can only
+            // happen for a row this caller owns, because a row they do not own is not matched at all.
+            return this.translateNameConflict(err, nameKey, 'updateReorderList');
+        }
     }
 
     /**
@@ -1459,25 +2008,31 @@ export class ReorderListService {
      * @since 3.8.0
      */
     async deleteReorderList(ctx: RequestContext, id: ID): Promise<DeleteReorderListResult> {
-        const scope = await this.getOwnerScope(ctx);
+        const scope = await this.getOwnerScope(ctx, 'deleteReorderList');
 
-        return this.connection.withTransaction(ctx, async transactionCtx => {
-            const result = await this.connection
-                .getRepository(transactionCtx, ReorderList)
-                .createQueryBuilder('reorderlist')
-                .delete()
-                .where('id = :id', { id })
-                .andWhere('customerId = :customerId', { customerId: scope.customerId })
-                .andWhere('channelId = :channelId', { channelId: scope.channelId })
-                .execute();
+        try {
+            return await this.connection.withTransaction(ctx, async transactionCtx => {
+                const result = await this.connection
+                    .getRepository(transactionCtx, ReorderList)
+                    .createQueryBuilder('reorderlist')
+                    .delete()
+                    .where('id = :id', { id })
+                    .andWhere('customerId = :customerId', { customerId: scope.customerId })
+                    .andWhere('channelId = :channelId', { channelId: scope.channelId })
+                    .execute();
 
-            if (result.affected !== 1) {
-                return new ReorderListNotFoundError();
-            }
-            // No counter maintenance is needed or possible: the counter lived on the row that has just been
-            // removed, and the lines went with it through the cascade.
-            return { __typename: 'DeletionResponse', result: DeletionResult.DELETED };
-        });
+                if (result.affected !== 1) {
+                    return new ReorderListNotFoundError();
+                }
+                // No counter maintenance is needed or possible: the counter lived on the row that has just
+                // been removed, and the lines went with it through the cascade.
+                return { __typename: 'DeletionResponse', result: DeletionResult.DELETED };
+            });
+        } catch (err: unknown) {
+            // No constraint on this path is a buyer outcome — a delete cannot collide with a unique index —
+            // so every failure here is unclassified and is reported without driver detail.
+            return this.rethrowSanitisedFailure(err, 'deleteReorderList');
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1533,100 +2088,187 @@ export class ReorderListService {
         ctx: RequestContext,
         input: AddItemToReorderListInput,
     ): Promise<AddItemToReorderListResult> {
-        const scope = await this.getOwnerScope(ctx);
+        const scope = await this.getOwnerScope(ctx, 'addItemToReorderList');
 
-        return this.connection.withTransaction(ctx, async transactionCtx => {
-            const list = await this.findOwnedList(transactionCtx, input.reorderListId, scope);
-            if (!list) {
-                // Indistinguishable for an unknown identifier, another customer's list and another channel's
-                // list, and nothing has been written.
-                return new ReorderListNotFoundError();
-            }
-
-            // Existence in the active channel, and nothing else. This is the only collaborator call this
-            // operation makes: no saleable-stock read, no display-stock read and no available-stock read.
-            const variant = await this.productVariantService.findOne(transactionCtx, input.productVariantId);
-            if (!variant) {
-                throw new UserInputError(VARIANT_NOT_FOUND_KEY, {
-                    [ID_VARIABLE]: String(input.productVariantId),
-                });
-            }
-
-            const lineRepository = this.connection.getRepository(transactionCtx, ReorderListLine);
-
-            // Step one: resolve the existing line, scoped to this list so a line of another list cannot be
-            // reached even by a variant they share.
-            const existingLine = await lineRepository.findOne({
-                where: { reorderListId: list.id, productVariantId: input.productVariantId },
-            });
-
-            // Step two: validate, and BOTH checks are needed rather than one being a superset of the other.
-            // The increment must itself be a positive integer, or a caller could subtract by adding — and an
-            // increment of zero onto a line already holding six would leave a resulting quantity that passes.
-            // The resulting quantity must then be within the maximum, because the bound applies to what the
-            // line would hold and not to what was asked for: an add of six onto a line already holding six is
-            // refused at a maximum of ten even though the increment alone is legal.
-            this.validateQuantity(input.quantity);
-            const resultingQuantity = (existingLine?.quantity ?? 0) + input.quantity;
-            this.validateQuantity(resultingQuantity);
-
-            if (existingLine) {
-                // Accumulate: one atomic statement addressed by the line's own identifier, whose affected-row
-                // count is read. The line's identifier is unchanged, no second row is created, and the list's
-                // stored line count is untouched because no line was added.
-                const quantityColumn = this.escapeColumn('quantity');
-                let accumulated: number | null | undefined;
-                try {
-                    const result = await lineRepository
-                        .createQueryBuilder('reorderlistline')
-                        .update()
-                        .set({ quantity: () => `${quantityColumn} + :delta` })
-                        .where('id = :lineId', { lineId: existingLine.id })
-                        .andWhere('reorderListId = :reorderListId', { reorderListId: list.id })
-                        .setParameter('delta', input.quantity)
-                        .execute();
-                    accumulated = result.affected;
-                } catch (err: unknown) {
-                    // Nothing a caller can provoke reaches here — the quantity was validated above — so this
-                    // is a defect rather than an outcome, and is reported as one without leaking driver text.
-                    return this.rethrowSanitisedWriteFailure(
-                        err,
-                        'accumulating a reorder list line quantity',
-                    );
-                }
-                if (accumulated !== 1) {
-                    // The line was removed by a concurrent request between resolving it and incrementing it.
-                    // There is no state left to accumulate onto, so the truthful answer is that the line is
-                    // gone — reported through the list-level result this union carries.
-                    return new ReorderListNotFoundError();
-                }
-                return this.reloadOwnedList(transactionCtx, list.id, scope);
-            }
-
-            // Step three, and only now: claim room for a new line. This is the first write of the insert path,
-            // so a refusal leaves nothing to undo.
-            const claimed = await this.claimLineCapacity(transactionCtx, list.id);
-            if (!claimed) {
-                return new ReorderListLimitError(this.maxLinesPerList);
-            }
+        // Bounded retries, and each retry is a WHOLE fresh transaction rather than a second attempt inside a
+        // failed one. Two states require it, both of them a concurrent request having created the very line
+        // this call was about to create: the line-level uniqueness constraint refusing the insert, and the
+        // capacity claim discovering the duplicate before it inserts. In both the contract's answer is an
+        // accumulation onto the winner's row rather than an error, so the loser redoes the operation with the
+        // row now visible. See addItemWithinTransaction for why the retry resolves the line by a current read.
+        for (let attempt = 0; ; attempt++) {
+            const useCurrentRead = attempt > 0;
             try {
-                await lineRepository.save(
-                    new ReorderListLine({
-                        reorderListId: list.id,
-                        productVariantId: input.productVariantId,
-                        quantity: input.quantity,
-                    }),
+                return await this.connection.withTransaction(ctx, transactionCtx =>
+                    this.addItemWithinTransaction(transactionCtx, input, scope, useCurrentRead),
                 );
             } catch (err: unknown) {
-                // A duplicate line for this list-and-variant pair can only arrive here when two concurrent
-                // adds both found no existing line and both inserted. The line-level uniqueness constraint
-                // exists to make the deduplication rule unbypassable rather than to produce a buyer-visible
-                // outcome, so a violation of it is an internal defect and is **never** translated into a name
-                // conflict — the two constraints are separate and are named separately.
-                return this.rethrowSanitisedWriteFailure(err, 'inserting a reorder list line');
+                const reconcilable =
+                    err instanceof ConcurrentLineInsertDetected ||
+                    this.violatesConstraint(err, LINE_DEDUPLICATION_CONSTRAINT_DESCRIPTOR);
+                if (reconcilable && attempt + 1 < MAX_ADD_RECONCILIATION_ATTEMPTS) {
+                    // The transaction (or the savepoint, under a resolver's own transaction) has already been
+                    // rolled back by the platform's wrapper before this line runs, which is what makes a
+                    // fresh attempt possible at all: the capacity claim this attempt may have taken is undone
+                    // with it, so the retry neither double-counts the counter nor inherits an aborted
+                    // transaction. Translating or retrying INSIDE the callback cannot do either.
+                    continue;
+                }
+                return this.rethrowSanitisedFailure(err, 'addItemToReorderList');
             }
-            return this.reloadOwnedList(transactionCtx, list.id, scope);
-        });
+        }
+    }
+
+    /**
+     * One attempt at {@link ReorderListService.addItemToReorderList}, inside one transaction.
+     *
+     * The three mandated steps are unchanged and in their fixed order — resolve the existing line, validate
+     * the RESULTING quantity, and only then consult the line bound — and each of the three concurrent states
+     * the straight-line version could not distinguish is now resolved explicitly rather than collapsed into
+     * whichever outcome happened to be nearest.
+     *
+     * @param useCurrentRead - Whether to resolve the existing line by a locking (current) read. `false` on
+     * the first attempt, so the ordinary path takes no row locks and cannot deadlock on a gap lock; `true` on
+     * a retry, where it does two things at once. It sees the winner's committed row — which a plain read on
+     * MariaDB or MySQL would NOT, because a retry that runs as a savepoint inside a resolver's transaction
+     * keeps that transaction's original REPEATABLE READ snapshot and the winner committed after it was taken,
+     * so a retry built on a consistent read would loop until its attempts ran out. And it holds the row for
+     * the increment that follows, so the quantity this attempt validated is the quantity it increments.
+     */
+    private async addItemWithinTransaction(
+        ctx: RequestContext,
+        input: AddItemToReorderListInput,
+        scope: ReorderListOwnerScope,
+        useCurrentRead: boolean,
+    ): Promise<AddItemToReorderListResult> {
+        const list = await this.findOwnedList(ctx, input.reorderListId, scope);
+        if (!list) {
+            // Indistinguishable for an unknown identifier, another customer's list and another channel's
+            // list, and nothing has been written.
+            return new ReorderListNotFoundError();
+        }
+
+        // Existence in the active channel, and nothing else. This is the only collaborator call this
+        // operation makes: no saleable-stock read, no display-stock read and no available-stock read.
+        //
+        // The empty relation list is load-bearing rather than decorative. Omitting the argument does not
+        // mean "no relations": the collaborator substitutes a default set of three — the product, the
+        // variant's featured asset and the product's featured asset — so a request whose only question is
+        // "does this variant resolve in this channel?" would load a catalogue object graph while a write
+        // transaction holds its connection. Passing the empty list declines all three.
+        //
+        // What remains is not free, and is stated rather than implied: the collaborator always joins the
+        // variant's tax category, the variant's own prices and translations are declared eager on the core
+        // entity, and it applies channel price and tax to the row before returning it. That residual cost
+        // is the price of asking the platform rather than reading the table directly, which is the trade
+        // the architecture requires — a channel-scoped existence check with a narrower cost is not part of
+        // the collaborator's published surface.
+        const variant = await this.productVariantService.findOne(ctx, input.productVariantId, []);
+        if (!variant) {
+            throw withoutStackFrames(
+                new UserInputError(VARIANT_NOT_FOUND_KEY, {
+                    [ID_VARIABLE]: String(input.productVariantId),
+                }),
+            );
+        }
+
+        // Step one: resolve the existing line, scoped to this list so a line of another list cannot be
+        // reached even by a variant they share.
+        const existingLine = await this.findLineForVariant(
+            ctx,
+            list.id,
+            input.productVariantId,
+            useCurrentRead,
+        );
+
+        // Step two: validate, and BOTH checks are needed rather than one being a superset of the other.
+        // The increment must itself be a positive integer, or a caller could subtract by adding — and an
+        // increment of zero onto a line already holding six would leave a resulting quantity that passes.
+        // The resulting quantity must then be within the maximum, because the bound applies to what the
+        // line would hold and not to what was asked for: an add of six onto a line already holding six is
+        // refused at a maximum of ten even though the increment alone is legal.
+        this.validateQuantity(input.quantity);
+        this.validateQuantity((existingLine?.quantity ?? 0) + input.quantity);
+
+        if (existingLine) {
+            const accumulation = await this.accumulateLineQuantity(
+                ctx,
+                existingLine.id,
+                list.id,
+                input.productVariantId,
+                input.quantity,
+                scope,
+            );
+            if (accumulation === 'accumulated') {
+                // The line's identifier is unchanged, no second row was created, and the list's stored line
+                // count is untouched because no line was added.
+                return this.reloadOwnedList(ctx, list.id, scope);
+            }
+            if (accumulation === 'above-maximum') {
+                // A concurrent add raised the stored quantity between this attempt's read and its increment,
+                // so the total this attempt would leave behind breaches the configured maximum. That is the
+                // same malformed-request outcome an over-maximum add reaches directly, and it is thrown for
+                // the same reason: a quantity that cannot be stored is not a business outcome.
+                throw withoutStackFrames(
+                    new UserInputError(QUANTITY_ABOVE_MAXIMUM_KEY, {
+                        [MAX_VARIABLE]: this.maxQuantityPerLine,
+                    }),
+                );
+            }
+            if (accumulation === 'list-gone') {
+                // The addressed line is still there and within the maximum, so the only conjunct left to have
+                // refused the increment is the ownership one: the list was deleted or moved out of the
+                // caller's scope between this attempt resolving it and the increment. Normalised to the same
+                // not-found every inaccessible case produces.
+                return new ReorderListNotFoundError();
+            }
+            if (accumulation === 'line-replaced') {
+                // A concurrent request removed the line this attempt had resolved and inserted a fresh one for
+                // the same variant. That is the same state a losing insert reaches — a row for this variant now
+                // exists and was not put there by this attempt — so it takes the same route: abandon this
+                // attempt so the platform unwinds it, and retry with the replacement visible, which accumulates
+                // onto it. Inserting instead would be refused by the per-variant constraint, and reporting it
+                // would refuse a write the contract requires to succeed.
+                throw new ConcurrentLineInsertDetected();
+            }
+            // 'line-gone': a concurrent request removed the line between the read and the increment. The list
+            // itself still resolved under the predicate at the top of this attempt, so the truthful answer is
+            // not "the list is gone" — it is that this variant is no longer on the list, which is precisely
+            // the state the insert path below exists for. Falling through re-uses the whole of it, including
+            // the capacity claim a new line has to make.
+        }
+
+        // Step three, and only now: claim room for a new line. This is the first write of the insert path,
+        // so a refusal leaves nothing to undo.
+        const capacity = await this.claimLineCapacity(ctx, list.id, input.productVariantId, scope);
+        switch (capacity) {
+            case 'claimed':
+                break;
+            case 'list-gone':
+                // The list was deleted (or moved out of scope) after this attempt resolved it. Reported as
+                // the same normalised not-found every inaccessible case produces, rather than as a limit
+                // breach it has nothing to do with.
+                return new ReorderListNotFoundError();
+            case 'duplicate-line':
+                // A concurrent add created the line for this very variant. The contract's answer is an
+                // accumulation onto it, so this attempt is abandoned and retried with the row visible.
+                throw new ConcurrentLineInsertDetected();
+            case 'full':
+                return new ReorderListLimitError(this.maxLinesPerList);
+        }
+
+        // A duplicate line for this list-and-variant pair can only arrive here when two concurrent adds both
+        // found no existing line and both inserted. The insert therefore DECLINES a conflict rather than
+        // failing on one, and the decline is signalled as the same reconciliation state every other duplicate
+        // route uses: the attempt is abandoned so the platform's wrapper unwinds it — releasing the capacity
+        // claim above with it — and the retry in the caller resolves the winner's row and accumulates onto it.
+        // It is never translated into a name conflict: the two constraints are separate, are named separately
+        // and carry different columns.
+        const inserted = await this.insertLineIfAbsent(ctx, list.id, input.productVariantId, input.quantity);
+        if (!inserted) {
+            throw new ConcurrentLineInsertDetected();
+        }
+        return this.reloadOwnedList(ctx, list.id, scope);
     }
 
     /**
@@ -1643,15 +2285,28 @@ export class ReorderListService {
      * changing a quantity on a line that already exists adds no line and therefore cannot breach a line-count
      * bound. Measuring it against that bound would refuse a write that adds nothing.
      *
-     * The quantity is validated **before any statement is issued**, so a refused adjustment leaves the line at
-     * exactly its prior value. A quantity of zero is refused rather than treated as a removal — removing the
-     * line is what expresses "none of this", and there is a published operation for it.
+     * The quantity is validated **before any write is issued**, so a refused adjustment leaves the line at
+     * exactly its prior value. It is not validated before any *statement*: the owner scope is resolved first,
+     * by one `Customer` read, because who is asking has to be established before what they asked for is
+     * judged — a caller with no session must be refused as forbidden rather than told their quantity was
+     * malformed. That read touches neither plugin table and writes nothing. A quantity of zero is refused
+     * rather than treated as a removal — removing the line is what expresses "none of this", and there is a
+     * published operation for it.
      *
-     * **The two not-found results are distinguished by a deliberate two-step.** The list is resolved first
-     * under the ownership predicate: if that fails the answer is `ReorderListNotFoundError`, indistinguishable
-     * for an unknown, foreign or other-channel list. Only if the list *did* resolve is the line addressed, by
-     * its own identifier together with the parent list's, and a zero affected-row count then means the line
-     * genuinely did not exist within a list the caller owns — which is `ReorderListLineNotFoundError`.
+     * **The ownership predicate is carried by the statement that writes, not by a read before it.** The
+     * update's `WHERE` names the line, its parent list, and — through a correlated `EXISTS` over
+     * `reorder_list` — the acting customer and the active channel, so a single conditional statement decides
+     * whether this caller may change this line and its affected-row count is the authority. Resolving the list
+     * first and then addressing the line by that list's identifier alone would leave a window in which the
+     * list is deleted, or its ownership changes, between the two statements, and the second — holding only an
+     * identifier — would apply anyway.
+     *
+     * **The two not-found results are still distinguished, but by labelling a decided miss rather than by
+     * deciding.** A zero affected-row count means the line was not changed, and one minimal scoped read then
+     * says which of the two reasons to report: no accessible list gives `ReorderListNotFoundError` —
+     * indistinguishable for an unknown, foreign or other-channel list — and an accessible list gives
+     * `ReorderListLineNotFoundError`. That read cannot admit a write, because the write has already been
+     * refused.
      *
      * @param ctx - The request context.
      * @param input - The list, the line, and the absolute quantity to set.
@@ -1664,43 +2319,57 @@ export class ReorderListService {
         ctx: RequestContext,
         input: AdjustReorderListLineInput,
     ): Promise<AdjustReorderListLineResult> {
-        const scope = await this.getOwnerScope(ctx);
-        // Before any statement, so a refused adjustment cannot have touched the line.
+        const scope = await this.getOwnerScope(ctx, 'adjustReorderListLine');
+        // Before any write, so a refused adjustment cannot have touched the line. The one statement that
+        // precedes it is the owner-scope read above, which touches neither plugin table: who is asking has
+        // to be established before what they asked for is judged.
         this.validateQuantity(input.quantity);
 
-        return this.connection.withTransaction(ctx, async transactionCtx => {
-            const list = await this.findOwnedList(transactionCtx, input.reorderListId, scope);
-            if (!list) {
-                return new ReorderListNotFoundError();
-            }
+        try {
+            return await this.connection.withTransaction(ctx, async transactionCtx => {
+                const result = await this.connection
+                    .getRepository(transactionCtx, ReorderListLine)
+                    .createQueryBuilder('reorderlistline')
+                    .update()
+                    // An absolute set, not an increment. No raw expression, so no escaping is needed here.
+                    .set({ quantity: input.quantity })
+                    .where('id = :lineId', { lineId: input.lineId })
+                    .andWhere('reorderListId = :reorderListId', { reorderListId: input.reorderListId })
+                    // The remaining two conjuncts of the ownership predicate, in this same statement.
+                    .andWhere(this.ownedListExistsClause())
+                    .setParameters({
+                        ownerCustomerId: scope.customerId,
+                        ownerChannelId: scope.channelId,
+                    })
+                    .execute();
 
-            const result = await this.connection
-                .getRepository(transactionCtx, ReorderListLine)
-                .createQueryBuilder('reorderlistline')
-                .update()
-                // An absolute set, not an increment. No raw expression, so no escaping is needed here.
-                .set({ quantity: input.quantity })
-                .where('id = :lineId', { lineId: input.lineId })
-                .andWhere('reorderListId = :reorderListId', { reorderListId: list.id })
-                .execute();
-
-            if (result.affected !== 1) {
-                return new ReorderListLineNotFoundError();
-            }
-            // The stored line count is deliberately untouched: no line was added or removed.
-            return this.reloadOwnedList(transactionCtx, list.id, scope);
-        });
+                if (result.affected !== 1) {
+                    return await this.classifyLineWriteMiss(transactionCtx, input.reorderListId, scope);
+                }
+                // The stored line count is deliberately untouched: no line was added or removed.
+                return await this.reloadOwnedList(transactionCtx, input.reorderListId, scope);
+            });
+        } catch (err: unknown) {
+            return this.rethrowSanitisedFailure(err, 'adjustReorderListLine');
+        }
     }
 
     /**
      * @description
      * Removes one line from a list.
      *
-     * The delete is a **single conditional statement** addressed by the line's own identifier together with
-     * the parent list's, issued only after the list itself has resolved under the ownership predicate — the
-     * same two-step that distinguishes `ReorderListNotFoundError` from `ReorderListLineNotFoundError`. The
-     * affected-row count is the authority: one means the line was removed, and zero means it was not there,
-     * which is also how a **second remove of the same line** is refused rather than reported as a success.
+     * The delete is a **single conditional statement carrying the whole ownership predicate**: the line's own
+     * identifier, its parent list's, and — through a correlated `EXISTS` over `reorder_list` — the acting
+     * customer and the active channel. One statement therefore decides both whether the line exists and
+     * whether this caller may remove it, and its affected-row count is the authority: one means the line was
+     * removed, and zero means it was not removed, which is also how a **second remove of the same line** is
+     * refused rather than reported as a success. Resolving the list in an earlier statement and then deleting
+     * by that list's identifier alone would leave the delete unguarded against the list being deleted, or
+     * changing hands, in between.
+     *
+     * A zero count is then labelled by one minimal scoped read: no accessible list gives
+     * `ReorderListNotFoundError`, an accessible list gives `ReorderListLineNotFoundError`. The read explains a
+     * refusal that has already happened; it never authorises one.
      *
      * **The stored line count is decremented in the same transaction as the delete**, which is what keeps the
      * counter and the rows in agreement, and the decrement carries a floor guard so the column's non-negative
@@ -1716,34 +2385,116 @@ export class ReorderListService {
         ctx: RequestContext,
         input: RemoveReorderListLineInput,
     ): Promise<RemoveReorderListLineResult> {
-        const scope = await this.getOwnerScope(ctx);
+        const scope = await this.getOwnerScope(ctx, 'removeReorderListLine');
 
-        return this.connection.withTransaction(ctx, async transactionCtx => {
-            const list = await this.findOwnedList(transactionCtx, input.reorderListId, scope);
-            if (!list) {
-                return new ReorderListNotFoundError();
-            }
+        try {
+            return await this.connection.withTransaction(ctx, async transactionCtx => {
+                // The parent BEFORE the child, and under a write lock where the engine has one. This is the
+                // one transaction in the service that would otherwise take the two rows in the opposite order
+                // to `deleteReorderList` — which takes the parent and then its children through the cascade —
+                // and two transactions taking the same two rows in opposite orders deadlock rather than wait.
+                // The predicate is the same three conjuncts, so an inaccessible list is still refused by
+                // matching nothing rather than by being loaded and discarded, and its answer is the same
+                // normalised not-found. See {@link ReorderListService.findOwnedListForUpdate}.
+                const parent = await this.findOwnedListForUpdate(transactionCtx, input.reorderListId, scope);
+                if (!parent) {
+                    return new ReorderListNotFoundError();
+                }
+                const result = await this.connection
+                    .getRepository(transactionCtx, ReorderListLine)
+                    .createQueryBuilder('reorderlistline')
+                    .delete()
+                    .where('id = :lineId', { lineId: input.lineId })
+                    .andWhere('reorderListId = :reorderListId', { reorderListId: input.reorderListId })
+                    // The remaining two conjuncts of the ownership predicate, in this same statement.
+                    .andWhere(this.ownedListExistsClause())
+                    .setParameters({
+                        ownerCustomerId: scope.customerId,
+                        ownerChannelId: scope.channelId,
+                    })
+                    .execute();
 
-            const result = await this.connection
-                .getRepository(transactionCtx, ReorderListLine)
-                .createQueryBuilder('reorderlistline')
-                .delete()
-                .where('id = :lineId', { lineId: input.lineId })
-                .andWhere('reorderListId = :reorderListId', { reorderListId: list.id })
-                .execute();
-
-            if (result.affected !== 1) {
-                return new ReorderListLineNotFoundError();
-            }
-            // Same transaction as the delete above, so the counter and the rows cannot be observed disagreeing.
-            await this.releaseLineCapacity(transactionCtx, list.id);
-            return this.reloadOwnedList(transactionCtx, list.id, scope);
-        });
+                if (result.affected !== 1) {
+                    return await this.classifyLineWriteMiss(transactionCtx, input.reorderListId, scope);
+                }
+                // Same transaction as the delete above, so the counter and the rows cannot be observed
+                // disagreeing.
+                await this.releaseLineCapacity(transactionCtx, input.reorderListId);
+                return await this.reloadOwnedList(transactionCtx, input.reorderListId, scope);
+            });
+        } catch (err: unknown) {
+            return this.rethrowSanitisedFailure(err, 'removeReorderListLine');
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------
     // Write-side conventions, shared by all six mutations so that none of them can quietly differ.
     // ---------------------------------------------------------------------------------------------------
+
+    /**
+     * Resolves one list under the full predicate by a **current** read, for the zero-affected path of a write.
+     *
+     * **This exists because {@link ReorderListService.findOwnedList} answers the wrong question after a write
+     * has been refused.** A plain `SELECT` is a consistent read, and on MariaDB and MySQL — whose default
+     * isolation level is REPEATABLE READ — every consistent read in a transaction answers from the read view
+     * built at that transaction's *first* one. Every mutation resolver carries `@Transaction()`, and the owner
+     * scope resolves through a customer `SELECT` before any of this service's own statements, so by the time a
+     * conditional write is issued the read view is already older than any concurrent commit. The write itself
+     * is a current operation and sees the truth, which is precisely why it can affect zero rows while a plain
+     * re-read still returns the row it was refused for: a list deleted since the read view was built is gone
+     * to the write and present to the read. Classifying the refusal from that stale answer reports the wrong
+     * reason — a deleted list read back as still there is then blamed on the line bound instead.
+     *
+     * A shared rather than exclusive lock is requested, because the question is existence and nothing here
+     * writes the row afterwards. On the SQLite family the lock is skipped and the plain read is already
+     * current, that driver serving a single connection so no second transaction can have committed anything
+     * this one has not seen.
+     *
+     * It is issued **only** on a zero-affected path, so a successful write never pays for it.
+     */
+    private async findOwnedListNow(
+        ctx: RequestContext,
+        id: ID,
+        scope: ReorderListOwnerScope,
+    ): Promise<ReorderList | null> {
+        const queryBuilder = this.connection
+            .getRepository(ctx, ReorderList)
+            .createQueryBuilder('reorderlist')
+            .where('reorderlist.id = :id', { id })
+            .andWhere('reorderlist.customerId = :customerId', { customerId: scope.customerId })
+            .andWhere('reorderlist.channelId = :channelId', { channelId: scope.channelId });
+        if (this.supportsPessimisticLocking) {
+            queryBuilder.setLock('pessimistic_read');
+        }
+        return queryBuilder.getOne();
+    }
+
+    /**
+     * Says which of the two not-found results to report for a line write that affected no row.
+     *
+     * It is a *labelling* step and never a deciding one, and the distinction is what keeps it safe. The write
+     * has already been refused by a single statement carrying the line, its parent and the caller's owner
+     * scope, so nothing this read returns can admit a write that the statement declined. All it establishes is
+     * which of the predicate's parts was unsatisfied, because the two are reported differently: an
+     * inaccessible list is `ReorderListNotFoundError` — indistinguishable for an unknown identifier, another
+     * customer's list and another channel's list, so no caller can probe for the existence of a list that is
+     * not theirs — while an accessible list means the line itself was the part that was missing, which is
+     * `ReorderListLineNotFoundError`.
+     *
+     * It is one statement, it is scoped by the same predicate as every other read here, and it runs only on
+     * the zero-affected path, so a successful write never pays for it. It is a **current** read for the reason
+     * {@link ReorderListService.findOwnedListNow} sets out: a plain read here would answer from a view older
+     * than the concurrent delete that caused the refusal, and would then report the line as missing from a
+     * list that is itself gone.
+     */
+    private async classifyLineWriteMiss(
+        ctx: RequestContext,
+        listId: ID,
+        scope: ReorderListOwnerScope,
+    ): Promise<ReorderListNotFoundError | ReorderListLineNotFoundError> {
+        const list = await this.findOwnedListNow(ctx, listId, scope);
+        return list ? new ReorderListLineNotFoundError() : new ReorderListNotFoundError();
+    }
 
     /**
      * Escapes a column identifier for the configured engine, for use inside a raw `SET` expression.
@@ -1760,7 +2511,86 @@ export class ReorderListService {
     }
 
     /**
-     * Refuses a quantity that cannot be stored, before any statement is issued.
+     * The correlated `EXISTS` fragment that carries the ownership predicate into a statement written against
+     * `reorder_list_line`, whose own row holds no customer and no channel.
+     *
+     * **Why a sub-query and not a preceding read.** Every write in this service is required to be a single
+     * conditional statement whose `WHERE` carries the acting customer and the active channel beside the row's
+     * identifier, with the affected-row count as the authority. A line row cannot satisfy that on its own — it
+     * stores only its parent's identifier — so resolving the parent first and then addressing the line by its
+     * parent's id splits the decision across two statements. Between them a list can be deleted or its
+     * ownership can change, and the second statement, having only an id to go on, applies anyway. Folding the
+     * parent's two columns into the same statement closes that window: the row is matched only while it still
+     * belongs to a list this caller owns in this channel.
+     *
+     * **Why a join is not used instead.** A join in an `UPDATE`/`DELETE` is spelled differently by each of the
+     * four engines and is not expressible at all in the SQLite family's `UPDATE` syntax, whereas a correlated
+     * `EXISTS` sub-query is standard and identical on all four.
+     *
+     * **Every identifier here is escaped explicitly, and that is a requirement rather than a precaution.** The
+     * query builder rewrites bare property names it recognises in the finished statement, but it recognises
+     * only the columns of the entity being written — it has no knowledge of an aliased second table this
+     * fragment introduces, so `alias.column` tokens are left exactly as written. Unescaped camel-cased
+     * identifiers are folded to lower case by PostgreSQL, where they then match no column; escaping through
+     * the driver is what makes one fragment correct on every engine. The names themselves are read from the
+     * entity metadata rather than written as literals, so the fragment cannot drift from the schema.
+     *
+     * The outer reference to the line's own `reorderListId` is deliberately left unqualified. It is
+     * unambiguous — `reorder_list` carries no column of that name, so the identifier can only resolve to the
+     * statement's target table — and it avoids depending on how each engine's dialect renders (or omits) an
+     * alias for that target.
+     *
+     * The two values are bound as the parameters `ownerCustomerId` and `ownerChannelId`, which the caller
+     * supplies alongside its own; nothing is interpolated into the SQL.
+     */
+    private ownedListExistsClause(): string {
+        const rawConnection = this.connection.rawConnection;
+        const escape = (identifier: string) => rawConnection.driver.escape(identifier);
+        const listMetadata = rawConnection.getMetadata(ReorderList);
+        const lineMetadata = rawConnection.getMetadata(ReorderListLine);
+        const alias = escape(OWNED_LIST_SUBQUERY_ALIAS);
+        const listColumn = (propertyName: string) =>
+            `${alias}.${escape(this.columnNameOf(listMetadata, propertyName))}`;
+        const lineListIdColumn = escape(this.columnNameOf(lineMetadata, 'reorderListId'));
+        return (
+            `EXISTS (SELECT 1 FROM ${escape(listMetadata.tableName)} ${alias}` +
+            ` WHERE ${listColumn('id')} = ${lineListIdColumn}` +
+            ` AND ${listColumn('customerId')} = :ownerCustomerId` +
+            ` AND ${listColumn('channelId')} = :ownerChannelId)`
+        );
+    }
+
+    /**
+     * The mapped database column name for one entity property.
+     *
+     * Raw SQL fragments read their identifiers through here rather than spelling them as literals, so a
+     * fragment cannot drift from the schema if a column is ever renamed in its entity declaration.
+     *
+     * An unmapped property name is a defect in this file rather than anything the request did, so it is logged
+     * as one — the entity and property names are this file's own literals, so the line discloses nothing about
+     * the caller or the database — and reported with the same generic message every unclassified failure
+     * carries.
+     */
+    private columnNameOf(metadata: EntityMetadata, propertyName: string): string {
+        const column = metadata.findColumnWithPropertyName(propertyName);
+        if (!column) {
+            Logger.error(
+                `Reorder plugin entity ${metadata.name} declares no column for the property ${propertyName}`,
+                loggerCtx,
+            );
+            throw withoutStackFrames(new InternalServerError(UNCLASSIFIED_FAILURE_MESSAGE));
+        }
+        return column.databaseName;
+    }
+
+    /**
+     * Refuses a quantity that cannot be stored, before any write is issued.
+     *
+     * "Before any write" rather than "before any statement", stated precisely because the difference is
+     * observable: each caller resolves its owner scope first — and the add path additionally resolves the list,
+     * the variant and any existing line, because the bound applies to the RESULTING quantity and that cannot be
+     * known without reading what the line already holds. All of those are reads. What this guard guarantees is
+     * that no row is created, changed or removed on a path it refuses.
      *
      * **Both refusals are thrown rather than returned, and that is a contract rather than an implementation
      * choice.** A quantity outside its bounds is a malformed request and not a business outcome, so it reaches
@@ -1784,63 +2614,237 @@ export class ReorderListService {
             // The registered message states the whole rule in one sentence and interpolates nothing, so no
             // variables are passed. A non-integer and a non-positive value are one condition to a caller:
             // the quantity is not a positive integer.
-            throw new UserInputError(QUANTITY_MUST_BE_POSITIVE_KEY);
+            throw withoutStackFrames(new UserInputError(QUANTITY_MUST_BE_POSITIVE_KEY));
         }
         if (resultingQuantity > this.maxQuantityPerLine) {
-            throw new UserInputError(QUANTITY_ABOVE_MAXIMUM_KEY, {
-                [MAX_VARIABLE]: this.maxQuantityPerLine,
-            });
+            throw withoutStackFrames(
+                new UserInputError(QUANTITY_ABOVE_MAXIMUM_KEY, {
+                    [MAX_VARIABLE]: this.maxQuantityPerLine,
+                }),
+            );
         }
     }
 
     /**
-     * Takes a pessimistic write lock on the owning customer row, where the engine both supports and needs one.
+     * Refuses a request carrying no authenticated session, without issuing a statement.
      *
-     * This serialises concurrent creates for one customer so that the second creator waits and then counts the
-     * first one's row — which is what makes a count-and-insert a correct enforcement of the list bound rather
-     * than a race. The alternative, a conditional counter update, is unavailable for that bound: it would need
-     * a plugin-owned per-customer counter row, this plugin owns none, the maximum counts list rows rather than
-     * reading a stored total, and the customer table is a core table this feature may not add a column to. No
-     * such counter is invented.
+     * It is the third conjunct of the ownership predicate — "the session carries an active user at all" —
+     * separated out so that a write can evaluate it before opening a transaction while the two row-level
+     * conjuncts are still resolved by a single scoped statement afterwards. Both scope resolvers call it, so
+     * the check itself has one implementation rather than three.
      *
-     * **The lock is taken through the request-bound repository and never through the raw connection's own
-     * transaction helper.** The shipped scheduler strategy uses the raw helper correctly, because it runs
-     * outside any request; here that would open a transaction *separate from the request's* and destroy the
-     * very atomicity the bound depends on — the count and the insert would then sit in a different transaction
-     * from the lock that was supposed to protect them.
-     *
-     * On the in-process SQLite engine the lock is skipped, and that is required rather than an optimisation:
-     * that driver serves a single connection so two transactions cannot interleave, and asking it for a lock
-     * raises rather than degrades.
+     * `FORBIDDEN` rather than `UNAUTHORIZED` is the platform's own distinction: an unauthorized error is
+     * raised where credentials do not *match*, whereas an absent session on a permission-gated operation is
+     * reported as forbidden.
      */
-    private async acquireCustomerLock(ctx: RequestContext, customerId: ID): Promise<void> {
-        if (!this.supportsPessimisticLocking) {
-            return;
+    private requireActiveUser(ctx: RequestContext): void {
+        if (!ctx.activeUserId) {
+            throw withoutStackFrames(new ForbiddenError());
         }
-        await this.connection
-            .getRepository(ctx, Customer)
-            .createQueryBuilder('customer')
-            .setLock('pessimistic_write')
-            .where('customer.id = :customerId', { customerId })
-            .getOne();
     }
 
     /**
-     * Claims room for one more line on a list, by a single conditional counter update, and reports whether the
-     * claim succeeded.
+     * Resolves the line a list holds for one variant, optionally by a locking (current) read.
+     *
+     * The lookup is scoped to the parent list, which was itself resolved under the full predicate inside this
+     * same transaction, so a line belonging to another list cannot be reached even through a variant the two
+     * lists share.
+     *
+     * **No relation is joined, and that is a PostgreSQL requirement rather than an economy.** A relation
+     * condition would be realised as a LEFT join, and PostgreSQL refuses `FOR UPDATE` on the nullable side of
+     * an outer join — so the locking form would fail on one engine only. The parent scope is carried by the
+     * parent's own identifier here and by the correlated `EXISTS` clause on every statement that writes.
+     *
+     * @param useCurrentRead - Whether to take a pessimistic write lock, which on MariaDB, MySQL and
+     * PostgreSQL also makes the read a *current* one that sees the latest committed row rather than this
+     * transaction's snapshot. Skipped on the SQLite family, which serves a single connection and raises rather
+     * than degrades when asked for a lock.
+     */
+    private findLineForVariant(
+        ctx: RequestContext,
+        listId: ID,
+        productVariantId: ID,
+        useCurrentRead: boolean,
+    ): Promise<ReorderListLine | null> {
+        const queryBuilder = this.connection
+            .getRepository(ctx, ReorderListLine)
+            .createQueryBuilder('reorderlistline')
+            .where('reorderlistline.reorderListId = :listId', { listId })
+            .andWhere('reorderlistline.productVariantId = :productVariantId', { productVariantId });
+        if (useCurrentRead && this.supportsPessimisticLocking) {
+            queryBuilder.setLock('pessimistic_write');
+        }
+        return queryBuilder.getOne();
+    }
+
+    /**
+     * Adds to an existing line's quantity by ONE conditional statement, and reports which of the three
+     * possible states the affected-row count revealed.
+     *
+     * **The statement carries four conjuncts and each one is load-bearing.** The line's own identifier and its
+     * parent list's identifier address the row. The correlated `EXISTS` over `reorder_list` carries the acting
+     * customer and the active channel, so the ownership predicate is enforced by the *same* statement whose
+     * affected-row count is the authority rather than by an earlier read. And `quantity <= :maxBeforeIncrement`
+     * is the configured maximum applied atomically to the RESULTING value: the caller has already validated
+     * the total it expects, but between that read and this statement a concurrent add can raise the stored
+     * quantity, and without this conjunct both callers would validate against a stale total and the line would
+     * end up above the maximum. With it, the loser affects no row and is refused.
+     *
+     * **The increment is expressed in SQL, never computed in TypeScript.** A read-compute-save loses one of
+     * two concurrent adds: both read six, both compute twelve, both store twelve, and the buyer who asked for
+     * eighteen holds twelve. `quantity = quantity + :delta` is evaluated by the engine against the row's
+     * current value, so the second writer increments the first writer's result.
+     *
+     * @returns `'accumulated'` when the row was updated; `'line-replaced'` when the addressed line has gone and
+     * a *different* row now holds this variant, which is a concurrent insert to reconcile onto rather than a
+     * state to report; `'line-gone'` when no row holds this variant at all, so the caller should take the
+     * insert path; `'above-maximum'` when the addressed line is still there and its current quantity plus this
+     * increment would breach the configured maximum; `'list-gone'` when the addressed line is there and within
+     * the maximum, which leaves the ownership conjunct as the only thing the statement can have failed on.
+     */
+    private async accumulateLineQuantity(
+        ctx: RequestContext,
+        lineId: ID,
+        listId: ID,
+        productVariantId: ID,
+        delta: number,
+        scope: ReorderListOwnerScope,
+    ): Promise<'accumulated' | 'line-replaced' | 'line-gone' | 'above-maximum' | 'list-gone'> {
+        const quantityColumn = this.escapeColumn('quantity');
+        const result = await this.connection
+            .getRepository(ctx, ReorderListLine)
+            .createQueryBuilder('reorderlistline')
+            .update()
+            .set({ quantity: () => `${quantityColumn} + :delta` })
+            .where('id = :lineId', { lineId })
+            .andWhere('reorderListId = :listId', { listId })
+            .andWhere(`${quantityColumn} <= :maxBeforeIncrement`)
+            .andWhere(this.ownedListExistsClause())
+            .setParameters({
+                delta,
+                maxBeforeIncrement: this.maxQuantityPerLine - delta,
+                ownerCustomerId: scope.customerId,
+                ownerChannelId: scope.channelId,
+            })
+            .execute();
+        if (result.affected === 1) {
+            return 'accumulated';
+        }
+        // Zero affected rows is ambiguous by construction — the row's existence, the maximum guard and the
+        // ownership conjunct are all in the one predicate — so the state is re-established rather than
+        // guessed. The re-read is a current read where the engine offers one, both because a snapshot older
+        // than the competing commit would answer the question wrongly and because holding the row makes the
+        // answer stable for the caller acting on it. It is addressed by the variant for the same reason the
+        // caller's first read was: if the line has gone, the caller's next step is to insert one for that
+        // variant.
+        const current = await this.findLineForVariant(ctx, listId, productVariantId, true);
+        if (!current) {
+            return 'line-gone';
+        }
+        // IDENTITY BEFORE ARITHMETIC. A row for this variant exists, but "a row for this variant" and "the row
+        // this statement addressed" are not the same thing: a concurrent request can remove the addressed line
+        // and insert a fresh one for the same variant, and the per-variant uniqueness constraint then makes the
+        // replacement the only row the lookup above can return. Every remaining answer here is a statement
+        // about the ADDRESSED row, so reading its quantity off a different row would answer a question that was
+        // not asked — and the two wrong answers it produces are both plausible: a replacement holding a small
+        // quantity looks like "the list must have gone", and one holding a large quantity looks like a maximum
+        // breach the caller never caused. A different identifier means a concurrent insert, which is the state
+        // the reconciliation path already exists for, so it is named as that and nothing is inferred from it.
+        if (String(current.id) !== String(lineId)) {
+            return 'line-replaced';
+        }
+        // The addressed row is there, so exactly one of the two remaining conjuncts refused it, and the
+        // arithmetic says which: a stored quantity that this increment would carry past the maximum is the
+        // guard, and anything else leaves only the ownership conjunct.
+        return current.quantity + delta > this.maxQuantityPerLine ? 'above-maximum' : 'list-gone';
+    }
+
+    /**
+     * Inserts a line for a list-and-variant pair unless the pair already has one, and reports whether this
+     * request is the one that inserted it.
+     *
+     * **The insert declines a conflict rather than failing on one, and that is a portability requirement rather
+     * than a preference.** Letting the unique-constraint violation be raised instead works on the MySQL family
+     * and the SQLite family, but on PostgreSQL a failed statement aborts the whole transaction: every
+     * subsequent statement in it is then refused, so the transaction can only be rolled back and any
+     * reconciliation has to start again from a fresh one. The builder's ignore form compiles to `INSERT IGNORE`
+     * on the MySQL family and to `ON CONFLICT DO NOTHING` on PostgreSQL and the SQLite family, so no statement
+     * ever fails and the transaction stays usable whichever engine is configured.
+     *
+     * A decline is not silently absorbed: the caller raises {@link ConcurrentLineInsertDetected}, which is the
+     * one reconciliation signal every duplicate route in this service uses, so the attempt is unwound — giving
+     * back the capacity claim it took, because a pair that already has a line adds no line — and the bounded
+     * retry accumulates onto the winner's row instead.
+     *
+     * **The affected-row count is obtained from the driver rather than inferred, and that needs the raw runner.**
+     * The builder's insert result carries the generated identifiers but not a row count, and what each driver
+     * reports for an ignored insert differs — an insert id of zero here, an empty returning set there. The
+     * platform's own connection abstraction normalises exactly this: asking the request's query runner for a
+     * structured result yields one `affected` number on every engine, taken from the driver's own affected-rows,
+     * row-count or rows-modified report. The statement itself is still generated by the builder, so the value
+     * transformation, the date columns and the identifier strategy are the ORM's rather than hand-written.
+     */
+    private async insertLineIfAbsent(
+        ctx: RequestContext,
+        listId: ID,
+        productVariantId: ID,
+        quantity: number,
+    ): Promise<boolean> {
+        const repository = this.connection.getRepository(ctx, ReorderListLine);
+        const [query, parameters] = repository
+            .createQueryBuilder()
+            .insert()
+            .values({ reorderListId: listId, productVariantId, quantity })
+            .orIgnore()
+            .getQueryAndParameters();
+        // The runner the request's transaction is bound to. A repository obtained through the platform's
+        // request-aware accessor carries the transactional entity manager, and that manager carries the runner,
+        // so this is the same connection every other statement in this transaction is issued on — not a second
+        // one, which would place the insert outside the transaction it must belong to.
+        const queryRunner = repository.queryRunner ?? repository.manager.queryRunner;
+        if (!queryRunner) {
+            // Every write in this service runs inside a transaction, so the request always has a runner. A
+            // missing one is a broken invariant rather than a caller error, and is reported as one — carrying
+            // no statement text, so the report cannot itself become a disclosure channel.
+            Logger.error(
+                'A reorder list line insert was attempted outside a transaction, so no query runner was available',
+                loggerCtx,
+            );
+            throw withoutStackFrames(new InternalServerError(UNCLASSIFIED_FAILURE_MESSAGE));
+        }
+        const result: QueryResult = await queryRunner.query(query, parameters, true);
+        return result.affected === 1;
+    }
+
+    /**
+     * Claims room for one more line on a list, by a single conditional counter update, and reports which state
+     * the affected-row count revealed.
      *
      * **This statement IS the line bound.** It increments the counter only while it is still below the
-     * configured maximum, and its affected-row count is the verdict: one means the room was claimed and the
-     * line may now be inserted, zero means the list was already full. Because a single statement decides, no
-     * interleaving can admit an extra line — which is exactly the assertion a count-then-insert check fails,
-     * since two concurrent requests can both read a count below the maximum and both then insert.
+     * configured maximum — and only for a list the acting customer owns in the active channel, so the
+     * ownership predicate is enforced by the statement that writes rather than by an earlier read. Its
+     * affected-row count is the verdict: one means the room was claimed and the line may now be inserted.
+     * Because a single statement decides, no interleaving can admit an extra line, which is exactly the
+     * assertion a count-then-insert check fails.
      *
-     * It is issued as the **first write of the transaction**, so a refusal leaves nothing to undo.
+     * **Zero affected rows is where a boolean return was wrong, and the three states it conflated are not
+     * interchangeable.** The list may be genuinely full; it may have been deleted (or moved out of the
+     * caller's scope) since this transaction resolved it; or a concurrent add may have inserted a line for the
+     * very variant this call is adding, in which case the contract's answer is an accumulation onto that row
+     * and not a limit error at all. Reporting "full" for the second is a wrong reason, and for the third it
+     * refuses a write the contract requires to succeed — a duplicate add to a list at its maximum accumulates,
+     * because it creates no line. So the state is re-established with two scoped reads on the zero path only.
      *
-     * @returns `true` when the counter was incremented and the caller may insert, `false` when the list is at
-     * its maximum and the caller must refuse.
+     * It is issued as the **first write of the insert path**, so a refusal leaves nothing to undo.
+     *
+     * @returns `'claimed'`, `'list-gone'`, `'duplicate-line'` or `'full'`.
      */
-    private async claimLineCapacity(ctx: RequestContext, listId: ID): Promise<boolean> {
+    private async claimLineCapacity(
+        ctx: RequestContext,
+        listId: ID,
+        productVariantId: ID,
+        scope: ReorderListOwnerScope,
+    ): Promise<'claimed' | 'list-gone' | 'duplicate-line' | 'full'> {
         const lineCount = this.escapeColumn('lineCount');
         const result = await this.connection
             .getRepository(ctx, ReorderList)
@@ -1848,9 +2852,30 @@ export class ReorderListService {
             .update()
             .set({ lineCount: () => `${lineCount} + 1` })
             .where('id = :listId', { listId })
+            .andWhere('customerId = :customerId', { customerId: scope.customerId })
+            .andWhere('channelId = :channelId', { channelId: scope.channelId })
             .andWhere('lineCount < :maxLinesPerList', { maxLinesPerList: this.maxLinesPerList })
             .execute();
-        return result.affected === 1;
+        if (result.affected === 1) {
+            return 'claimed';
+        }
+        // The two reads below run on the zero path only, so the ordinary add pays for neither. BOTH are
+        // current reads, and for the list that is the difference between a right and a wrong answer: a
+        // consistent read would answer from a view predating the delete that caused this refusal, report the
+        // list as present, find no duplicate, and blame the line bound for a list that no longer exists.
+        const list = await this.findOwnedListNow(ctx, listId, scope);
+        if (!list) {
+            return 'list-gone';
+        }
+        // A duplicate is looked for BEFORE the counter is believed, because a duplicate add accumulates
+        // regardless of how full the list is: the write it is about to make creates no line, so the bound the
+        // counter guards is not the bound it should be measured against. A current read is used so a snapshot
+        // taken before the competing insert committed cannot report the row as absent.
+        const duplicate = await this.findLineForVariant(ctx, listId, productVariantId, true);
+        if (duplicate) {
+            return 'duplicate-line';
+        }
+        return 'full';
     }
 
     /**
@@ -1919,73 +2944,184 @@ export class ReorderListService {
      * already holds it.
      *
      * Everything that is not this one constraint goes to
-     * {@link ReorderListService.rethrowSanitisedWriteFailure}, so a driver message never reaches a caller.
+     * {@link ReorderListService.rethrowSanitisedFailure}, so a driver message never reaches a caller.
+     *
+     * **It is called from outside the transaction callback, never inside it**, so by the time it runs the
+     * platform's transaction wrapper has already unwound the failed statement — a rollback on the outermost
+     * transaction, or `ROLLBACK TO SAVEPOINT` on the nested one every `@Transaction()`-decorated resolver
+     * produces. Translating before that unwind is what breaks on PostgreSQL, whose aborted subtransaction
+     * refuses the `RELEASE SAVEPOINT` a normal return would trigger; the create and update paths each carry
+     * the full reasoning at their own catch.
      *
      * @param err - The caught driver failure.
      * @param nameKey - The canonical key the caller's own submitted name produced.
+     * @param operation - The operation code an unclassified failure is logged under.
      */
-    private translateNameConflict(err: unknown, nameKey: string): ReorderListNameConflictError {
-        if (this.mentionsConstraint(err, NAME_CONFLICT_CONSTRAINT)) {
+    private translateNameConflict(
+        err: unknown,
+        nameKey: string,
+        operation: ReorderListOperation,
+    ): ReorderListNameConflictError {
+        if (this.violatesConstraint(err, NAME_CONFLICT_CONSTRAINT_DESCRIPTOR)) {
             return new ReorderListNameConflictError(nameKey);
         }
-        return this.rethrowSanitisedWriteFailure(err, 'saving a reorder list');
+        return this.rethrowSanitisedFailure(err, operation);
     }
 
     /**
-     * Re-raises a database failure this service cannot classify, with the detail retained server-side and none
-     * of it exposed to the caller.
+     * Re-raises a failure this service cannot classify, disclosing nothing about it to the caller and
+     * nothing about it to the log either.
      *
-     * **The failure is never swallowed and never leaked, and both halves matter.** A driver message can carry
-     * the schema, the column list, a SQL fragment and sometimes the conflicting values, so the caller receives
-     * a short generic message under the platform's internal-error code while the original — including its
-     * stack — is logged at error level against the plugin's own logger context. An operator therefore has
-     * everything needed to diagnose it and the caller learns nothing about the schema.
+     * **Every database-touching member of this service funnels its unclassified failures through here** — the
+     * eight published operations, the two scope resolvers whose statements precede them, the batched line
+     * read behind the `lines` field, and the counter reconciliation — which is what makes the disclosure
+     * boundary a property of the class rather than a habit at each call site: there is exactly one place a
+     * driver error can turn into a response, and exactly one place it can turn into a log line. The two name
+     * writes reach it through {@link ReorderListService.translateNameConflict}, which forwards everything the
+     * one named constraint does not explain.
      *
-     * An already-classified platform error is re-raised unchanged rather than re-wrapped. Nothing currently
-     * routes one through here, but a future edit that widened a `try` block would otherwise turn a deliberate
-     * input refusal into an internal error, and silently: the caller would see the wrong code for the right
-     * reason.
+     * **An already-classified platform error keeps its code and its message, and loses only its frames.** The
+     * test is `instanceof I18nError` — the platform's own base for every error that carries a code and a
+     * translatable message — so `UserInputError`, `ForbiddenError` and the list builder's own over-limit
+     * refusal all reach the caller under their own codes. Re-wrapping one would turn a deliberate
+     * `USER_INPUT_ERROR` into an internal error silently, giving the caller the wrong code for the right
+     * reason. Testing the base rather than listing subclasses is deliberate: the list would have to be
+     * revisited every time a `try` widened.
+     *
+     * **The one exception to that pass-through is an internal error this module did not author.** An
+     * `INTERNAL_SERVER_ERROR` is the one code whose message is written for operators rather than for callers,
+     * and a collaborator's internal message can name a table, a column, a configuration key or a strategy
+     * class. Only the two internal messages this module authors — see {@link OWN_INTERNAL_MESSAGES} — are
+     * forwarded; any other is reported as this module's own generic failure and logged like any unclassified
+     * one, so a platform internal is neither published to the caller nor copied into the log.
+     *
+     * **What reaches the log, and what deliberately does not.** The log line carries three things this file
+     * chose: the fixed operation code, a fixed classification of the failure's shape, and a fresh correlation
+     * id that distinguishes one occurrence from the next. It carries **no** part of the caught value — not
+     * `message`, not `stack`, not the failing statement, not its parameters, not a constraint name. A driver
+     * failure's message routinely contains the SQL it was executing together with schema and column names,
+     * often the conflicting values, and on some drivers a filesystem path; an application log outlives the
+     * request and is read by people and tools that were never entitled to any of that, which is the whole of
+     * CWE-532. An operator who needs statement-level detail turns on the platform's own TypeORM logging,
+     * which is a deployment decision made deliberately and with the retention consequences understood —
+     * rather than one this plugin makes for every deployment by copying driver text into its own log.
+     *
+     * **The error that leaves here carries no frame list either**, because this file's own log line is not the
+     * last one written about it: the platform's exception filter logs `exception.stack` for every error a
+     * resolver raises. See {@link withoutStackFrames} for why sanitising the message and keeping the frames
+     * closes the boundary only as far as the edge of this file.
+     *
+     * **Nothing is swallowed.** The failure still terminates the operation, as an `InternalServerError` under
+     * the platform's `INTERNAL_SERVER_ERROR` code carrying one generic sentence, identical for every
+     * operation and every cause so that the message itself cannot become the channel this method closes.
      *
      * @param err - The caught failure.
-     * @param operation - A short description of what was being attempted, for the log line only. It is never
-     * returned to the caller.
-     * @returns Never — the declared return type lets a caller write `return this.rethrowSanitisedWriteFailure(…)`
+     * @param operation - The fixed operation code the failure is logged under. Never returned to the caller.
+     * @returns Never — the declared return type lets a caller write `return this.rethrowSanitisedFailure(…)`
      * and keeps reachability analysis correct at every call site.
      */
-    private rethrowSanitisedWriteFailure(err: unknown, operation: string): never {
-        if (
-            err instanceof UserInputError ||
-            err instanceof ForbiddenError ||
-            err instanceof InternalServerError
-        ) {
-            throw err;
+    private rethrowSanitisedFailure(err: unknown, operation: ReorderListOperation): never {
+        if (err instanceof I18nError && this.isClassifiedForCaller(err)) {
+            throw withoutStackFrames(err);
         }
+        const correlationId = randomUUID();
         Logger.error(
-            `Unexpected database failure while ${operation}`,
+            `The reorder list operation ${operation} failed with ${this.classifyFailure(err)} ` +
+                `(correlation id ${correlationId})`,
             loggerCtx,
-            err instanceof Error ? err.stack : String(err),
         );
-        throw new InternalServerError(UNCLASSIFIED_WRITE_FAILURE_MESSAGE);
+        throw withoutStackFrames(new InternalServerError(UNCLASSIFIED_FAILURE_MESSAGE));
     }
 
     /**
-     * Whether a caught driver failure names the given database constraint.
+     * Whether a platform error is one whose own code and message may be given to the caller.
+     *
+     * Every code other than `INTERNAL_SERVER_ERROR` describes a decision about the request — the input was
+     * malformed, the session may not do this, the page size is above the configured limit — so its message is
+     * written for whoever made the request and is forwarded. `INTERNAL_SERVER_ERROR` is the one code that
+     * describes the server instead, and its message is therefore only safe to forward when this module wrote
+     * it. That is a narrow, enumerated test rather than a judgement: the two messages this module authors are
+     * declared in {@link OWN_INTERNAL_MESSAGES}, and anything else — an internal error from a platform
+     * collaborator this service calls into — is reported as this module's own generic failure.
+     */
+    private isClassifiedForCaller(err: I18nError): boolean {
+        return err.code !== INTERNAL_SERVER_ERROR_CODE || OWN_INTERNAL_MESSAGES.has(err.message);
+    }
+
+    /**
+     * Describes the *shape* of an unclassified failure, using only strings this file owns.
+     *
+     * The database-failure branch is decided structurally rather than by class name: TypeORM's
+     * `QueryFailedError` carries the statement it was running on a `query` property, so the presence of that
+     * property identifies the failure class without reading its contents. Nothing is copied out of the value
+     * — the returned string is one of three literals declared in this module — which is what allows the log
+     * line to say "a database query failure in addItemToReorderList" without saying which statement, which
+     * table, which constraint or which values.
+     */
+    private classifyFailure(err: unknown): ReorderListFailureClass {
+        if (
+            err != null &&
+            typeof err === 'object' &&
+            typeof (err as { query?: unknown }).query === 'string'
+        ) {
+            return 'a database query failure';
+        }
+        return err instanceof Error ? 'an unexpected error' : 'a non-error value';
+    }
+
+    /**
+     * Whether a caught driver failure is a violation of the one named database object described.
      *
      * **A textual, case-insensitive search is the portable test here, and that is a considered choice rather
-     * than a lazy one.** Every supported engine reports a constraint identifier differently — in the message
+     * than a lazy one.** Every supported engine reports the offending object differently — in the message
      * body, in a driver-specific field, quoted, bracketed, or with a table prefix — and on the MySQL family a
      * named `UNIQUE` constraint materialises as a named unique *index* rather than as a constraint object,
-     * under the same name. There is consequently no single structured field that carries the name on all four
-     * engines, while the name itself appears on all four. The search therefore covers the message together with
-     * the driver-specific fields the common drivers populate, and is case-insensitive because engines differ in
-     * how they case an identifier they echo back.
+     * under the same name. There is consequently no single structured field that carries an identifier on all
+     * four engines, so the search covers the message together with the driver-specific fields the common
+     * drivers populate, and is case-insensitive because engines differ in how they case an identifier they
+     * echo back.
      *
-     * The search is for one exact constraint name supplied by the caller, never for an error class or a
-     * vendor error code, which is what keeps the translation narrow.
+     * Two spellings are accepted and they identify the same one object, described in
+     * {@link ReorderListConstraintDescriptor}: the object's **name**, which MySQL, MariaDB and PostgreSQL
+     * report, and the object's **exact qualified column list** beside the SQLite family's own
+     * `UNIQUE constraint failed` wording, which is all that family reports. The column form requires *every*
+     * one of the object's columns to be present, so it cannot match a different object on the same table or
+     * the same object on a different table.
+     *
+     * What is deliberately not tested is an error class or a vendor error code: `ER_DUP_ENTRY` and `23505`
+     * identify "some unique violation", which is precisely the width this method exists not to have.
      */
-    private mentionsConstraint(err: unknown, constraintName: string): boolean {
-        if (err == null || typeof err !== 'object') {
+    private violatesConstraint(err: unknown, constraint: ReorderListConstraintDescriptor): boolean {
+        const texts = this.collectFailureTexts(err);
+        if (texts.length === 0) {
             return false;
+        }
+        const name = constraint.name.toLowerCase();
+        if (texts.some(text => text.includes(name))) {
+            return true;
+        }
+        const qualifiedColumns = constraint.columns.map(column =>
+            `${constraint.table}.${column}`.toLowerCase(),
+        );
+        return texts.some(
+            text =>
+                text.includes(SQLITE_UNIQUE_VIOLATION_TEXT) &&
+                qualifiedColumns.every(column => text.includes(column)),
+        );
+    }
+
+    /**
+     * Collects the lower-cased text a driver failure carries, from the wrapper and from one level of the
+     * driver error it wraps.
+     *
+     * One level of unwrapping is enough: TypeORM exposes the driver's own error on `driverError` and no
+     * driver nests a second wrapper inside the first. The strings gathered here are read for a match and are
+     * never logged or returned — {@link ReorderListService.rethrowSanitisedFailure} is the only thing that
+     * writes about a failure, and it writes none of this.
+     */
+    private collectFailureTexts(err: unknown): string[] {
+        if (err == null || typeof err !== 'object') {
+            return [];
         }
         const candidate = err as {
             message?: unknown;
@@ -1994,29 +3130,29 @@ export class ReorderListService {
             sqlMessage?: unknown;
             driverError?: unknown;
         };
-        const needle = constraintName.toLowerCase();
-        const haystacks = [candidate.message, candidate.detail, candidate.constraint, candidate.sqlMessage];
-        for (const haystack of haystacks) {
-            if (typeof haystack === 'string' && haystack.toLowerCase().includes(needle)) {
-                return true;
+        const driverError =
+            candidate.driverError != null && typeof candidate.driverError === 'object'
+                ? (candidate.driverError as {
+                      message?: unknown;
+                      detail?: unknown;
+                      constraint?: unknown;
+                      sqlMessage?: unknown;
+                  })
+                : {};
+        return [
+            candidate.message,
+            candidate.detail,
+            candidate.constraint,
+            candidate.sqlMessage,
+            driverError.message,
+            driverError.detail,
+            driverError.constraint,
+            driverError.sqlMessage,
+        ].reduce<string[]>((texts, value) => {
+            if (typeof value === 'string' && value !== '') {
+                texts.push(value.toLowerCase());
             }
-        }
-        // TypeORM wraps the driver's own error and exposes it, and some drivers put the constraint name only
-        // there. One level of unwrapping is enough: no driver nests a second wrapper inside the first.
-        const driverError = candidate.driverError;
-        if (driverError != null && typeof driverError === 'object') {
-            const inner = driverError as {
-                message?: unknown;
-                detail?: unknown;
-                constraint?: unknown;
-                sqlMessage?: unknown;
-            };
-            for (const haystack of [inner.message, inner.detail, inner.constraint, inner.sqlMessage]) {
-                if (typeof haystack === 'string' && haystack.toLowerCase().includes(needle)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+            return texts;
+        }, []);
     }
 }
