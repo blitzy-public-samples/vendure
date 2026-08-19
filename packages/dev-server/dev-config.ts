@@ -20,6 +20,7 @@ import {
 import { DashboardPlugin } from '@vendure/dashboard/plugin';
 import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
 import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
+import { ReorderPlugin } from '@vendure/reorder-plugin';
 import { TelemetryPlugin } from '@vendure/telemetry-plugin';
 import 'dotenv/config';
 import path from 'path';
@@ -96,7 +97,11 @@ export const devConfig: VendureConfig = {
     dbConnectionOptions: {
         synchronize: false,
         logging: false,
-        migrations: [path.join(__dirname, 'migrations/*.ts')],
+        // FEATURE-001-01: ReorderPlugin owns its migration in its own package, so it is globbed from there.
+        migrations: [
+            path.join(__dirname, 'migrations/*.ts'),
+            path.join(__dirname, '../reorder-plugin/src/migrations/*.ts'),
+        ],
         ...getDbConfig(),
     },
     paymentOptions: {
@@ -202,6 +207,14 @@ export const devConfig: VendureConfig = {
         DashboardPlugin.init({
             route: 'dashboard',
             appDir: dashboardAppDir,
+        }),
+        // FEATURE-001-01: Named Reorder Lists with Line Quantities
+        ReorderPlugin.init({
+            maxListsPerCustomer: 25,
+            maxLinesPerList: 200,
+            maxQuantityPerLine: 999,
+            defaultReorderListsPageSize: 25,
+            defaultReorderListLinesPageSize: 50,
         }),
     ],
 };
