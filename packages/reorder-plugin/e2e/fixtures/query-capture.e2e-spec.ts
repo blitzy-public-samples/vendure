@@ -13,8 +13,8 @@ import {
 /**
  * The correlated-ownership verifier, tested as the load-bearing instrument it is.
  *
- * ★ **WHY THIS SPEC EXISTS, AND WHY IT LIVES IN THE UNIT RUN.** Every future assertion that a
- * `reorder_list_line` write is scoped to its owner is decided by
+ * ★ **WHY THIS SPEC EXISTS.** Every future assertion that a `reorder_list_line` write is scoped to its
+ * owner is decided by
  * {@link whereRequiresCorrelatedOwnership}: a line row stores its parent's identifier, a variant reference
  * and a quantity, so the acting customer and the active channel can only reach the statement through a
  * sub-query over the parent table (FEATURE-001-01 §2.11). If this parser certifies a statement that does
@@ -23,10 +23,23 @@ import {
  * what its own negative cases prove, and those cases have to be COMMITTED to prove anything twice: a check
  * performed once by hand cannot fail when a later edit weakens the parser.
  *
- * The specs run in the package's unit run rather than in an end-to-end suite because the module under test
- * is pure — it imports `typeorm` types only, reaches no database and starts no server — and because the
- * end-to-end runner collects `*.e2e-spec.ts` only, so a `.spec.ts` here would otherwise be executed by
- * nothing. `packages/reorder-plugin/vitest.config.mts` states that boundary explicitly.
+ * ★ **WHICH RUNNER EXECUTES IT, AND WHY THAT ONE.** The `e2e-spec` suffix places this file in the
+ * end-to-end run [e2e-common/vitest.config.mts:L7], which is the runner that owns everything under
+ * `e2e/`. The package's unit run reaches into `src` and nowhere else
+ * [packages/reorder-plugin/vitest.config.mts], matching the sibling that states the same boundary
+ * [packages/create/vitest.config.mts:L8]; a `.spec.ts` sitting here would breach that boundary, which is
+ * exactly what it did until this file was renamed. Nothing is lost by the move and nothing extra is
+ * required by it: the module under test is pure — it imports `typeorm` types only, reaches no database
+ * and starts no server — so it needs none of the machinery the end-to-end configuration supplies, and
+ * the e2e run applies the same `unplugin-swc` decorator transform the unit run does.
+ *
+ * ★ **AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE.** AAP §0.5.1.8 enumerates
+ * `e2e/fixtures/query-capture.ts` as a fixture module and enumerates no spec for it; this file is
+ * therefore an addition rather than a planned artefact, admitted by the in-scope pattern
+ * `packages/reorder-plugin/e2e/fixtures/*.ts` (AAP §0.6.1.2) and declared under §0.8.2's
+ * no-silent-deviation obligation. It is kept because an instrument whose negative cases are not
+ * committed protects nothing against a later edit, and it is a fixture spec rather than a seventh
+ * end-to-end suite: it boots no server, opens no database, seeds nothing and destroys nothing.
  *
  * **The statements are the real renderings**, not invented SQL. The PostgreSQL, MySQL/MariaDB and sql.js
  * forms below were taken from what TypeORM 0.3.28 actually emits for

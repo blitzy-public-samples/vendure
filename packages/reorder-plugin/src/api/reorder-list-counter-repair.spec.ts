@@ -8,6 +8,16 @@
  * STORY-001-01-04 (the per-page batching equality and the zero-statement `viewerAccess`), or to a cited line
  * of this repository.
  *
+ * AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE. AAP section 0.5.1.7 enumerates three unit specs —
+ * `src/service/reorder-list-name.spec.ts`, `src/service/reorder-list.service.spec.ts` and
+ * `src/reorder.plugin.spec.ts` — and this is a fourth, so the runtime inventory is wider than the plan's
+ * and that is stated here rather than left to be noticed. It is admitted by section 0.6.1.2, whose
+ * in-scope pattern covers every co-located `.spec.ts` beneath `packages/reorder-plugin/src`, and it is
+ * declared here under section 0.8.2's no-silent-deviation obligation. It is a separate file rather than a section of the service spec because
+ * the two make different claims about different layers, for the reason set out immediately below; folding
+ * it in would put api-layer execution-order assertions inside a file whose own stated scope is the
+ * service's branching around its statements.
+ *
  * WHY THIS FILE EXISTS SEPARATELY FROM THE SERVICE SPECIFICATION. The service owns the statement — its
  * guard, its arithmetic and its refusal of a value the column may not hold — and `reorder-list.service.spec.ts`
  * pins all of that. What this file pins is something the service cannot see: WHEN the reconciliation happens

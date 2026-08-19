@@ -72,7 +72,7 @@ import gql from 'graphql-tag';
  * And `lineCount` is a real stored column on `reorder_list` for the same reason: it is offered as a
  * generated sort and filter key, so there must be a column behind it.
  *
- * Four properties of this contract are worth stating for a consumer, because each is a decision a
+ * Five properties of this contract are worth stating for a consumer, because each is a decision a
  * storefront will feel rather than an implementation detail:
  *
  * - **`includeShared` is accepted at both values and, for now, both return the same page.** No grant
@@ -88,6 +88,23 @@ import gql from 'graphql-tag';
  * - **Neither payload carries a price, a currency or a stock field.** A saved line is a reference,
  *   valued when it is read rather than when it is written; price and availability delta surfacing
  *   belongs to FEATURE-001-03.
+ * - **`deleteReorderList` requires one field alias to be selected in full, and the requirement is a
+ *   validation rule rather than a style preference.** Its success member is the platform's own
+ *   `DeletionResponse`, whose `message` is a nullable `String`
+ *   [packages/core/src/api/schema/common/common-types.graphql:L64-L67], while every error result
+ *   below declares `message: String!`. A document that selects `message` on **both** members of
+ *   `DeleteReorderListResult` under one response key is therefore INVALID: GraphQL's
+ *   overlapping-fields rule compares response shapes without unwrapping nullability, and inline
+ *   fragments on mutually exclusive types relax only the name-and-arguments half of that check, so
+ *   a Non-Null `String!` paired with a nullable `String` conflicts outright
+ *   [node_modules/graphql/validation/rules/OverlappingFieldsCanBeMergedRule.js:doTypesConflict].
+ *   The request is then refused at validation time with `GRAPHQL_VALIDATION_FAILED` before any
+ *   resolver runs. Alias one of the two — the plugin's own shared documents alias the success
+ *   branch, `... on DeletionResponse { result deletionMessage: message }`
+ *   [packages/reorder-plugin/e2e/graphql/reorder-definitions.ts] — and select `message` unaliased
+ *   on the error branch so one error shape serves every operation that returns it. Neither
+ *   nullability may be "corrected" instead: `DeletionResponse` is a published platform type reused
+ *   verbatim here by ruling, and `ErrorResult` fixes `message: String!` on every implementor.
  * - **Keep a `default` branch when switching on `ErrorCode`.** That enum is generated from every type
  *   implementing `ErrorResult` [packages/core/src/api/config/generate-error-code-enum.ts:L11-L19], so
  *   the four members these error results add are a widening that later features widen further. An
@@ -277,6 +294,24 @@ export const shopApiExtensions = gql`
         lineId: ID!
     }
 
+    # The six result unions, each carrying the exact membership its own operation can produce.
+    #
+    # DeleteReorderListResult reuses the platform's own DeletionResponse verbatim rather than
+    # declaring a plugin-owned deletion payload, and that reuse has ONE consequence a client must
+    # know before writing the document: DeletionResponse declares message as a NULLABLE String
+    # [packages/core/src/api/schema/common/common-types.graphql:L64-L67], while every error result
+    # above declares message: String!. Selecting message on BOTH members of this union under a
+    # single response key is therefore an INVALID document rather than merely an unusual one — the
+    # overlapping-fields rule compares response shapes without unwrapping nullability, and inline
+    # fragments on mutually exclusive types relax only the name-and-arguments half of that check
+    # [node_modules/graphql/validation/rules/OverlappingFieldsCanBeMergedRule.js:doTypesConflict] —
+    # so the request is refused with GRAPHQL_VALIDATION_FAILED before any resolver runs. Alias one
+    # of the two, as this plugin's own shared documents do on the success branch:
+    #     ... on DeletionResponse { result deletionMessage: message }
+    #     ... on ReorderListNotFoundError { errorCode message }
+    # Changing either nullability instead is not available: DeletionResponse is a published platform
+    # type and ErrorResult fixes message: String! on every implementor, so either edit would break
+    # the additive-only guarantee this document is bound by.
     union CreateReorderListResult = ReorderList | ReorderListNameConflictError | ReorderListLimitError
     union UpdateReorderListResult = ReorderList | ReorderListNotFoundError | ReorderListNameConflictError
     union DeleteReorderListResult = DeletionResponse | ReorderListNotFoundError

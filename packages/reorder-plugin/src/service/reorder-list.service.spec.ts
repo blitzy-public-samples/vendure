@@ -13,8 +13,10 @@
  *
  * Where this file lives, and why. It sits beside the module it tests and carries the `.spec.ts` suffix,
  * which is this repository's stated convention for a unit test [CONTRIBUTING.md:L428]. The package's
- * Vitest configuration confines unit discovery to `src` and excludes `e2e` outright, and its
- * `unplugin-swc` transform sets `useDefineForClassFields: false` — which is load-bearing rather than
+ * Vitest configuration confines unit discovery to `src` and excludes `e2e` outright — its include pattern
+ * reaches the `.spec.ts` files under `src` and its exclude pattern names the whole of `e2e`, so the only
+ * files `bun run test` can reach are the ones sitting beside the modules they test — and its
+ * `unplugin-swc` transform sets `useDefineForClassFields: false`, which is load-bearing rather than
  * incidental here, because `ReorderListService` is `@Injectable()` and carries constructor-parameter
  * decorators that any other transform would mis-emit.
  *
