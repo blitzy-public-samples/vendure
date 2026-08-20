@@ -75,8 +75,13 @@
  * -------------------------------------------------------------------------------------------------------
  */
 
+import { MODULE_METADATA } from '@nestjs/common/constants';
+import { Type } from '@vendure/core';
+import fs from 'fs';
+import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { REORDER_PLUGIN_OPTIONS } from './constants';
 import { ReorderPlugin, ReorderPluginConfigurationError } from './reorder.plugin';
 import { ReorderPluginOptions, ResolvedReorderPluginOptions } from './types';
 
@@ -335,6 +340,55 @@ function resetToDeclaredDefaults(): void {
 }
 
 /**
+ * The option set a registration's own options provider is bound to, located the way the injector locates it.
+ *
+ * A registration returned by `init()` carries a `useValue` provider for {@link REORDER_PLUGIN_OPTIONS} in its
+ * Nest module metadata; the bare `ReorderPlugin` class carries a `useFactory` over the static instead, which
+ * is what makes registering it without calling `init()` a valid installation on the declared defaults. Both
+ * are read here through the same metadata key Nest reads, rather than by reaching into module state, so what
+ * these cases assert is the binding a running server would resolve.
+ *
+ * @param registration - The plugin class or an `init()` registration.
+ * @returns The resolved option set that registration's provider yields.
+ */
+function optionsBoundTo(registration: Type<ReorderPlugin>): ResolvedReorderPluginOptions {
+    const providers: unknown[] = Reflect.getMetadata(MODULE_METADATA.PROVIDERS, registration) ?? [];
+    const bound = providers.find(
+        (provider): provider is { provide: symbol; useValue?: unknown; useFactory?: () => unknown } =>
+            typeof provider === 'object' &&
+            provider !== null &&
+            (provider as { provide?: unknown }).provide === REORDER_PLUGIN_OPTIONS,
+    );
+
+    expect(
+        bound,
+        'every registration must bind the options token, or nothing can read the bounds',
+    ).toBeDefined();
+    const value = bound?.useFactory ? bound.useFactory() : bound?.useValue;
+
+    return value as ResolvedReorderPluginOptions;
+}
+
+/**
+ * The option set a registration's bootstrap hook re-validates.
+ *
+ * The hook reads a protected accessor rather than the static, so that in a process holding more than one
+ * registration each checks the values it will itself serve with. Read here by instantiating the registration
+ * with a stub for its one dependency, because the accessor is protected and the behaviour — not the property —
+ * is the guarantee.
+ *
+ * @param registration - The plugin class or an `init()` registration.
+ * @returns The set that registration's `onApplicationBootstrap` would validate.
+ */
+function optionsInForceFor(registration: Type<ReorderPlugin>): ResolvedReorderPluginOptions {
+    const instance = new (registration as unknown as new (i18nService: unknown) => {
+        optionsInForce(): ResolvedReorderPluginOptions;
+    })({ addTranslationFile: () => undefined });
+
+    return instance.optionsInForce();
+}
+
+/**
  * Runs `init()` with the given options and returns the refusal it raised.
  *
  * The `expect` inside is not redundant with the caller's assertions: it is what turns "the call did not
@@ -440,12 +494,12 @@ describe('ReorderPlugin startup option validation', () => {
 
     describe('the accepted option set', () => {
         it('resolves every declared default when init() is called with no argument at all', () => {
-            expect(ReorderPlugin.init()).toBe(ReorderPlugin);
+            expect(ReorderPlugin.init().prototype instanceof ReorderPlugin).toBe(true);
             expect(ReorderPlugin.options).toEqual(DECLARED_DEFAULTS);
         });
 
         it('resolves every declared default when init() is called with an empty object', () => {
-            expect(ReorderPlugin.init({})).toBe(ReorderPlugin);
+            expect(ReorderPlugin.init({}).prototype instanceof ReorderPlugin).toBe(true);
             expect(ReorderPlugin.options).toEqual(DECLARED_DEFAULTS);
         });
 
@@ -738,6 +792,94 @@ describe('ReorderPlugin startup option validation', () => {
             expect(ReorderPlugin.options.maxLinesPerList).toBe(200);
         });
 
+        it('gives two differently configured registrations their own options, whenever they bootstrap', () => {
+            /*
+             * THE ISOLATION PROPERTY, exercised in the order that used to break it: BOTH registrations are
+             * created BEFORE either is bootstrapped. That order is what made the old shape wrong — the options
+             * provider was a factory reading a module-level variable, so it resolved whatever the LAST `init()`
+             * had stored, and the earlier registration silently enforced the later one's bounds. It is reachable
+             * wherever one process holds two servers: a multi-tenant host, or a test file that builds two
+             * configurations before booting either.
+             *
+             * Each registration's own provider is read rather than the static, because the provider is what the
+             * service and both resolvers are given. It is located by name in the registration's Nest metadata,
+             * exactly as the injector locates it, so this reads the binding the injector would use rather than a
+             * value this file arranged.
+             */
+            const first = ReorderPlugin.init({ maxListsPerCustomer: 10 });
+            const second = ReorderPlugin.init({ maxListsPerCustomer: 20 });
+
+            expect(first).not.toBe(second);
+            expect(first).not.toBe(ReorderPlugin);
+            expect(optionsBoundTo(first).maxListsPerCustomer).toBe(10);
+            expect(optionsBoundTo(second).maxListsPerCustomer).toBe(20);
+
+            // A third initialisation, standing in for a third server configured after the other two have been
+            // built: it must move neither of them.
+            ReorderPlugin.init({ maxListsPerCustomer: 30 });
+
+            expect(optionsBoundTo(first).maxListsPerCustomer).toBe(10);
+            expect(optionsBoundTo(second).maxListsPerCustomer).toBe(20);
+
+            // Every other key still takes its declared default in each, so isolation carries the whole set
+            // rather than only the key that differed.
+            expect(optionsBoundTo(first).maxLinesPerList).toBe(DECLARED_DEFAULTS.maxLinesPerList);
+            expect(optionsBoundTo(second).maxLinesPerList).toBe(DECLARED_DEFAULTS.maxLinesPerList);
+        });
+
+        it('re-asserts its OWN options at bootstrap, not whichever configuration initialised last', () => {
+            // The bootstrap hook's re-validation has to read the registration's own set for the same reason
+            // the provider does. Asserted by making a later initialisation carry a value the earlier
+            // registration must not adopt, and reading what that registration's hook validates.
+            const first = ReorderPlugin.init({ maxLinesPerList: 11 });
+            ReorderPlugin.init({ maxLinesPerList: 22 });
+
+            expect(optionsBoundTo(first).maxLinesPerList).toBe(11);
+            expect(ReorderPlugin.options.maxLinesPerList).toBe(22);
+            expect(optionsInForceFor(first).maxLinesPerList).toBe(11);
+        });
+
+        it('keeps the bare class on the declared defaults, whatever any earlier init() asked for', () => {
+            /*
+             * THE OTHER HALF OF THE ISOLATION PROPERTY, and the one that survives longest if it is not asserted.
+             * A deployment may register `ReorderPlugin` itself instead of calling `init()`, and doing so is a
+             * request for the DOCUMENTED DEFAULTS. If the bare class's provider read the latest initialisation,
+             * a process in which some other server had called `init({ maxLinesPerList: 33 })` would hand that
+             * 33 to this one in place of the documented 200 — silently, and depending on the order the two were
+             * created in. A bound a deployment never asked for is the one thing a bound must never be.
+             *
+             * Several prior initialisations are made, with different values and in a deliberate order, so the
+             * assertion cannot be satisfied by the bare class merely happening to agree with the last one.
+             */
+            ReorderPlugin.init({ maxLinesPerList: 33 });
+            ReorderPlugin.init({ maxListsPerCustomer: 3, maxQuantityPerLine: 7 });
+            ReorderPlugin.init({ defaultReorderListsPageSize: 5, defaultReorderListLinesPageSize: 6 });
+
+            // The latest initialisation is reported by the static, which is all the static claims to do.
+            expect(ReorderPlugin.options.defaultReorderListsPageSize).toBe(5);
+
+            // And it has moved neither what the bare registration's provider yields nor what its bootstrap
+            // hook re-validates. All five keys, so a leak in any one of them is named rather than a single
+            // key standing in for the set.
+            expect(optionsBoundTo(ReorderPlugin)).toEqual(DECLARED_DEFAULTS);
+            expect(optionsInForceFor(ReorderPlugin)).toEqual(DECLARED_DEFAULTS);
+        });
+
+        it('binds the bare class and its bootstrap hook to the very same frozen object', () => {
+            // Not two equal snapshots but one object: the hook's re-validation is only a check on what this
+            // registration will serve with if it reads exactly what the injector hands out.
+            expect(optionsInForceFor(ReorderPlugin)).toBe(optionsBoundTo(ReorderPlugin));
+            expect(Object.isFrozen(optionsBoundTo(ReorderPlugin))).toBe(true);
+        });
+
+        it('binds each scoped registration and its bootstrap hook to the very same frozen object', () => {
+            const scoped = ReorderPlugin.init({ maxLinesPerList: 44 });
+
+            expect(optionsInForceFor(scoped)).toBe(optionsBoundTo(scoped));
+            expect(optionsBoundTo(scoped).maxLinesPerList).toBe(44);
+            expect(Object.isFrozen(optionsBoundTo(scoped))).toBe(true);
+        });
+
         it('leaves a previously accepted set in force when a later init is refused', () => {
             ReorderPlugin.init({ maxLinesPerList: 7, maxQuantityPerLine: 11 });
 
@@ -750,5 +892,93 @@ describe('ReorderPlugin startup option validation', () => {
             expect(ReorderPlugin.options.maxQuantityPerLine).toBe(11);
             expect(ReorderPlugin.options.maxListsPerCustomer).toBe(25);
         });
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// THE INVENTORY THIS PACKAGE DISCOVERS, AND WHY IT IS ENUMERATED RATHER THAN MATCHED.
+//
+// Section 0.5.1.7 fixes this feature's unit inventory at exactly three co-located specifications, and
+// `vitest.config.mts` states that inventory directly: its `unit` project ENUMERATES those three rather than
+// matching a glob, so the run cannot quietly grow a fourth.
+//
+// Two specifications once sat beside them — an api-layer counter-repair spec under `src/api/` and a fixture
+// spec under `e2e/fixtures/` — and between them widened the discovered inventory to four unit specs and
+// seven e2e suites. Neither was dropped: the counter-repair cases are a section of
+// `src/service/reorder-list.service.spec.ts` and the statement-parser cases a section of
+// `e2e/reorder-list-mutate.e2e-spec.ts`, so every claim they made is still made from a file the manifest
+// names. What the assertions below pin is that the inventory is exactly those three, and that no
+// specification anywhere in the package is orphaned — a file collected by no project would be silently
+// unrun, which is a worse failure than a miscount because it is invisible.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+describe('the specifications this package discovers, and the project each belongs to', () => {
+    const PACKAGE_DIR = path.join(__dirname, '..');
+
+    /** This feature's own inventory: the three specifications section 0.5.1.7 names, and no others. */
+    const UNIT_PROJECT_FILES = [
+        'src/reorder.plugin.spec.ts',
+        'src/service/reorder-list-name.spec.ts',
+        'src/service/reorder-list.service.spec.ts',
+    ];
+
+    /** The `include` list a named project declares, in declaration order, read from the configuration. */
+    function declaredInclude(projectName: string): string[] {
+        const source = fs.readFileSync(path.join(PACKAGE_DIR, 'vitest.config.mts'), 'utf-8');
+        const at = source.indexOf(`name: '${projectName}'`);
+        expect(at, `vitest.config.mts declares no project named "${projectName}"`).toBeGreaterThan(-1);
+        const list = /include:\s*\[([^\]]*)\]/.exec(source.slice(at));
+        expect(list, `the "${projectName}" project declares no include list`).not.toBeNull();
+        return (list as RegExpExecArray)[1]
+            .split(',')
+            .map(token => token.trim().replace(/^'|'$/g, ''))
+            .filter(token => token.length > 0);
+    }
+
+    /** Every `*.spec.ts` beneath one directory, as package-relative POSIX paths. */
+    function specsUnder(relativeDirectory: string): string[] {
+        const root = path.join(PACKAGE_DIR, relativeDirectory);
+        if (!fs.existsSync(root)) {
+            return [];
+        }
+        const found: string[] = [];
+        const walk = (directory: string): void => {
+            for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+                const absolute = path.join(directory, entry.name);
+                if (entry.isDirectory()) {
+                    if (entry.name !== 'node_modules' && entry.name !== '__data__') {
+                        walk(absolute);
+                    }
+                } else if (entry.name.endsWith('.spec.ts') && !entry.name.endsWith('.e2e-spec.ts')) {
+                    found.push(path.relative(PACKAGE_DIR, absolute).split(path.sep).join('/'));
+                }
+            }
+        };
+        walk(root);
+        return found;
+    }
+
+    it('declares this feature inventory as exactly the three specifications the plan names', () => {
+        // THE REQUIREMENT THIS WORK OWNS. Enumerated in the configuration rather than matched by a pattern,
+        // so a fourth specification added to this feature does not join the run by existing — it has to be
+        // declared, and declaring it fails this assertion, which is the point.
+        expect(declaredInclude('unit')).toEqual(UNIT_PROJECT_FILES);
+        for (const relative of UNIT_PROJECT_FILES) {
+            expect(
+                fs.existsSync(path.join(PACKAGE_DIR, relative)),
+                `${relative} is declared in the unit project but is not on disk`,
+            ).toBe(true);
+        }
+    });
+
+    it('leaves no specification orphaned, so every one on disk belongs to the project', () => {
+        // THE GAP AN ENUMERATED LIST COULD OTHERWISE OPEN, CLOSED. A specification the list does not name
+        // runs nowhere, which is invisible rather than merely wrong, so the filesystem is required to hold
+        // exactly the enumerated set — under `src/` and under `e2e/` alike.
+        const onDisk = [...specsUnder('src'), ...specsUnder('e2e')].sort();
+        expect(
+            onDisk,
+            'a specification exists that no project collects, or a declared one has moved',
+        ).toEqual([...UNIT_PROJECT_FILES].sort());
     });
 });

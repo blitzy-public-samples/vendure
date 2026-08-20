@@ -1,5 +1,5 @@
 import { DeepPartial, EntityId, ID, ProductVariant, VendureEntity } from '@vendure/core';
-import { Check, Column, Entity, ManyToOne, Unique } from 'typeorm';
+import { Check, Column, Entity, Index, ManyToOne, Unique } from 'typeorm';
 
 import { ReorderList } from './reorder-list.entity';
 
@@ -11,7 +11,7 @@ import { ReorderList } from './reorder-list.entity';
  * that" rather than merely "these things" — the per-line quantity is the whole reason this table
  * exists rather than a plain membership set.
  *
- * Four characteristics are load-bearing, and each is easy to undo by accident:
+ * Five characteristics are load-bearing, and each is easy to undo by accident:
  *
  * 1. De-duplication is a *database* constraint and not a service convention. At most one row may
  *    exist for a given list-and-variant pair, and `UQ_reorder_list_line_list_variant` over
@@ -42,6 +42,19 @@ import { ReorderList } from './reorder-list.entity';
  * 4. A line does not know how many siblings it has. The line total a list reports is the stored
  *    counter on {@link ReorderList}, written in the same transaction as every insert and delete here,
  *    so nothing on this entity derives, caches or duplicates it.
+ * 5. **Both foreign keys are indexed, and the second index exists for a predicate no request issues.**
+ *    `UQ_reorder_list_line_list_variant` leads with `reorderListId`, so it already serves every lookup
+ *    this plugin performs — a list's own lines, and the one line a list holds for a variant. Nothing led
+ *    with `productVariantId`, though, and the engine needs one: `ON DELETE CASCADE` on
+ *    {@link ReorderListLine.productVariant} means a *hard* deletion of a variant makes the engine find
+ *    every line row referencing it, and PostgreSQL and SQLite index the referenced key rather than the
+ *    referencing column, so that probe would scan the whole line table — the largest table this feature
+ *    owns. `IDX_reorder_list_line_variant` is the index for it. The path is rare rather than absent:
+ *    the platform's own variant deletion is a soft delete, so this fires only for a hard delete issued
+ *    outside the shipped operations — which is also the one drift the stored line counter's repair
+ *    exists to correct. (The MySQL family creates a foreign-key index of its own accord, so there the
+ *    declaration is redundant rather than wrong; declaring it keeps the four engines' schemas the same
+ *    shape.)
  *
  * `id`, `createdAt` and `updatedAt` are inherited from {@link VendureEntity} and are deliberately not
  * re-declared here, though all three are part of this entity's published contract. `createdAt` is
@@ -63,6 +76,7 @@ import { ReorderList } from './reorder-list.entity';
  */
 @Entity()
 @Unique('UQ_reorder_list_line_list_variant', ['reorderListId', 'productVariantId'])
+@Index('IDX_reorder_list_line_variant', ['productVariantId'])
 @Check('CHK_reorder_list_line_quantity_positive', '"quantity" > 0')
 export class ReorderListLine extends VendureEntity {
     constructor(input?: DeepPartial<ReorderListLine>) {

@@ -47,9 +47,10 @@
  * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires a
  * new public API to carry a `@since` tag naming what will be the next minor version, and its own literal
  * example names a different version entirely. This checkout declares 3.7.0, so the next minor derives to
- * 3.8.0. That string appears nowhere else in this repository and is therefore not a quotation from it; it is
- * computed from the checkout's version plus the guide's rule. Should the branch decision route this work to
- * a major release instead, the derived tag changes with it.
+ * 3.8.0. The guide never states that value, so the tag is computed from the checkout's version plus the
+ * guide's rule rather than quoted from it — which is also how the authoritative tickets, where the same
+ * derived value does appear, present it. Should the branch decision route this work to a major release
+ * instead, the derived tag changes with it.
  *
  * Deliberate absences, so that they read as rulings rather than as gaps. There is no sixth key. In
  * particular there is no name-length option: the list-name bound is the fixed constant 191 that equals the
@@ -77,9 +78,11 @@
  * `ReorderPlugin.init({})` is a valid call that yields exactly the documented defaults. A key that is
  * supplied is still validated, so omitting a key and supplying a malformed one are different outcomes.
  *
- * **Startup validation.** Every value is validated once, at plugin initialisation, rather than at request
- * time. A value that is not an integer, is not finite, or is below one fails plugin initialisation with a
- * named configuration error identifying the offending key; `maxQuantityPerLine` additionally rejects a
+ * **Startup validation.** Every value is validated in `ReorderPlugin.init()` — the primary check, on the
+ * input a deployment supplies — and re-asserted once more when the application bootstraps, which catches a
+ * plugin registered as a bare class whose `init()` never ran the validator. Neither check is ever performed
+ * per request. A value that is not an integer, is not finite, or is below one fails plugin initialisation
+ * with a named configuration error identifying the offending key; `maxQuantityPerLine` additionally rejects a
  * value above the largest signed 32-bit integer, 2147483647. Initialisation fails rather than the bound
  * degrading, because a bound that silently becomes "admit everything" or "admit nothing" is worse than no
  * bound at all: nothing fails, while the guarantee the bound existed to make is gone.
@@ -94,7 +97,7 @@
  *   maxQuantityPerLine: 999,
  *   defaultReorderListsPageSize: 25,
  *   defaultReorderListLinesPageSize: 50,
- * }),
+ * });
  * ```
  *
  * @docsCategory core plugins/ReorderPlugin
@@ -105,11 +108,14 @@ export interface ReorderPluginOptions {
      * @description
      * The maximum number of reorder lists a single customer may hold in a single channel.
      *
-     * Enforced by the `createReorderList` mutation, which counts and inserts inside one transaction under a
-     * pessimistic write lock on the owning `Customer` row, so two concurrent creates cannot both pass a
-     * bound that admits only one of them. Breaching it returns `ReorderListLimitError` carrying this value
-     * as `maxItems`. The composite unique constraint on the list name is a backstop for the name race and
-     * not for this bound.
+     * Enforced by the `createReorderList` mutation, which counts and inserts inside one transaction. On
+     * PostgreSQL, MySQL and MariaDB that count is taken under a pessimistic write lock on the owning
+     * `Customer` row, so two concurrent creates cannot both pass a bound that admits only one of them. On
+     * sql.js the lock is deliberately skipped — that driver serves a single connection, so two transactions
+     * cannot interleave, and asking it for a lock raises rather than degrading. The transaction is what
+     * upholds the bound on every engine; the lock is what upholds it on the three that can interleave.
+     * Breaching it returns `ReorderListLimitError` carrying this value as `maxItems`. The composite unique
+     * constraint on the list name is a backstop for the name race and not for this bound.
      *
      * Must be an integer, finite, and at least 1. Declared by EPIC-001 section 7.10, the single authority
      * for every configured key; owning story STORY-001-01-01.

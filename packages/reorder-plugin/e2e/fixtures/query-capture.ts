@@ -1780,6 +1780,91 @@ function resolveStatementText(statement: CapturedStatement | string): string {
 }
 
 /**
+ * @description
+ * What kind of row lock a statement asks the engine for: `'exclusive'`, `'shared'`, or `'none'`.
+ *
+ * ★ **It exists because lock ORDER is a correctness property that no payload assertion can see.** Two
+ * transactions taking the same two rows in opposite orders deadlock, and the engine resolves that by killing
+ * one of them — which a caller observes as an operation that failed for no reason it can see, intermittently,
+ * under load. The order a service actually takes its locks in is visible only in the statements it issued and
+ * the sequence it issued them in, which is precisely what this instrument records. Reading the lock clause off
+ * each statement turns "the parent is locked before the child" into an assertion.
+ *
+ * **Every dialect that has these clauses spells them differently, and the spelling is read rather than
+ * assumed.** PostgreSQL writes `FOR UPDATE` and `FOR SHARE`. MySQL 8 accepts both of those and also the older
+ * `LOCK IN SHARE MODE`, which is what MariaDB and TypeORM's MySQL driver emit for a shared lock. The SQLite
+ * family has no such clause at all, so a statement from it is `'none'` — correctly, because that driver serves
+ * a single connection, cannot interleave two transactions, and raises rather than degrades when asked for a
+ * lock. A caller therefore gates a lock-clause assertion on the engine rather than expecting one everywhere.
+ *
+ * **Comments, string literals and quoted identifiers cannot produce a false positive.** The text is passed
+ * through the same comment-blanking the rest of this fixture uses, and every quoted run — `'a string'`,
+ * `"an identifier"`, a back-quoted or bracketed one — is then blanked WHOLE rather than unquoted, which is the
+ * opposite of what the table-scanning helpers here do and is deliberate. Unquoting is right for finding a
+ * table name and wrong for finding a keyword: it turns the perfectly legal column `"for update"` into the very
+ * clause this function is looking for. Blanking the run means a note, a stored string and a column named after
+ * the keywords all read as no lock, while a real clause — which is never quoted — still reads as one.
+ *
+ * @param statement - A captured statement, or raw SQL text.
+ * @returns `'exclusive'` for a `FOR UPDATE`, `'shared'` for a `FOR SHARE` or `LOCK IN SHARE MODE`, and
+ * `'none'` when the statement asks for no row lock. An exclusive clause wins if somehow both appear.
+ *
+ * @example
+ * ```ts
+ * const [parentRead] = capture.selectsFor('reorder_list');
+ * expect(classifyLockClause(parentRead)).toBe('shared');
+ * ```
+ */
+/**
+ * Every quoted run of a statement replaced by spaces of the same length, delimiters included.
+ *
+ * It preserves the text's length and every unquoted character's position, so a caller can match on the result
+ * and still reason about the original. It is deliberately not {@link stripIdentifierQuotes}: that one removes
+ * the delimiters and keeps the content, which is what a table-name scan needs and the exact opposite of what a
+ * KEYWORD scan needs — `"for update"` is a legal column name, and unquoting it manufactures the clause.
+ *
+ * The four delimiters cover every dialect this suite meets: `'` for a string on all of them, `"` for an
+ * identifier on PostgreSQL and SQLite and a string on the MySQL family, a back quote for an identifier on the
+ * MySQL family, and a bracket for one on SQL Server. Escaping and doubling inside each run are handled by the
+ * same scanners the rest of this fixture uses, so a doubled quote does not terminate a run early.
+ */
+function blankQuotedRuns(text: string): string {
+    let output = '';
+    let index = 0;
+    while (index < text.length) {
+        const character = text.charAt(index);
+        if (character === "'" || character === '"' || character === '`' || character === '[') {
+            const end =
+                character === "'" ? skipStringLiteral(text, index) : skipQuotedIdentifier(text, index);
+            output += ' '.repeat(end - index);
+            index = end;
+            continue;
+        }
+        output += character;
+        index += 1;
+    }
+    return output;
+}
+
+export function classifyLockClause(statement: CapturedStatement | string): 'exclusive' | 'shared' | 'none' {
+    const text = resolveStatementText(statement);
+    if (typeof text !== 'string' || text.length === 0) {
+        return 'none';
+    }
+    // Through the shared resolver, which reads the captured statement's own `dialect` — the field the
+    // recorder fills — and falls back to the fail-closed lexicon for a bare string that carries no dialect.
+    const lexicon = lexiconForStatement(statement, undefined);
+    const scannable = blankQuotedRuns(blankComments(text, lexicon));
+    if (/\bFOR\s+UPDATE\b/i.test(scannable)) {
+        return 'exclusive';
+    }
+    if (/\bFOR\s+SHARE\b/i.test(scannable) || /\bLOCK\s+IN\s+SHARE\s+MODE\b/i.test(scannable)) {
+        return 'shared';
+    }
+    return 'none';
+}
+
+/**
  * The quote-stripped `WHERE` portion of a statement together with the number of positional `?`
  * placeholders that precede it.
  *
@@ -4165,6 +4250,166 @@ export function statementCarriesParameterValue(
 }
 
 /**
+ * @description
+ * What {@link QueryCaptureLogger.format} may put in a diagnostic.
+ *
+ * @docsCategory testing
+ */
+export interface QueryCaptureFormatOptions {
+    /**
+     * @description
+     * Renders every bound value and every quoted literal VERBATIM instead of describing it.
+     *
+     * Off by default, and the default is a security property rather than a style choice — see
+     * {@link QueryCaptureLogger.format}. Turn it on only for a local investigation, never in a committed
+     * assertion message: a failing assertion prints its message into the run's log, and a continuous
+     * integration log is readable by everyone who can see the build.
+     */
+    readonly revealValues?: boolean;
+}
+
+/**
+ * Describes one bound value WITHOUT disclosing it: its type, and for a sized value its size.
+ *
+ * ★ WHY A DESCRIPTION RATHER THAN THE VALUE. This instrument is attached to the whole connection, so the
+ * statements it captures are not only the plugin's: a request that resolves a session is a `SELECT` over
+ * `session` whose bound parameter is the caller's AUTHENTICATION TOKEN, and a failing count assertion
+ * embeds the dump in its message, which lands in the run's log. A number, a boolean and a null are rendered
+ * as themselves because they are the identifiers and flags a reader actually needs and cannot carry a
+ * credential; a string, a buffer or a structure is described by its shape alone, which is enough to tell
+ * "the right parameter in the right position" from "the wrong one" without publishing what it was.
+ *
+ * The exact value remains available to every assertion through `statement.parameters`, which is untouched:
+ * what changes here is only what a human-readable dump says.
+ */
+function describeParameterForDiagnostic(value: unknown): string {
+    if (value === null) {
+        return 'null';
+    }
+    if (value === undefined) {
+        return 'undefined';
+    }
+    if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean') {
+        return String(value);
+    }
+    if (typeof value === 'string') {
+        return `string(${value.length})`;
+    }
+    if (value instanceof Date) {
+        return 'date';
+    }
+    if (ArrayBuffer.isView(value)) {
+        return `binary(${value.byteLength})`;
+    }
+    if (Array.isArray(value)) {
+        return `array(${value.length})`;
+    }
+    if (typeof value === 'function') {
+        return 'function';
+    }
+    return typeof value === 'object' ? 'object' : typeof value;
+}
+
+/** The whole parameter list, described rather than disclosed. */
+function describeParametersForDiagnostic(parameters: readonly unknown[] | undefined): string {
+    if (parameters === undefined) {
+        return 'none';
+    }
+    return `[${parameters.map(describeParameterForDiagnostic).join(', ')}]`;
+}
+
+/**
+ * Replaces every single-quoted literal in a statement with a description of its length.
+ *
+ * ★ WHY THE STATEMENT TEXT NEEDS THIS TOO, AND NOT ONLY THE PARAMETER LIST. The SQLite family — which is
+ * the default engine for this package's suites — receives its values written INLINE rather than bound, so
+ * a session look-up arrives as `... WHERE "token" = 'the-actual-token'` and describing the (empty)
+ * parameter list would disclose it anyway. Numeric literals are deliberately left alone: they are the
+ * identifiers a reader is diagnosing with, and they cannot carry a credential.
+ *
+ * Both escape conventions the target engines use are honoured while scanning — a doubled quote and a
+ * backslash-escaped quote — so a literal containing either is consumed whole rather than ended early,
+ * which is what stops the remainder of it from being rendered as though it were SQL.
+ */
+function redactQuotedLiterals(sql: string): string {
+    let redacted = '';
+    let index = 0;
+    while (index < sql.length) {
+        const character = sql[index];
+        if (character !== "'") {
+            redacted += character;
+            index++;
+            continue;
+        }
+        // Inside a literal. Consume to its close, counting the characters it held.
+        let length = 0;
+        let cursor = index + 1;
+        let closed = false;
+        while (cursor < sql.length) {
+            if (sql[cursor] === '\\' && cursor + 1 < sql.length) {
+                length += 1;
+                cursor += 2;
+                continue;
+            }
+            if (sql[cursor] === "'") {
+                if (sql[cursor + 1] === "'") {
+                    length += 1;
+                    cursor += 2;
+                    continue;
+                }
+                closed = true;
+                cursor++;
+                break;
+            }
+            length += 1;
+            cursor++;
+        }
+        redacted += `'<redacted:${length}>'`;
+        if (!closed) {
+            // An unterminated literal — a truncated statement, or one this scanner cannot read. Everything
+            // after the opening quote has already been replaced, which fails CLOSED.
+            return redacted;
+        }
+        index = cursor;
+    }
+    return redacted;
+}
+
+/**
+ * The shortest bound string this redactor will look for inside a driver's own message.
+ *
+ * A value this short cannot be a credential, and replacing it globally would corrupt the message it was
+ * meant to make safe — a one-character parameter occurs in almost every word of an error text.
+ */
+const MIN_REDACTED_VALUE_LENGTH = 4;
+
+/**
+ * Replaces the values a statement actually bound, wherever a driver's message repeats them.
+ *
+ * ★ WHY NOT THE QUOTED-LITERAL SCAN THAT THE STATEMENT TEXT GETS. A driver quotes more than the value into
+ * its failure message: the MySQL family writes `Duplicate entry '<value>' for key '<constraint>'`, so a
+ * scan that blanked every quoted run would take the CONSTRAINT NAME with it — and the constraint name is
+ * the one part of that message the suites read, is not sensitive, and is what tells a reader which
+ * invariant refused the write. Matching the bound values themselves is exact instead of heuristic: it
+ * removes precisely what the statement supplied, leaves everything the driver added, and covers the forms
+ * that are not quoted at all — PostgreSQL's `DETAIL: Key (col)=(value) already exists.` among them.
+ */
+function redactKnownValues(text: string, parameters: readonly unknown[] | undefined): string {
+    if (parameters === undefined) {
+        return text;
+    }
+    let redacted = text;
+    for (const value of parameters) {
+        if (typeof value === 'string' && value.length >= MIN_REDACTED_VALUE_LENGTH) {
+            // `split`/`join` rather than a regular expression, so a value carrying regex metacharacters is
+            // matched literally rather than compiled into a pattern.
+            redacted = redacted.split(value).join(`<redacted:${value.length}>`);
+        }
+    }
+    return redacted;
+}
+
+/**
  * Renders a value to a string without ever throwing. Circular structures fall back to a plain
  * `String()` rendering, mirroring the `stringifyParams` idiom in
  * `packages/core/src/config/logger/typeorm-logger.ts:L88-L95`.
@@ -4619,23 +4864,78 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
 
     /**
      * @description
+     * Every statement captured that is not transaction control, **whatever table it names** — including
+     * statements against tables this plugin does not own, and table-less probes.
+     *
+     * This is the accessor the WHOLE-REQUEST boundary needs, and the reason it exists is that a
+     * table-filtered count cannot serve that boundary. A comparison across two page sizes filtered to
+     * `reorder_list` and `reorder_list_line` is blind to an N+1 anywhere else in the request: a
+     * `ReorderListLine.productVariant` resolved once per line would add a `product_variant` statement
+     * per entry, both filtered numbers would still agree, and the comparison would report non-growth
+     * while the request had in fact grown. Counting everything closes that.
+     *
+     * Transaction control is excluded because it is bookkeeping rather than work, and its volume tracks
+     * the number of transactions rather than the size of the page — a read that opens one transaction
+     * per page contributes the same `START TRANSACTION`/`COMMIT` pair whatever the page size, so
+     * including it would only add a constant to both sides. It is excluded rather than dropped: the
+     * statements remain in {@link statements} for the same-transaction proofs that depend on them.
+     */
+    nonTransactionStatements(): CapturedStatement[] {
+        return this.capturedStatements.filter(entry => entry.kind !== 'transaction');
+    }
+
+    /**
+     * @description
+     * `nonTransactionStatements().length`, for readability at an assertion site.
+     *
+     * **Non-growth only.** Epic §7.7 fixes an exact number to the plugin-statement boundary alone, and
+     * this value belongs to the whole-request boundary — where the number legitimately moves with an
+     * unrelated platform change, so asserting it exactly would make a brittle test out of a sound
+     * claim. Compare two of these across two input sizes; never assert one of them against a literal.
+     */
+    wholeRequestCount(): number {
+        return this.nonTransactionStatements().length;
+    }
+
+    /**
+     * @description
      * A compact, deterministic, multi-line dump of everything captured — one line per statement,
      * carrying its sequence, kind, runner identifier, transaction state, extracted tables, the
      * statement text truncated to a character budget, and its parameters.
      *
-     * It **builds a string and never prints**; a suite embeds it in a failure message. Parameters are
-     * rendered through a stringifier that falls back rather than throwing on a circular structure,
-     * mirroring `packages/core/src/config/logger/typeorm-logger.ts:L88-L95`.
+     * It **builds a string and never prints**; a suite embeds it in a failure message.
+     *
+     * ★ VALUES ARE DESCRIBED, NOT DISCLOSED, AND THAT IS THE POINT OF THE DEFAULT. This instrument is
+     * installed on the whole connection, so what it captures is not only the plugin's statements: a
+     * request that resolves a session issues a `SELECT` over `session` whose value is the caller's
+     * AUTHENTICATION TOKEN — bound as a parameter on the server engines, and written inline into the
+     * statement text on the SQLite family. A failing count assertion embeds this dump in its message, and
+     * that message goes into the run's log, which on continuous integration is readable by everyone who
+     * can see the build. So by default every bound value is replaced by a description of its type and
+     * size, and every quoted literal in the statement text by its length. Identifiers, table names,
+     * statement shape, numeric literals, transaction state and sequence — everything a reader diagnoses a
+     * count with — are untouched, and the raw values remain available to every ASSERTION through
+     * `statement.parameters`, which this method does not modify.
+     *
+     * Verbatim rendering is available, and it is deliberately explicit: `format(undefined, {
+     * revealValues: true })`. It is for a local investigation and must not be committed in an assertion
+     * message.
+     *
+     * A described value cannot throw, so no stringifier is needed for the default path; the verbatim path
+     * uses one that falls back rather than throwing on a circular structure, mirroring
+     * `packages/core/src/config/logger/typeorm-logger.ts:L88-L95`.
      *
      * @param maxQueryLength A character budget for the statement text. A control value for the dump,
      * not a claim about any statement.
+     * @param options See {@link QueryCaptureFormatOptions}. Omitted, values are described rather than
+     * disclosed.
      *
      * @example
      * ```ts
      * expect(capture.selectsFor('reorder_list').length, capture.format()).toBe(1);
      * ```
      */
-    format(maxQueryLength = DEFAULT_FORMATTED_QUERY_LENGTH): string {
+    format(maxQueryLength = DEFAULT_FORMATTED_QUERY_LENGTH, options: QueryCaptureFormatOptions = {}): string {
         const budget =
             typeof maxQueryLength === 'number' && maxQueryLength > 0
                 ? maxQueryLength
@@ -4645,8 +4945,12 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
                 this.captureEnabled ? 'enabled' : 'disabled'
             }, engine ${resolveConfiguredEngine()}`,
         ];
+        const reveal = options.revealValues === true;
         for (const entry of this.capturedStatements) {
-            const text = entry.query.length > budget ? `${entry.query.slice(0, budget)}...` : entry.query;
+            // REDACTED BEFORE TRUNCATED, so a literal cut in half by the budget cannot leave its opening
+            // quote unmatched and its contents rendered as though they were SQL.
+            const rendered = reveal ? entry.query : redactQuotedLiterals(entry.query);
+            const text = rendered.length > budget ? `${rendered.slice(0, budget)}...` : rendered;
             const parts = [
                 `#${entry.sequence}`,
                 entry.kind,
@@ -4655,9 +4959,17 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
                 `tables=[${entry.tables.join(', ')}]`,
             ];
             if (entry.error !== undefined) {
-                parts.push(`error=${entry.error}`);
+                // The driver's own message, with the values THIS statement bound removed from it and
+                // everything the driver added — the constraint name above all — left intact. See
+                // {@link redactKnownValues} for why this is not the same scan the statement text gets.
+                parts.push(
+                    `error=${reveal ? entry.error : redactKnownValues(entry.error, entry.parameters)}`,
+                );
             }
-            lines.push(`${parts.join(' ')} :: ${text} :: params=${safeStringify(entry.parameters)}`);
+            const parameters = reveal
+                ? safeStringify(entry.parameters)
+                : describeParametersForDiagnostic(entry.parameters);
+            lines.push(`${parts.join(' ')} :: ${text} :: params=${parameters}`);
         }
         if (this.capturedSlowQueryNotices.length > 0) {
             lines.push(`slow-query notices: ${String(this.capturedSlowQueryNotices.length)}`);

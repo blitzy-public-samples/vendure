@@ -78,7 +78,11 @@
  * The repository's reviews test plugin reverses the mutation order
  * (`packages/dev-server/test-plugins/reviews/api/product-review-shop.resolver.ts` L20-L21); the precedent
  * is the mandated one, so the order below is the wishlist plugin's. `@Transaction()` appears on all six
- * mutations and on neither read, which is an idiom the precedent establishes and no ticket names.
+ * mutations and on neither read, which is an idiom the precedent establishes and no ticket names. Five of the
+ * six take the decorator's default `'auto'` mode; `addItemToReorderList` declares `'manual'`, because it is the
+ * one operation that RETRIES and a retry nested inside an already-open transaction is a savepoint rather than a
+ * fresh transaction. That method's own documentation gives the whole reasoning and the engine behaviour it
+ * turns on.
  *
  * THERE IS NO CODEGEN BEHIND THIS FILE. The reviews plugin types its arguments from a generated
  * `generated-shop-types` module; this plugin has no such artefact and no ticket asks for one. The argument
@@ -98,9 +102,10 @@
  * session, so no `customerId` and no `channelId` is accepted anywhere below.
  *
  * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires
- * new public API to carry a `@since` tag naming what will be the next minor version. This checkout
- * declares 3.7.0, so the next minor derives to 3.8.0. That string appears nowhere in this repository and
- * is therefore not a quotation from it.
+ * new public API to carry a `@since` tag naming what will be the next minor version, and its own example
+ * names a different one. This checkout declares 3.7.0, so the next minor derives to 3.8.0 — computed from
+ * that declared version plus the guide's rule, and never a quotation from the guide, which does not state
+ * the value. The authoritative tickets record the same derivation.
  * -------------------------------------------------------------------------------------------------------
  */
 
@@ -243,7 +248,8 @@ type ReorderListEntity = NonNullable<Awaited<ReturnType<ReorderListService['getR
 /**
  * @description
  * Publishes the eight Shop API operations of feature FEATURE-001-01 "Named Reorder Lists with Line
- * Quantities": the two paginated read queries and the six mutations declared by this plugin's own
+ * Quantities": the two read queries — one returning a paginated collection of lists, one returning a single
+ * nullable list whose nested `lines` field is paginated — and the six mutations declared by this plugin's own
  * `shopApiExtensions` document.
  *
  * Every method is gated with `@Allow(Permission.Owner)`, every mutation runs inside a transaction, and every
@@ -470,8 +476,10 @@ export class ReorderListShopResolver {
             markSingleReorderListRead(list);
             // Then the reconciliation, and BEFORE this method returns — see the note above on why the ordering
             // is the whole of the fix. It issues nothing where the document selected no `lines` field or
-            // narrowed the nested collection, and it never raises: a failure leaves the nested field resolver to
-            // read the page as it always could.
+            // narrowed the nested collection. A nested page it could not READ is forgiven and left to the field
+            // resolver, which would fail there if the failure were real; a counter repair that was attempted
+            // and FAILED propagates instead, already sanitised by the service, because the alternative is a
+            // response carrying a correct page beside a stale `lineCount` and no indication of it.
             await reconcileSingleReorderListRead(
                 this.reorderListService,
                 ctx,
@@ -590,17 +598,49 @@ export class ReorderListShopResolver {
      *
      * A second add of the same variant accumulates onto the existing line rather than inserting a duplicate,
      * enforced by the named per-`(list, variant)` uniqueness constraint and applied by a conditional
-     * statement whose affected-row count is the authority. The line bound is enforced on this path only, by
-     * a conditional counter update taken before the insert, and a list already at the configured maximum
-     * resolves to `ReorderListLimitError` carrying that maximum. A variant that does not resolve in the
-     * active channel, and a resulting quantity outside the configured bounds, are both refused by a
-     * propagating `UserInputError`.
+     * statement whose affected-row count is the authority.
+     *
+     * **`AddItemToReorderListResult` carries exactly three members: `ReorderList`,
+     * `ReorderListNotFoundError` and `ReorderListLimitError`.** A list the caller does not own in the active
+     * channel — and an id that names no list at all — resolves to `ReorderListNotFoundError`. The line bound
+     * is enforced on this path only, by a conditional counter update taken before the insert, so a list
+     * already at the configured maximum resolves to `ReorderListLimitError` carrying that maximum as
+     * `maxItems`. The union carries no line-level not-found result, because an add either accumulates onto an
+     * existing line or creates one and so has no line it can fail to find.
+     *
+     * **A malformed request is not a union member.** A quantity that is not a positive integer, a resulting
+     * quantity above `maxQuantityPerLine`, and a variant that does not resolve in the active channel are each
+     * refused by a propagating `UserInputError`, which reaches the client as one top-level `errors` entry
+     * with `extensions.code` exactly `USER_INPUT_ERROR`, `data` null and no row written. Each carries one of
+     * this plugin's own message keys: `error.reorder-list-line-quantity-must-be-positive`,
+     * `error.reorder-list-line-quantity-above-maximum` (interpolating `max`) and
+     * `error.reorder-list-variant-not-found` (interpolating `id`) respectively.
      *
      * **The input declares exactly three fields, and the absence of a fourth is a ruling rather than an
      * omission.** There is no idempotency key: the delivery guarantee is at-least-once, stated plainly, and
-     * `adjustReorderListLine`'s absolute set is the deterministic remedy. The union carries no line-level
-     * not-found result, because an add either accumulates onto an existing line or creates one and so has no
-     * line it can fail to find.
+     * `adjustReorderListLine`'s absolute set is the deterministic remedy.
+     *
+     * **THE ONE MUTATION HERE THAT DECLARES `'manual'`, AND WHY IT MUST.** Every other mutation on this
+     * resolver runs one transaction and is decorated `@Transaction()`, whose `'auto'` mode opens that
+     * transaction before the resolver body runs. This operation runs a BOUNDED RETRY — a concurrent request can
+     * create the very line this call was about to create, or remove the line it had just resolved, and in both
+     * cases the contract's answer is to redo the operation with the other request's row visible rather than to
+     * report an error. Under `'auto'` the service's own `connection.withTransaction` would INHERIT the
+     * already-open transaction, and TypeORM opens a nested one as a savepoint
+     * (`QueryRunner.startTransaction` issues `SAVEPOINT typeorm_N` once `transactionDepth` is above zero;
+     * every driver family this plugin supports declares `transactionSupport = 'nested'`). A savepoint retry is
+     * not a retry of the kind this operation needs, for two reasons that are properties of the engines rather
+     * than of this code: `ROLLBACK TO SAVEPOINT` on InnoDB does NOT release the row locks taken after the
+     * savepoint, and the transaction's REPEATABLE READ snapshot outlives it — so the second attempt would
+     * inherit the first attempt's locks and its stale view of the very row it is retrying because of.
+     *
+     * `'manual'` removes both. The interceptor still creates the query runner, attaches it to the context and
+     * still rolls back on an uncaught error, but it starts no transaction — so each attempt's
+     * `withTransaction` opens a REAL one at depth zero, and committing or rolling it back releases every lock
+     * and every snapshot it took. That is what lets the ordinary path lock as little as it does: the retry
+     * needs nothing carried over, so no attempt has to lock defensively for the benefit of the next one. The
+     * service is the component that opens and closes each transaction, which is the arrangement `'manual'`
+     * exists for, and it wraps every write without exception.
      *
      * @param ctx - The request context, whose session and active channel scope both the list and the
      * variant.
@@ -609,7 +649,7 @@ export class ReorderListShopResolver {
      * @since 3.8.0
      */
     @Mutation()
-    @Transaction()
+    @Transaction('manual')
     @Allow(Permission.Owner)
     async addItemToReorderList(
         @Ctx() ctx: RequestContext,
@@ -623,15 +663,20 @@ export class ReorderListShopResolver {
      * `adjustReorderListLine`: sets a line's quantity to an absolute value.
      *
      * The quantity is an absolute set rather than an increment, which makes the operation idempotent by
-     * construction: repeating the call leaves the same stored value. A quantity outside the configured
-     * bounds is refused by a propagating `UserInputError` before any write, so a refused adjustment cannot
-     * have touched the line.
+     * construction: repeating the call leaves the same stored value.
      *
-     * **The union carries `ReorderListNotFoundError` and `ReorderListLineNotFoundError` but no limit
-     * result**, and that is exact rather than incidental: the line bound is enforced on the add path only,
-     * so changing the quantity of a line that already exists cannot breach a line-count bound. The two
-     * not-found results are distinguishable because the list is resolved under the ownership predicate
-     * first.
+     * **`AdjustReorderListLineResult` carries exactly three members: `ReorderList`,
+     * `ReorderListNotFoundError` and `ReorderListLineNotFoundError` — and no limit result.** That is exact
+     * rather than incidental: the line bound is enforced on the add path only, so changing the quantity of a
+     * line that already exists cannot breach a line-count bound. The two not-found results are
+     * distinguishable because the list is resolved under the ownership predicate first.
+     *
+     * **A malformed quantity is not a union member.** A value that is not a positive integer, or that
+     * exceeds `maxQuantityPerLine`, is refused by a propagating `UserInputError` before any write — one
+     * top-level `errors` entry whose `extensions.code` is exactly `USER_INPUT_ERROR`, with `data` null —
+     * carrying `error.reorder-list-line-quantity-must-be-positive` or
+     * `error.reorder-list-line-quantity-above-maximum` (interpolating `max`) respectively. A refused
+     * adjustment cannot have touched the line.
      *
      * @param ctx - The request context, whose session and active channel scope the addressed rows.
      * @param args - The `AdjustReorderListLineInput`: the list, the line, and the absolute quantity to set.

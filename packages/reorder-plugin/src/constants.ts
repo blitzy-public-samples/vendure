@@ -11,8 +11,12 @@
 /**
  * @description
  * The logger context supplied to every `Logger` call this plugin makes. A stable context string is
- * what lets an operator filter the server log down to this plugin's output, and what lets them raise
- * or lower the log level for this plugin alone without touching the rest of the server.
+ * what lets an operator identify this plugin's output and filter the server log down to it.
+ *
+ * Filtering is the whole of the promise. The platform's default logger applies one log level to the
+ * whole server and the logger interface defines no per-context threshold, so a stable context does
+ * not by itself let an operator raise or lower the level for this plugin alone; a custom logger
+ * implementation, or a downstream log pipeline, can key such a policy off this value.
  *
  * The value is the plugin class name, with no suffix and no surrounding brackets, which is the
  * convention each shipped first-party plugin follows in its own `src/constants.ts`.
@@ -60,10 +64,16 @@ export const REORDER_PLUGIN_OPTIONS = Symbol('REORDER_PLUGIN_OPTIONS');
 
 /**
  * @description
- * The maximum number of characters a reorder list name may contain, measured on its canonical form
- * — that is, after leading and trailing whitespace has been removed and internal whitespace runs
- * have been collapsed. A name whose canonical form is longer is refused as a malformed request, and
- * no row is written for it.
+ * The maximum number of Unicode code points either stored form of a reorder list name may contain.
+ * **Both stored values are measured against it**: the display `name`, which is the submitted value
+ * after leading and trailing whitespace has been removed and internal whitespace runs collapsed; and
+ * the derived `nameKey`, that display value NFC-normalised and lower-cased. A name is refused as a
+ * malformed request, with no row written, when either exceeds this bound.
+ *
+ * Both measurements are needed because NFC composition is not guaranteed to shorten a string and can
+ * lengthen one, so a display value inside the bound can still derive a key outside it — 191
+ * repetitions of U+0344 normalise to 382 code points. For a name whose characters NFC leaves alone
+ * the two measurements are equal, which is the ordinary case.
  *
  * This is a constant rather than a plugin option, and that is deliberate. 191 is not a product
  * judgement about how long a list name ought to be; it is an engine ceiling. Both `name` and

@@ -74,8 +74,9 @@
  *
  * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires new
  * public API to carry a `@since` tag naming what will be the next minor version, and its own literal example
- * names a different version. This checkout declares 3.7.0, so the next minor derives to 3.8.0. That string
- * appears nowhere in this repository and is therefore not a quotation from it.
+ * names a different version. This checkout declares 3.7.0, so the next minor derives to 3.8.0 — computed
+ * from that declared version plus the guide's rule, and never a quotation from the guide, which does not
+ * state the value. The authoritative tickets record the same derivation.
  * -------------------------------------------------------------------------------------------------------
  */
 
@@ -93,6 +94,7 @@ import {
     RequestContext,
     RequestContextCacheService,
     Translated,
+    UserInputError,
 } from '@vendure/core';
 import { FieldNode, GraphQLResolveInfo, SelectionNode, valueFromASTUntyped } from 'graphql';
 
@@ -136,6 +138,19 @@ import { ResolvedReorderPluginOptions } from '../types';
  * (`RESOLVED_OWNER_SCOPES`), so this is the established mechanism in this package rather than a new one.
  */
 const SINGLE_LIST_READ_OCCURRENCES = new WeakSet<ReorderList>();
+
+/**
+ * How many times the single-list read attempts its line-page pre-resolve before it gives up and fails.
+ *
+ * TWO, deliberately, and the number is the bound rather than the point. The pre-resolve is what lets the
+ * counter be reconciled BEFORE the parent object is exposed, so a failure here cannot simply be absorbed:
+ * the nested `lines` resolver would then read its own page, succeed, and repair the row in its fallback —
+ * after the executor has already taken `lineCount` from the parent. The response would carry a coherent
+ * page beside the stale scalar the repair had just corrected in storage, with nothing in it to say so. So a
+ * transient failure — a dropped connection, a lock timeout, a momentarily exhausted pool — is given one more
+ * attempt, and a failure that survives the retry is propagated already sanitised by the service.
+ */
+const PRE_RESOLVE_READ_ATTEMPTS = 2;
 
 /** The request-scoped key prefix under which one page's pending line-page batch is held. */
 const LINES_BATCH_KEY_PREFIX = 'ReorderListEntityResolver.linesBatch';
@@ -451,14 +466,59 @@ function collectLinesSelections(
 }
 
 /**
+ * Every member of an untyped literal whose value is `undefined`, removed — recursively.
+ *
+ * It exists because `valueFromASTUntyped` keeps a key whose variable was not supplied and gives it the value
+ * `undefined`, whereas the executor's own input coercion OMITS the key. That distinction decides whether a
+ * window counts as narrowing and what cache key it renders to, so the two spellings of one request must not
+ * disagree — see {@link linesSelectionPageOptions}.
+ *
+ * Array elements are recursed into but never dropped: removing one would shift every later index, which is a
+ * different value rather than the same value with an absent member.
+ */
+function withoutAbsentMembers(value: unknown): unknown {
+    if (Array.isArray(value)) {
+        return value.map(element => withoutAbsentMembers(element));
+    }
+    if (value === null || typeof value !== 'object') {
+        return value;
+    }
+    return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+            .filter(([, member]) => member !== undefined)
+            .map(([key, member]) => [key, withoutAbsentMembers(member)]),
+    );
+}
+
+/**
  * The window one `lines` selection asked for, normalised to the object the field resolver will compute for the
  * same selection.
  *
- * **The argument is read off the document rather than reconstructed.** `valueFromASTUntyped` resolves literals
- * and variables through the request's own coerced variable values, which is what makes a window written as
- * `lines(options: { take: $take, sort: { createdAt: $order } })` readable here — the shape this plugin's paged
- * end-to-end document uses. Where a member's variable was not supplied it reads as absent, exactly as the
- * coerced argument the field resolver receives does, so the two render to the same cache key.
+ * **The argument is read off the document rather than reconstructed, and it is coerced AGAINST THE SCHEMA.**
+ * That second half is load-bearing and an earlier revision got it wrong. `valueFromASTUntyped` resolves
+ * literals and variables through the request's own variable values, but for a member whose variable was NOT
+ * supplied it keeps the key and gives it the value `undefined` — `keyValMap` sets every field it walks, and a
+ * missing variable resolves to `undefined` rather than being skipped. Typed input coercion does the opposite:
+ * it OMITS the field entirely (`valueFromAST` continues past a field whose variable is missing, applying the
+ * field's default if it has one). So a window written `lines(options: { filter: { quantity: $unset } })` read
+ * untyped, with `$unset` not supplied, is `{ filter: { quantity: undefined } }` — a filter with one key —
+ * while the argument the field resolver receives is `{ filter: {} }`, a filter with none. Two consequences
+ * followed, and both were silent: `narrowsTheLineCollection` counted the request as narrowing and suppressed
+ * the counter reconciliation the request was entitled to, and the two spellings stringified to different
+ * cache keys so the nested resolver reloaded the page that had already been resolved for it.
+ *
+ * The fix is {@link withoutAbsentMembers}: the untyped read, with absent members stripped recursively, which
+ * is exactly the omission the executor performs.
+ *
+ * **Coercing through the declared input type was tried first and withdrawn, for a measured reason.** Reading
+ * the generated argument's type off `info.schema` and calling `valueFromAST` requires `isObjectType` and the
+ * type predicates inside `valueFromAST` to recognise objects the SERVER built. In this repository's end-to-end
+ * environment they do not: two copies of `graphql` are resolvable at run time, and graphql-js raises
+ * `Cannot use GraphQLObjectType "ReorderList" from another module or realm.` rather than returning false. The
+ * two approaches are in any case equivalent for this argument, because the generated list-options input
+ * declares no field default — `generateListOptions` builds `skip`, `take`, `sort`, `filter` and
+ * `filterOperator` with descriptions and types only — so there is no default for typed coercion to apply that
+ * the strip would miss.
  *
  * A non-object argument value is ignored rather than trusted: the generated input type makes that unreachable
  * through a valid document, and a resolver is not the place to re-litigate what the schema already refuses.
@@ -469,7 +529,9 @@ function linesSelectionPageOptions(
     defaultPageSize: number,
 ): ListQueryOptions<ReorderListLine> {
     const argument = linesSelection.arguments?.find(node => node.name.value === 'options');
-    const supplied = argument ? valueFromASTUntyped(argument.value, info.variableValues) : undefined;
+    const supplied = argument
+        ? withoutAbsentMembers(valueFromASTUntyped(argument.value, info.variableValues))
+        : undefined;
     const options =
         supplied != null && typeof supplied === 'object' && !Array.isArray(supplied)
             ? (supplied as ListQueryOptions<ReorderListLine>)
@@ -586,25 +648,76 @@ export async function reconcileSingleReorderListRead(
         // narrows must not be allowed to suppress a reconciliation a sibling alias entitles this request to.
         return;
     }
-    try {
-        const pages = await reorderListService.getLinesForLists(ctx, [list.id], options);
-        const page = pages.get(list.id);
-        if (!page) {
-            return;
+    // THE READ IS RETRIED ONCE, AND A SECOND FAILURE IS PROPAGATED. Neither half of that is a preference.
+    //
+    // Swallowing the failure and letting the parent through produces a WRONG ANSWER rather than an error. The
+    // nested `lines` resolver reads its own page when this request cached none, and if THAT read succeeds it
+    // repairs the row — but by then GraphQL has already resolved `lineCount` from this parent object, so the
+    // response goes out carrying a coherent page beside the stale scalar the repair has just corrected in
+    // storage. The row ends up right and the answer the buyer received stays wrong. A repair that can only run
+    // after the parent is exposed is exactly the ordering this function exists to prevent.
+    //
+    // So the parent is never exposed on an unreconciled path: a transient failure is given one more attempt
+    // ({@link PRE_RESOLVE_READ_ATTEMPTS}) and a failure that survives it is propagated. What propagates is
+    // already sanitised — the service classifies and logs it under its own correlation id and re-raises an
+    // internal error carrying no driver text, no SQL fragment and no constraint name — so the client receives
+    // one top-level `errors` entry rather than a payload that looks right and is not. That is the same
+    // treatment the failed repair below receives, and for the same reason.
+    let page: ReorderListLinePage | undefined;
+    for (let attempt = 0; ; attempt++) {
+        try {
+            const pages = await reorderListService.getLinesForLists(ctx, [list.id], options);
+            page = pages.get(list.id);
+            break;
+        } catch (error) {
+            if (error instanceof UserInputError) {
+                // THE ONE FAILURE CLASS THAT BELONGS TO THE NESTED FIELD, left there deliberately. A
+                // `UserInputError` is attributable to the request's own arguments — an over-limit nested
+                // `take`, refused by the platform's own `parseTakeSkipParams` — so retrying it only repeats
+                // it, and raising it from the parent would report the nested collection's bound at the root's
+                // path when the error's path is the only proof the bound is enforced on the nested collection
+                // at all. It also cannot produce the hazard the retry exists for: a deterministic refusal of
+                // the same arguments fails in the nested resolver too, so no response goes out carrying a
+                // reconciled row behind a stale scalar. Nothing is reconciled and nothing is cached, so the
+                // nested resolver reads for itself and meets the same refusal.
+                Logger.verbose(
+                    `The line-page window requested of reorder list ${String(list.id)} was refused as ` +
+                        'malformed, so its counter is reported as stored and the refusal is left to the ' +
+                        'nested field it belongs to',
+                    loggerCtx,
+                );
+                return;
+            }
+            if (attempt >= PRE_RESOLVE_READ_ATTEMPTS - 1) {
+                Logger.warn(
+                    `Could not pre-resolve the line page of reorder list ${String(list.id)} for its counter ` +
+                        `reconciliation after ${String(PRE_RESOLVE_READ_ATTEMPTS)} attempt(s); the read is ` +
+                        'failing rather than answering with a counter it could not reconcile',
+                    loggerCtx,
+                );
+                throw error;
+            }
+            Logger.warn(
+                `Retrying the pre-resolve of the line page of reorder list ${String(list.id)} for its ` +
+                    'counter reconciliation',
+                loggerCtx,
+            );
         }
-        cacheResolvedLinePage(list, stableStringify(options), page);
-        await repairStaleLineCount(reorderListService, ctx, list, page.authoritativeTotalItems);
-    } catch {
-        // Deliberately not re-raised, and deliberately not bound. Not re-raised, because the nested field
-        // resolver will read the page itself and will fail there if the failure was real, which is where a
-        // failed nested read belongs. Not bound, because the service has already logged this failure,
-        // classified and sanitised, under its own correlation id — so there is nothing here to add that would
-        // not either duplicate that line or copy driver text into it.
-        Logger.warn(
-            `Could not pre-resolve the line page of reorder list ${String(list.id)} for its counter reconciliation`,
-            loggerCtx,
-        );
     }
+    if (!page) {
+        // The service seeds an entry for every identifier it is given, so this is unreachable against its own
+        // contract. Returning leaves the stored counter reported as it stands, which is the same outcome as a
+        // request that selected no unfiltered window — there is no observed total to reconcile against.
+        return;
+    }
+    // AND THE REPAIR PRECEDES THE CACHING, which is the other half of the same finding. Caching first left the
+    // nested field resolver holding a page it would serve happily while the compare-and-set that was supposed
+    // to correct the counter had rejected — the request then succeeded, reported the stale number, and the
+    // rejection reached nobody. Reconciling first means a rejection propagates out of this function to the
+    // root resolver with the service's own sanitised message, and no cached page exists for anything to fall
+    // back to. On the ordinary path the repair resolves and the page is cached exactly as before.
+    await repairStaleLineCount(reorderListService, ctx, list, page.authoritativeTotalItems);
+    cacheResolvedLinePage(list, stableStringify(options), page);
 }
 
 /**
@@ -1019,8 +1132,9 @@ export class ReorderListEntityResolver {
     /**
      * The configured nested page size, read straight from the injected options and restating nothing.
      *
-     * The provider supplies {@link ResolvedReorderPluginOptions}: every key present, validated once at plugin
-     * initialisation, and frozen. A `?? 50` here would be a second executable copy of a number the plugin
+     * The provider supplies {@link ResolvedReorderPluginOptions}: every key present, validated in
+     * `ReorderPlugin.init()` and re-asserted at application bootstrap — never per request — and frozen. A
+     * `?? 50` here would be a second executable copy of a number the plugin
      * already declares — unreachable through `ReorderPlugin.init()`, and therefore untested and free to drift
      * from the value the server is actually running on. Fifty is stricter than the Shop-side maximum the
      * default configuration sets, which is the property that makes applying it safe

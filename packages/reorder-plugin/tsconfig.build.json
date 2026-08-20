@@ -1,9 +1,8 @@
 {
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "outDir": "./lib"
-  },
-  "files": [
-    "./index.ts"
-  ]
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "outDir": "./lib"
+    },
+    "//": "Two build roots. `./index.ts` is the package's public barrel; `reorderPluginMigrations` re-exports the migration class from it, so a consumer can register the class without naming a path. The migration is ALSO named here as a root of its own, so that its emission into `lib/src/migrations/` — which the manifest's `files` entry publishes and which a deployment may glob instead — never depends on what the barrel happens to import.",
+    "files": ["./index.ts", "./src/migrations/1786838400000-add-reorder-lists.ts"]
 }

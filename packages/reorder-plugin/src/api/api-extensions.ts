@@ -24,7 +24,8 @@ import gql from 'graphql-tag';
 /* eslint-disable max-len */
 /**
  * @description
- * The Shop API extensions published by the ReorderPlugin: two paginated read queries, six
+ * The Shop API extensions published by the ReorderPlugin: two read queries — a paginated collection
+ * of lists, and a single list addressed by id whose nested `lines` field is paginated — six
  * mutations, the plugin-owned object types, enums, error results, inputs and result unions that
  * make up feature FEATURE-001-01 "Named Reorder Lists with Line Quantities".
  *
@@ -112,8 +113,9 @@ import gql from 'graphql-tag';
  *
  * The `@since` value below is a **derivation, not a quotation**: it applies the contribution guide's
  * next-minor rule [CONTRIBUTING.md:§New features] to this checkout's declared version 3.7.0
- * [packages/core/package.json:L2-L3]. The guide's own example names a different version, and `3.8.0`
- * is stated nowhere in the repository, so it must never be presented as quoted from it.
+ * [packages/core/package.json:L2-L3]. The guide's own example names a different version and the guide never
+ * states `3.8.0`, so the value must never be presented as quoted from it; the authoritative tickets, where
+ * the same derived value appears, present it the same way.
  *
  * @since 3.8.0
  */

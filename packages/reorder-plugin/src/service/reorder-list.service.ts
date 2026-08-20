@@ -62,8 +62,9 @@
  *
  * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires new
  * public API to carry a `@since` tag naming what will be the next minor version, and its own literal example
- * names a different version. This checkout declares 3.7.0, so the next minor derives to 3.8.0. That string
- * appears nowhere in this repository and is therefore not a quotation from it.
+ * names a different version. This checkout declares 3.7.0, so the next minor derives to 3.8.0 — computed
+ * from that declared version plus the guide's rule, and never a quotation from the guide, which does not
+ * state the value. The authoritative tickets record the same derivation.
  * -------------------------------------------------------------------------------------------------------
  */
 
@@ -202,7 +203,54 @@ const ID_VARIABLE = 'id';
  * cannot interleave and a count-and-insert inside one transaction is sufficient on its own. Asking that
  * driver for a lock raises rather than degrades, so the branch is required and is not a micro-optimisation.
  */
-const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: string[] = ['postgres', 'mysql', 'mariadb'];
+/*
+ * Exported so the unit spec's lock-order replay reads the SAME list rather than a copy of it: the model has
+ * to agree with the implementation about which engines have an order to impose, and a second literal would
+ * be one more place to keep in step. It is not part of the package's published surface, this module being
+ * absent from the root barrel.
+ */
+export const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: string[] = ['postgres', 'mysql', 'mariadb'];
+
+/**
+ * The engines on which a transaction that will write a LINE must hold the parent list row exclusively rather
+ * than shared, because two such transactions holding it shared deadlock at the line row.
+ *
+ * **This is a measured engine difference, not a preference.** A transaction writing only a line row needs the
+ * parent lock solely to impose the parent-before-child order, so the shared mode is the natural choice: two of
+ * them stay mutually compatible and continue to meet at the line row, which is where the atomic increment's
+ * guard lives and where the contract requires the race to be observable. On PostgreSQL that is exactly what
+ * happens. On the MySQL family it is not, and the difference was measured through the shipped resolvers rather
+ * than reasoned about:
+ *
+ * Two adds accumulate onto one line and both hold the parent shared; the line is removed beneath both; both
+ * increments then address a delete-marked record, and each transaction's follow-up current read of that record
+ * (see {@link ReorderListService.findLineById}, which must take a shared lock to read current under REPEATABLE
+ * READ) waits on the other's record lock from its own scan. InnoDB detects the cycle and answers `Deadlock
+ * found when trying to get lock` — captured on both MariaDB 11.5 and MySQL 8, on the first attempt, at the
+ * increment statement.
+ *
+ * **Its consequence is not a retry but an unrecoverable failure, which is why prevention is the fix.** An
+ * InnoDB deadlock rolls back the WHOLE transaction, destroying every savepoint in it. Every mutation resolver
+ * carries `@Transaction()`, so this service's own transaction is a nested savepoint
+ * [packages/core/src/connection/transaction-wrapper.ts]; the platform then issues `ROLLBACK TO SAVEPOINT` for
+ * the scope it believes is open and receives `SAVEPOINT typeorm_1 does not exist`, and that error REPLACES the
+ * deadlock error on the way out. The replacement is fatal to recovery: `ER_LOCK_DEADLOCK` is retriable by the
+ * platform's own wrapper and the savepoint error is not, and this service's retry loop never sees its own
+ * signal either. The masking happens inside `packages/core` and cannot be corrected from here, so the cycle
+ * must not be formed in the first place.
+ *
+ * Holding the parent exclusively costs the interleaving on these two engines — two accumulations against one
+ * list serialise at the parent instead of meeting at the line — and that cost is accepted deliberately: the
+ * atomic increment's guard is still evidenced on PostgreSQL by the same barrier-released pair, and on every
+ * engine by the sequential pair, whereas an unclassified failure reaching a buyer is not recoverable at all.
+ * Nothing upgrades under either mode: the exclusive lock is taken at admission, before any line statement.
+ *
+ * Exported for the same reason {@link ENGINES_SUPPORTING_PESSIMISTIC_LOCKING} is: the unit spec's lock-order
+ * replay has to read the SAME list rather than a copy of it. The e2e fixture publishes its own
+ * `EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES` over the same two engines, an `e2e/` module being unreachable
+ * from `src/`.
+ */
+export const ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES: string[] = ['mysql', 'mariadb'];
 
 /*
  * The alias, column names and bound parameters the nested-lines read gives its per-parent ranking subquery.
@@ -456,6 +504,22 @@ export function reportReorderListInternalFailure(diagnostic: string, cause?: unk
 class ConcurrentLineInsertDetected extends Error {
     constructor() {
         super('A concurrent request created the reorder list line this request was creating');
+    }
+}
+
+/**
+ * Signals that the line this attempt had resolved was removed by a concurrent request before its increment
+ * landed, so the add must be retried as an insert.
+ *
+ * It exists as a signal rather than a fall-through inside the same transaction because of the lock the
+ * accumulation branch has by then acquired on a LINE row: the insert branch's capacity claim writes the PARENT,
+ * and a transaction holding a child while it asks for the parent is the one ordering this plugin's rule forbids —
+ * the half of a cycle whose other half is any concurrent removal, which holds the parent and waits for a child.
+ * A fresh attempt sees no line, holds nothing, and reaches the insert branch cleanly.
+ */
+class ConcurrentLineRemovalDetected extends Error {
+    constructor() {
+        super('A concurrent request removed the reorder list line this request was incrementing');
     }
 }
 
@@ -1048,8 +1112,9 @@ type AppendedReorderListLineOrder = { createdAt?: 'ASC'; id?: 'ASC' };
 
 /**
  * @description
- * Holds every read and write for the `reorder_list` and `reorder_list_line` tables: the two paginated Shop
- * reads, the six Shop mutations, and the three support members the entity field resolvers call.
+ * Holds every read and write for the `reorder_list` and `reorder_list_line` tables: the two Shop reads — one
+ * paginated collection of lists, and one single-list read whose nested `lines` field is itself paginated —
+ * the six Shop mutations, and the three support members the entity field resolvers call.
  *
  * **The ownership-and-channel predicate in this class is the access control for all eight operations.** The
  * `@Allow(Permission.Owner)` decorator on the resolvers is not: that permission is declared unassignable and
@@ -1103,8 +1168,9 @@ export class ReorderListService {
      * ─────────────────────────────────────────────────────────────────────────────────────────────────────
      * THE FIVE BOUNDS BELOW READ THE INJECTED OPTIONS DIRECTLY, AND NONE OF THEM RESTATES A DEFAULT.
      *
-     * The provider supplies {@link ResolvedReorderPluginOptions}: every key present, validated once at
-     * plugin initialisation, and frozen. A fallback here would be a second executable copy of a number the
+     * The provider supplies {@link ResolvedReorderPluginOptions}: every key present, validated in
+     * `ReorderPlugin.init()` and re-asserted at application bootstrap — never per request — and frozen. A
+     * fallback here would be a second executable copy of a number the
      * plugin already declares — unreachable through `ReorderPlugin.init()`, and therefore untested and free
      * to drift away from the value the server is actually running on. The named accessors remain, because
      * each one records WHERE its bound bites, which is the fact a reader of a call site needs.
@@ -1161,6 +1227,22 @@ export class ReorderListService {
      */
     private get supportsPessimisticLocking(): boolean {
         return ENGINES_SUPPORTING_PESSIMISTIC_LOCKING.includes(this.connection.rawConnection.options.type);
+    }
+
+    /**
+     * The mode in which a transaction that will write only a LINE holds the parent list row.
+     *
+     * Shared where two such transactions can share it safely, exclusive where measurement shows they cannot.
+     * See {@link ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES} for the measured deadlock this answers and
+     * for what the exclusive mode costs. Read from the connection on each call for the same reason
+     * {@link ReorderListService.supportsPessimisticLocking} is: the options are the authority.
+     */
+    private get parentLockModeForLineWrite(): 'pessimistic_read' | 'pessimistic_write' {
+        return ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES.includes(
+            this.connection.rawConnection.options.type,
+        )
+            ? 'pessimistic_write'
+            : 'pessimistic_read';
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -1308,12 +1390,30 @@ export class ReorderListService {
      * the bound is still exceeded. So the scope resolution and the lock are the same statement here, and it
      * is the first statement the transaction issues.
      *
-     * The join is an INNER join written explicitly rather than the relation condition a find-options `where`
-     * would produce, because PostgreSQL refuses `FOR UPDATE` on the nullable side of an outer join and
-     * TypeORM realises a relation condition as a LEFT join. Only the id column is selected, so no customer
-     * field beyond the identifier reaches process memory. On the SQLite family the lock is skipped, which is
-     * required rather than an optimisation: that driver serves a single connection, so two transactions
-     * cannot interleave, and asking it for a lock raises rather than degrades.
+     * **The statement joins nothing at all, and that is what bounds WHICH rows the lock covers.** The acting
+     * user is addressed through the `customer` table's own foreign-key column rather than through the `user`
+     * relation, so the statement reads one table. That matters because the lock this method takes is the
+     * unqualified form: `FOR UPDATE` with no `OF` clause locks a row of **every** table the statement reads, so
+     * an earlier revision that wrote `.innerJoin('customer.user', 'user')` and filtered on `user.id` locked the
+     * `User` row as well as the `Customer` row — a row this feature never writes, shared with authentication
+     * and with every other feature that touches a session, held for the whole of a list creation. The bound
+     * requires a lock on the owning customer and nothing more, and one table in the statement is the portable
+     * way to say so: `FOR UPDATE OF customer` would express it on PostgreSQL and is not accepted by the MySQL
+     * family in the same form, whereas a single-table statement needs no dialect-specific clause and TypeORM's
+     * own `pessimistic_write` emits exactly it on all three locking engines.
+     *
+     * Removing the join also removes the reason the join had to be written by hand. A find-options relation
+     * condition (`where: { user: { id } }`) is realised as a LEFT join, and PostgreSQL refuses `FOR UPDATE` on
+     * the nullable side of an outer join — so the *relation* could not be filtered on at all under a lock
+     * without spelling the join explicitly. The foreign-key column sidesteps both: no join to write, no
+     * nullable side to refuse. The column name is read from the relation's own metadata rather than spelled as
+     * a literal, because it is a join column the entity declares no property for, so a literal here would be
+     * the one identifier in this file that could drift from the schema unnoticed.
+     *
+     * Only the id column is selected, so no customer field beyond the identifier reaches process memory — and
+     * with the join gone, no `User` field can either. On the SQLite family the lock is skipped, which is
+     * required rather than an optimisation: that driver serves a single connection, so two transactions cannot
+     * interleave, and asking it for a lock raises rather than degrades.
      *
      * **This resolver deliberately does not consult the request-scoped scope cache, and must never be made
      * to.** It is not here for the customer identifier — the plain resolver produces the same one — it is here
@@ -1331,12 +1431,15 @@ export class ReorderListService {
         this.requireActiveUser(ctx);
         let customer: Customer | null;
         try {
+            const alias = 'customer';
             const queryBuilder = this.connection
                 .getRepository(ctx, Customer)
-                .createQueryBuilder('customer')
-                .select(['customer.id'])
-                .innerJoin('customer.user', 'user')
-                .where('user.id = :userId', { userId: ctx.activeUserId });
+                .createQueryBuilder(alias)
+                .select([`${alias}.id`])
+                .where(
+                    `${this.escapeColumn(alias)}.${this.escapeColumn(this.customerUserJoinColumn())} = :userId`,
+                    { userId: ctx.activeUserId },
+                );
             if (this.supportsPessimisticLocking) {
                 queryBuilder.setLock('pessimistic_write');
             }
@@ -1406,13 +1509,98 @@ export class ReorderListService {
      * cannot interleave there, so there is no order to impose, and asking that driver for a lock raises rather
      * than degrades.
      *
-     * The add and adjust paths deliberately take NO parent lock, because serialising them would destroy the
-     * concurrent-accumulate interleaving the contract requires as race evidence.
+     * **The rule this method exists to serve is stated over the transactions it binds, not over the operations**
+     * (FEATURE-001-01 §5, the lock-ordering seam item): any transaction touching both the parent `reorder_list`
+     * row and a child `reorder_list_line` row takes the parent **first**. What each operation writes decides
+     * only the STRENGTH of the lock it needs, never whether it needs one: a transaction that writes the parent
+     * takes it exclusively here, and one that writes only a child still LOCKS the parent — in share mode,
+     * through {@link ReorderListService.findOwnedListForShare} — because its child statement carries a
+     * correlated ownership sub-query and that sub-query is a current read on the MySQL family. The one
+     * transaction that takes no separate lock is the add path's insert branch, whose conditional capacity claim
+     * IS its first parent statement; `findOwnedListForShare` sets out all four cases.
      */
     private findOwnedListForUpdate(
         ctx: RequestContext,
         id: ID,
         scope: ReorderListOwnerScope,
+    ): Promise<ReorderList | null> {
+        return this.findOwnedListUnderLock(ctx, id, scope, 'pessimistic_write');
+    }
+
+    /**
+     * Resolves one list under the full predicate exactly as {@link ReorderListService.findOwnedList} does, and
+     * additionally takes a row lock on it where the engine supports one — **shared on PostgreSQL, exclusive on
+     * the MySQL family**, as {@link ReorderListService.parentLockModeForLineWrite} decides and
+     * {@link ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES} explains. Everything below describes the
+     * shared mode, which is the general case; on those two engines the same lock is taken exclusively, so the
+     * ordering it establishes is identical and only the concurrency between two line writes on ONE list is
+     * given up. The strength never changes within a transaction, so nothing upgrades under either mode.
+     *
+     * **It is the parent-first half of the lock order for a transaction that writes a child row and never the
+     * parent.** `adjustReorderListLine` changes one line's quantity: it touches no counter and no other column
+     * of `reorder_list`, so it needs the parent held only for as long as it takes to write the child — which is
+     * what a shared lock provides. A concurrent adjustment of a different line on the same list also holds the
+     * parent in share mode and neither waits for the other, so the ordering costs nothing in concurrency, while
+     * `removeReorderListLine` and `deleteReorderList` — which take the same row exclusively as their own first
+     * statement — now queue against it in the same direction rather than against it from the opposite one. That
+     * inversion is what a deadlock is: on the MySQL family the correlated ownership `EXISTS` a child write
+     * carries takes a shared lock on the parent row it reads, so an adjust that had already locked the child
+     * would be waiting for the parent while a remove holding the parent waited for the child, and the engine
+     * would resolve it by killing one of them — which a buyer sees as an operation that failed for no reason
+     * they can act on.
+     *
+     * **The accumulation branch of the add path calls this too, and for the same reason an adjustment does.**
+     * That branch writes only the child — an accumulation leaves `lineCount` untouched — but its increment
+     * carries the ownership predicate as a correlated `EXISTS` over `reorder_list`, and on the MySQL family a
+     * sub-query evaluated by a DML statement is a current read: the statement takes the child exclusively and
+     * then the parent in share mode, so its own acquisition order is child then parent. Taking this lock first
+     * puts the parent ahead of it. The insert branch does NOT call this and does not need to: it writes the
+     * parent, and its capacity claim is a conditional counter update on that very row, so the claim IS its first
+     * parent statement and the engine takes the row exclusively to evaluate it, which orders the parent write
+     * ahead of the child insert by itself. Calling this there as well would take the row in share mode and then
+     * ask for it exclusively — an upgrade, and two concurrent inserts holding one share lock each would deadlock
+     * on it.
+     *
+     * The crossing between those two branches is what makes them safe together, and it is handled by ABANDONING
+     * the attempt rather than by a lock. Where an accumulation's increment matches nothing because the line was
+     * removed under it, the insert path is what the call needs — but the transaction holds a lock on a line row
+     * by then, and taking the parent while a child is held is the one ordering this rule forbids. So the attempt
+     * ends, every lock it took is released with it, and the bounded retry reaches the insert branch holding
+     * nothing. An earlier revision instead took ONE exclusive lock ahead of both branches, which cannot cycle
+     * either but serialises every add to a list — including adds of unrelated variants — and closes the very
+     * windows the atomic increment and the conditional claim exist to defend. A revision after that took this
+     * shared lock on the accumulation branch and a locking read on retries, which reintroduced the inversion by
+     * another route: a savepoint retry keeps both, so the retry asked for the parent exclusively while holding a
+     * shared lock on it and a lock on a child row.
+     *
+     * The predicate, the single-statement shape and the SQLite-family skip are all exactly as
+     * {@link ReorderListService.findOwnedListForUpdate} describes them.
+     */
+    private findOwnedListForShare(
+        ctx: RequestContext,
+        id: ID,
+        scope: ReorderListOwnerScope,
+    ): Promise<ReorderList | null> {
+        return this.findOwnedListUnderLock(ctx, id, scope, this.parentLockModeForLineWrite);
+    }
+
+    /**
+     * The one implementation behind the two locking resolvers, parameterised by lock strength.
+     *
+     * Neither the predicate nor the statement count varies with the strength: it is the same single scoped
+     * `SELECT` in both cases, and on an engine that cannot take a row lock it is the same statement
+     * {@link ReorderListService.findOwnedList} issues — so a suite counting statements on the in-process SQLite
+     * engine sees the same number whichever resolver a path chose, and the locking behaviour is the only thing
+     * that differs.
+     *
+     * @param mode - `'pessimistic_write'` for a transaction that will also write the parent row,
+     * `'pessimistic_read'` for one that will only write a child of it.
+     */
+    private findOwnedListUnderLock(
+        ctx: RequestContext,
+        id: ID,
+        scope: ReorderListOwnerScope,
+        mode: 'pessimistic_read' | 'pessimistic_write',
     ): Promise<ReorderList | null> {
         if (!this.supportsPessimisticLocking) {
             return this.findOwnedList(ctx, id, scope);
@@ -1420,7 +1608,7 @@ export class ReorderListService {
         return this.connection
             .getRepository(ctx, ReorderList)
             .createQueryBuilder('reorderlist')
-            .setLock('pessimistic_write')
+            .setLock(mode)
             .where('reorderlist.id = :id', { id })
             .andWhere('reorderlist.customerId = :customerId', { customerId: scope.customerId })
             .andWhere('reorderlist.channelId = :channelId', { channelId: scope.channelId })
@@ -2587,28 +2775,44 @@ export class ReorderListService {
     ): Promise<AddItemToReorderListResult> {
         const scope = await this.getOwnerScope(ctx, 'addItemToReorderList');
 
-        // Bounded retries, and each retry is a WHOLE fresh transaction rather than a second attempt inside a
-        // failed one. Two states require it, both of them a concurrent request having created the very line
-        // this call was about to create: the line-level uniqueness constraint refusing the insert, and the
-        // capacity claim discovering the duplicate before it inserts. In both the contract's answer is an
+        // Bounded retries, and each retry is a WHOLE FRESH TRANSACTION rather than a second attempt inside a
+        // failed one. Three states require one. Two are a concurrent request having created the very line this
+        // call was about to create — the line-level uniqueness constraint refusing the insert, and the capacity
+        // claim discovering the duplicate before it inserts — and in both the contract's answer is an
         // accumulation onto the winner's row rather than an error, so the loser redoes the operation with the
-        // row now visible. See addItemWithinTransaction for why the retry resolves the line by a current read.
+        // row now visible. The third is its mirror: a concurrent request REMOVED the line this attempt had
+        // resolved, so the operation must be redone as an insert — which this attempt cannot do, because it
+        // already holds a lock on a LINE row and the insert path's first parent statement would then be a
+        // parent lock taken while a child one is held. A fresh attempt holds neither.
+        //
+        // ★ THE FRESHNESS IS THE RESOLVER'S DOING, NOT THIS LOOP'S, and it is a property this loop cannot
+        // establish for itself. `withTransaction` INHERITS an already-open transaction from the context, and
+        // TypeORM opens a nested one as a savepoint (`SAVEPOINT typeorm_N` once `transactionDepth` is above
+        // zero; every driver family here declares `transactionSupport = 'nested'`). Rolling back to a savepoint
+        // is NOT equivalent to rolling back a transaction: on InnoDB the row locks taken after the savepoint are
+        // retained, and the enclosing transaction's REPEATABLE READ snapshot outlives it — so a savepoint retry
+        // would inherit both the locks it needed released and the stale view of the row it is retrying because
+        // of. `addItemToReorderList`'s resolver therefore declares `@Transaction('manual')`, under which nothing
+        // is open when this loop starts and each `withTransaction` below opens a real transaction at depth zero.
+        // Every attempt consequently begins holding nothing and seeing the latest committed state, which is what
+        // makes the plain reads inside each attempt correct and what keeps each attempt's locking as narrow as
+        // it is.
         for (let attempt = 0; ; attempt++) {
-            const useCurrentRead = attempt > 0;
             try {
                 return await this.connection.withTransaction(ctx, transactionCtx =>
-                    this.addItemWithinTransaction(transactionCtx, input, scope, useCurrentRead),
+                    this.addItemWithinTransaction(transactionCtx, input, scope),
                 );
             } catch (err: unknown) {
                 const reconcilable =
                     err instanceof ConcurrentLineInsertDetected ||
+                    err instanceof ConcurrentLineRemovalDetected ||
                     this.violatesConstraint(err, LINE_DEDUPLICATION_CONSTRAINT_DESCRIPTOR);
                 if (reconcilable && attempt + 1 < MAX_ADD_RECONCILIATION_ATTEMPTS) {
-                    // The transaction (or the savepoint, under a resolver's own transaction) has already been
-                    // rolled back by the platform's wrapper before this line runs, which is what makes a
-                    // fresh attempt possible at all: the capacity claim this attempt may have taken is undone
-                    // with it, so the retry neither double-counts the counter nor inherits an aborted
-                    // transaction. Translating or retrying INSIDE the callback cannot do either.
+                    // The transaction has already been rolled back by the platform's wrapper before this line
+                    // runs, which is what makes a fresh attempt possible at all: the capacity claim this attempt
+                    // may have taken is undone with it, every lock it held is released, and the next attempt
+                    // takes its own snapshot. Translating or retrying INSIDE the callback could do none of the
+                    // three.
                     continue;
                 }
                 return this.rethrowSanitisedFailure(err, 'addItemToReorderList');
@@ -2624,19 +2828,42 @@ export class ReorderListService {
      * the straight-line version could not distinguish is now resolved explicitly rather than collapsed into
      * whichever outcome happened to be nearest.
      *
-     * @param useCurrentRead - Whether to resolve the existing line by a locking (current) read. `false` on
-     * the first attempt, so the ordinary path takes no row locks and cannot deadlock on a gap lock; `true` on
-     * a retry, where it does two things at once. It sees the winner's committed row — which a plain read on
-     * MariaDB or MySQL would NOT, because a retry that runs as a savepoint inside a resolver's transaction
-     * keeps that transaction's original REPEATABLE READ snapshot and the winner committed after it was taken,
-     * so a retry built on a consistent read would loop until its attempts ran out. And it holds the row for
-     * the increment that follows, so the quantity this attempt validated is the quantity it increments.
+     * **The lock order is satisfied per branch, and which lock each branch takes follows from what it writes.**
+     * FEATURE-001-01 §5's lock-ordering item fixes one rule for the whole plugin — a transaction touching both
+     * the parent row and a child row takes the parent first — and the two branches here touch different rows:
+     *
+     *   - an ACCUMULATION writes one line's quantity and NO column of `reorder_list`, but it still LOCKS the
+     *     parent, and the distinction between writing and locking is the whole of the point. Its increment
+     *     carries the ownership predicate as a correlated `EXISTS` over the parent table, and on the MySQL
+     *     family a sub-query evaluated by a DML statement is a CURRENT read — so that one statement takes the
+     *     child exclusively and then the parent in share mode, child first. The branch therefore takes the
+     *     shared parent lock itself, first, which puts it on the same side of the rule as every other line
+     *     write. SHARED because no parent column is written: two concurrent accumulations of one list both hold
+     *     it and neither waits, so they still contend on the atomic increment rather than on the lock, and the
+     *     lock is never upgraded. The correlated predicate remains in the statement as well, and is what scopes
+     *     the write on an engine where no lock was available.
+     *   - an INSERT writes the parent's counter and then the child, so its conditional capacity claim is its
+     *     first parent statement and no separate lock is taken. Two concurrent inserters contend on that one
+     *     statement, and the loser's own insert then meets the per-variant unique object.
+     *
+     * The branch is decided by a NON-LOCKING read of the line, which joins no wait-for graph and so cannot
+     * invert anything by preceding a lock. It is correct on every engine because each attempt runs in its own
+     * fresh transaction and therefore its own snapshot — see the retry loop in
+     * {@link ReorderListService.addItemToReorderList} for why that is the resolver's doing and what it replaced.
+     * The variant is resolved before either branch takes or writes anything on the parent, which is the same
+     * ticket item's other sentence: "no transaction holds the parent row across a call it does not control".
+     *
+     * **The one crossing between the branches goes through a fresh transaction, not through a fall-through.**
+     * Where the increment matches nothing because a concurrent request removed the line, the insert path is what
+     * this call now needs — but by then this attempt holds a lock on a LINE row (the increment's own, and the
+     * current read that established the state), and the insert path's capacity claim would take the parent while
+     * that is held. That is the one ordering the rule forbids, so the attempt is abandoned instead and the
+     * bounded retry reaches the insert branch in a transaction holding nothing.
      */
     private async addItemWithinTransaction(
         ctx: RequestContext,
         input: AddItemToReorderListInput,
         scope: ReorderListOwnerScope,
-        useCurrentRead: boolean,
     ): Promise<AddItemToReorderListResult> {
         const list = await this.findOwnedList(ctx, input.reorderListId, scope);
         if (!list) {
@@ -2671,12 +2898,29 @@ export class ReorderListService {
 
         // Step one: resolve the existing line, scoped to this list so a line of another list cannot be
         // reached even by a variant they share.
-        const existingLine = await this.findLineForVariant(
-            ctx,
-            list.id,
-            input.productVariantId,
-            useCurrentRead,
-        );
+        //
+        // THIS READ TAKES NO LOCK, WHICH IS WHY IT MAY PRECEDE ONE. Which branch the add takes is decided
+        // before anything is locked: an accumulation goes on to take the parent in share mode and then write the
+        // child, and an insert's first parent statement is its conditional capacity claim, which takes the row
+        // exclusively. A non-locking read joins no wait-for graph, so deciding the branch first cannot invert
+        // the ordering rule — and it is what makes the two orderings expressible at all. It also has to stay
+        // non-locking for the insert branch's sake: a share lock taken here would be upgraded by that branch's
+        // claim, and two concurrent inserts each holding one would deadlock on the upgrade.
+        //
+        // A PLAIN READ IS ALSO ENOUGH ON EVERY ENGINE, and that is a consequence of the transaction boundary
+        // rather than of this statement. Each attempt runs in a transaction of its own, so its snapshot is taken
+        // here and reflects everything committed before it; there is no earlier attempt whose view this one could
+        // inherit. An earlier revision took a LOCKING read on retries precisely because there was — the retry ran
+        // as a savepoint inside the resolver's transaction and kept its original REPEATABLE READ snapshot — and
+        // that lock was itself the defect: it put a lock on a LINE row ahead of the insert branch's parent
+        // statement, inverting the one ordering the plugin fixes.
+        //
+        // An even earlier revision took ONE exclusive parent lock here for both branches. It ordered the locks
+        // correctly and cost far too much for it: every add to a list serialised behind every other, including
+        // adds of unrelated variants and accumulations onto an existing line, and the serialisation hid the
+        // very defects the atomic statements below exist to prevent — a read-compute-save increment and a
+        // count-then-insert capacity check both pass a race whose contention window a preceding lock has closed.
+        const existingLine = await this.findLineForVariant(ctx, list.id, input.productVariantId, false);
 
         // Step two: validate, and BOTH checks are needed rather than one being a superset of the other.
         // The increment must itself be a positive integer, or a caller could subtract by adding — and an
@@ -2688,6 +2932,43 @@ export class ReorderListService {
         this.validateQuantity((existingLine?.quantity ?? 0) + input.quantity);
 
         if (existingLine) {
+            // THE PARENT FIRST, IN SHARE MODE, BECAUSE THIS BRANCH DOES TOUCH THE PARENT ROW — inside its own
+            // child statement, which is exactly why an earlier revision missed it.
+            //
+            // The increment below carries its ownership predicate as a correlated `EXISTS` over `reorder_list`,
+            // because a line row stores neither a customer nor a channel and the affected-row count has to be
+            // the authority. On the MySQL family a sub-query evaluated by a DML statement is a CURRENT read, so
+            // that `EXISTS` takes a shared lock on the parent row — and it takes it AFTER the engine has taken
+            // the child row exclusively to update it. The acquisition order of the statement is therefore child
+            // then parent, whatever its author intended, and `removeReorderListLine` and `deleteReorderList`
+            // take the same two rows parent then child. That is an inversion, and an inversion is what a
+            // deadlock is: the engine resolves it by killing one of the two, which a buyer sees as an operation
+            // that failed for no reason they can act on. An earlier revision reasoned that this branch "writes
+            // only the child, so the ordering rule does not reach it" — true of what it WRITES and false of
+            // what it LOCKS, and the rule is about locks.
+            //
+            // SHARED rather than exclusive, because this transaction writes no column of `reorder_list`: an
+            // accumulation changes one line's quantity and leaves `lineCount` untouched. Two concurrent
+            // accumulations of the same list both hold it in share mode and neither waits for the other, so the
+            // ordering costs nothing between them and the atomic increment remains the statement a concurrent
+            // pair actually contends on — which is what keeps a read-compute-save implementation of it failing
+            // the concurrent-add evidence rather than being shielded from it. Nothing on this branch ever asks
+            // for the parent exclusively, so the share lock is never upgraded and cannot cycle with a second
+            // accumulation either.
+            //
+            // ONLY WHERE AN ENGINE CAN ORDER TWO TRANSACTIONS AT ALL. The in-process SQLite engine serves a
+            // single connection, so there is no interleaving to order, its correlated read takes no lock, and
+            // asking that driver for one raises rather than degrades. Skipping the statement there also leaves
+            // this path's counted statements unchanged on the one engine those counts are asserted on.
+            if (this.supportsPessimisticLocking) {
+                const admitted = await this.findOwnedListForShare(ctx, list.id, scope);
+                if (!admitted) {
+                    // The list left the caller's scope between the admission read and this lock. Refused with
+                    // the same indistinguishable answer, and with nothing written — the increment is not
+                    // attempted at all, so there is no affected count to classify.
+                    return new ReorderListNotFoundError();
+                }
+            }
             const accumulation = await this.accumulateLineQuantity(
                 ctx,
                 existingLine.id,
@@ -2730,13 +3011,29 @@ export class ReorderListService {
             }
             // 'line-gone': a concurrent request removed the line between the read and the increment. The list
             // itself still resolved under the predicate at the top of this attempt, so the truthful answer is
-            // not "the list is gone" — it is that this variant is no longer on the list, which is precisely
-            // the state the insert path below exists for. Falling through re-uses the whole of it, including
-            // the capacity claim a new line has to make.
+            // not "the list is gone" — it is that this variant is no longer on the list, which is precisely the
+            // state the insert path below exists for.
+            //
+            // This attempt does NOT fall through to it, and that is a correction rather than a preference. By
+            // now it holds a lock on a LINE row — the increment examined one, and the current read that
+            // established this state holds either the replacement's row or the gap the removed row left — while
+            // the insert path's capacity claim would take the PARENT. A transaction holding a child and then
+            // asking for the parent is the one ordering the plugin's rule forbids, and it is the half of a cycle
+            // whose other half is any concurrent removal or deletion: those hold the parent and wait for a child.
+            // Abandoning the attempt lets the platform unwind it, releasing every lock it took, and the caller's
+            // bounded retry opens a fresh transaction which sees no line, holds nothing, and reaches the insert
+            // branch with the capacity claim as its first parent statement.
+            throw new ConcurrentLineRemovalDetected();
         }
 
-        // Step three, and only now: claim room for a new line. This is the first write of the insert path,
-        // so a refusal leaves nothing to undo.
+        // Step three, and only now: claim room for a new line.
+        //
+        // THIS IS THE INSERT BRANCH'S FIRST PARENT STATEMENT AS WELL AS ITS FIRST WRITE, and taking no separate
+        // pre-lock is what keeps the ordering rule satisfied without closing the window the race is about. The
+        // claim is a conditional `UPDATE` of the parent row, so the engine takes that row exclusively to
+        // evaluate it: the parent is written before the child is inserted, which is the rule, and two
+        // concurrent inserters contend on this single statement rather than on a lock taken before either had
+        // decided anything. A refusal leaves nothing to undo, because nothing has been written yet.
         const capacity = await this.claimLineCapacity(ctx, list.id, input.productVariantId, scope);
         switch (capacity) {
             case 'claimed':
@@ -2847,11 +3144,15 @@ export class ReorderListService {
                 // the identical payload while having issued DML for a caller entitled to none, which is the
                 // one thing the published evidence contract for a refused write forbids outright.
                 //
-                // It is deliberately NOT a locking read, unlike the rename and delete paths. Holding this row
-                // would serialise concurrent adjustments and accumulations against the same list, which is
-                // exactly the interleaving the contract requires as race evidence — a barrier-released pair
-                // that queued on a parent lock would evidence sequencing rather than the guard.
-                const admitted = await this.findOwnedList(transactionCtx, input.reorderListId, scope);
+                // It is a SHARED locking read where the engine has one, and the strength is the whole of the
+                // difference from the rename and delete paths. This transaction writes a child row and never
+                // the parent, so it needs the parent held only until the child write lands — which share mode
+                // gives it while leaving two concurrent adjustments of the same list free to proceed together.
+                // What it buys is the lock ORDER: every transaction in this service that touches both rows now
+                // takes the parent first, so an adjust can no longer hold the child while waiting for the
+                // parent that a concurrent remove is holding while waiting for the child. See
+                // {@link ReorderListService.findOwnedListForShare}.
+                const admitted = await this.findOwnedListForShare(transactionCtx, input.reorderListId, scope);
                 if (!admitted) {
                     // Indistinguishable for an unknown identifier, another customer's list and another
                     // channel's list, and deliberately NOT the line-level not-found: a caller who cannot
@@ -3231,6 +3532,12 @@ export class ReorderListService {
      * the driver is what makes one fragment correct on every engine. The names themselves are read from the
      * entity metadata rather than written as literals, so the fragment cannot drift from the schema.
      *
+     * **The table is rendered through {@link ReorderListService.qualifiedTableName}, not by escaping its bare
+     * name.** On a connection configured with a schema or a database, the statement this fragment sits inside
+     * has a QUALIFIED target, so a bare name here would consult a different table of the same name on the
+     * connection's search path — and answer the ownership question from it. That helper explains what goes
+     * wrong in full; the requirement here is only that this one identifier never be spelled unqualified.
+     *
      * The outer reference to the line's own `reorderListId` is deliberately left unqualified. It is
      * unambiguous — `reorder_list` carries no column of that name, so the identifier can only resolve to the
      * statement's target table — and it avoids depending on how each engine's dialect renders (or omits) an
@@ -3249,11 +3556,66 @@ export class ReorderListService {
             `${alias}.${escape(this.columnNameOf(listMetadata, propertyName))}`;
         const lineListIdColumn = escape(this.columnNameOf(lineMetadata, 'reorderListId'));
         return (
-            `EXISTS (SELECT 1 FROM ${escape(listMetadata.tableName)} ${alias}` +
+            `EXISTS (SELECT 1 FROM ${this.qualifiedTableName(listMetadata)} ${alias}` +
             ` WHERE ${listColumn('id')} = ${lineListIdColumn}` +
             ` AND ${listColumn('customerId')} = :ownerCustomerId` +
             ` AND ${listColumn('channelId')} = :ownerChannelId)`
         );
+    }
+
+    /**
+     * One entity's relation, rendered the way the query builder renders the statement's own target table:
+     * qualified by whatever schema or database the connection is configured with, and escaped part by part.
+     *
+     * **This is a correctness requirement under a configured schema and not a cosmetic one.** The statements
+     * this fragment is appended to are built by the query builder, which renders their target table from
+     * `metadata.tablePath` — so under `dbConnectionOptions.schema` the target is `"tenant"."reorder_list_line"`
+     * while a sub-query naming `metadata.tableName` is the bare `"reorder_list"`. PostgreSQL then resolves
+     * that bare name through `search_path`, which the driver does NOT set from the schema option, so it either
+     * fails outright or — worse, and silently — correlates the ownership predicate against a same-named table
+     * in ANOTHER schema. A tenant's write would then be judged by another tenant's rows.
+     *
+     * The split-and-escape is TypeORM's own rule, taken from `QueryBuilder.getTableName`
+     * [node_modules/typeorm/query-builder/QueryBuilder.js:L362-L372] rather than reimplemented from a guess,
+     * including its treatment of an EMPTY part: SQL Server produces `database..table` when a database is
+     * configured without a schema, and an empty identifier must be passed through unescaped for that to
+     * remain valid SQL.
+     */
+    private qualifiedTableName(metadata: EntityMetadata): string {
+        const escape = (identifier: string) => this.connection.rawConnection.driver.escape(identifier);
+        return metadata.tablePath
+            .split('.')
+            .map(part => (part === '' ? part : escape(part)))
+            .join('.');
+    }
+
+    /**
+     * The database column on `customer` holding the id of the `User` a buyer signs in as.
+     *
+     * It is read from the relation's own metadata rather than written as the literal `userId`, and the reason is
+     * specific to this one column: `Customer` declares the relation as `@OneToOne(() => User) @JoinColumn()`
+     * and declares **no property** for its foreign key, so there is no `customerId`-style field for
+     * {@link ReorderListService.columnNameOf} to answer from. A literal would therefore be the one identifier in
+     * this file able to drift from the schema in silence — and it is the identifier the create path's owner lock
+     * is addressed by, so drifting would either lock the wrong row or lock nothing.
+     *
+     * A relation carrying anything other than exactly one join column is a schema this lookup cannot express,
+     * so it is reported as the defect it would be rather than guessed at. The message names only this file's own
+     * literals, so it discloses nothing about the caller or the database.
+     */
+    private customerUserJoinColumn(): string {
+        const metadata = this.connection.rawConnection.getMetadata(Customer);
+        const relation = metadata.findRelationWithPropertyPath('user');
+        const joinColumns = relation?.joinColumns ?? [];
+        if (joinColumns.length !== 1) {
+            Logger.error(
+                `Reorder plugin requires Customer.user to carry exactly one join column, found ` +
+                    `${joinColumns.length}`,
+                loggerCtx,
+            );
+            throw withoutStackFrames(new InternalServerError(UNCLASSIFIED_FAILURE_MESSAGE));
+        }
+        return joinColumns[0].databaseName;
     }
 
     /**

@@ -13,8 +13,10 @@
  * WHAT THIS FILE IS. It is the plugin's single registration point and its only initialisation surface: the
  * two entities, the service, the resolved-options provider and the three Shop resolver classes — the
  * operation resolver, the one entity resolver that serves both parent types, and the union type resolver —
- * are registered here and nowhere else, `init()` is the one place a deployment's option values enter the
- * plugin, and the one place they are validated. Every other module in this package is registered *by* this
+ * are registered here and nowhere else, and `init()` is the one place a deployment's option values enter
+ * the plugin and the primary place they are validated — `onApplicationBootstrap` re-asserts the resolved set
+ * once more, which is what catches a server registered with the bare class whose `init()` never ran the
+ * validator. Neither check runs per request. Every other module in this package is registered *by* this
  * file rather than registering itself.
  *
  * TWO DELIBERATE DEPARTURES FROM THE STRUCTURAL PRECEDENT. This class is modelled on the shipped wishlist
@@ -25,8 +27,10 @@
  * 1. NO `configuration` HOOK, for any purpose. The precedent's hook (same file, L17-L26) pushes an internal
  *    `relation` custom field onto `Customer`. Ruling R1 forbids a custom field on any core entity, so
  *    ownership here is the `customerId` column on this plugin's own `reorder_list` table instead. The
- *    consequences are observable rather than stylistic: `packages/dev-server/dev-config.ts` L116
- *    `customFields: {}` stays byte-identical, and `addItemToOrder` and `adjustOrderLine` gain no argument.
+ *    consequences are observable rather than stylistic: the `customFields: {}` property of
+ *    `packages/dev-server/dev-config.ts` stays byte-identical — cited by name rather than by line, because a
+ *    line number is invalidated by any edit above it — and `addItemToOrder` and `adjustOrderLine` gain no
+ *    argument.
  *    Nothing else in this plugin needs the hook either, because it changes no platform configuration at
  *    all — it registers no custom permission, so the published `Permission` enum stays at 97 members (R15
  *    requires that zero delta to be asserted rather than omitted); no `ScheduledTask`, no `VendureEvent`
@@ -70,10 +74,12 @@
  *
  * THE `@since 3.8.0` TAGS BELOW ARE A DERIVATION AND ARE FLAGGED AS ONE, per EPIC-001 section 11.2. The
  * contribution guide requires new public API to carry a `@since` tag naming what will be the next minor
- * version (`CONTRIBUTING.md`), and this checkout declares 3.7.0
- * (`packages/core/package.json` L2-L3), so the next minor derives to 3.8.0. That string appears nowhere in
- * this repository and must never be presented as quoted from it. Section 11.5 forbids a hand-written
- * reference page, so the JSDoc in this file is the documentation deliverable for the plugin class.
+ * version (`CONTRIBUTING.md`, whose own example names a different one), and this checkout declares 3.7.0
+ * (`packages/core/package.json` L2-L3), so the next minor derives to 3.8.0. The guide does not state that
+ * value, so it is computed rather than quoted and must never be presented as a quotation from the guide;
+ * the authoritative tickets, where the same derived value appears, present it the same way. Section 11.5
+ * forbids a hand-written reference page, so the JSDoc in this file is the documentation deliverable for the
+ * plugin class.
  * -------------------------------------------------------------------------------------------------------
  */
 
@@ -203,11 +209,15 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
  * @description
  * Thrown when {@link ReorderPlugin.init} is given an option value the plugin cannot use.
  *
- * It is a distinct, exported class rather than a bare `Error` for two reasons. A caller — or a test — can
- * discriminate a configuration mistake from any other startup failure with `instanceof`, and the offending
- * key is available as data on {@link ReorderPluginConfigurationError.optionKey} rather than only as prose
- * inside a message that would then have to be parsed. The message names the key as well, so a stack trace
- * alone is enough to act on.
+ * It is a distinct class rather than a bare `Error`, and it is published from the package root, for two
+ * reasons. A caller — or a test — can discriminate a configuration mistake from any other startup failure
+ * with `instanceof`, and the offending key is available as data on
+ * {@link ReorderPluginConfigurationError.optionKey} rather than only as prose inside a message that would
+ * then have to be parsed. The message names the key as well, so a stack trace alone is enough to act on.
+ *
+ * The root export is what makes that first reason true for a consumer rather than only for this package:
+ * the class is one of the symbols `index.ts` publishes, so the `instanceof` check below is written against
+ * the same specifier a deployment already imports `ReorderPlugin` from.
  *
  * **The message names the key and the KIND of value that arrived, and never the value's content.** The key
  * is what EPIC-001 section 7.10 requires the failure to identify, and it comes from a fixed set of five; the
@@ -224,6 +234,8 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
  *
  * @example
  * ```ts
+ * import { ReorderPlugin, ReorderPluginConfigurationError } from '\@vendure/reorder-plugin';
+ *
  * try {
  *   ReorderPlugin.init({ maxLinesPerList: 0 });
  * } catch (e) {
@@ -456,17 +468,22 @@ function validateResolvedReorderPluginOptions(
 }
 
 /**
- * The resolved, validated option set in force for this plugin.
+ * The last option set {@link ReorderPlugin.init} accepted, reported by {@link ReorderPlugin.options}.
+ *
+ * **It is a REPORT and not an authority, and the distinction is the whole of it.** No registration reads it:
+ * a registration returned by `init()` is bound to the set that call resolved, and the bare class is bound to
+ * the frozen declared defaults. So this variable being mutable cannot move what any server serves — which is
+ * exactly the property that a provider reading it would have destroyed, because a process in which one server
+ * called `init({ maxLinesPerList: 33 })` would then have handed that 33 to a second, bare server that had
+ * asked for the documented 200.
  *
  * It is module-private and there is deliberately no way to write to it from outside this module: the only
- * assignment is in {@link ReorderPlugin.init}, immediately after validation has accepted the merged values,
- * and every read goes through the read-only {@link ReorderPlugin.options} accessor. That is what makes
- * startup validation durable rather than momentary — a public writable static would let any later code
- * install a bound the validator had already refused, for every service and resolver holding the provider.
+ * assignment is in `init()`, immediately after validation has accepted the merged values, and every read goes
+ * through the read-only accessor. That is what makes the report itself trustworthy — a public writable static
+ * would let any later code make it report a set the validator had never seen.
  *
- * It starts as the frozen declared defaults rather than as `undefined`, so registering the bare
- * `ReorderPlugin` class without calling `init()` is a valid installation that runs on the documented
- * defaults instead of reading `undefined` on a request path.
+ * It starts as the frozen declared defaults rather than as `undefined`, so it reports a complete set from the
+ * moment this module is imported rather than only after the first initialisation.
  */
 let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIONS;
 
@@ -476,8 +493,9 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  * to the Vendure Shop API.
  *
  * A reorder list is a saved, named selection of product variants that a buyer curates and returns to. The
- * plugin publishes eight Shop operations: two paginated reads, `activeCustomerReorderLists` and
- * `activeCustomerReorderList`; three list-level mutations, `createReorderList`, `updateReorderList` and
+ * plugin publishes eight Shop operations: two reads — `activeCustomerReorderLists`, a paginated collection
+ * of the caller's lists, and `activeCustomerReorderList`, one nullable list addressed by id whose nested
+ * `lines` field is paginated; three list-level mutations, `createReorderList`, `updateReorderList` and
  * `deleteReorderList`; and three line-level mutations, `addItemToReorderList`, `adjustReorderListLine` and
  * `removeReorderListLine`.
  *
@@ -488,10 +506,10 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  *   three-way predicate over the authenticated customer, the active channel and the addressed row is what
  *   actually protects one buyer's lists from another's. A single-list read that is absent, another
  *   customer's or another channel's returns the same `null`, so the read cannot be used to enumerate.
- * - **Both reads are bounded and deterministically ordered.** Lists are ordered by creation timestamp
- *   descending and lines ascending, each tie-broken by identifier so that a page boundary cannot reorder
- *   rows sharing a timestamp, and a caller who supplies no page size receives the configured default rather
- *   than every row.
+ * - **Every collection this plugin returns is bounded and deterministically ordered** — the lists page and
+ *   the nested `lines` page alike. Lists are ordered by creation timestamp descending and lines ascending,
+ *   each tie-broken by identifier so that a page boundary cannot reorder rows sharing a timestamp, and a
+ *   caller who supplies no page size receives the configured default rather than every row.
  * - **A malformed quantity or list name is a bad request, not a business outcome.** It is refused with a
  *   top-level `USER_INPUT_ERROR` carrying one of this plugin's own message keys, while genuine domain
  *   outcomes arrive as union members: `ReorderListNotFoundError`, `ReorderListNameConflictError`,
@@ -512,6 +530,7 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  *
  * @example
  * ```ts
+ * import type { VendureConfig } from '\@vendure/core';
  * import { ReorderPlugin } from '\@vendure/reorder-plugin';
  *
  * const config: VendureConfig = {
@@ -542,10 +561,53 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  *
  * This plugin defines two new database entities, `ReorderList` and `ReorderListLine`, which become the
  * `reorder_list` and `reorder_list_line` tables. Adding the plugin to your `VendureConfig` is therefore not
- * sufficient on its own: **generate and run a migration** so those tables, their indices and their named
+ * sufficient on its own: **a migration has to be applied** so those tables, their indices and their named
  * constraints exist before the first request arrives. No existing table is altered and no column is added
  * to one — every foreign key points from this plugin's tables to core tables — so the migration is purely
  * additive and reverses cleanly.
+ *
+ * **One registration serves every supported engine, because the bundled migration carries no SQL.** It
+ * describes the two tables to TypeORM's `QueryRunner` table API and lets the configured driver render the
+ * statements, taking the identifier type from `connection.driver.normalizeType()` over the configured
+ * `EntityIdStrategy` and the table path from `connection.driver.buildTableName()`, so a configured non-default
+ * schema is honoured in both directions. You do not need to generate a migration of your own for these two
+ * tables on any engine.
+ *
+ * Register the classes this package publishes from its root as `reorderPluginMigrations`. Registering by
+ * value rather than by path is correct in both the source and the built layout, because a class is resolved
+ * by the module system:
+ *
+ * ```ts
+ * import type { VendureConfig } from '\@vendure/core';
+ * import { reorderPluginMigrations } from '\@vendure/reorder-plugin';
+ *
+ * const config: VendureConfig = {
+ *   // ...
+ *   dbConnectionOptions: {
+ *     // ...your own entries stay where they are; add the plugin's beside them
+ *     migrations: [...reorderPluginMigrations],
+ *   },
+ * };
+ * ```
+ *
+ * Apply it with `runMigrations(config)`, exported by `\@vendure/core`. Rolling back is a separate,
+ * deliberate operation rather than the next line of the same script: `revertLastMigration(config)` reverses
+ * whichever migration was applied most recently, so it removes these two tables only while this one is the
+ * last applied.
+ *
+ * Register it before the first boot of a server whose `dbConnectionOptions.synchronize` is `true`. That
+ * server's schema builder creates the two tables itself, after which this migration compares what it finds
+ * against its own frozen minimum and records itself as applied rather than authoring anything — a supported
+ * outcome, but one where the schema builder and not the migration is what created the tables. The package's
+ * README sets that sequencing out step by step, separates applying from rolling back, and records the
+ * sql.js seed-cache reset a test harness needs after a schema change.
+ *
+ * One engine-scoped shortfall is declared rather than hidden: TypeORM 0.3.x cannot create a `CHECK`
+ * constraint on the MySQL family and discards it silently, so the two named check constraints exist on
+ * PostgreSQL and the SQLite family and not on MySQL or MariaDB. No behaviour depends on them — the quantity
+ * invariant is refused by this plugin's service layer before any write on every engine, and the stored line
+ * count is maintained by a conditional counter update — and both named unique constraints and the named
+ * indices do exist on all four engines.
  *
  * ## Localisation
  *
@@ -565,10 +627,24 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
         ReorderListService,
         {
             provide: REORDER_PLUGIN_OPTIONS,
-            // A factory rather than `useValue`, so that the provider reads whatever `init()` resolved
-            // instead of capturing the static at decorator-evaluation time — which runs when this module
-            // is first imported, before any deployment has had the chance to call `init()`.
-            useFactory: () => ReorderPlugin.options,
+            // THE DECLARED DEFAULTS, and nothing that can move afterwards.
+            //
+            // This provider serves exactly one installation: a deployment that registers the bare
+            // `ReorderPlugin` class instead of calling `init()`. Such a deployment has asked for the
+            // documented defaults, so the defaults are what it gets — and it gets them whatever else has
+            // happened in the process.
+            //
+            // It deliberately does NOT read `ReorderPlugin.options`. That accessor reports the most recent
+            // initialisation, so reading it here would make a bare registration serve some OTHER
+            // configuration's bounds: a process in which one server called
+            // `init({ maxLinesPerList: 33 })` would silently give a second, bare server that same 33 rather
+            // than the documented 200, and nothing would fail to say so. A configuration a deployment never
+            // asked for is the one thing a bound must never be.
+            //
+            // `useValue` over an already-frozen constant rather than a factory, because there is nothing
+            // left to defer: the value is fixed at module load and every path that could vary it now
+            // carries its own registration. See {@link createScopedRegistration}.
+            useValue: DEFAULT_REORDER_PLUGIN_OPTIONS,
         },
     ],
     shopApiExtensions: {
@@ -604,7 +680,7 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
 export class ReorderPlugin implements OnApplicationBootstrap {
     /**
      * @description
-     * The resolved, validated options in force for this plugin.
+     * The resolved, validated options most recently accepted by {@link ReorderPlugin.init}.
      *
      * It is {@link ResolvedReorderPluginOptions} rather than the partial a caller supplies, and it is
      * pre-seeded with the declared defaults, so it is fully populated from the moment this module is
@@ -613,13 +689,22 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      * path. And the service and both API-layer resolvers can read every key directly, which is what keeps
      * the defaults declared in one place rather than restated at each point of use.
      *
+     * **It reports the latest initialisation, and NO registration serves from it.** Each `init()` returns a
+     * registration carrying the set that call resolved, bound as a `useValue` at that moment; the bare class
+     * is bound to the frozen declared defaults. So every registration in a process serves the values it was
+     * itself created with, whatever order they were created and bootstrapped in, and this accessor reports
+     * whichever initialised last purely as a report of what was last accepted. Read
+     * {@link REORDER_PLUGIN_OPTIONS} from a server's own injector for the set THAT server serves with. See
+     * {@link createScopedRegistration}.
+     *
      * **It is readable and not writable, deliberately.** An accessor with no setter over module-private
      * state, returning a frozen object, is what makes the startup validation hold for the life of the
      * process: `ReorderPlugin.options = …` is a compile error, `ReorderPlugin.options.maxLinesPerList = …`
      * is a compile error, and both throw at run time as well under the emitted `'use strict'`. A writable
-     * static would have let any later code install a bound this plugin had already refused — and because
-     * the provider hands the same object to every consumer, one write would silently lower the bound for
-     * all of them, with nothing failing to report it. {@link ReorderPlugin.init} is the only way in.
+     * static would have let any later code install a bound this plugin had already refused — and because a
+     * registration's provider hands one frozen object to every consumer of that registration, a single write
+     * would lower the bound for all of them at once, with nothing failing to report it.
+     * {@link ReorderPlugin.init} is the only way in.
      *
      * @since 3.8.0
      */
@@ -646,7 +731,9 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      *
      * @example
      * ```ts
-     * ReorderPlugin.init({ maxListsPerCustomer: 25, maxLinesPerList: 200, maxQuantityPerLine: 999 })
+     * import { ReorderPlugin } from '\@vendure/reorder-plugin';
+     *
+     * ReorderPlugin.init({ maxListsPerCustomer: 25, maxLinesPerList: 200, maxQuantityPerLine: 999 });
      * ```
      *
      * @param options - Any subset of {@link ReorderPluginOptions}; every omitted key takes its declared
@@ -674,7 +761,7 @@ export class ReorderPlugin implements OnApplicationBootstrap {
         // Reached only if validation returned rather than threw, which is what leaves a rejected call with
         // the previously resolved options still in force instead of a half-applied set.
         resolvedOptions = resolved;
-        return ReorderPlugin;
+        return createScopedRegistration(resolved);
     }
 
     /**
@@ -690,8 +777,29 @@ export class ReorderPlugin implements OnApplicationBootstrap {
         // write from outside this module impossible, so this is no longer the guard against one — it is the
         // guard against a server that was registered with a `ReorderPlugin` whose `init()` never ran the
         // validator, and a failure here still prevents the server from reaching a ready state.
-        validateResolvedReorderPluginOptions(ReorderPlugin.options);
+        //
+        // It reads THIS REGISTRATION's options rather than the static, so that in a process holding more
+        // than one differently-configured registration each one checks the set it will actually serve with.
+        validateResolvedReorderPluginOptions(this.optionsInForce());
         this.registerTranslations();
+    }
+
+    /**
+     * The option set THIS registration serves with, which is the set its own provider is bound to.
+     *
+     * The base class serves the declared defaults, because registering the bare class without calling
+     * `init()` is precisely a request for them. A registration returned by `init()` overrides this to return
+     * the set that call resolved. Either way this method and the registration's `REORDER_PLUGIN_OPTIONS`
+     * provider are bound to the SAME object, which is what makes
+     * {@link ReorderPlugin.onApplicationBootstrap}'s re-validation a check on the values this server will
+     * actually serve with rather than on whichever configuration initialised last.
+     *
+     * Nothing here reads {@link ReorderPlugin.options}. That accessor is a report of the latest
+     * initialisation and is not the authority on what any registration serves — see
+     * {@link createScopedRegistration}.
+     */
+    protected optionsInForce(): ResolvedReorderPluginOptions {
+        return DEFAULT_REORDER_PLUGIN_OPTIONS;
     }
 
     /**
@@ -741,6 +849,77 @@ export class ReorderPlugin implements OnApplicationBootstrap {
             loggerCtx,
         );
     }
+}
+
+/**
+ * A registration that carries one resolved option set of its own, rather than reading the module's.
+ *
+ * **The defect this closes.** `init()` used to return the `ReorderPlugin` class itself, and the options
+ * provider read a module-level variable through {@link ReorderPlugin.options}. Since the class is the
+ * registration, two configurations built in one process shared one slot: `A.init({ maxListsPerCustomer: 10 })`
+ * followed by `B.init({ maxListsPerCustomer: 20 })` left A's provider resolving 20, because the provider's
+ * factory ran when A bootstrapped — after B's `init()` had already overwritten the variable. Nothing failed
+ * and nothing logged; A simply enforced a bound its own configuration never asked for. It is reachable
+ * wherever one process holds more than one server: a multi-tenant host, and any test file that builds two
+ * configurations before booting either.
+ *
+ * **How it is closed.** Each `init()` returns a distinct subclass of `ReorderPlugin` whose options provider
+ * is a `useValue` capturing the set that call resolved. The value is fixed at registration time, so no later
+ * `init()` can reach it — there is no shared slot left to overwrite.
+ *
+ * **What the subclass declares, and what it deliberately inherits.** It declares only the two module-scoped
+ * keys, `imports` and `providers`. It has to declare `imports` as well as `providers` even though the value is
+ * identical to the base's, because `VendurePlugin` hands its Nest metadata through a `pick` over every
+ * `MODULE_METADATA` key and so defines each of them on the target — an absent key is defined as `undefined`,
+ * which SHADOWS the base's rather than inheriting it. Measured: applying only `providers` left the subclass
+ * reporting no `imports` at all, and its providers could not have resolved.
+ *
+ * Everything else inherits, and inherits LIVE, because `Reflect.getMetadata` walks the prototype chain and
+ * `VendurePlugin` defines a plugin-scoped key only when it is non-null. So `entities`, `shopApiExtensions` and
+ * `compatibility` are read off the base at the moment they are asked for. That is not merely economical, it is
+ * required: `e2e/reorder-plugin-compatibility.e2e-spec.ts` substitutes an unsatisfiable range by
+ * `Reflect.defineMetadata` on the base class AFTER the registration has been created, and a subclass that had
+ * snapshotted the range would not see it.
+ *
+ * The subclass's `name` is set to the base's so that every platform log line, and the compatibility check's
+ * own message, name `ReorderPlugin` rather than an internal class name. Its identity, not its name, is what
+ * distinguishes it.
+ *
+ * **The bare class is bound to the DEFAULTS, not to the latest initialisation, and that is the other half of
+ * the same property.** Registering `ReorderPlugin` itself instead of calling `init()` is a request for the
+ * documented defaults, so the base class's provider is `useValue: DEFAULT_REORDER_PLUGIN_OPTIONS` and its
+ * `optionsInForce()` returns the same object. Had either read {@link ReorderPlugin.options} instead, isolating
+ * the scoped registrations would have left the hole open at the one registration that never asked for anything:
+ * a process where one server called `init({ maxLinesPerList: 33 })` would have given a second, bare server
+ * that same 33 in place of the documented 200, silently and in an order-dependent way.
+ *
+ * **What the static still means.** {@link ReorderPlugin.options} reports the most recently resolved set, which
+ * is what keeps the shape EPIC-001 section 7.10 and the AAP prescribe — a readable static behind a validated
+ * `init()`. It is a report and nothing serves from it, which is why the mutable variable behind it can no
+ * longer move any server's bounds.
+ *
+ * @param resolved - The frozen, validated set this registration will serve with for the life of the process.
+ * @returns A `ReorderPlugin` registration bound to exactly that set.
+ */
+function createScopedRegistration(resolved: ResolvedReorderPluginOptions): Type<ReorderPlugin> {
+    class ScopedReorderPlugin extends ReorderPlugin {
+        protected optionsInForce(): ResolvedReorderPluginOptions {
+            return resolved;
+        }
+    }
+    // Non-writable and non-enumerable, matching a class's own `name` descriptor, so nothing downstream can
+    // tell this apart from the base by how the property behaves.
+    Object.defineProperty(ScopedReorderPlugin, 'name', {
+        value: ReorderPlugin.name,
+        writable: false,
+        enumerable: false,
+        configurable: true,
+    });
+    VendurePlugin({
+        imports: [PluginCommonModule],
+        providers: [ReorderListService, { provide: REORDER_PLUGIN_OPTIONS, useValue: resolved }],
+    })(ScopedReorderPlugin);
+    return ScopedReorderPlugin;
 }
 
 /**

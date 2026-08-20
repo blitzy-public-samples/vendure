@@ -10,7 +10,8 @@
  * 2. **A server bootstrapped with a deliberately unsatisfiable range fails with the platform's own
  *    message rather than starting anyway.**
  * 3. **The export proof:** every symbol a deployment configures this plugin through is reachable by a
- *    *static import from the package root*, `@vendure/reorder-plugin`, and never from a deep path.
+ *    *static import from the package root*, `@vendure/reorder-plugin`, rather than only from a deep path
+ *    into the package's own tree.
  *
  * ## Attribution — where these obligations come from
  *
@@ -92,6 +93,7 @@ import {
     PLUGIN_METADATA,
     PluginCommonModule,
     resetConfig,
+    runMigrations,
     TransactionalConnection,
     VENDURE_VERSION,
     VendureConfig,
@@ -104,11 +106,16 @@ import {
  * configures this plugin through to be reachable from the root, and requires that reachability be proved
  * by a static import from the root rather than from a deep path into the package's own source tree. A
  * test that reached past `package.json` — for a module beneath the package's `src` directory, say — would
- * exercise a route no published consumer can use, because the manifest's `files` allow-list ships only
- * the compiled tree and its `main` resolves to `lib/index.js`. So this line is load-bearing twice over:
- * it fails at resolution time if the root barrel stops publishing one of these four symbols, and it fails
- * at build time if `tsconfig.build.json` — which compiles the barrel alone as its single entry file —
- * stops emitting the module a symbol lives in.
+ * exercise a route that is *unsupported* rather than impossible: the manifest publishes the whole compiled
+ * tree and declares no `exports` map, so such a specifier does resolve for an installed consumer, but it
+ * names an internal module carrying no compatibility guarantee. The root is the surface the package
+ * documents and keeps. So this line is load-bearing twice over: it fails at resolution time if the root
+ * barrel stops publishing one of the six symbols it names, and it fails at build time if
+ * `tsconfig.build.json` stops emitting the module a symbol lives in. That file names TWO build roots, and
+ * the distinction matters to this proof: the barrel is the public one, from which every symbol here is
+ * reachable, and the plugin's single migration is the second. The migration is a root of its own so that its
+ * compiled class is emitted into the published tree whatever the barrel happens to import — a module no root
+ * reaches is not compiled, and a migration absent from `lib` cannot be registered by a consumer.
  *
  * `ReorderPluginOptions` carries the `type` modifier because the root barrel publishes it with
  * `export type`, so it has no runtime binding to import. The modifier is what keeps the statement honest:
@@ -122,21 +129,45 @@ import {
  * describes the three banned specifiers instead of spelling them out: writing one out would trip the
  * guard on the comment itself and so fail the very check the comment exists to explain.
  */
+import { preBootstrapConfig } from '@vendure/core/dist/bootstrap';
 import {
     ReorderList,
     ReorderListLine,
     ReorderPlugin,
+    ReorderPluginConfigurationError,
+    reorderPluginMigrations,
     type ReorderPluginOptions,
 } from '@vendure/reorder-plugin';
 import { createTestEnvironment } from '@vendure/testing';
+import { execFileSync } from 'child_process';
+import fs from 'fs-extra';
+import os from 'os';
+import path from 'path';
+import { DataSource, DataSourceOptions, QueryRunner } from 'typeorm';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
+import { AddReorderLists1786838400000 } from '../src/migrations/1786838400000-add-reorder-lists';
+
+import {
+    ADD_ITEM_TO_REORDER_LIST,
+    AddItemToReorderListMutation,
+    AddItemToReorderListMutationVariables,
+    CREATE_REORDER_LIST,
+    CreateReorderListMutation,
+    CreateReorderListMutationVariables,
+    GET_ACTIVE_CUSTOMER_REORDER_LIST,
+    GetActiveCustomerReorderListQuery,
+    GetActiveCustomerReorderListQueryVariables,
+    ReorderListSuccessShape,
+} from './graphql/reorder-definitions';
 
 /**
- * The compatibility range `ReorderPlugin` declares, transcribed from the declaration itself
- * [packages/reorder-plugin/src/reorder.plugin.ts:L602] rather than guessed at.
+ * The compatibility range `ReorderPlugin` declares, transcribed from the declaration itself — the
+ * `compatibility` property of the `@VendurePlugin` metadata in
+ * [packages/reorder-plugin/src/reorder.plugin.ts] — rather than guessed at. Cited by property name and not
+ * by line, because a line number is invalidated by any edit above it.
  *
  * It is a **floor** (`>=`) and not the `^3.0.0` caret form that five shipped first-party plugins declare,
  * because EPIC-001 section 7.9.2 rules that a plugin depending on a mechanism introduced later states the
@@ -211,9 +242,101 @@ const DECLARED_OPTION_KEYS_SORTED = [
  * base of 3250 [e2e-common/test-config.ts:L55-L64]. That gap is **reported and not fixed**: `e2e-common`
  * lies outside this feature's boundary and may not be edited.
  */
+// THE SQL.JS SNAPSHOT DIRECTORY, CREATED IDEMPOTENTLY AND AT MODULE SCOPE, FOR TWO SEPARATE REASONS.
+//
+// The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
+// guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
+// which is a check-then-act race: this package's six suites start together, so when the directory is absent —
+// as it is on a fresh checkout, and after the operational reset a schema change requires — two of them can
+// both observe it missing and the loser fails its `beforeAll` with `EEXIST`. Measured, not hypothesised: that
+// is exactly how one four-engine sweep of this package failed on sql.js while the three server engines, which
+// use no snapshot directory, all passed.
+//
+// The second is why it happens HERE, before `testConfig()` below, rather than inside `beforeAll`.
+// `e2e-common/test-config.ts` derives this suite's server port from the INDEX of this file within `e2e/` —
+// `getIndexOfTestFileInParentDir` reads the listing with `readdirSync` and takes `indexOf` — so a directory
+// that appears inside `e2e/` between one suite's index computation and another's shifts the second suite's
+// port onto a neighbour's and one of them dies of `EADDRINUSE`. Creating it before this file computes its own
+// index means every suite computes with it present, whichever arrives first.
+//
+// `recursive` makes the call idempotent, so whichever suite arrives second simply proceeds. An EMPTY
+// directory is not a cached snapshot — the initializer keys synchronisation on the snapshot FILE — so this
+// does not weaken the stale-cache reset it exists alongside.
+fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
+
 const harnessConfig = mergeConfig(testConfig(), {
     plugins: [ReorderPlugin.init(DECLARED_OPTIONS)],
+    // The seeded catalogue's assets live in core's fixtures, and the shipped cross-package route to them is
+    // `packages/dashboard/e2e/global-setup.ts:L105,L122`. It is pointed at here because the shared
+    // configuration aims this at THIS package's own `e2e/fixtures/assets`, which this package does not ship
+    // and may not add — its directory file set is closed.
+    importExportOptions: {
+        importAssetsDir: path.join(__dirname, '../../core/e2e/fixtures/assets'),
+    },
 });
+
+/** The two plugin-owned table names, as TypeORM's snake-casing of the entity class names produces them. */
+const LIST_TABLE = 'reorder_list';
+const LINE_TABLE = 'reorder_list_line';
+
+/**
+ * The engines whose database lives inside whichever connection holds it, so two connections cannot see one
+ * another's writes without an explicit export and load.
+ */
+const CONNECTION_LOCAL_ENGINES: readonly string[] = ['sqljs', 'sqlite', 'better-sqlite3'];
+
+/** The password `@vendure/testing` gives every seeded customer, as the sibling suites also declare it. */
+const SEEDED_CUSTOMER_PASSWORD = 'test';
+
+/**
+ * Runs work with a query runner and releases it in a `finally`, however the work ends.
+ *
+ * A leaked runner holds a pooled connection open, which on PostgreSQL is enough to make a later `DROP` in
+ * the same file wait on a lock it can never get.
+ */
+async function withRunner<T>(
+    connection: { createQueryRunner: () => QueryRunner },
+    work: (runner: QueryRunner) => Promise<T>,
+): Promise<T> {
+    const runner = connection.createQueryRunner();
+    try {
+        return await work(runner);
+    } finally {
+        if (!runner.isReleased) {
+            await runner.release();
+        }
+    }
+}
+
+/**
+ * The e-mail address of a seeded buyer, read from the database rather than transcribed.
+ *
+ * Which addresses `@vendure/testing`'s populator generates is its business and not this suite's, so the
+ * lowest-identifier customer is taken and the login below is driven with whatever it is.
+ */
+async function firstCustomerEmail(connection: DataSource): Promise<string> {
+    const rows: Array<{ emailAddress: string }> = await connection.query(
+        `SELECT ${connection.driver.escape('emailAddress')} FROM ` +
+            `${connection.driver.escape('customer')} ORDER BY ${connection.driver.escape('id')} ASC`,
+    );
+    expect(rows.length, 'the seeded data must carry at least one customer').toBeGreaterThan(0);
+    return String(rows[0].emailAddress);
+}
+
+/**
+ * The API identifier of a seeded product variant, read from the database rather than assumed.
+ *
+ * This suite populates no catalogue CSV, so the variants present are whatever `initialData` creates; taking
+ * the lowest identifier makes the case independent of how many there are.
+ */
+async function firstProductVariantId(connection: DataSource): Promise<string> {
+    const rows: Array<{ id: number | string }> = await connection.query(
+        `SELECT ${connection.driver.escape('id')} FROM ${connection.driver.escape('product_variant')} ` +
+            `ORDER BY ${connection.driver.escape('id')} ASC`,
+    );
+    expect(rows.length, 'the seeded data must carry at least one product variant').toBeGreaterThan(0);
+    return `T_${rows[0].id}`;
+}
 
 /**
  * Ports for the two applications this suite bootstraps itself, derived from the harness's own port and
@@ -330,6 +453,37 @@ function directBootstrapConfigFor(
     });
 }
 
+/** The timestamp the one additive migration carries, which is also its class-name suffix. */
+const MIGRATION_TIMESTAMP = '1786838400000';
+
+/** The class the emitted migration must export, since the glob registers whatever the module exports. */
+const MIGRATION_CLASS_NAME = `AddReorderLists${MIGRATION_TIMESTAMP}`;
+
+/** How long the packer is given. It reads the manifest and walks the package; a second is typical. */
+const PACK_INVOCATION_TIMEOUT_MS = 120_000;
+
+/**
+ * The exact file list a consumer installing this package would receive, as the packer itself reports it.
+ *
+ * ★ WHY THE PACKER RATHER THAN THE MANIFEST. `files` is a pattern list, and the question this answers is
+ * whether those patterns cover a particular emitted path — which is npm's own matching semantics, including
+ * its always-included and never-included sets. Re-implementing that here would mean asserting this file's
+ * reading of the rules rather than the rules, and the failure it exists to catch (an emission that lands
+ * outside every pattern and is therefore never published) is exactly the case a hand-rolled matcher gets
+ * wrong. `--dry-run` writes no tarball, so nothing is left behind to clean up.
+ */
+function publishedFileList(): string[] {
+    const packageDir = path.join(__dirname, '..');
+    const output = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+        cwd: packageDir,
+        encoding: 'utf-8',
+        timeout: PACK_INVOCATION_TIMEOUT_MS,
+    });
+    const reported = JSON.parse(output) as Array<{ files?: Array<{ path?: string }> }>;
+    expect(reported.length, 'the packer must report exactly one package').toBe(1);
+    return (reported[0].files ?? []).map(entry => String(entry.path));
+}
+
 /**
  * Asks the platform's own health endpoint whether a server is listening on `port`, and reports either the
  * HTTP status it answered with or {@link UNREACHABLE}.
@@ -364,17 +518,20 @@ async function probeHealthEndpoint(port: number): Promise<number | typeof UNREAC
  * because a hook is governed by the separate hook timeout rather than by this one.
  */
 describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, () => {
-    const { server } = createTestEnvironment(harnessConfig);
+    const { server, shopClient } = createTestEnvironment(harnessConfig);
 
     beforeAll(async () => {
-        // No `productsCsvPath`: none of the obligations in this file needs catalogue data, and importing
-        // a product set would only lengthen every run and enlarge the cached sql.js snapshot. Where a
-        // suite in this package does need products, the shipped cross-package route is to point at
-        // `packages/core/e2e/fixtures/` as `packages/dashboard/e2e/global-setup.ts:L105,L122` does; no
-        // fixture is added to this package for it, because this directory's file set is closed.
+        // The MINIMAL catalogue, and one variant is the whole reason for it: the migration-owned deployment
+        // case below adds a line to a list, which is what exercises the child table, its foreign key to
+        // `product_variant` and the stored counter's increment — none of which a parent-only case can reach.
+        // The compatibility obligations themselves need no catalogue at all, so the smallest shipped CSV is
+        // used rather than a fuller one, and it is reached in core's fixtures because this package ships no
+        // fixture of its own and its directory file set is closed; the cross-package route is the one
+        // `packages/dashboard/e2e/global-setup.ts:L105,L122` takes.
         await server.init({
             initialData,
             customerCount: 1,
+            productsCsvPath: path.join(__dirname, '../../core/e2e/fixtures/e2e-products-minimal.csv'),
         });
     }, TEST_SETUP_TIMEOUT_MS);
 
@@ -410,11 +567,20 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         expect(ReorderPlugin.name).toBe('ReorderPlugin');
         expect(typeof ReorderPlugin.init).toBe('function');
 
-        // `init()` returns the plugin class itself, which is what makes `plugins: [ReorderPlugin.init()]`
-        // a valid registration. Calling it here is safe and idempotent: it is passed the same declared
-        // options the harness registered, so it re-resolves to an equal frozen set and the running
-        // application — which read the previously resolved object at injection time — is unaffected.
-        expect(ReorderPlugin.init(DECLARED_OPTIONS)).toBe(ReorderPlugin);
+        // `init()` returns a `ReorderPlugin` REGISTRATION, which is what makes `plugins: [ReorderPlugin.init()]`
+        // a valid entry. It is a distinct subclass rather than the class itself, so that each configuration
+        // in a process carries its own resolved options instead of sharing one module-level slot — see
+        // `createScopedRegistration` in `src/reorder.plugin.ts`. What a consumer needs is asserted here: it is
+        // a constructor function, it is a `ReorderPlugin`, and it presents under that name so every platform
+        // log line reads the same as before.
+        const registration = ReorderPlugin.init(DECLARED_OPTIONS);
+
+        expect(typeof registration).toBe('function');
+        expect(registration.prototype instanceof ReorderPlugin).toBe(true);
+        expect(registration.name).toBe('ReorderPlugin');
+        // And calling it again is safe: each call yields its own registration, so re-initialising cannot
+        // reach the options of a registration that already exists — which is the whole point of the change.
+        expect(ReorderPlugin.init(DECLARED_OPTIONS)).not.toBe(registration);
 
         expect(ReorderList).toBeDefined();
         expect(ReorderListLine).toBeDefined();
@@ -438,6 +604,124 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         };
         expect(Object.keys(options).sort()).toEqual(DECLARED_OPTION_KEYS_SORTED);
         expect(options).toEqual(DECLARED_OPTIONS);
+    });
+
+    it('publishes the configuration error class and the migration classes from the package root', () => {
+        // The error class is documented with an `instanceof` consumer path, so the root export is what
+        // makes that documentation true. Read back as a class rather than merely as defined: a plain
+        // `Error` re-exported under the name would satisfy `toBeDefined()` and fail the subclass check.
+        expect(typeof ReorderPluginConfigurationError).toBe('function');
+        expect(ReorderPluginConfigurationError.prototype instanceof Error).toBe(true);
+
+        // The documented `instanceof` path itself, driven through the root-imported `init()`. `0` is
+        // below the minimum of every bound, so it is refused whichever key carries it, and a refused
+        // call leaves the previously resolved options in force — which is why the harness's own
+        // registration is unaffected by running this.
+        let caught: unknown;
+        try {
+            ReorderPlugin.init({ maxLinesPerList: 0 });
+        } catch (e) {
+            caught = e;
+        }
+        expect(caught).toBeInstanceOf(ReorderPluginConfigurationError);
+        expect((caught as ReorderPluginConfigurationError).optionKey).toBe('maxLinesPerList');
+        // Restores the declared set, so the assertion above cannot leave a rejected value — or an
+        // unrelated one — in force for any test that follows: `init()` assigns the module-level slot
+        // `ReorderPlugin.options` reports, and only an accepted call reaches that assignment.
+        //
+        // What the accepted call RETURNS is a `ReorderPlugin` REGISTRATION, which is what makes
+        // `plugins: [ReorderPlugin.init()]` a valid entry. It is a distinct subclass rather than the class
+        // itself, so that each configuration in a process carries its own resolved options instead of
+        // sharing one module-level slot — see `createScopedRegistration` in `src/reorder.plugin.ts`. What a
+        // consumer needs is asserted here: it is a constructor function, it is a `ReorderPlugin`, and it
+        // presents under that name so every platform log line reads the same as before.
+        const registration = ReorderPlugin.init(DECLARED_OPTIONS);
+        expect(typeof registration).toBe('function');
+        expect(registration.prototype instanceof ReorderPlugin).toBe(true);
+        expect(registration.name).toBe('ReorderPlugin');
+        // And calling it again is safe: each call yields its own registration, so re-initialising cannot
+        // reach the options of a registration that already exists — which is the whole point of the design.
+        expect(ReorderPlugin.init(DECLARED_OPTIONS)).not.toBe(registration);
+
+        // The migration classes are what a deployment registers in `dbConnectionOptions.migrations`, so
+        // the export is the registration contract and is read back as such: a non-empty array whose
+        // every member is a constructor carrying the timestamped name TypeORM orders migrations by.
+        expect(Array.isArray(reorderPluginMigrations)).toBe(true);
+        expect(reorderPluginMigrations.length).toBeGreaterThan(0);
+        for (const migration of reorderPluginMigrations) {
+            expect(typeof migration).toBe('function');
+            expect(migration.name).toMatch(/^[A-Za-z]+\d{13}$/);
+            const instance = new migration();
+            expect(typeof instance.up).toBe('function');
+            expect(typeof instance.down).toBe('function');
+        }
+    });
+
+    it('ships its migration in the built package, at the path a deployment registers', () => {
+        // ★ WHY THIS IS ASSERTED AGAINST THE INSTALLED ARTEFACT RATHER THAN THE SOURCE TREE. A consumer
+        // installs `@vendure/reorder-plugin` from the registry, and what arrives is whatever `files` ships:
+        // `lib/**/*` and `i18n/**/*`, and no `src/` at all. The plugin's two tables are created by exactly
+        // one migration, so a migration that is emitted nowhere and shipped in nothing cannot be applied by
+        // the deployment that needs it — the tables never exist, and every published operation fails on a
+        // missing relation. Asserting the file under `src/` would prove nothing about that, because `src/`
+        // is precisely the directory a consumer does not receive.
+        //
+        // The path is resolved the way `packages/dev-server/dev-config.ts` resolves it — through the
+        // package's own `main` — so this test and the registration cannot drift apart: if the emission moves,
+        // both follow it, and if the emission disappears, both fail.
+        const installedEntry = require.resolve('@vendure/reorder-plugin');
+        const installedLib = path.dirname(installedEntry);
+        const packageRoot = path.dirname(installedLib);
+        expect(
+            path.relative(packageRoot, installedEntry),
+            'the package must be entered through its built barrel, which is what makes `lib/` the layout a ' +
+                'deployment has',
+        ).toBe(path.join('lib', 'index.js'));
+
+        // ONE EMITTED MIGRATION, at the registered glob's own directory. Exactly one, because the feature
+        // owns exactly one additive migration and a second emitted file would be applied as a second
+        // migration by every deployment that globs this directory.
+        const installedMigrationDir = path.join(installedLib, 'src', 'migrations');
+        expect(
+            fs.existsSync(installedMigrationDir),
+            `${installedMigrationDir} does not exist, so the migration is emitted nowhere a deployment can ` +
+                'register it: the build graph must reach it, which `tsconfig.build.json` does by naming it ' +
+                'as a second root rather than by publishing it from the barrel',
+        ).toBe(true);
+        const emitted = fs
+            .readdirSync(installedMigrationDir)
+            .filter(name => name.endsWith('.js'))
+            .sort();
+        expect(emitted).toEqual([`${MIGRATION_TIMESTAMP}-add-reorder-lists.js`]);
+
+        // LOADABLE FROM THERE, which is the difference between a file that exists and a class TypeORM can
+        // register: the glob is resolved with Node's own `require`, so an emission that throws on load, or
+        // that exports the class under another name, is registered as nothing at all.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const loaded = require(path.join(installedMigrationDir, emitted[0])) as Record<string, unknown>;
+        const migrationClass = loaded[MIGRATION_CLASS_NAME] as
+            | { prototype: Record<string, unknown> }
+            | undefined;
+        expect(migrationClass, `the emitted migration must export ${MIGRATION_CLASS_NAME}`).toBeDefined();
+        expect(typeof (migrationClass as { prototype: Record<string, unknown> }).prototype.up).toBe(
+            'function',
+        );
+        expect(typeof (migrationClass as { prototype: Record<string, unknown> }).prototype.down).toBe(
+            'function',
+        );
+
+        // AND PUBLISHED, read out of the packer rather than inferred from `files`. `npm pack --dry-run`
+        // reports exactly the file list a consumer would receive, so this is the only assertion that can
+        // fail when a manifest pattern stops covering the emission.
+        const packed = publishedFileList();
+        expect(packed).toContain(
+            ['lib', 'src', 'migrations', `${MIGRATION_TIMESTAMP}-add-reorder-lists.js`].join('/'),
+        );
+        expect(
+            packed.filter(name => name.split('/')[0] === 'src'),
+            'the published package ships no source tree, which is why the built path is the one a ' +
+                'deployment can name',
+        ).toEqual([]);
     });
 
     it('declares a compatibility range, and declares it as a floor rather than a caret', () => {
@@ -487,9 +771,14 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
             // Closed whether or not the assertions held, so a failure here cannot leave a second server
             // listening and break the rest of this file. Closing also resets the global configuration by
             // itself [packages/core/src/config/config.module.ts]; the explicit reset below is kept
-            // because the negative tests never create an application and so never reach that hook.
-            await app?.close();
-            resetConfig();
+            // because the negative tests never create an application and so never reach that hook. Nested,
+            // so the reset is not conditional on the close succeeding: a close that throws is the case where
+            // a stale global configuration would otherwise survive into every later test in this file.
+            try {
+                await app?.close();
+            } finally {
+                resetConfig();
+            }
         }
     });
 
@@ -526,9 +815,14 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
             // listener behind. `resetConfig()` is required rather than defensive here: `bootstrap()`
             // reaches `preBootstrapConfig` and mutates the global singleton before the check throws
             // [packages/core/src/bootstrap.ts:L194-L197], and no application shutdown hook runs to undo
-            // it because no application was created.
-            await app?.close();
-            resetConfig();
+            // it because no application was created. Nested, so neither the metadata restore above nor a
+            // failing close can prevent the reset: leaving the singleton mutated would carry an
+            // unsatisfiable range, or a half-built configuration, into the rest of the file.
+            try {
+                await app?.close();
+            } finally {
+                resetConfig();
+            }
         }
 
         // Ruling R17, discharged item by item: no application, the exact platform error class, its exact
@@ -568,8 +862,13 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         } catch (e) {
             caught = e;
         } finally {
-            await app?.close();
-            resetConfig();
+            // Nested for the same reason as the cases above: the reset must run even when the close throws,
+            // because the global configuration was already mutated before the compatibility check refused.
+            try {
+                await app?.close();
+            } finally {
+                resetConfig();
+            }
         }
 
         expect(app).toBeUndefined();
@@ -582,5 +881,150 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
 
         // This plugin's own declaration was never in play and is unchanged.
         expect(getCompatibility(ReorderPlugin)).toBe(DECLARED_COMPATIBILITY_RANGE);
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // THE MIGRATION-OWNED DEPLOYMENT, EXECUTED
+    //
+    // A deployment that provisions this plugin the way a real one does — the consumer's own migrations
+    // create the core schema, then this plugin's migration creates its two tables, and the server that
+    // serves them creates nothing — has to be shown working rather than described. This is where it can
+    // be shown, and the reason it is HERE rather than in the migration suite is a platform fact:
+    // `AppModule` imports `PluginModule.forRoot()`, which reads `getConfig().plugins` inside the
+    // `@Module({...})` decorator argument, and Node evaluates that once, when
+    // `@vendure/core/dist/app.module.js` is first loaded [packages/core/src/app.module.ts:L18-L30,
+    // packages/core/src/plugin/plugin.module.ts:L14-L19]. Every test server loads it through the same
+    // `await import(...)` [packages/testing/src/test-server.ts:L108-L112], so the plugin module set of a
+    // worker is frozen by its first bootstrap. The migration suite's first bootstrap is deliberately
+    // plugin-less — that is what leaves the two tables for the migration to create — so a plugin-enabled
+    // server booted there merges the SDL and registers neither providers nor resolvers, which was measured:
+    // it answers `Cannot return null for non-nullable field Mutation.createReorderList` while
+    // `activeCustomer` still resolves. THIS file's first bootstrap registers the plugin, so its resolvers
+    // are live, and the schema underneath them can be replaced with the migration's own output.
+    //
+    // The sequence below is therefore: drop what synchronisation created, apply the migration with
+    // synchronization off, and issue the published operations against what the migration built.
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+    describe('a deployment provisioned by the migration alone', () => {
+        it(
+            'serves the published operations against a schema this migration created',
+            async () => {
+                const { rawConnection } = server.app.get(TransactionalConnection);
+                const engine = rawConnection.options.type;
+                const connectionLocal = CONNECTION_LOCAL_ENGINES.indexOf(engine) !== -1;
+
+                // ONE. Remove the tables the harness's own synchronisation created at bootstrap, child before
+                // parent so a foreign key cannot be what fails the drop. From here the running server has the
+                // core schema and nothing of this plugin's — the state a real deployment is in before this
+                // plugin's migration has ever run.
+                await withRunner(rawConnection, async runner => {
+                    await runner.dropTable(LINE_TABLE, true);
+                    await runner.dropTable(LIST_TABLE, true);
+                    expect(await runner.hasTable(LINE_TABLE)).toBe(false);
+                    expect(await runner.hasTable(LIST_TABLE)).toBe(false);
+                });
+
+                // TWO. Apply the migration. On a server engine the lifecycle's own connection addresses the
+                // same physical database; on the connection-local engine it cannot — the database is a buffer
+                // inside whichever connection holds it — so the running server's database is exported to a file
+                // this test owns, the lifecycle is pointed at it with `autoSave`, and the result is loaded back
+                // into the running connection afterwards. Both are the same claim, arranged for each engine.
+                let sharedDatabase: string | undefined;
+                if (connectionLocal) {
+                    sharedDatabase = path.join(
+                        await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-plugin-provisioned-')),
+                        'provisioned.sqlite',
+                    );
+                    await fs.writeFile(
+                        sharedDatabase,
+                        Buffer.from(rawConnection.sqljsManager.exportDatabase()),
+                    );
+                }
+                try {
+                    const migrationDrivenConfig = {
+                        ...harnessConfig,
+                        dbConnectionOptions: {
+                            ...harnessConfig.dbConnectionOptions,
+                            ...(sharedDatabase === undefined
+                                ? {}
+                                : { location: sharedDatabase, autoSave: true }),
+                            // Declared, and the platform force-assigns the same value over it for every
+                            // migration entry point [packages/core/src/migrate.ts:L197-L204]. So the schema
+                            // builder cannot be what creates these tables, here or anywhere.
+                            synchronize: false,
+                            // The class rather than a `*.ts` glob, for the reason the migration suite records:
+                            // TypeORM resolves a glob with Node's own `require`, which has no TypeScript loader
+                            // registered under this runner.
+                            migrations: [AddReorderLists1786838400000],
+                        } as DataSourceOptions,
+                    };
+
+                    await runMigrations(migrationDrivenConfig);
+                    // `runMigrations` resets the platform's module-level configuration in its own `finally`
+                    // [packages/core/src/migrate.ts:L63], and the server this test goes on to use is still
+                    // running against it. Re-establishing it is what keeps that server's request handling
+                    // reading this suite's configuration rather than the platform default.
+                    await preBootstrapConfig(harnessConfig);
+
+                    if (sharedDatabase !== undefined) {
+                        await rawConnection.sqljsManager.loadDatabase(sharedDatabase);
+                    }
+
+                    // The migration, and only the migration, put them back.
+                    await withRunner(rawConnection, async runner => {
+                        expect(await runner.hasTable(LIST_TABLE)).toBe(true);
+                        expect(await runner.hasTable(LINE_TABLE)).toBe(true);
+                    });
+
+                    // THREE. The published contract, over the running server's own Shop API, against that
+                    // schema. Nothing here can create or alter a table: the server synchronised once at
+                    // bootstrap, before the drop, and never again.
+                    await shopClient.asUserWithCredentials(
+                        await firstCustomerEmail(rawConnection),
+                        SEEDED_CUSTOMER_PASSWORD,
+                    );
+
+                    const { createReorderList } = await shopClient.query<
+                        CreateReorderListMutation,
+                        CreateReorderListMutationVariables
+                    >(CREATE_REORDER_LIST, { input: { name: 'Provisioned by the migration' } });
+                    expect(createReorderList.__typename).toBe('ReorderList');
+                    const list = createReorderList as ReorderListSuccessShape;
+                    expect(list.name).toBe('Provisioned by the migration');
+                    expect(list.lineCount).toBe(0);
+
+                    // The child table, its cascading foreign keys and the stored counter.
+                    const variantId = await firstProductVariantId(rawConnection);
+                    const { addItemToReorderList } = await shopClient.query<
+                        AddItemToReorderListMutation,
+                        AddItemToReorderListMutationVariables
+                    >(ADD_ITEM_TO_REORDER_LIST, {
+                        input: { reorderListId: list.id, productVariantId: variantId, quantity: 3 },
+                    });
+                    expect(addItemToReorderList.__typename).toBe('ReorderList');
+                    expect((addItemToReorderList as ReorderListSuccessShape).lineCount).toBe(1);
+
+                    // And the read path, which exercises the named ownership index, the nested page and the
+                    // variant relation.
+                    const { activeCustomerReorderList } = await shopClient.query<
+                        GetActiveCustomerReorderListQuery,
+                        GetActiveCustomerReorderListQueryVariables
+                    >(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: list.id });
+                    expect(activeCustomerReorderList).not.toBeNull();
+                    const read = activeCustomerReorderList as NonNullable<typeof activeCustomerReorderList>;
+                    expect(read.lineCount).toBe(1);
+                    expect(read.lines.totalItems).toBe(1);
+                    expect(read.lines.items[0].quantity).toBe(3);
+                    expect(read.lines.items[0].productVariantId).toBe(variantId);
+                } finally {
+                    if (sharedDatabase !== undefined) {
+                        // The test's own file, outside the repository, removed however the case ends.
+                        await fs.remove(path.dirname(sharedDatabase));
+                    }
+                }
+            },
+            TEST_SETUP_TIMEOUT_MS,
+        );
     });
 });

@@ -117,9 +117,12 @@ import {
     TransactionalConnection,
     UserInputError,
 } from '@vendure/core';
+import { DocumentNode, FragmentDefinitionNode, GraphQLResolveInfo, parse } from 'graphql';
 import { FindOperator } from 'typeorm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { ReorderListEntityResolver, ReorderListLinesArgs } from '../api/reorder-list-entity.resolver';
+import { ReorderListShopResolver, singleListReadMarked } from '../api/reorder-list-shop.resolver';
 import { loggerCtx } from '../constants';
 import { ReorderListLine } from '../entities/reorder-list-line.entity';
 import { ReorderList } from '../entities/reorder-list.entity';
@@ -127,8 +130,11 @@ import { ReorderPlugin } from '../reorder.plugin';
 import { ResolvedReorderPluginOptions } from '../types';
 
 import {
+    ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES,
+    ENGINES_SUPPORTING_PESSIMISTIC_LOCKING,
     ReorderListLimitError,
     ReorderListLineNotFoundError,
+    ReorderListLinePage,
     ReorderListNameConflictError,
     ReorderListNotFoundError,
     ReorderListService,
@@ -244,6 +250,16 @@ const REORDER_LIST_LINE_COLUMNS = [
 const REORDER_LIST_TABLE = 'reorder_list';
 const REORDER_LIST_LINE_TABLE = 'reorder_list_line';
 
+/**
+ * The database column on `customer` that holds the id of the `User` a buyer signs in as.
+ *
+ * The core entity declares the relation as `@OneToOne(() => User) @JoinColumn()` and declares no property for
+ * its foreign key, so this is the name TypeORM derives — and the create path's owner lock addresses its row by
+ * it. It is stated once here and read from the metadata double rather than spelled into any assertion, so a
+ * schema change in core would move both together.
+ */
+const CUSTOMER_USER_JOIN_COLUMN = 'userId';
+
 // -------------------------------------------------------------------------------------------------------
 // The statement journal. This is the instrument every structural assertion in this file reads.
 // -------------------------------------------------------------------------------------------------------
@@ -264,6 +280,22 @@ type StatementOperation = 'select' | 'update' | 'delete' | 'insert';
  * clones builders — a live reference would let a later mutation rewrite history and an assertion would then
  * describe the wrong statement.
  */
+/**
+ * One transaction the harness opened: its ordinal, whether it was NESTED inside an already-open one, and how it
+ * ended.
+ *
+ * The distinction is not bookkeeping. TypeORM opens a nested transaction as a savepoint, and rolling back to a
+ * savepoint retains the row locks taken after it on the MySQL family while keeping the enclosing transaction's
+ * snapshot — so a retry nested inside a failed attempt begins holding what that attempt held. Rolling back a
+ * real transaction releases everything, so a retry begins holding nothing. Which of the two a retry gets is what
+ * decides whether the plugin's one lock-ordering rule survives across attempts.
+ */
+interface TransactionOutcome {
+    id: number;
+    nested: boolean;
+    outcome: 'open' | 'commit' | 'rollback';
+}
+
 interface JournalledStatement {
     entity: ProbedEntity;
     operation: StatementOperation;
@@ -629,6 +661,38 @@ interface HarnessPlan {
     /** Where set, every owner look-up fails with this value — the one statement every operation issues
      * before its own, and therefore the one that must also be inside the disclosure boundary. */
     customerFailure?: unknown;
+    /**
+     * The join columns the metadata double reports for `Customer.user`, which is where the create path's owner
+     * lock reads its column name from.
+     *
+     * It is one column in the shipped schema, and it is configurable here so that the service's refusal to
+     * guess at any other cardinality is itself testable: a relation that reported none, or two, is a schema the
+     * addressed lock cannot express, and answering it with a lock on an arbitrary row would be worse than
+     * failing.
+     */
+    customerUserJoinColumns: string[];
+    /**
+     * The schema or database segment the metadata double prefixes onto each entity's `tablePath`, or
+     * `undefined` for an unqualified connection.
+     *
+     * TypeORM composes `tablePath` as `driver.buildTableName(tableName, schema, database)`, so a connection
+     * configured with PostgreSQL's `schema` (which the development server exposes as `DB_SCHEMA`) or the MySQL
+     * family's `database` makes every table reference a qualified one. This is configurable because the raw
+     * fragment that consults the PARENT table decides whether a line may be changed or removed: rendered
+     * unqualified it would resolve through the connection's search path instead, and a table of the same name
+     * there would answer the ownership question from rows this deployment does not own.
+     */
+    tableQualifier: string | undefined;
+    /**
+     * What the metadata double reports as `tablePath`, given the bare table name. Absent, it reports the bare
+     * name — which is what a connection carrying neither a schema nor a database option produces.
+     *
+     * It is stated as the composed path rather than as a schema name because that is what the driver hands
+     * the metadata [node_modules/typeorm/metadata/EntityMetadata.js:L627], and the composed shapes are not all
+     * reachable from a schema alone: SQL Server produces `database..table` for a database configured without
+     * one. A test that has to drive that shape can only do so by naming it.
+     */
+    tablePathFor?: (tableName: string) => string;
     /** The properties the metadata double will resolve, so a missing column can be driven deliberately. */
     listColumns: string[];
     lineColumns: string[];
@@ -681,10 +745,21 @@ class ServiceHarness {
     readonly metadataRequests: string[] = [];
     readonly escapedIdentifiers: string[] = [];
     transactionsOpened = 0;
+    /**
+     * Every transaction this harness opened, whether it was NESTED inside another, and how it ended.
+     *
+     * Read together with the journal's own transaction tags this is what makes the lock ORDER assertable across
+     * attempts rather than only within one: a nested transaction's rollback leaves its row locks behind, a real
+     * one's does not, so whether a retry starts holding anything is decided here.
+     */
+    readonly transactionOutcomes: TransactionOutcome[] = [];
+    private transactionDepth = 0;
 
     readonly plan: HarnessPlan = {
         engine: 'postgres',
         customerRow: new Customer({ id: CUSTOMER_ID }),
+        customerUserJoinColumns: [CUSTOMER_USER_JOIN_COLUMN],
+        tableQualifier: undefined,
         listColumns: [...REORDER_LIST_COLUMNS],
         lineColumns: [...REORDER_LIST_LINE_COLUMNS],
         listFindOne: () => ownedList(),
@@ -860,11 +935,16 @@ class ServiceHarness {
      *  - **The projection is the identifier alone.** `Customer` carries personal data and an eagerly declared
      *    `user` relation, so a look-up whose entire output is one id must say so; a widened projection loads
      *    fields that can then reach a log line or a serialised context [FEATURE-001-01:§2.7].
-     *  - **The join is the explicit inner join to `user`.** A find-options relation condition is realised as a
-     *    LEFT join and PostgreSQL refuses `FOR UPDATE` on its nullable side, so the locking form would fail on
-     *    exactly one engine — a one-engine failure this unit file can catch in milliseconds.
-     *  - **The predicate names the user.** Without it the statement selects an arbitrary customer row, and
-     *    every ownership assertion downstream would be scoped to a stranger.
+     *  - **NOTHING is joined.** The lock TypeORM emits for `pessimistic_write` is the unqualified `FOR UPDATE`,
+     *    which locks a row of every table the statement reads — so a statement that joined `user` would lock the
+     *    `User` row as well as the `Customer` row, and the bound requires the owning customer and nothing more.
+     *    A `FOR UPDATE OF customer` clause is not the portable alternative: TypeORM raises "Lock tables not
+     *    supported in selected driver" for the MySQL family, so one table in the statement is the only form that
+     *    means the same thing on all three locking engines.
+     *  - **The predicate names the acting user through the customer table's own foreign-key column**, escaped
+     *    through the driver. Without a predicate the statement selects an arbitrary customer row and every
+     *    ownership assertion downstream would be scoped to a stranger; unescaped, the camel-cased column is
+     *    folded to lower case by PostgreSQL and matches nothing there while passing on sql.js.
      *  - **The bound value is the ACTING session's user.** Compared against the identifier the repository was
      *    requested with rather than against a constant this file owns, so an implementation that bound a
      *    literal, bound another session's id, or resolved the owner from an argument is refused here.
@@ -881,17 +961,13 @@ class ServiceHarness {
             Array.isArray(probe.selections[0].expression) &&
             (probe.selections[0].expression as unknown[]).length === 1 &&
             (probe.selections[0].expression as unknown[])[0] === `${probe.alias}.id`;
-        const joinsUserRelation = probe.joins.some(
-            join =>
-                Array.isArray(join) &&
-                join.length >= 2 &&
-                join[0] === `${probe.alias}.user` &&
-                join[1] === 'user',
-        );
+        const joinsNothing = probe.joins.length === 0;
         const namesTheUser = probe.conditions.some(
-            condition => condition.replace(/\s+/g, '') === 'user.id=:userId',
+            condition =>
+                condition.replace(/\s+/g, '') ===
+                `${escaped(probe.alias)}.${escaped(CUSTOMER_USER_JOIN_COLUMN)}=:userId`,
         );
-        if (!projectsIdentifierOnly || !joinsUserRelation || !namesTheUser) {
+        if (!projectsIdentifierOnly || !joinsNothing || !namesTheUser) {
             return null;
         }
         return this.answerForBoundUser(probe.parameters.userId, probe.requestedByUserId);
@@ -934,17 +1010,56 @@ class ServiceHarness {
         return this.plan.customerRow;
     }
 
-    private runInTransaction(
+    private async runInTransaction(
         ctx: RequestContext,
         work: (transactionCtx: RequestContext) => Promise<unknown>,
     ): Promise<unknown> {
         this.transactionsOpened += 1;
+        const id = this.transactionsOpened;
+        // NESTING IS MODELLED, because it decides what a rolled-back attempt leaves behind. `withTransaction`
+        // inherits an already-open transaction from the context, and TypeORM opens a nested one as a SAVEPOINT —
+        // whose rollback retains the row locks taken after it on the MySQL family and keeps the enclosing
+        // transaction's snapshot. A transaction opened at depth zero is a real one, and rolling it back releases
+        // everything. `openOuterTransaction` is how a test asks for the first shape, which is what a resolver
+        // decorated `@Transaction()` in its default mode produces.
+        const nested = this.transactionDepth > 0;
+        this.transactionDepth += 1;
+        this.transactionOutcomes.push({ id, nested, outcome: 'open' });
         // A prototype-linked child rather than a copy, so every getter on RequestContext keeps working
         // while the child remains a distinct object this harness can tag. That tag is what turns "in the
         // same transaction as the delete" into an assertion rather than a hope [FEATURE-001-01:§2.11].
         const transactionCtx = Object.create(ctx) as RequestContext;
         this.transactionIds.set(transactionCtx, this.transactionsOpened);
-        return work(transactionCtx);
+        try {
+            const result = await work(transactionCtx);
+            this.transactionDepth -= 1;
+            this.outcomeOf(id).outcome = 'commit';
+            return result;
+        } catch (err) {
+            this.transactionDepth -= 1;
+            this.outcomeOf(id).outcome = 'rollback';
+            throw err;
+        }
+    }
+
+    /**
+     * Models a transaction already open on the runner when the service is called — the shape a resolver
+     * decorated with the transaction decorator's DEFAULT mode produces.
+     *
+     * The shipped `addItemToReorderList` resolver declares `'manual'` instead, so nothing is open when its
+     * service method starts. This exists so that the consequence of the other choice can be asserted rather than
+     * argued: the same statement sequence, run under a nested boundary, inverts the plugin's lock order.
+     */
+    openOuterTransaction(): void {
+        this.transactionDepth += 1;
+    }
+
+    private outcomeOf(id: number): TransactionOutcome {
+        const found = this.transactionOutcomes.find(outcome => outcome.id === id);
+        if (found === undefined) {
+            throw new Error(`the harness lost the record of transaction ${id}`);
+        }
+        return found;
     }
 
     private rawConnection(): unknown {
@@ -972,11 +1087,39 @@ class ServiceHarness {
                   : [];
         const column = (property: string) =>
             columns.includes(property) ? { databaseName: property, propertyName: property } : undefined;
+        const tableName = tableFor(name);
         return {
             name,
-            tableName: tableFor(name),
+            tableName,
+            // A real `EntityMetadata` carries BOTH names and they are not interchangeable: `tableName` is the
+            // bare relation, while `tablePath` is what the driver built from it together with the configured
+            // schema and database [node_modules/typeorm/metadata/EntityMetadata.js:L627]. The double supplies
+            // both, composed the way the driver composes it
+            // [node_modules/typeorm/driver/postgres/PostgresDriver.js:L683-L689], because a double holding
+            // only the bare name cannot judge a fragment whose whole job is to render the qualified one. A
+            // test states the composed path outright through `tablePathFor` where it needs a shape a schema
+            // alone cannot reach (SQL Server's `database..table`), and states just the leading segment through
+            // `tableQualifier` where the ordinary `schema.table` composition is what matters.
+            tablePath: this.plan.tablePathFor
+                ? this.plan.tablePathFor(tableName)
+                : this.plan.tableQualifier === undefined
+                  ? tableName
+                  : `${this.plan.tableQualifier}.${tableName}`,
             findColumnWithPropertyName: column,
             findColumnWithPropertyPath: column,
+            // The relation look-up the create path's owner lock resolves its column name through. Only
+            // `Customer.user` is answered, and only with the ONE join column the core entity declares
+            // (`@OneToOne(() => User) @JoinColumn()`), because the service treats any other cardinality as a
+            // schema it cannot express and refuses rather than guessing. Configurable through the plan so the
+            // refusal itself is testable.
+            findRelationWithPropertyPath: (propertyPath: string) =>
+                name === 'Customer' && propertyPath === 'user'
+                    ? {
+                          joinColumns: this.plan.customerUserJoinColumns.map(databaseName => ({
+                              databaseName,
+                          })),
+                      }
+                    : undefined,
         };
     }
 
@@ -1351,10 +1494,121 @@ function scopeBoundBy(statement: JournalledStatement): { customer: unknown; chan
     };
 }
 
+/**
+ * Replays the journal against the transaction record and returns every place the plugin's one lock-ordering rule
+ * was broken — a lock or write acquired on the PARENT table while one on a CHILD row was still held.
+ *
+ * ★ WHY A REPLAY, AND WHY NOT A CHECK INSIDE ONE STATEMENT. FEATURE-001-01 §5's lock-ordering item is a rule
+ * about TRANSACTIONS, not about statements: a transaction touching both rows takes the parent first. Two things
+ * follow that no single-statement assertion can see. A row is locked by being WRITTEN as much as by a `FOR
+ * UPDATE` — an `UPDATE` of a line takes that line's row lock — so the holds include writes and not only explicit
+ * lock modes. And a transaction's holds can OUTLIVE the attempt that took them: TypeORM opens a nested
+ * transaction as a savepoint, and rolling back to a savepoint retains the locks taken after it on the MySQL
+ * family, so a bounded retry nested inside a failed attempt begins already holding that attempt's child locks and
+ * inverts the order the moment it touches the parent. Replaying the whole sequence, with the nesting and the
+ * outcomes, is what makes that visible.
+ *
+ * ★ AND ONE ACQUISITION IS NOT WRITTEN WHERE IT HAPPENS. A write against the line table carries its ownership
+ * predicate as a correlated `EXISTS` over the LIST table, because a line row stores neither a customer nor a
+ * channel. On the MySQL family a sub-query evaluated by a DML statement is a CURRENT read: the statement takes
+ * a shared lock on the parent row it reads, and it takes it after the engine has taken the child row it is
+ * updating. So a single journalled statement against the child can acquire BOTH rows, child first — which is
+ * the inversion, inside one statement, invisible to any model that reads only a statement's declared target.
+ * The replay therefore models that hidden acquisition: where an acquiring statement against the child carries a
+ * readable ownership sub-query, the parent is acquired immediately after the child, and the rule then requires
+ * the transaction to have taken the parent already. An earlier revision of this function modelled only the
+ * declared target and consequently agreed with an implementation that took the child first.
+ *
+ * It is modelled only where the configured engine takes row locks at all. The in-process SQLite engine serves a
+ * single connection, so nothing interleaves, its correlated read locks nothing, and there is no order to impose.
+ *
+ * Transactions do not interleave in this file — one service call runs at a time — so a change of the journal's
+ * transaction tag means the previous transaction ended, and its recorded outcome says whether its holds went with
+ * it.
+ */
+function lockOrderViolations(harness: ServiceHarness): string[] {
+    const outcomes = new Map(harness.transactionOutcomes.map(outcome => [outcome.id, outcome]));
+    const violations: string[] = [];
+    const held = new Set<ProbedEntity>();
+    // The same predicate the service reads to decide whether to take a row lock at all, so the model and the
+    // implementation agree about which engines have an order to impose.
+    const locksRows = ENGINES_SUPPORTING_PESSIMISTIC_LOCKING.includes(harness.plan.engine);
+    let currentTransaction = 0;
+    for (const statement of harness.journal) {
+        if (statement.transaction !== currentTransaction) {
+            const previous = outcomes.get(currentTransaction);
+            // A real transaction's end releases every hold. A nested one's rollback does not, which is the whole
+            // point of distinguishing them; its commit releases nothing either, the enclosing transaction still
+            // holding what the savepoint took.
+            if (previous === undefined || previous.nested === false) {
+                held.clear();
+            }
+            currentTransaction = statement.transaction;
+        }
+        const acquires = statement.locks.length > 0 || statement.operation !== 'select';
+        if (!acquires) {
+            continue;
+        }
+        if (statement.entity === 'ReorderList' && held.has('ReorderListLine')) {
+            violations.push(
+                `transaction ${statement.transaction} acquired ${statement.entity} (${statement.operation}) ` +
+                    'while holding ReorderListLine',
+            );
+        }
+        held.add(statement.entity);
+        // THE ACQUISITION THE STATEMENT DOES NOT DECLARE. Modelled after the child hold above, because that is
+        // the order the engine takes them in, and only on an engine that takes row locks.
+        if (
+            locksRows &&
+            statement.entity === 'ReorderListLine' &&
+            ownershipSubqueryOf(statement) !== undefined
+        ) {
+            if (!held.has('ReorderList')) {
+                violations.push(
+                    `transaction ${statement.transaction} acquired ReorderList (correlated current read ` +
+                        `inside a ReorderListLine ${statement.operation}) while holding ReorderListLine`,
+                );
+            }
+            held.add('ReorderList');
+        }
+    }
+    return violations;
+}
+
+/**
+ * The same replay over a journal with one statement withheld, which is how the counterfactual is expressed.
+ *
+ * ★ A lock-order assertion that passes is only worth what its failure would have been, and the acquisition this
+ * rule turns on — the accumulation branch's shared parent lock — cannot be removed from the service by a test.
+ * Withholding it from the journal and replaying is the next best thing and answers the same question: does the
+ * ORDER depend on that statement, or would the sequence be acceptable without it? Applied to an accumulation the
+ * answer must be that it depends on it, because what follows is a child write whose correlated sub-query then
+ * acquires the parent second.
+ */
+function lockOrderViolationsWithout(
+    harness: ServiceHarness,
+    withheld: (statement: JournalledStatement) => boolean,
+): string[] {
+    const kept = harness.journal.filter(statement => !withheld(statement));
+    return lockOrderViolations({ ...harness, journal: kept } as ServiceHarness);
+}
+
 /** The ownership predicate a statement carries through a correlated `EXISTS` sub-query, once parsed. */
 interface OwnershipSubquery {
     /** The table the sub-query reads, which must be the list table for the predicate to mean anything. */
     table: string;
+    /**
+     * The FULL reference to that table, segments unescaped and rejoined — so `reorder_list` on an unqualified
+     * connection and `configured.reorder_list` on one carrying a schema or a database.
+     *
+     * It is read separately from {@link OwnershipSubquery.table} because the bare name being right is not the
+     * same claim as the reference being right. The statement this sub-query sits inside has its target rendered
+     * by TypeORM from the same metadata, so on a qualified connection the target is qualified; a sub-query
+     * naming the bare table would read a DIFFERENT table of that name from the connection's search path, and
+     * with identifiers allocated sequentially a row of the same id there is not far-fetched. That reads as an
+     * ownership answer about rows this deployment does not own.
+     */
+    tablePath: string;
     /** The sub-query column the correlation compares — the parent list's own identifier. */
     correlatedColumn: string;
     /** The outer column the correlation compares it to — the line row's reference to its parent. */
@@ -1402,7 +1656,18 @@ function ownershipSubqueryOf(statement: JournalledStatement): OwnershipSubquery 
     if (relation === null) {
         return undefined;
     }
-    const table = unescapeIdentifier(relation[1]);
+    // The table reference is read SEGMENT BY SEGMENT, and every segment must have gone through the driver's
+    // escape. Two spellings are refused by that, and each is a real defect: a bare `reorder_list`, which
+    // PostgreSQL folds to lower case and which names whatever the search path resolves rather than the schema
+    // the statement's own target carries; and a whole dotted path escaped as ONE identifier, which produces the
+    // single quoted name `"configured.reorder_list"` — not a qualified reference to anything that exists.
+    const referenceSegments = relation[1].split('.');
+    const unescapedSegments = referenceSegments.map(segment => unescapeIdentifier(segment));
+    if (unescapedSegments.some((segment, index) => segment === referenceSegments[index].trim())) {
+        return undefined;
+    }
+    const tablePath = unescapedSegments.join('.');
+    const table = unescapedSegments[unescapedSegments.length - 1];
     const alias = unescapeIdentifier(relation[2]);
     const conjuncts = relation[3].split(/\s+AND\s+/i);
     if (conjuncts.length !== 3) {
@@ -1437,6 +1702,7 @@ function ownershipSubqueryOf(statement: JournalledStatement): OwnershipSubquery 
     }
     return {
         table,
+        tablePath,
         correlatedColumn: correlation.column,
         correlatedTo,
         customer: resolveOperandValue(customer.operand, statement.parameters),
@@ -1448,9 +1714,10 @@ function ownershipSubqueryOf(statement: JournalledStatement): OwnershipSubquery 
  * The complete ownership sub-query a line write must carry, expressed once so that all three line-writing
  * paths assert the same thing and none can quietly differ.
  */
-function ownedLineScope(correlatedTo: string): OwnershipSubquery {
+function ownedLineScope(correlatedTo: string, tablePath: string = REORDER_LIST_TABLE): OwnershipSubquery {
     return {
         table: REORDER_LIST_TABLE,
+        tablePath,
         correlatedColumn: 'id',
         correlatedTo,
         customer: CUSTOMER_ID,
@@ -1829,6 +2096,111 @@ describe('ReorderListService', () => {
 
             expect(created).toBeInstanceOf(ReorderList);
             expect(read).toBeInstanceOf(ReorderList);
+        });
+    });
+
+    describe('the table the ownership predicate names, on a connection that qualifies its identifiers', () => {
+        /*
+         * ★ WHY THESE EXIST. The correlated sub-query every line write carries is what decides whether that
+         * line may be changed or removed, and it names the PARENT table in a raw fragment this service renders
+         * itself. TypeORM renders the statement's own target from `EntityMetadata.tablePath`, which is
+         * `driver.buildTableName(tableName, schema, database)` — so a connection configured with PostgreSQL's
+         * `schema` (the development server exposes it as `DB_SCHEMA`) or the MySQL family's `database` gets a
+         * QUALIFIED target. A sub-query naming the bare table would then read some other table of that name on
+         * the connection's search path, and the two failures that follows are not equivalent: where no such
+         * table exists the statement errors, and where one DOES exist it answers the ownership question from
+         * rows this deployment does not own. Identifiers are allocated sequentially by the default strategy, so
+         * a row of the same id in a same-named table is an ordinary occurrence rather than a contrivance.
+         *
+         * None of this is observable in the default single-schema configuration — both spellings work there —
+         * which is exactly why it is asserted here rather than left to a deployment to discover.
+         */
+        const QUALIFIER = 'reorder_alt';
+
+        it('renders the bare escaped table where the connection qualifies nothing', async () => {
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 3,
+            });
+
+            const update = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+            expect(ownershipSubqueryOf(update)).toEqual(ownedLineScope('reorderListId'));
+        });
+
+        it('qualifies the table with the configured schema on all three line-writing paths', async () => {
+            harness.plan.tableQualifier = QUALIFIER;
+            const qualified = `${QUALIFIER}.${REORDER_LIST_TABLE}`;
+
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 3,
+            });
+            await service.removeReorderListLine(ctx, { reorderListId: LIST_ID, lineId: LINE_ID });
+            harness.plan.lineGetOne = () => ownedLine({ quantity: 2 });
+            await service.addItemToReorderList(ctx, {
+                reorderListId: LIST_ID,
+                productVariantId: VARIANT_ID,
+                quantity: 1,
+            });
+
+            // Every statement that carries the predicate, whichever operation produced it: the absolute set,
+            // the removal, and the accumulation onto an existing line.
+            const carriers = harness.journal.filter(
+                statement =>
+                    statement.entity === 'ReorderListLine' &&
+                    (statement.operation === 'update' || statement.operation === 'delete') &&
+                    ownershipSubqueryOf(statement) !== undefined,
+            );
+            expect(carriers.length).toBeGreaterThanOrEqual(3);
+            for (const carrier of carriers) {
+                expect(ownershipSubqueryOf(carrier)).toEqual(ownedLineScope('reorderListId', qualified));
+            }
+        });
+
+        it('qualifies with a database segment too, which is the shape the MySQL family produces', async () => {
+            // `MysqlDriver.buildTableName` prefixes the DATABASE rather than a schema, so the same fragment
+            // must be correct for a two-segment path that is not a schema at all. Nothing in the rendering may
+            // depend on which of the two the segment is.
+            harness.plan.engine = 'mariadb';
+            harness.plan.tableQualifier = 'vendure_dev';
+
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 3,
+            });
+
+            const update = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+            expect(ownershipSubqueryOf(update)).toEqual(
+                ownedLineScope('reorderListId', `vendure_dev.${REORDER_LIST_TABLE}`),
+            );
+        });
+
+        it('escapes each segment separately rather than the dotted path as one identifier', async () => {
+            // THE ADVERSARIAL CASE, and the one an ordinary reading of the fragment would produce. Handing the
+            // dotted path to the driver's escape whole yields the single quoted name `"schema.reorder_list"`,
+            // which is not a qualified reference to anything — it is one identifier that happens to contain a
+            // dot, and it names no table on any engine. Both halves are asserted: the correct spelling is
+            // present, and the wrong one is absent from the rendered SQL text.
+            harness.plan.tableQualifier = QUALIFIER;
+
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 3,
+            });
+
+            const update = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+            const text = conditionTextOf(update);
+            expect(text).toContain(`${escaped(QUALIFIER)}.${escaped(REORDER_LIST_TABLE)}`);
+            expect(text).not.toContain(escaped(`${QUALIFIER}.${REORDER_LIST_TABLE}`));
+            // And the segments reached the driver as separate identifiers, which is what produced that
+            // spelling — read off the escape calls rather than inferred from the text.
+            expect(harness.escapedIdentifiers).toContain(QUALIFIER);
+            expect(harness.escapedIdentifiers).toContain(REORDER_LIST_TABLE);
+            expect(harness.escapedIdentifiers).not.toContain(`${QUALIFIER}.${REORDER_LIST_TABLE}`);
         });
     });
 
@@ -2294,21 +2666,31 @@ describe('ReorderListService', () => {
             expect(statementsAgainst(harness, 'ReorderListLine')).toEqual([]);
             const selects = rowLookupsAgainst(harness, 'ReorderList');
             expect(selects).toHaveLength(1);
-            expect(whereKeysOf(selects[0])).toEqual(
-                expect.arrayContaining(['id', 'customerId', 'channelId']),
-            );
-            expect(selects[0].findOptions?.where).toEqual({
+            // ONE statement, and all three conjuncts inside its own `WHERE`. The read is a locking one on this
+            // engine, so the predicate is asserted through the statement's conditions rather than through
+            // find-options — the shape is what matters and it is unchanged by the lock.
+            expect(conditionTextOf(selects[0])).toContain('reorderlist.id = :id');
+            expect(conditionTextOf(selects[0])).toContain('reorderlist.customerId = :customerId');
+            expect(conditionTextOf(selects[0])).toContain('reorderlist.channelId = :channelId');
+            expect(selects[0].parameters).toMatchObject({
                 id: LIST_ID,
                 customerId: CUSTOMER_ID,
                 channelId: CHANNEL_ID,
             });
         });
 
-        it('takes no lock on the admission read, so two adjustments can still interleave', async () => {
-            // The rename and delete paths lock the parent row; this one deliberately does not. Holding it would
-            // serialise concurrent adjustments and accumulations against the same list, and a barrier-released
-            // pair that queued on a parent lock would evidence sequencing rather than the guard the contract
-            // asks to be proved [FEATURE-001-01:§2.11].
+        it('takes a SHARED lock on the parent before writing the line, so the order is parent first', async () => {
+            // THE LOCK ORDER, WHICH IS THE WHOLE OF THIS CLAIM [FEATURE-001-01:§5 lock-ordering seam]. Any
+            // transaction in this plugin touching both the parent row and a child row takes the parent FIRST,
+            // and this one is a child write: `removeReorderListLine` and `deleteReorderList` take the same
+            // parent row exclusively as their own first statement, so an adjust that locked the line first
+            // would be waiting for the parent while a remove holding the parent waited for the line — the
+            // definition of a deadlock, resolved by the engine killing one buyer's request.
+            //
+            // SHARED rather than exclusive because this transaction writes no column of `reorder_list`: two
+            // concurrent adjustments of the same list can both hold it and neither waits, so the ordering
+            // costs nothing in concurrency. The parent statement is also FIRST in the journal, which is the
+            // half a mode assertion alone would not carry.
             harness.plan.engine = 'postgres';
 
             await service.adjustReorderListLine(ctx, {
@@ -2317,7 +2699,45 @@ describe('ReorderListService', () => {
                 quantity: 2,
             });
 
-            expect(pluginStatements(harness).every(statement => statement.locks.length === 0)).toBe(true);
+            const statements = pluginStatements(harness);
+            expect(statements[0].entity).toBe('ReorderList');
+            expect(statements[0].terminal).toBe('getOne');
+            expect(statements[0].locks).toEqual(['pessimistic_read']);
+            // And no LINE row is locked by this path at all: the child is written by one conditional statement
+            // whose affected-row count is the authority, never by a read-then-save under a row lock.
+            expect(
+                statements
+                    .filter(statement => statement.entity === 'ReorderListLine')
+                    .every(statement => statement.locks.length === 0),
+            ).toBe(true);
+        });
+
+        it('attempts no parent lock where the engine serves a single connection', async () => {
+            // The in-process SQLite engine cannot interleave two transactions, so there is no order to impose
+            // and asking that driver for a lock raises rather than degrades. The statement count is unchanged
+            // by the difference, which is what keeps this file's counted assertions engine-independent.
+            harness.plan.engine = 'sqljs';
+
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 2,
+            });
+
+            expect(harness.journal.every(statement => statement.locks.length === 0)).toBe(true);
+            // The admission read is still the transaction's first statement against either plugin table, and
+            // still ONE scoped `SELECT` carrying all three conjuncts: only the lock differs between the
+            // engines, never the predicate. The terminal differs with it — an unlockable engine takes the
+            // repository's own `findOne`, which is the same single statement expressed through find-options —
+            // and the predicate is asserted through whichever form the path took.
+            const statements = pluginStatements(harness);
+            expect(statements[0].entity).toBe('ReorderList');
+            expect(statements[0].terminal).toBe('findOne');
+            expect(statements[0].findOptions?.where).toEqual({
+                id: LIST_ID,
+                customerId: CUSTOMER_ID,
+                channelId: CHANNEL_ID,
+            });
         });
 
         it('returns ReorderListLineNotFoundError when the list resolves and the line statement misses', async () => {
@@ -2605,6 +3025,371 @@ describe('ReorderListService', () => {
     // created [FEATURE-001-01:§2.11], [STORY-001-01-02:AC-2, AC-5, AC-6].
     // ---------------------------------------------------------------------------------------------------
 
+    describe('the one lock order every line write takes, parent before child', () => {
+        // FEATURE-001-01:§5's lock-ordering seam item fixes one rule for the whole plugin: a transaction that
+        // touches both the parent `reorder_list` row and a child `reorder_list_line` row takes the parent
+        // FIRST. Two transactions taking the same two rows in opposite orders deadlock rather than wait, which
+        // a buyer observes as an operation that failed for no reason they can act on.
+        //
+        // ★ THE RULE IS READ OVER TRANSACTIONS, NOT OVER OPERATIONS, and that is what these cases assert. Three
+        // consequences follow, and two earlier revisions of this block missed one each.
+        //
+        //   - A branch that writes only the child can still LOCK the parent, and one here does. An
+        //     accumulation changes one line's quantity and leaves `lineCount` untouched, but its increment
+        //     carries the ownership predicate as a correlated `EXISTS` over the parent table — a CURRENT read
+        //     on the MySQL family — so the statement takes the child exclusively and then the parent in share
+        //     mode. The branch therefore takes an explicit SHARED lock on the parent first, which is what puts
+        //     it on the same side of the rule as every other line write. Shared rather than exclusive because
+        //     the parent is never written here, so two accumulations still overlap and the increment remains
+        //     the statement a concurrent pair contends on.
+        //   - A branch that writes both takes the parent first BY WRITING IT FIRST. The insert branch's
+        //     conditional capacity claim is a write of the parent row, so the engine takes that row exclusively
+        //     to evaluate it and no separate lock is needed. Two concurrent inserters then contend on that one
+        //     statement rather than on a lock taken before either had decided anything.
+        //   - A row is held by being WRITTEN as much as by being locked, and a hold can outlive the ATTEMPT that
+        //     took it. That is why the crossing between the branches is a fresh transaction rather than a
+        //     fall-through, and why {@link lockOrderViolations} replays the whole sequence.
+        //
+        // A third earlier revision removed the accumulation branch's parent lock outright, on the reading that a
+        // branch writing only the child is outside the rule. That is true of what it WRITES and false of what it
+        // LOCKS, and the rule is about locks — the hidden acquisition above is the whole of the difference, and
+        // {@link lockOrderViolations} now models it so a model that agrees with such an implementation fails.
+        //
+        // The first earlier revision took ONE exclusive parent lock ahead of both branches. It ordered the locks
+        // correctly and paid far too much: every add to a list queued behind every other, and — worse for a
+        // suite whose job is evidence — the serialisation closed the windows the atomic statements exist to
+        // defend, so a read-compute-save increment and a count-then-insert capacity check would both have passed
+        // the races that name them. The second took a shared parent lock on the accumulation branch and a
+        // LOCKING read on retries; that reintroduced the inversion by another route, because a retry nested
+        // inside the resolver's own transaction is a savepoint and keeps both.
+
+        for (const engine of ['postgres', 'mysql', 'mariadb']) {
+            // The MODE is engine-dependent and the ORDER is not, which is the whole of the difference this loop
+            // carries. `ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES` is read from the service rather than
+            // restated here so the model cannot drift from the implementation it replays: on the MySQL family
+            // two shared holders were measured to deadlock at the line row when it is removed beneath them, and
+            // an InnoDB deadlock inside a savepoint surfaces as an unrecoverable savepoint error rather than as
+            // the retriable deadlock it is. Everything else about the case is identical on all three engines.
+            const exclusiveParent = ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES.includes(engine);
+            const expectedParentLock = exclusiveParent ? 'pessimistic_write' : 'pessimistic_read';
+            it(`takes ${
+                exclusiveParent ? 'an EXCLUSIVE' : 'a SHARED'
+            } lock on the parent before accumulating onto an existing line on ${engine}`, async () => {
+                // THE ACQUISITION THIS BRANCH USED TO LEAVE TO THE ENGINE, now taken deliberately and first.
+                // The increment below carries its ownership predicate as a correlated `EXISTS` over the parent
+                // table, and on the MySQL family a sub-query evaluated by a DML statement is a CURRENT read:
+                // the statement takes the child row exclusively and then a shared lock on the parent row it
+                // read, in that order. So the branch does touch both rows, child first, and
+                // `removeReorderListLine` and `deleteReorderList` touch the same two parent first — the
+                // inversion the rule exists to prevent [FEATURE-001-01:§5 lock-ordering seam]. An earlier
+                // revision of this test asserted the ABSENCE of a lock here, on the reasoning that the branch
+                // "writes only the child": true of what it writes and false of what it locks.
+                //
+                // SHARED on PostgreSQL, because no column of the parent is written: two concurrent
+                // accumulations of one list both hold it and neither waits, so the increment remains the
+                // statement a concurrent pair contends on and a read-compute-save implementation of it still
+                // fails that evidence. EXCLUSIVE on the MySQL family, where that overlap was measured to
+                // deadlock instead — the interleaving evidence is carried there by the sequential pair, and the
+                // ordering this case is about is unchanged either way.
+                harness.plan.engine = engine;
+                harness.plan.lineGetOne = () => ownedLine({ quantity: 4 });
+                harness.plan.lineAffected = () => 1;
+
+                await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                // The ONE lock this branch takes, on the parent, in share mode, and before any line statement.
+                const locked = harness.journal.filter(statement => statement.locks.length > 0);
+                expect(locked).toHaveLength(1);
+                expect(locked[0].entity).toBe('ReorderList');
+                expect(locked[0].locks).toEqual([expectedParentLock]);
+                const lockIndex = harness.journal.indexOf(locked[0]);
+                const firstLineStatement = harness.journal.findIndex(
+                    statement => statement.entity === 'ReorderListLine' && statement.operation !== 'select',
+                );
+                expect(firstLineStatement).toBeGreaterThan(lockIndex);
+                // Scoped exactly as every other ownership read is, so the lock cannot be taken on a row this
+                // caller does not own.
+                expect(scopeBoundBy(locked[0])).toEqual({
+                    customer: CUSTOMER_ID,
+                    channel: CHANNEL_ID,
+                });
+
+                // It writes no parent row — which is what makes the shared mode available at all where the
+                // engine can honour it, and, on either mode, what makes the lock taken at admission the ONLY
+                // one this branch takes on the parent: nothing upgrades, so two accumulations cannot deadlock
+                // on an upgrade either.
+                expect(
+                    writeStatements(harness).filter(statement => statement.entity === 'ReorderList'),
+                    'an accumulation wrote the parent row',
+                ).toEqual([]);
+                // What carries the ownership into the write itself: the increment's own correlated predicate.
+                const increment = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+                expect(ownershipSubqueryOf(increment)).toEqual(ownedLineScope('reorderListId'));
+
+                // THE WHOLE SEQUENCE IS ORDERED, replayed with the hidden acquisition modelled.
+                expect(lockOrderViolations(harness)).toEqual([]);
+
+                // AND THE ORDER DEPENDS ON THAT ONE STATEMENT. Withheld from the journal, the same replay
+                // reports the inversion — which is what makes the assertion above evidence rather than a
+                // sequence that happened to be acceptable.
+                const withoutTheLock = lockOrderViolationsWithout(
+                    harness,
+                    statement => statement === locked[0],
+                );
+                expect(withoutTheLock.length).toBeGreaterThan(0);
+                expect(withoutTheLock.join(' | ')).toContain('correlated current read');
+            });
+
+            it(`refuses an accumulation whose list left scope before the lock, without issuing the increment, on ${engine}`, async () => {
+                // THE REACHABLE WINDOW, WHICH IS THE ONE BEFORE THE LOCK. The admission read found the list and
+                // the line, and the list was then deleted or moved out of this caller's scope before the shared
+                // parent lock was taken — so the locking read matches no row, and the branch refuses there.
+                // Reported as the same normalised not-found every inaccessible case produces, with NOTHING
+                // written, no increment issued at all, and NO retry: this is a decision about the request rather
+                // than a state to reconcile.
+                //
+                // The window AFTER the lock is a different matter and is covered separately below, because on
+                // these engines it is not reachable through a committed change: a competing delete, or an update
+                // of the owning customer or channel, has to wait for the shared lock this branch holds.
+                harness.plan.engine = engine;
+                harness.plan.lineGetOne = () => ownedLine({ quantity: 4 });
+                // The admission read resolves — it is the repository's own `findOne` — and the LOCKING read that
+                // follows it, which the query builder issues, matches nothing.
+                harness.plan.listFindOne = rowMatchingPredicate(ownedList());
+                harness.plan.listGetOne = () => null;
+
+                const result = await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                // NO INCREMENT WAS ISSUED. The refusal happened at the lock, so the child was never addressed —
+                // which is also why no lock order could have been inverted.
+                expect(statementsOfKind(harness, 'ReorderListLine', 'update')).toEqual([]);
+                expect(
+                    writeStatements(harness).filter(statement => statement.entity === 'ReorderList'),
+                    'the refused accumulation wrote the parent row',
+                ).toEqual([]);
+                expect(harness.transactionsOpened, 'a decision about the request was retried').toBe(1);
+                expect(lockOrderViolations(harness)).toEqual([]);
+            });
+
+            it(`classifies an increment that matches nothing as not-found, as defence in depth, on ${engine}`, async () => {
+                // WHAT THIS CASE IS AND IS NOT. It drives the affected count to zero directly, and it is a claim
+                // about CLASSIFICATION rather than about a reachable interleaving: with the shared parent lock
+                // held, a committed deletion or re-owning of the list cannot happen between the lock and the
+                // increment, so on these engines the ownership conjunct of the increment should never be the one
+                // that fails. The conjunct stays in the statement regardless — it is what scopes the write on an
+                // engine where no lock was available, and what would answer if a future revision ever moved or
+                // dropped the lock — so the behaviour behind it is asserted rather than left untested. An earlier
+                // revision of this case narrated it as a concurrent deletion, which the lock had already made
+                // impossible.
+                harness.plan.engine = engine;
+                harness.plan.lineGetOne = () => ownedLine({ quantity: 4 });
+                harness.plan.lineAffected = () => 0;
+
+                const result = await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                expect(
+                    writeStatements(harness).filter(statement => statement.entity === 'ReorderList'),
+                    'the refused accumulation wrote the parent row',
+                ).toEqual([]);
+                expect(harness.transactionsOpened, 'a decision about the request was retried').toBe(1);
+                expect(lockOrderViolations(harness)).toEqual([]);
+            });
+
+            it(`writes the parent before inserting a line, and locks nothing first, on ${engine}`, async () => {
+                // The insert branch's half of the same rule. The conditional capacity claim is a write of the
+                // parent row, so the engine takes that row exclusively to evaluate it: the ordering is
+                // satisfied by the claim itself, which is why no lock statement precedes it.
+                harness.plan.engine = engine;
+                harness.plan.lineGetOne = () => null;
+                harness.plan.listAffected = () => 1;
+
+                await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                expect(
+                    harness.journal.filter(statement => statement.locks.length > 0),
+                    'the insert branch took a lock before its capacity claim, which serialises every add',
+                ).toEqual([]);
+                const writes = writeStatements(harness);
+                expect(writes.length).toBeGreaterThanOrEqual(2);
+                expect(isLineCountClaim(writes[0])).toBe(true);
+                expect(writes[0].entity).toBe('ReorderList');
+                expect(writes[1].entity).toBe('ReorderListLine');
+                expect(writes[1].operation).toBe('insert');
+                expect(writes[0].transaction).toBe(writes[1].transaction);
+            });
+
+            it(`resolves the variant before touching the parent row on ${engine}`, async () => {
+                // The same ticket item's second obligation: no transaction holds the parent row across a call
+                // it does not control. `ProductVariantService.findOne` is exactly such a call, so it happens
+                // before the capacity claim — otherwise the window that row is held for would include a
+                // collaborator's own database work, and the window a row is held for is the whole of its cost.
+                harness.plan.engine = engine;
+                harness.plan.lineGetOne = () => null;
+                harness.plan.listAffected = () => 1;
+                let statementsWhenVariantResolved = -1;
+                harness.productVariantService.findOne.mockImplementationOnce(() => {
+                    statementsWhenVariantResolved = pluginStatements(harness).length;
+                    return Promise.resolve(harness.plan.variant);
+                });
+
+                await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                const statements = pluginStatements(harness);
+                const parentWrite = statements.findIndex(
+                    statement => statement.entity === 'ReorderList' && statement.operation === 'update',
+                );
+                expect(statementsWhenVariantResolved).toBeGreaterThan(-1);
+                expect(parentWrite).toBeGreaterThan(-1);
+                expect(parentWrite).toBeGreaterThanOrEqual(statementsWhenVariantResolved);
+            });
+
+            it(`retries as an insert in a FRESH transaction when the line is removed under it on ${engine}`, async () => {
+                /*
+                 * The one path that crosses from the accumulation branch into the insert branch — the increment
+                 * matching nothing because a concurrent request removed the line. It does NOT continue inside the
+                 * same transaction, and the reason is the rule: by then the attempt holds a lock on a line row
+                 * (the increment examined one, and the current read that established the state holds either the
+                 * replacement or the gap the removed row left), so taking the parent now would be exactly the
+                 * inversion a removal or a deletion is the other half of.
+                 *
+                 * Asserted by the shapes rather than by the outcome: the parent write follows the RETRY's own
+                 * admission read, the first attempt is recorded as rolled back, and neither transaction is
+                 * nested — so the retry starts holding nothing.
+                 */
+                harness.plan.engine = engine;
+                let lineReads = 0;
+                harness.plan.lineGetOne = () => {
+                    lineReads += 1;
+                    return lineReads === 1 ? ownedLine({ quantity: 4 }) : null;
+                };
+                harness.plan.lineAffected = () => 0;
+                harness.plan.listAffected = () => 1;
+
+                await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                const statements = pluginStatements(harness);
+                const admissionReads = statements
+                    .map((statement, index) => ({ statement, index }))
+                    .filter(
+                        entry =>
+                            entry.statement.entity === 'ReorderList' &&
+                            entry.statement.operation === 'select' &&
+                            entry.statement.locks.length === 0,
+                    )
+                    .map(entry => entry.index);
+                const parentWrite = statements.findIndex(
+                    statement => statement.entity === 'ReorderList' && statement.operation === 'update',
+                );
+                expect(parentWrite, 'the retry never claimed capacity').toBeGreaterThan(-1);
+                expect(
+                    admissionReads.length,
+                    'the operation did not open a second attempt, so it never retried',
+                ).toBeGreaterThanOrEqual(2);
+                expect(parentWrite).toBeGreaterThan(admissionReads[1]);
+                // The first attempt ENDED, and ended by rolling back — which is what released the line locks it
+                // had taken. Two transactions, neither nested.
+                expect(harness.transactionOutcomes).toHaveLength(2);
+                expect(harness.transactionOutcomes[0]).toMatchObject({ nested: false, outcome: 'rollback' });
+                expect(harness.transactionOutcomes[1]).toMatchObject({ nested: false, outcome: 'commit' });
+                // THE RULE ITSELF, across both attempts rather than within either.
+                expect(lockOrderViolations(harness)).toEqual([]);
+            });
+
+            it(`would invert that order if the retry were nested, which is why the resolver declares manual mode on ${engine}`, async () => {
+                /*
+                 * ★ THE REASON FOR THE TRANSACTION MODE, MADE EXECUTABLE. This drives the identical sequence with
+                 * a transaction already open on the runner — the shape a resolver decorated in the decorator's
+                 * DEFAULT mode produces. Each attempt then opens a nested transaction, TypeORM realises that as a
+                 * savepoint, and rolling back to a savepoint retains the row locks taken after it on the MySQL
+                 * family. The retry therefore begins holding the first attempt's LINE locks and inverts the
+                 * plugin's order the moment its capacity claim touches the parent.
+                 *
+                 * The shipped `addItemToReorderList` resolver declares `'manual'` for exactly this reason, so
+                 * nothing is open when the service's retry loop starts. This case is the counterfactual: it
+                 * asserts what the other choice costs, and it fails if the replay ever stops noticing.
+                 *
+                 * What this file can prove is the CONSEQUENCE given a boundary; the boundary itself is a fact
+                 * about the resolver, and the end-to-end suite asserts it directly by counting the savepoints a
+                 * real request issues.
+                 */
+                harness.plan.engine = engine;
+                harness.openOuterTransaction();
+                let lineReads = 0;
+                harness.plan.lineGetOne = () => {
+                    lineReads += 1;
+                    return lineReads === 1 ? ownedLine({ quantity: 4 }) : null;
+                };
+                harness.plan.lineAffected = () => 0;
+                harness.plan.listAffected = () => 1;
+
+                await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                expect(harness.transactionOutcomes[0]).toMatchObject({ nested: true, outcome: 'rollback' });
+                expect(lockOrderViolations(harness)).not.toEqual([]);
+                expect(lockOrderViolations(harness)[0]).toContain('while holding ReorderListLine');
+            });
+        }
+
+        for (const engine of ['sqljs', 'better-sqlite3', 'sqlite']) {
+            it(`issues no lock statement at all on ${engine}`, async () => {
+                // A single-connection driver cannot interleave two transactions, so there is no order to
+                // impose, its correlated read takes no lock either, and asking it for one raises rather than
+                // degrades. So the accumulation branch's shared parent lock — which the cases above require on
+                // every locking engine — is SKIPPED here rather than degraded to an unlocked read: skipping it
+                // issues no statement, which is what keeps the end-to-end statement-count claims, running on
+                // exactly this engine, unchanged by that fix.
+                harness.plan.engine = engine;
+                harness.plan.lineGetOne = () => ownedLine({ quantity: 4 });
+                harness.plan.lineAffected = () => 1;
+
+                await service.addItemToReorderList(ctx, {
+                    reorderListId: LIST_ID,
+                    productVariantId: VARIANT_ID,
+                    quantity: 2,
+                });
+
+                expect(harness.journal.every(statement => statement.locks.length === 0)).toBe(true);
+                expect(lockOrderViolations(harness)).toEqual([]);
+                // TWO reads of the parent and no third: the admission read that decides the branch, and the
+                // reload that answers the caller. The lock statement the locking engines take is not among them.
+                expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(2);
+                // And the write is still scoped by the increment's own correlated predicate, which is what
+                // enforces ownership on an engine where no lock was available.
+                const increment = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+                expect(ownershipSubqueryOf(increment)).toEqual(ownedLineScope('reorderListId'));
+            });
+        }
+    });
     describe('addItemToReorderList on the insert path', () => {
         beforeEach(() => {
             harness.plan.lineGetOne = () => null;
@@ -2932,9 +3717,10 @@ describe('ReorderListService', () => {
             });
 
             const update = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
-            // The accumulate path is the one line write with no parent lock and no preceding conditional
-            // statement of its own, so the correlated sub-query is the ONLY thing standing between this
-            // increment and another customer's line. It is asserted in full for that reason: the parent list
+            // The accumulate path takes a SHARED parent lock and no conditional parent statement of its own, so
+            // on an engine that cannot lock a row the correlated sub-query is the ONLY thing standing between
+            // this increment and another customer's line — and on one that can, it is the conjunct whose
+            // affected-row count remains the authority. It is asserted in full for that reason: the parent list
             // is addressed here as `:listId` rather than `:reorderListId`, and the correlation still has to
             // reach the line's own parent reference [FEATURE-001-01:§2.11].
             expect(conditionTextOf(update)).toContain('id = :lineId');
@@ -3095,6 +3881,123 @@ describe('ReorderListService', () => {
     // Quantity validation. A malformed quantity is a bad request rather than a business outcome, which is
     // exactly why this feature declares four error results and not five [EPIC-001:R13].
     // ---------------------------------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------------------------------
+    // The relation the correlated sub-query reads. Under a configured schema this is a tenant-isolation
+    // property rather than a spelling preference, so it is asserted on every path that writes a line.
+    // ---------------------------------------------------------------------------------------------------
+
+    describe("the sub-query relation, which must be qualified the way the statement's own target is", () => {
+        /** The alias the fragment introduces, spelled here because the service keeps its constant private. */
+        const SUBQUERY_ALIAS = 'owned_list_scope';
+
+        /**
+         * The whole ownership fragment, given the relation it should be reading.
+         *
+         * Composed rather than substring-matched because the relation is the ONE part under test: a fragment
+         * that qualified the relation but lost a conjunct, or qualified it and stopped escaping the rest,
+         * would satisfy a `toContain('tenant')` while being a different predicate.
+         */
+        const ownershipClauseReading = (relation: string) =>
+            `EXISTS (SELECT 1 FROM ${relation} ${escaped(SUBQUERY_ALIAS)}` +
+            ` WHERE ${escaped(SUBQUERY_ALIAS)}.${escaped('id')} = ${escaped('reorderListId')}` +
+            ` AND ${escaped(SUBQUERY_ALIAS)}.${escaped('customerId')} = :ownerCustomerId` +
+            ` AND ${escaped(SUBQUERY_ALIAS)}.${escaped('channelId')} = :ownerChannelId)`;
+
+        /** The three statements that carry the fragment, each produced by the path that issues it. */
+        const lineWrites: Array<{
+            path: string;
+            issue: () => Promise<unknown>;
+            statement: () => JournalledStatement;
+        }> = [
+            {
+                path: 'adjustReorderListLine',
+                issue: () =>
+                    service.adjustReorderListLine(ctx, {
+                        reorderListId: LIST_ID,
+                        lineId: LINE_ID,
+                        quantity: 2,
+                    }),
+                statement: () => statementsOfKind(harness, 'ReorderListLine', 'update')[0],
+            },
+            {
+                path: 'removeReorderListLine',
+                issue: () => service.removeReorderListLine(ctx, { reorderListId: LIST_ID, lineId: LINE_ID }),
+                statement: () => statementsOfKind(harness, 'ReorderListLine', 'delete')[0],
+            },
+            {
+                path: 'addItemToReorderList on the accumulate path',
+                issue: () => {
+                    harness.plan.lineGetOne = () => ownedLine({ quantity: 1 });
+                    return service.addItemToReorderList(ctx, {
+                        reorderListId: LIST_ID,
+                        productVariantId: VARIANT_ID,
+                        quantity: 1,
+                    });
+                },
+                statement: () => statementsOfKind(harness, 'ReorderListLine', 'update')[0],
+            },
+        ];
+
+        for (const lineWrite of lineWrites) {
+            it(`names the configured schema on ${lineWrite.path}, so the predicate cannot resolve elsewhere`, async () => {
+                // ★ WHY THIS IS A SECURITY PROPERTY. The statements this fragment is appended to are rendered
+                // by the query builder from `metadata.tablePath`, so under `dbConnectionOptions.schema` their
+                // target is `"tenant"."reorder_list_line"`. A sub-query naming the BARE relation is resolved by
+                // PostgreSQL through `search_path` — which the driver does not set from the schema option — so
+                // it either fails outright or, silently, correlates the ownership predicate against a
+                // same-named table in another schema. One tenant's write would then be admitted or refused by
+                // another tenant's rows, and every response-shaped assertion would stay green
+                // [node_modules/typeorm/metadata/EntityMetadata.js:L627].
+                harness.plan.tablePathFor = tableName => `tenant.${tableName}`;
+
+                await lineWrite.issue();
+
+                expect(conditionTextOf(lineWrite.statement())).toContain(
+                    ownershipClauseReading(`${escaped('tenant')}.${escaped(REORDER_LIST_TABLE)}`),
+                );
+                // Each part went through the driver on its own. A path escaped whole would arrive as one
+                // quoted identifier containing a dot, which names a table whose name contains a dot rather
+                // than a table in a schema.
+                expect(harness.escapedIdentifiers).toContain('tenant');
+                expect(harness.escapedIdentifiers).not.toContain(`tenant.${REORDER_LIST_TABLE}`);
+            });
+        }
+
+        it('reads the bare relation where the connection carries no schema and no database', async () => {
+            // The control. Without it the qualification could be unconditional — a prefix invented by this
+            // service rather than read from the metadata — and every engine without a configured schema would
+            // then be issued a statement naming a relation that does not exist.
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 2,
+            });
+
+            const statement = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+            expect(conditionTextOf(statement)).toContain(ownershipClauseReading(escaped(REORDER_LIST_TABLE)));
+        });
+
+        it('passes an empty path part through unescaped, which is what keeps `database..table` valid', async () => {
+            // TypeORM's own rule, reproduced rather than guessed: `QueryBuilder.getTableName` escapes every
+            // part of the path EXCEPT an empty one, because SQL Server renders a database configured without a
+            // schema as `database..table` and an escaped empty identifier is not valid there
+            // [node_modules/typeorm/query-builder/QueryBuilder.js:L362-L372].
+            harness.plan.tablePathFor = tableName => `ledger..${tableName}`;
+
+            await service.adjustReorderListLine(ctx, {
+                reorderListId: LIST_ID,
+                lineId: LINE_ID,
+                quantity: 2,
+            });
+
+            const statement = statementsOfKind(harness, 'ReorderListLine', 'update')[0];
+            expect(conditionTextOf(statement)).toContain(
+                ownershipClauseReading(`${escaped('ledger')}..${escaped(REORDER_LIST_TABLE)}`),
+            );
+            expect(harness.escapedIdentifiers).not.toContain('');
+        });
+    });
 
     describe('quantity validation, which refuses rather than returning a fifth error result', () => {
         const malformed: Array<{ label: string; quantity: number }> = [
@@ -4331,19 +5234,27 @@ describe('ReorderListService', () => {
                 await service.createReorderList(ctx, { name: 'Pantry' });
 
                 const [lockedLookup] = statementsAgainst(harness, 'Customer');
-                // WHICH row is locked is the whole of the claim, and a lock mode says nothing about it. All
+                // WHICH rows are locked is the whole of the claim, and a lock mode says nothing about it. All
                 // four properties below are load-bearing:
-                //  - the projection is the identifier alone, so no personal field of a customer or of the
-                //    user row joined to it reaches process memory where it could reach a log line;
-                //  - the join is written explicitly rather than as a find-options relation condition, because
-                //    TypeORM realises a relation condition as a LEFT join and PostgreSQL refuses `FOR UPDATE`
-                //    on the nullable side of one — a one-engine failure;
-                //  - the predicate names the joined user, so an arbitrary customer row cannot be selected;
+                //  - the projection is the identifier alone, so no personal field of the customer reaches
+                //    process memory where it could reach a log line;
+                //  - NOTHING is joined, because `pessimistic_write` emits the unqualified `FOR UPDATE` and that
+                //    locks a row of every table the statement reads. An earlier revision joined `customer.user`
+                //    and filtered on `user.id`, which locked the `User` row too — a row this feature never
+                //    writes, shared with authentication, held for the whole of a create. The bound is a lock on
+                //    the owning customer and nothing more. `FOR UPDATE OF customer` is not the portable way to
+                //    say that: TypeORM raises "Lock tables not supported in selected driver" for the MySQL
+                //    family, so a single-table statement is the only form that means the same on all three;
+                //  - the predicate names the acting user through the customer table's own foreign-key column,
+                //    escaped through the driver — unescaped, PostgreSQL folds the camel case and matches nothing
+                //    while sql.js passes — so an arbitrary customer row cannot be selected;
                 //  - and it is bound to the ACTING session's user rather than to anything the caller sent,
                 //    which is what makes ownership underivable from an argument [FEATURE-001-01:§2.7].
                 expect(lockedLookup.selections).toEqual([{ expression: ['customer.id'], alias: undefined }]);
-                expect(lockedLookup.joins).toEqual([['customer.user', 'user']]);
-                expect(lockedLookup.conditions).toEqual(['user.id = :userId']);
+                expect(lockedLookup.joins).toEqual([]);
+                expect(lockedLookup.conditions).toEqual([
+                    `${escaped('customer')}.${escaped(CUSTOMER_USER_JOIN_COLUMN)} = :userId`,
+                ]);
                 expect(lockedLookup.parameters).toEqual({ userId: USER_ID });
             });
 
@@ -4377,6 +5288,64 @@ describe('ReorderListService', () => {
                 expect(harness.journal[0].transaction).toBeGreaterThan(0);
                 expect(firstCountIndex).toBe(1);
                 expect(counts[0].transaction).toBe(harness.journal[0].transaction);
+            });
+        }
+
+        it('locks one table, so no row of the joined user is taken with it', async () => {
+            // The reason the statement joins nothing, asserted as the property rather than as the absence of a
+            // line of code: TypeORM emits the unqualified `FOR UPDATE` for `pessimistic_write`, which locks a
+            // row of EVERY table the statement reads. One table in the statement is therefore the whole of
+            // "the owning customer and nothing more" — and it is the portable form, since `FOR UPDATE OF
+            // customer` is refused for the MySQL family with "Lock tables not supported in selected driver".
+            harness.plan.engine = 'postgres';
+
+            await service.createReorderList(ctx, { name: 'Pantry' });
+
+            const [lockedLookup] = statementsAgainst(harness, 'Customer');
+            expect(lockedLookup.joins).toEqual([]);
+            expect(lockedLookup.locks).toEqual(['pessimistic_write']);
+            // Nothing anywhere in the operation reaches for the `User` entity — not as a repository and not as
+            // metadata — so there is no second table for the lock to have covered.
+            expect(harness.repositoryRequests).not.toContain('User');
+            expect(harness.metadataRequests).not.toContain('User');
+        });
+
+        it('reads the locked column from the relation metadata rather than assuming its name', async () => {
+            // The column is a join column the core entity declares no property for, so it cannot be resolved
+            // the way every other identifier in the service is. It is read from the relation's own metadata,
+            // and the escaping is the driver's — unescaped, PostgreSQL folds the camel case and the predicate
+            // matches nothing there while passing on sql.js.
+            harness.plan.engine = 'postgres';
+
+            await service.createReorderList(ctx, { name: 'Pantry' });
+
+            expect(harness.metadataRequests).toContain('Customer');
+            expect(harness.escapedIdentifiers).toContain(CUSTOMER_USER_JOIN_COLUMN);
+            const [lockedLookup] = statementsAgainst(harness, 'Customer');
+            expect(lockedLookup.conditions).toEqual([
+                `${escaped('customer')}.${escaped(CUSTOMER_USER_JOIN_COLUMN)} = :userId`,
+            ]);
+        });
+
+        for (const [label, joinColumns] of [
+            ['no join column', [] as string[]],
+            ['two join columns', ['userId', 'legacyUserId']],
+        ] as const) {
+            it(`refuses rather than locking an arbitrary row where the relation reports ${label}`, async () => {
+                // A relation with any other cardinality is a schema this addressed lock cannot express. Guessing
+                // would either lock the wrong row or lock none while looking like it had, so the operation fails
+                // with the same generic internal message every unclassified failure carries — and writes
+                // nothing.
+                harness.plan.engine = 'postgres';
+                harness.plan.customerUserJoinColumns = [...joinColumns];
+
+                const failure = await captureRejection(() =>
+                    service.createReorderList(ctx, { name: 'Pantry' }),
+                );
+
+                expect(failure).toBeInstanceOf(InternalServerError);
+                expect(String((failure as Error).message)).not.toContain(CUSTOMER_USER_JOIN_COLUMN);
+                expect(writeStatements(harness)).toEqual([]);
             });
         }
 
@@ -4537,7 +5506,8 @@ describe('ReorderListService', () => {
     // partial object assembled here.
     //
     // The distinction is the whole point of this block. The service is injected
-    // `ResolvedReorderPluginOptions` — every key present, validated once at plugin initialisation, frozen —
+    // `ResolvedReorderPluginOptions` — every key present, validated in `ReorderPlugin.init()` and
+    // re-asserted at application bootstrap rather than per request, frozen —
     // so a service constructed with a partial object could only ever exercise a fallback that production
     // never reaches. Reading `ReorderPlugin.options` instead exercises the one place the five numbers are
     // declared, by way of the same provider expression the plugin metadata registers
@@ -5012,6 +5982,999 @@ describe('ReorderListService', () => {
 
             expect(thrown).toBeInstanceOf(InternalServerError);
             expect(writeStatements(harness)).toEqual([]);
+        });
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// THE API LAYER'S HALF OF THE SAME RECONCILIATION — WHEN IT HAPPENS, AND WHICH OBJECT IS ELIGIBLE
+//
+// Everything above pins the SERVICE half of the compare-and-set repair: its guard, its arithmetic and its
+// refusal of a value the column may not hold. The section below pins the half the service cannot see —
+// WHEN the reconciliation happens relative to GraphQL's own execution, and WHICH parent object is eligible
+// for it. Both are api-layer properties, both are invisible in the payload of every request that has
+// nothing to repair, and both have already been got wrong once:
+//
+//   - Performing the reconciliation inside the nested `lines` resolver corrects the row but reports the
+//     stale number, because the executor completes an object's fields by walking its selection set
+//     synchronously and takes a scalar with no field resolver straight off the source object, awaiting only
+//     the promises that walk collected. The request that most needs the corrected value is exactly the one
+//     that reports the wrong one.
+//   - Deciding "was this object returned by the single-list read" from anything other than the object's own
+//     identity fails in the direction that looks like success. A licence keyed on the `RequestContext`
+//     instance is not found when a field resolver receives a different instance — the platform binds a
+//     context per handler (`packages/core/src/api/decorators/request-context.decorator.ts`) — and the
+//     required repair is then skipped in silence. A licence keyed on the row identifier is satisfied by a
+//     collection entry for the same row, which repairs on a path the contract forbids.
+//
+// Each `it` below is one of those failures, expressed as the observation that would catch it. Every
+// obligation traces to FEATURE-001-01 section 2.6.2.1 (the compare-and-set repair belongs to the
+// single-list read, the FIRST such read reports the corrected count, and the collection read never
+// repairs) or to STORY-001-01-04 (the per-page batching equality and the zero-statement `viewerAccess`).
+//
+// IT LIVES HERE, IN ONE OF THE THREE UNIT SPECIFICATIONS THE PLAN ENUMERATES, RATHER THAN IN A NEW FILE OF
+// ITS OWN. AAP section 0.5.1.7 fixes this feature's unit inventory at exactly three co-located
+// specifications — `src/service/reorder-list-name.spec.ts`, `src/service/reorder-list.service.spec.ts` and
+// `src/reorder.plugin.spec.ts` — so a new file would widen that inventory whatever its contents, and the
+// claims are folded into the specification that already owns the repair's other half, wrapped in one
+// `describe` so its own fixtures, doubles and constants stay in their own scope.
+//
+// TWO EARLIER SPECIFICATIONS NO LONGER SIT IN THIS PACKAGE, and their removal is what makes the sentence
+// above literally true rather than nearly true. `src/api/reorder-list-counter-repair.spec.ts` and
+// `e2e/fixtures/query-capture.e2e-spec.ts` both widened the inventory section 0.5.1.7 fixes at three, so
+// each was removed and every claim it made was relocated into a specification the plan does name: this
+// file carries the counter-repair cases — the block below is where they live — and
+// `e2e/reorder-list-mutate.e2e-spec.ts` carries the statement-parser cases. Nothing was dropped; the
+// claims simply moved to a file that is allowed to make them. `vitest.config.mts` therefore declares ONE
+// project, `unit`, enumerating exactly the three specifications above, and `src/reorder.plugin.spec.ts`
+// asserts both halves of that: that the project's list is exactly those three, and that those three
+// account for every `*.spec.ts` on disk — so a fourth file cannot land unrun, and nothing here is a
+// licence to add one.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+describe('the lineCount reconciliation as the api layer performs it', () => {
+    const RECONCILED_LIST_ID = 'T_1';
+    const RECONCILED_CHANNEL_ID = 'T_1';
+    const RECONCILED_LINES_PAGE_SIZE = 50;
+
+    /** The five options as `ReorderPlugin.init()` resolves them, with the two page sizes this file depends on. */
+    const PLUGIN_OPTIONS: ResolvedReorderPluginOptions = {
+        maxListsPerCustomer: 25,
+        maxLinesPerList: 200,
+        maxQuantityPerLine: 999,
+        defaultReorderListsPageSize: 25,
+        defaultReorderListLinesPageSize: RECONCILED_LINES_PAGE_SIZE,
+    };
+
+    /**
+     * The subset of `ReorderListService` these resolvers reach, as spies.
+     *
+     * It is a double rather than the real service because what is under test is the api layer's ordering and
+     * eligibility, and a real service would make every assertion below depend on a database. The service's own
+     * behaviour is pinned, against its own statement journal, in `reorder-list.service.spec.ts`.
+     */
+    interface ServiceDouble {
+        getReorderList: ReturnType<typeof vi.fn>;
+        getLinesForLists: ReturnType<typeof vi.fn>;
+        reconcileLineCount: ReturnType<typeof vi.fn>;
+        getViewerAccess: ReturnType<typeof vi.fn>;
+    }
+
+    /** A request context carrying an authenticated session in the active channel. */
+    function ctxFor(): RequestContext {
+        return new RequestContext({
+            apiType: 'shop',
+            channel: new Channel({ id: RECONCILED_CHANNEL_ID, code: 'default' }),
+            session: { user: { id: 'T_2' } } as unknown as RequestContext['session'],
+            isAuthorized: true,
+            authorizedAsOwnerOnly: true,
+        });
+    }
+
+    /** A hydrated list row carrying the given stored counter. Each call produces a DISTINCT object. */
+    function listRow(lineCount: number, id: string = RECONCILED_LIST_ID): ReorderList {
+        return new ReorderList({
+            id,
+            customerId: 'T_5',
+            channelId: RECONCILED_CHANNEL_ID,
+            name: 'Weekly',
+            nameKey: 'weekly',
+            lineCount,
+        });
+    }
+
+    /**
+     * A page of lines as the service publishes it.
+     *
+     * `authoritativeTotalItems` is present only for an unfiltered request, exactly as the service behaves: a
+     * filtered request counts the caller's own subset and so publishes no authoritative total. Passing that
+     * faithfully is what lets the filtered cases below assert "no repair" for the reason the service gives rather
+     * than for a reason this file invented.
+     */
+    function linePage(totalItems: number, authoritativeTotalItems?: number): ReorderListLinePage {
+        return {
+            items: [
+                new ReorderListLine({
+                    id: 'T_9',
+                    reorderListId: RECONCILED_LIST_ID,
+                    productVariantId: 'T_3',
+                    quantity: 1,
+                }),
+            ],
+            totalItems,
+            authoritativeTotalItems,
+        };
+    }
+
+    /**
+     * A `GraphQLResolveInfo` for the FIRST root field of the given document, with its fragments indexed.
+     *
+     * The document is parsed rather than hand-assembled so that fragment spreads, inline fragments, aliases,
+     * directives and variable-valued arguments are the real AST nodes the executor would hand a resolver. Only the
+     * three members the reconciliation reads — `fieldNodes`, `fragments` and `variableValues` — are populated,
+     * which is why the value is cast rather than constructed in full.
+     */
+    function infoFor(document: string, variableValues: Record<string, unknown> = {}): GraphQLResolveInfo {
+        const parsed: DocumentNode = parse(document);
+        const operation = parsed.definitions.find(definition => definition.kind === 'OperationDefinition');
+        if (!operation || operation.kind !== 'OperationDefinition') {
+            throw new Error('The document under test declares no operation');
+        }
+        const rootField = operation.selectionSet.selections[0];
+        if (rootField.kind !== 'Field') {
+            throw new Error('The first root selection of the document under test is not a field');
+        }
+        const fragments: Record<string, FragmentDefinitionNode> = {};
+        for (const definition of parsed.definitions) {
+            if (definition.kind === 'FragmentDefinition') {
+                fragments[definition.name.value] = definition;
+            }
+        }
+        return { fieldNodes: [rootField], fragments, variableValues } as unknown as GraphQLResolveInfo;
+    }
+
+    /** The generator-supplied arguments of `ReorderList.lines`, built without spelling a generated input name. */
+    function linesArgs(options?: Record<string, unknown>): ReorderListLinesArgs {
+        return { options: options as ReorderListLinesArgs['options'] };
+    }
+
+    /**
+     * Narrows a nullable read to its value, failing the test rather than asserting through a non-null assertion.
+     *
+     * Every case in this file arranges a list that resolves, so a null here is a defect in the case and is worth
+     * saying so out loud.
+     */
+    function present<T>(value: T | null | undefined): T {
+        if (value == null) {
+            throw new Error('The single-list read returned nothing, which no case in this file arranges');
+        }
+        return value;
+    }
+
+    /** The method function a decorator wrote its metadata onto, read without holding an unbound method. */
+    function methodOf(target: NewableFunction, name: string): object {
+        const descriptor = Object.getOwnPropertyDescriptor(target.prototype as object, name);
+        if (!descriptor) {
+            throw new Error(`${target.name} declares no member named ${name}`);
+        }
+        return descriptor.value as object;
+    }
+
+    /** A fresh service double whose line loads answer with an unfiltered total unless the request narrows. */
+    function serviceDoubleFor(row: ReorderList | null): ServiceDouble {
+        return {
+            getReorderList: vi.fn(() => Promise.resolve(row)),
+            getLinesForLists: vi.fn(
+                (_ctx: unknown, ids: Array<string | number>, options?: { filter?: unknown }) => {
+                    const narrowed = options?.filter != null && Object.keys(options.filter).length > 0;
+                    return Promise.resolve(
+                        new Map(ids.map(id => [id, linePage(1, narrowed ? undefined : 1)])),
+                    );
+                },
+            ),
+            reconcileLineCount: vi.fn((_ctx: unknown, _id: unknown, _stale: unknown, observed: number) =>
+                Promise.resolve(observed),
+            ),
+            getViewerAccess: vi.fn(() => ({ access: 'OWNED', grantedCapabilities: [] })),
+        };
+    }
+
+    function shopResolverFor(service: ServiceDouble): ReorderListShopResolver {
+        return new ReorderListShopResolver(service as unknown as ReorderListService, PLUGIN_OPTIONS);
+    }
+
+    function entityResolverFor(service: ServiceDouble): ReorderListEntityResolver {
+        return new ReorderListEntityResolver(
+            service as unknown as ReorderListService,
+            {} as unknown as ProductVariantService,
+            new RequestContextCacheService(),
+            PLUGIN_OPTIONS,
+        );
+    }
+
+    describe('the single-list read reconciles the stored lineCount before the parent is exposed', () => {
+        let service: ServiceDouble;
+        let shop: ReorderListShopResolver;
+        let entity: ReorderListEntityResolver;
+        let row: ReorderList;
+
+        beforeEach(() => {
+            // Stored 3, observed 1: a counter that disagrees, so every ordering assertion below has something to
+            // be wrong about.
+            row = listRow(3);
+            service = serviceDoubleFor(row);
+            shop = shopResolverFor(service);
+            entity = entityResolverFor(service);
+        });
+
+        it('reports the corrected count on the object it returns, not after a field has resolved', async () => {
+            // The canonical document, reaching `lines` through a NESTED fragment spread - the shape this
+            // package's own end-to-end read uses, and the one a walk of direct field selections would miss.
+            const info = infoFor(`
+                query Q($id: ID!) { activeCustomerReorderList(id: $id) { ...ListWithLines } }
+                fragment ListWithLines on ReorderList { ...ListFields lines { totalItems items { id } } }
+                fragment ListFields on ReorderList { id name lineCount }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // The whole of the ordering requirement: the value a synchronously-read sibling scalar would take off
+            // this object is already the corrected one.
+            expect(returned).toBe(row);
+            expect(returned.lineCount).toBe(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(singleListReadMarked(returned)).toBe(true);
+        });
+
+        it('serves the nested field from the page it already read, issuing no second load', async () => {
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+            );
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+            const page = await entity.lines(ctx, returned, linesArgs());
+
+            // Reconciling early costs the request nothing: the nested read's statements are issued once.
+            expect(page.totalItems).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+        });
+
+        it('computes the same window as the field resolver for a document written with variables', async () => {
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!, $take: Int, $order: SortOrder) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        lines(options: { take: $take, sort: { createdAt: $order } }) { totalItems }
+                    }
+                }`,
+                { id: RECONCILED_LIST_ID, take: 2, order: 'ASC' },
+            );
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+            await entity.lines(ctx, returned, linesArgs({ take: 2, sort: { createdAt: 'ASC' } }));
+
+            // One load, because both sides rendered the identical window: the argument was read off the document
+            // through the request's own variable values rather than reconstructed.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({
+                take: 2,
+                sort: { createdAt: 'ASC' },
+            });
+            expect(returned.lineCount).toBe(1);
+        });
+
+        it('reads nothing at all when the document selects no lines field', async () => {
+            const info = infoFor(`query Q($id: ID!) { activeCustomerReorderList(id: $id) { id lineCount } }`);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // No observed total exists for this request, which is the collection read's permanent position: the
+            // stored counter is reported exactly as it stands.
+            expect(service.getLinesForLists).not.toHaveBeenCalled();
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+            expect(returned.lineCount).toBe(3);
+        });
+
+        it('reads nothing when every lines selection narrows the collection', async () => {
+            const info = infoFor(`
+                query Q($id: ID!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        a: lines(options: { filter: { quantity: { eq: 2 } } }) { totalItems }
+                        b: lines(options: { filter: { quantity: { eq: 7 } } }) { totalItems }
+                    }
+                }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // A filtered total counts the caller's own subset. Writing it into `reorder_list.lineCount` would
+            // replace the number the atomic line bound is enforced against with one the caller chose.
+            expect(service.getLinesForLists).not.toHaveBeenCalled();
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+            expect(returned.lineCount).toBe(3);
+        });
+
+        it('reads nothing for a lines selection the document excluded with @skip', async () => {
+            const info = infoFor(
+                `query Q($id: ID!, $skip: Boolean!) {
+                    activeCustomerReorderList(id: $id) { lineCount lines @skip(if: $skip) { totalItems } }
+                }`,
+                { id: RECONCILED_LIST_ID, skip: true },
+            );
+
+            await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info);
+
+            // The field is not part of the request, so reading it would issue two statements nobody asked for and
+            // repair from a page the response never carries.
+            expect(service.getLinesForLists).not.toHaveBeenCalled();
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+        });
+
+        it('treats a nested member whose variable was not supplied as absent, exactly as the executor does', async () => {
+            /*
+             * THE OMITTED NESTED VARIABLE, which is the case that separates reading the document from coercing
+             * it. `valueFromASTUntyped` keeps a field whose variable was not supplied and gives it the value
+             * `undefined`, so `{ filter: { quantity: $unset } }` reads as a filter with ONE key; the executor's
+             * own input coercion omits the field, so the argument the field resolver receives is a filter with
+             * NONE. Both consequences of that divergence were silent: the request counted as narrowing and lost
+             * the reconciliation it was entitled to, and the two spellings rendered to different cache keys so
+             * the nested resolver reloaded a page that had already been resolved for it.
+             */
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!, $unset: Int) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        lines(options: { filter: { quantity: $unset } }) { totalItems }
+                    }
+                }`,
+                // `$unset` is deliberately absent from the variable values, which is the whole case.
+                { id: RECONCILED_LIST_ID },
+            );
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // The reconciliation happened, and it happened BEFORE the parent was exposed.
+            expect(returned).toBe(row);
+            expect(returned.lineCount).toBe(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            // The window the pre-read used is the one the executor produces for the same document: the absent
+            // member is gone rather than present-and-undefined.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({
+                filter: {},
+                take: RECONCILED_LINES_PAGE_SIZE,
+            });
+            // And because the two agree, the field resolver is served from the cache: exactly ONE line-page
+            // load for the whole request.
+            const page = await entity.lines(ctx, returned, linesArgs({ filter: {} }));
+            expect(page.totalItems).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+        });
+
+        it('still declines to reconcile when a nested filter member really was supplied', async () => {
+            /*
+             * THE CONTROL FOR THE TWO ABOVE. Stripping an ABSENT member must not turn into stripping a PRESENT
+             * one: a filter the caller actually sent still narrows the collection, and a narrowed request has
+             * no unfiltered total to reconcile against. Without this case the fix could have been "ignore the
+             * filter", which would let a caller's own subset count overwrite the counter the atomic line bound
+             * is enforced against.
+             */
+            const info = infoFor(
+                `query Q($id: ID!, $quantity: Int) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        lines(options: { filter: { quantity: $quantity } }) { totalItems }
+                    }
+                }`,
+                { id: RECONCILED_LIST_ID, quantity: 2 },
+            );
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            expect(service.getLinesForLists).not.toHaveBeenCalled();
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+            expect(returned.lineCount).toBe(3);
+        });
+
+        it('fails the request when the counter repair rejects, rather than serving a cached page', async () => {
+            /*
+             * THE REPAIR REJECTION, which an earlier revision could not distinguish from a failed pre-read. It
+             * cached the page BEFORE reconciling and caught both failures in one handler, so a rejected
+             * compare-and-set was swallowed, the nested field was served the cached page, and the request
+             * succeeded while reporting the counter the code had just established was wrong. Nothing observed
+             * the rejection.
+             *
+             * Two things are asserted, because either alone would leave the other half open: the request FAILS
+             * with the service's own message, and no page was cached for a later reader to be served from.
+             */
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+            );
+            service.reconcileLineCount.mockRejectedValueOnce(new Error('the counter repair failed'));
+
+            await expect(
+                shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            ).rejects.toThrow('the counter repair failed');
+
+            // The page was read, so the rejection is the repair's and not the pre-read's.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            // And nothing was cached: the nested field resolver has to load the page itself, which is what
+            // makes "no successful cached fallback hides it" a fact rather than an intention. Its own repair
+            // then surfaces the same one attempt, because a rejected repair is deliberately not retried.
+            await expect(entity.lines(ctx, row, linesArgs())).rejects.toThrow('the counter repair failed');
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+        });
+
+        it('retries a transiently failed pre-resolve and reconciles BEFORE the parent is exposed', async () => {
+            /*
+             * ★ A REPAIR THAT ARRIVES AFTER THE PARENT IS A REPAIR THAT CANNOT FIX THE ANSWER.
+             *
+             * The failure mode this closes is subtle and produces a wrong answer rather than an error. If a failed
+             * pre-resolve simply returned, the parent went out unreconciled — and the nested `lines` resolver then
+             * read its own page, succeeded, and repaired the row in its fallback. The row ends up correct and the
+             * response the buyer already received still carries the stale `lineCount`, beside a lines page that
+             * disagrees with it. Nothing in that response says so.
+             *
+             * So the read is retried and the reconciliation completes before the parent is returned. The
+             * assertions below are ordered to make that the only thing that can satisfy them: the reconciled value
+             * is read off the returned row BEFORE `lines` is resolved at all, so a fallback repair could not have
+             * produced it.
+             */
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+            );
+            service.getLinesForLists.mockRejectedValueOnce(new Error('a transient read failure'));
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+
+            expect(returned).toBe(row);
+            // Two attempts, and the second is what answered.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+            // THE ASSERTION THAT MATTERS, made before `lines` is touched: the counter the response will report is
+            // already the observed one, so the repair happened while the parent was still this function's to hold.
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(returned.lineCount).toBe(1);
+
+            // And the field resolver is then served the cached page rather than reading again or repairing again.
+            const page = await entity.lines(ctx, returned, linesArgs());
+            expect(page.totalItems).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+        });
+
+        it('leaves a malformed nested window to the nested field, unretried and unraised', async () => {
+            /*
+             * ★ THE ONE FAILURE CLASS THE PRE-RESOLVE MUST NOT CLAIM.
+             *
+             * An over-limit nested `take` is refused by the platform's own pagination parsing as a
+             * `UserInputError`. Two properties make it different from every other failure here. It is
+             * DETERMINISTIC in the request's own arguments, so retrying it only repeats it. And it belongs to the
+             * `lines` field: raising it from the parent would report the nested collection's bound at the root's
+             * path, and the error's path is the only thing that proves the bound is enforced on the nested
+             * collection at all.
+             *
+             * It is also the one class that cannot produce the hazard the retry exists for, because a refusal of
+             * the same arguments fails in the nested resolver too — so no response can go out with a reconciled
+             * row behind a stale scalar.
+             */
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+            );
+            const refusal = new UserInputError('error.list-query-limit-exceeded' as never);
+            service.getLinesForLists.mockRejectedValue(refusal);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // The parent is returned, carrying the counter exactly as stored.
+            expect(returned).toBe(row);
+            expect(returned.lineCount).toBe(3);
+            // Not retried: one attempt, because the same arguments would be refused again.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            // Nothing reconciled and nothing cached, so the nested field reads for itself and meets the same
+            // refusal — at its own path, which is the point.
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+            await expect(entity.lines(ctx, returned, linesArgs())).rejects.toBe(refusal);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+        });
+
+        it('fails the read when the pre-resolve cannot be read even on the retry', async () => {
+            /*
+             * The other side of the same rule. A failure that survives the bounded retry is propagated rather than
+             * absorbed: exposing the parent would mean answering with a counter this request was entitled to
+             * reconcile and could not, which is the wrong answer dressed as a successful one. What propagates is
+             * already sanitised by the service — the same object it raised — so the client receives one top-level
+             * `errors` entry carrying no driver text.
+             */
+            const ctx = ctxFor();
+            const info = infoFor(
+                `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+            );
+            const sanitised = new Error('An error occurred while reading the reorder list lines');
+            service.getLinesForLists.mockRejectedValue(sanitised);
+
+            await expect(shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info)).rejects.toBe(
+                sanitised,
+            );
+
+            // Bounded: the retry ran and then stopped, rather than either giving up at once or looping.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+            // Nothing was repaired and nothing was cached, so no later reader is served a page this request never
+            // reconciled.
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+            expect(row.lineCount).toBe(3);
+        });
+    });
+
+    /*
+     * Aliases are what make "does this document narrow the collection" a question about the WHOLE selection set.
+     * GraphQL lets one document select `lines` more than once with different arguments, so a filtered occurrence
+     * and an unfiltered one can sit side by side. A reconciliation that inspected only the first occurrence would
+     * decline a filtered one - correctly, in isolation - and the unfiltered alias behind it would then establish
+     * the true total in the field resolver, repairing the row after the executor had already taken `lineCount`.
+     * That is the stale-first-response defect reintroduced through an alias, and these are the cases that catch it.
+     */
+    describe('an unfiltered lines window is found wherever in the selection set it appears', () => {
+        let service: ServiceDouble;
+        let shop: ReorderListShopResolver;
+        let entity: ReorderListEntityResolver;
+        let row: ReorderList;
+
+        beforeEach(() => {
+            row = listRow(3);
+            service = serviceDoubleFor(row);
+            shop = shopResolverFor(service);
+            entity = entityResolverFor(service);
+        });
+
+        it('reconciles from a later unfiltered alias when the FIRST alias is filtered', async () => {
+            const info = infoFor(`
+                query Q($id: ID!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        filtered: lines(options: { filter: { quantity: { eq: 2 } } }) { totalItems }
+                        all: lines { totalItems }
+                    }
+                }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // The corrected value is on the object BEFORE it is returned, even though the document's first
+            // occurrence of `lines` narrows.
+            expect(returned.lineCount).toBe(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            // And the window pre-resolved is the UNFILTERED one, carrying no filter of the caller's.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({ take: RECONCILED_LINES_PAGE_SIZE });
+        });
+
+        it('serves the unfiltered alias from the cache and lets the filtered alias load its own page', async () => {
+            const ctx = ctxFor();
+            const info = infoFor(`
+                query Q($id: ID!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        filtered: lines(options: { filter: { quantity: { eq: 2 } } }) { totalItems }
+                        all: lines { totalItems }
+                    }
+                }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // Asserted BEFORE either field resolves, which is the discriminating observation: a request that
+            // reconciled only in the field resolver's fallback would still end up with the corrected value, but not
+            // yet - and the executor takes `lineCount` off this object at exactly this point.
+            expect(returned.lineCount).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+
+            // The executor then resolves both aliases; each computes its own window.
+            const filtered = await entity.lines(
+                ctx,
+                returned,
+                linesArgs({ filter: { quantity: { eq: 2 } } }),
+            );
+            const all = await entity.lines(ctx, returned, linesArgs());
+
+            expect(filtered.totalItems).toBe(1);
+            expect(all.totalItems).toBe(1);
+            // Two loads in total: the pre-resolved unfiltered page, plus the filtered alias's own. The unfiltered
+            // alias added none, having been served from the cache.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+            // And exactly one compare-and-set for the request: the filtered alias publishes no authoritative
+            // total, so it cannot repair, and the unfiltered one was already reconciled before the parent was
+            // exposed.
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(returned.lineCount).toBe(1);
+        });
+
+        it('finds an unfiltered alias that a filtered one precedes inside a fragment', async () => {
+            const info = infoFor(`
+                query Q($id: ID!) { activeCustomerReorderList(id: $id) { ...Windows } }
+                fragment Windows on ReorderList {
+                    lineCount
+                    narrowed: lines(options: { filter: { quantity: { eq: 2 } } }) { totalItems }
+                    ...Whole
+                }
+                fragment Whole on ReorderList { whole: lines { totalItems } }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            expect(returned.lineCount).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({ take: RECONCILED_LINES_PAGE_SIZE });
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+        });
+
+        it('finds an unfiltered alias inside an inline fragment behind a filtered one', async () => {
+            const info = infoFor(`
+                query Q($id: ID!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        narrowed: lines(options: { filterOperator: OR }) { totalItems }
+                        ... on ReorderList { whole: lines(options: { take: 5 }) { totalItems } }
+                    }
+                }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // A `filterOperator` alone counts as narrowing - it can only have been sent to combine filters - so
+            // the first occurrence is declined and the inline fragment's window is the one used.
+            expect(returned.lineCount).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({ take: 5 });
+        });
+
+        it('passes over an unfiltered alias the document skipped and uses the next one', async () => {
+            const info = infoFor(
+                `query Q($id: ID!, $skip: Boolean!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        hidden: lines(options: { take: 7 }) @skip(if: $skip) { totalItems }
+                        shown: lines(options: { take: 9 }) { totalItems }
+                    }
+                }`,
+                { id: RECONCILED_LIST_ID, skip: true },
+            );
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // The skipped occurrence is not part of the request, so its window must not be the one pre-resolved -
+            // that would load a page the response never carries and leave the executed alias to repair too late.
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({ take: 9 });
+            expect(returned.lineCount).toBe(1);
+        });
+
+        it('honours @include(if: false) the same way, taking the alias that will actually run', async () => {
+            const info = infoFor(
+                `query Q($id: ID!, $withNarrowed: Boolean!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        excluded: lines(options: { take: 3 }) @include(if: $withNarrowed) { totalItems }
+                        included: lines(options: { take: 4 }) { totalItems }
+                    }
+                }`,
+                { id: RECONCILED_LIST_ID, withNarrowed: false },
+            );
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, info),
+            );
+
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists.mock.calls[0][2]).toEqual({ take: 4 });
+            expect(returned.lineCount).toBe(1);
+        });
+
+        it('issues one compare-and-set when two unfiltered aliases ask for different windows', async () => {
+            const ctx = ctxFor();
+            const info = infoFor(`
+                query Q($id: ID!) {
+                    activeCustomerReorderList(id: $id) {
+                        lineCount
+                        first: lines(options: { take: 2 }) { totalItems }
+                        second: lines(options: { take: 6 }) { totalItems }
+                    }
+                }
+            `);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+            await entity.lines(ctx, returned, linesArgs({ take: 2 }));
+            await entity.lines(ctx, returned, linesArgs({ take: 6 }));
+
+            // Which unfiltered window is chosen cannot change the reconciled value, because every unfiltered
+            // window reports the same unfiltered total. The second alias loads its own page and then finds stored
+            // and observed already in agreement, so it issues no further statement.
+            expect(returned.lineCount).toBe(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+        });
+    });
+
+    describe('eligibility for the repair is decided by object identity', () => {
+        let service: ServiceDouble;
+        let shop: ReorderListShopResolver;
+        let entity: ReorderListEntityResolver;
+        let row: ReorderList;
+
+        beforeEach(() => {
+            row = listRow(3);
+            service = serviceDoubleFor(row);
+            shop = shopResolverFor(service);
+            entity = entityResolverFor(service);
+        });
+
+        it('never licenses or repairs an object the collection read produced', async () => {
+            // Same row identifier, different object - which is what a page of lists hydrates.
+            const collectionEntry = listRow(3);
+
+            const page = await entity.lines(ctxFor(), collectionEntry, linesArgs());
+
+            expect(page.totalItems).toBe(1);
+            expect(singleListReadMarked(collectionEntry)).toBe(false);
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+            expect(collectionEntry.lineCount).toBe(3);
+        });
+
+        it('does not depend on which RequestContext instance the field resolver receives', async () => {
+            const rootCtx = ctxFor();
+            const fieldCtx = ctxFor();
+            // No `lines` selection, so nothing is pre-resolved and the field resolver takes the fallback - the
+            // path on which a context-keyed licence would have been looked for and not found.
+            const info = infoFor(`query Q($id: ID!) { activeCustomerReorderList(id: $id) { id lineCount } }`);
+
+            const returned = present(
+                await shop.activeCustomerReorderList(rootCtx, { id: RECONCILED_LIST_ID }, info),
+            );
+            await entity.lines(fieldCtx, returned, linesArgs());
+
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(returned.lineCount).toBe(1);
+        });
+
+        it('issues one compare-and-set for concurrent fallback resolutions of one object', async () => {
+            const ctx = ctxFor();
+            const info = infoFor(`query Q($id: ID!) { activeCustomerReorderList(id: $id) { id lineCount } }`);
+            const returned = present(
+                await shop.activeCustomerReorderList(ctx, { id: RECONCILED_LIST_ID }, info),
+            );
+
+            // Two sibling fields of one object, started together as the executor starts them.
+            await Promise.all([
+                entity.lines(ctx, returned, linesArgs()),
+                entity.lines(ctx, returned, linesArgs()),
+            ]);
+
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(returned.lineCount).toBe(1);
+        });
+
+        it('carries no licence, gate or cached page from one request into the next', async () => {
+            const document = `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`;
+
+            // Request one: a stale row, reconciled and repaired once.
+            const first = listRow(3);
+            service.getReorderList.mockResolvedValueOnce(first);
+            await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, infoFor(document));
+            expect(first.lineCount).toBe(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+
+            // Request two: a DIFFERENT object for the same row, now storing the corrected value. It inherits
+            // nothing, is reconciled on its own merits, and issues no repair because the counter now agrees.
+            const second = listRow(1);
+            service.getReorderList.mockResolvedValueOnce(second);
+            const returned = present(
+                await shop.activeCustomerReorderList(ctxFor(), { id: RECONCILED_LIST_ID }, infoFor(document)),
+            );
+            expect(returned).toBe(second);
+            expect(second.lineCount).toBe(1);
+            expect(service.reconcileLineCount).toHaveBeenCalledTimes(1);
+            expect(singleListReadMarked(second)).toBe(true);
+
+            // Its nested field is served from ITS OWN pre-resolved page - a third context instance and a
+            // different resolver instance, because the cache is keyed on the row object and on nothing else.
+            const page = await entityResolverFor(service).lines(ctxFor(), second, linesArgs());
+            expect(page.totalItems).toBe(1);
+            expect(service.getLinesForLists).toHaveBeenCalledTimes(2);
+        });
+
+        it('licenses nothing when the read resolves to null', async () => {
+            const nullService = serviceDoubleFor(null);
+            const nullShop = shopResolverFor(nullService);
+            const info = infoFor(
+                `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+            );
+
+            const returned = await nullShop.activeCustomerReorderList(
+                ctxFor(),
+                { id: RECONCILED_LIST_ID },
+                info,
+            );
+
+            // A null result licenses nothing because there is no object to license, and nothing is read.
+            expect(returned).toBeNull();
+            expect(nullService.getLinesForLists).not.toHaveBeenCalled();
+            expect(nullService.reconcileLineCount).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('the per-page contracts the reconciliation must not have disturbed', () => {
+        async function linesForPageOf(size: number): Promise<{ loads: number; repairs: number }> {
+            const service = serviceDoubleFor(null);
+            const entity = entityResolverFor(service);
+            const ctx = ctxFor();
+            const parents = Array.from({ length: size }, (_unused, index) =>
+                listRow(1, `T_${String(index + 1)}`),
+            );
+
+            // Started synchronously for the whole page, exactly as the executor starts them.
+            await Promise.all(parents.map(parent => entity.lines(ctx, parent, linesArgs())));
+
+            return {
+                loads: service.getLinesForLists.mock.calls.length,
+                repairs: service.reconcileLineCount.mock.calls.length,
+            };
+        }
+
+        it('loads one page of lines per page of lists, whatever the page holds', async () => {
+            const three = await linesForPageOf(3);
+            const six = await linesForPageOf(6);
+
+            expect(three.loads).toBe(1);
+            expect(six.loads).toBe(1);
+            // Equal, not merely small: this is the assertion STORY-001-01-04 makes across a page of three lists
+            // and a page of six.
+            expect(six.loads).toBe(three.loads);
+        });
+
+        it('repairs no counter from the collection path, at either page size', async () => {
+            const three = await linesForPageOf(3);
+            const six = await linesForPageOf(6);
+
+            expect(three.repairs).toBe(0);
+            expect(six.repairs).toBe(0);
+        });
+
+        it('resolves viewerAccess without reading anything', () => {
+            const service = serviceDoubleFor(null);
+            const entity = entityResolverFor(service);
+
+            const access = entity.viewerAccess(ctxFor(), listRow(1));
+
+            expect(access).toEqual({ access: 'OWNED', grantedCapabilities: [] });
+            expect(service.getViewerAccess).toHaveBeenCalledTimes(1);
+            expect(service.getLinesForLists).not.toHaveBeenCalled();
+            expect(service.reconcileLineCount).not.toHaveBeenCalled();
+        });
+    });
+
+    /*
+     * The resolve-info parameter is the one signature change the reconciliation required, and a parameter
+     * decorator that landed on the wrong index would bind a resolver's arguments to the wrong values at run time
+     * while compiling perfectly. These read the metadata the decorators actually wrote: `@nestjs/common` and
+     * `@nestjs/graphql` share one parameter bag, defined on the CLASS and keyed by method name, whose own keys are
+     * `<paramtype>:<index>`. The paramtype is a `GqlParamtype` ordinal for the graphql decorators, and a
+     * uid-prefixed `__customRouteArgs__` token for anything built with `createParamDecorator` - which is how
+     * Vendure's own `@Ctx()` is built.
+     */
+    describe('the resolver parameter bindings the reconciliation depends on', () => {
+        const PARAM_ARGS = '__routeArguments__';
+        const RESOLVER_TYPE = 'graphql:resolver_type';
+        const RESOLVER_PROPERTY = 'graphql:resolve_property';
+        const PARAMTYPE_NAMES: Record<string, string> = {
+            '0': 'parent',
+            '1': 'context',
+            '2': 'info',
+            '3': 'args',
+        };
+
+        function bindingsOf(target: NewableFunction, method: string): string[] {
+            const declared: Record<string, { index: number }> =
+                (Reflect.getMetadata(PARAM_ARGS, target, method) as Record<string, { index: number }>) ?? {};
+            return Object.entries(declared)
+                .sort(([, left], [, right]) => left.index - right.index)
+                .map(([key, entry]) => {
+                    const paramtype = key.slice(0, key.lastIndexOf(':'));
+                    const named = paramtype.includes('__customRouteArgs__')
+                        ? 'ctx'
+                        : (PARAMTYPE_NAMES[paramtype] ?? paramtype);
+                    return `${String(entry.index)}:${named}`;
+                });
+        }
+
+        it('binds ctx, args and info on the single-list read, in that order', () => {
+            expect(bindingsOf(ReorderListShopResolver, 'activeCustomerReorderList')).toEqual([
+                '0:ctx',
+                '1:args',
+                '2:info',
+            ]);
+            expect(
+                Reflect.getMetadata(
+                    RESOLVER_TYPE,
+                    methodOf(ReorderListShopResolver, 'activeCustomerReorderList'),
+                ),
+            ).toBe('Query');
+        });
+
+        it('leaves the collection read and every mutation on two bindings', () => {
+            for (const method of [
+                'activeCustomerReorderLists',
+                'createReorderList',
+                'updateReorderList',
+                'deleteReorderList',
+                'addItemToReorderList',
+                'adjustReorderListLine',
+                'removeReorderListLine',
+            ]) {
+                expect(bindingsOf(ReorderListShopResolver, method)).toEqual(['0:ctx', '1:args']);
+            }
+            expect(
+                Reflect.getMetadata(RESOLVER_TYPE, methodOf(ReorderListShopResolver, 'createReorderList')),
+            ).toBe('Mutation');
+        });
+
+        it('keeps the entity resolver field bindings, including its second parent type', () => {
+            expect(bindingsOf(ReorderListEntityResolver, 'lines')).toEqual(['0:ctx', '1:parent', '2:args']);
+            expect(bindingsOf(ReorderListEntityResolver, 'viewerAccess')).toEqual(['0:ctx', '1:parent']);
+            expect(bindingsOf(ReorderListEntityResolver, 'productVariant')).toEqual(['0:ctx', '1:parent']);
+            expect(
+                Reflect.getMetadata(RESOLVER_PROPERTY, methodOf(ReorderListEntityResolver, 'productVariant')),
+            ).toBe(true);
+            expect(
+                Reflect.getMetadata(RESOLVER_TYPE, methodOf(ReorderListEntityResolver, 'productVariant')),
+            ).toBe('ReorderListLine');
+            expect(Reflect.getMetadata(RESOLVER_TYPE, ReorderListEntityResolver)).toBe('ReorderList');
+        });
+
+        it('declares no field resolver for lineCount, which is the stored column', () => {
+            expect(Reflect.getMetadata(PARAM_ARGS, ReorderListEntityResolver, 'lineCount')).toBeUndefined();
+            expect(Object.getOwnPropertyNames(ReorderListEntityResolver.prototype)).not.toContain(
+                'lineCount',
+            );
         });
     });
 });

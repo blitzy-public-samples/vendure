@@ -39,13 +39,14 @@
  * 3. WHY THE TWO TERMINAL BRANCHES PRODUCE OPPOSITE STATUSES, AND WHY THE BRANCH IS SWAPPED RATHER THAN
  *    APPENDED TO.
  *    The switch below carries exactly one `case` for each of the 32 `ErrorCode` members the Shop API
- *    publishes today [packages/common/src/generated-shop-types.ts:L989-L1022]. With no `default` clause
- *    those 32 arms handle none of the four members this plugin's SDL adds, so after the switch the
- *    narrowed type of `code` is the four-member `ReorderErrorCode` union rather than `never` and the
- *    trailing `never`-typed assignment is refused with TS2322 — a diagnostic that prints the unhandled
- *    members BY NAME, which is what distinguishes the failure under test from an unrelated compile error.
- *    With a `default` clause those same four members are handled, nothing is left unhandled, and there is
- *    nothing for the compiler to refuse.
+ *    publishes WITHOUT this plugin. The enum it switches over is not that 32-member baseline, though: it
+ *    is GENERATED FROM THE LIVE SCHEMA OF A SERVER CARRYING THIS PLUGIN and therefore has 36 members —
+ *    see note 5, which is where that generation is described. With no `default` clause those 32 arms
+ *    handle none of the four members the plugin's SDL added, so after the switch the narrowed type of
+ *    `code` is those four members rather than `never` and the trailing `never`-typed assignment is refused
+ *    with TS2322 — a diagnostic that prints the unhandled members BY NAME, which is what distinguishes the
+ *    failure under test from an unrelated compile error. With a `default` clause those same four members
+ *    are handled, nothing is left unhandled, and there is nothing for the compiler to refuse.
  *    AC-8 describes the exhaustive half as carrying "a `never`-typed exhaustiveness check in its final
  *    branch and no `default`" and the defaulted half as "identical but carrying a `default` branch", so
  *    what differs between them is the FINAL BRANCH ITSELF. The reading that a `default` clause could
@@ -71,22 +72,36 @@
  *    it is explicit that every consuming example carries a default branch
  *    [tickets/EPIC-001-reorder-and-replenishment.md:§6.4 The Settled Rulings, R9].
  *
- * 5. DOCUMENTED DIVERGENCE FROM AC-8 — RECORDED HERE RATHER THAN SILENTLY RESOLVED.
- *    AC-8 specifies that both fixtures compile "against types regenerated from the rebuilt schema by the
- *    repository's own generator, `bun run codegen`" [package.json:L22]
- *    [tickets/EPIC-001/FEATURE-001-01/STORY-001-01-04-read-reorder-lists-via-shop-api.md:§5 AC-8]. That
- *    is UNREACHABLE in this change, and by design: the checked-in introspection snapshot is never edited
- *    and never regenerated (AAP §0.4.1.5), because the script that produces it declares its own
- *    configuration with `plugins: [AdminUiPlugin]` and never imports the dev-server config
- *    [scripts/codegen/download-introspection-schema.ts:L46], so no regeneration could ever observe this
- *    plugin. The faithful substitute — which preserves exactly what AC-8 measures, namely that an
- *    exhaustive consumer switch stops compiling once the enum grows while a defaulted one keeps
- *    compiling — is to widen the imported 32-member enum with a plugin-local literal union of the four
- *    members the generator would derive. Consequently: `bun run codegen` must NOT be run for either
- *    half's benefit, and `schema-shop.json` must remain byte-identical. The imported enum is therefore
- *    the pristine 32-member Shop baseline and contains no `REORDER_*` member, which is precisely why the
- *    union below is needed. This is one divergence affecting both halves rather than two, which is why it
- *    is stated once in a shared header rather than twice in two.
+ * 5. WHERE THE ENUM COMES FROM: ISOLATED GENERATION FROM THE LIVE, PLUGIN-CARRYING SCHEMA.
+ *    AC-8 requires both halves to compile "against types regenerated from the rebuilt schema by the
+ *    repository's own generator"
+ *    [tickets/EPIC-001/FEATURE-001-01/STORY-001-01-04-read-reorder-lists-via-shop-api.md:§5 AC-8], and
+ *    that is what happens. Before either project is compiled, the specification that owns this pair
+ *    introspects the SHOP API OF THE RUNNING SERVER IT BOOTED — a server carrying `ReorderPlugin` — with
+ *    the same `getIntrospectionQuery({ inputValueDeprecation: true })` the repository's own download step
+ *    uses [scripts/codegen/download-introspection-schema.ts:L71], and hands the result to the same
+ *    `@graphql-codegen/cli` `generate()` entry point under the same plugin list and the same
+ *    configuration the repository declares for `packages/common/src/generated-shop-types.ts`
+ *    [scripts/codegen/generate-graphql-types.ts:L92-L102]. The output is written to
+ *    `.generated/shop-error-codes.ts` at the package root, which is the module imported below. It sits
+ *    outside `e2e/` because `e2e-common/test-config.ts` derives each suite's port from the index of its
+ *    file in that directory, so a generated entry appearing there shifts ports and collides servers.
+ *
+ *    Two things are deliberately NOT done, and both are boundary conditions rather than preferences. The
+ *    `bun run codegen` script itself is not invoked, because it writes the checked-in `schema-shop.json`
+ *    and `packages/common/src/generated-shop-types.ts`, and neither may be edited or regenerated (AAP
+ *    §0.4.1.5) — the snapshot is also structurally incapable of carrying this plugin, since the script
+ *    that produces it declares its own configuration with `plugins: [AdminUiPlugin]` and never imports a
+ *    plugin's [scripts/codegen/download-introspection-schema.ts:L46]. And nothing here declares the four
+ *    added members: an earlier revision of this pair widened the imported 32-member baseline with a
+ *    plugin-local literal union spelling them out, which made the exhaustive half's failure evidence of
+ *    that local declaration rather than of the schema's growth — a fixture asserting its own premise. The
+ *    members below arrive only because the live schema published them.
+ *
+ *    Consequently the generated module is a BUILD PRODUCT of the specification run: it is written before
+ *    the two compilations and removed after them, it is git-ignored, and neither half of this pair can be
+ *    type-checked outside that window. That is intended — the provenance of the enum is the evidence, so
+ *    a copy of it checked in beside these files would defeat the purpose.
  *
  * 6. NEITHER HALF IS EVER IMPORTED, SO NEITHER CAN BREAK THE BUILD OR ANY TEST RUN.
  *    Neither file is imported by `packages/reorder-plugin/index.ts`, nor by anything under
@@ -108,42 +123,37 @@
  *    is deliberate rather than overlooked.
  */
 
-// The enum is imported from the published `lib` entry point of the `@vendure/common` package. The
-// repository's import guard rejects any reference to a workspace package's internal source tree in
-// every `.ts` file under `packages/` — and it matches the whole file, not just import statements
-// [scripts/check-imports.ts:L12-L16]. This is the SHOP catalogue and it must stay the Shop catalogue:
-// the Admin catalogue publishes 47 members, and importing it instead would silently destroy the
-// 32-to-36 arithmetic this fixture pair exists to evidence.
-import { ErrorCode } from '@vendure/common/lib/generated-shop-types';
-
-/**
- * The four members `ReorderPlugin` adds to the published Shop `ErrorCode` enum.
+/*
+ * The enum is imported from the module GENERATED FROM THE LIVE SHOP SCHEMA of a server carrying this
+ * plugin — see note 5 of the shared header for how and when it is produced. It is the SHOP catalogue and
+ * it must stay the Shop catalogue: the Admin catalogue publishes 47 members, and generating from the Admin
+ * schema instead would silently destroy the 32-to-36 arithmetic this pair exists to evidence.
  *
- * Each is the upper-snake derivation of one of the four error-result object types the plugin declares
- * in its Shop API extensions — `ReorderListNotFoundError`, `ReorderListNameConflictError`,
- * `ReorderListLimitError` and `ReorderListLineNotFoundError` — produced by the platform's own
- * conversion of the declared type name [packages/core/src/api/config/generate-error-code-enum.ts:L31-L33].
- *
- * They are declared here as string literals rather than read from a generated enum for the reason
- * given in note 5 of the shared header: the checked-in snapshot is never regenerated, so no generated
- * artefact in this repository will ever carry them.
+ * The relative specifier is what keeps the two compiler projects honest. Each project names one of these
+ * fixtures as its single `files` entry, and TypeScript follows this import to the generated module, so the
+ * enum under test is the generated one and there is no ambient path mapping that could quietly substitute
+ * another. The specifier also cannot reach into a workspace package's internal source tree, which the
+ * repository's import guard rejects in every `.ts` file under `packages/` — and it matches the whole file,
+ * not just import statements [scripts/check-imports.ts:L12-L16].
  */
-type ReorderErrorCode =
-    | 'REORDER_LIST_NOT_FOUND_ERROR'
-    | 'REORDER_LIST_NAME_CONFLICT_ERROR'
-    | 'REORDER_LIST_LIMIT_ERROR'
-    | 'REORDER_LIST_LINE_NOT_FOUND_ERROR';
+import { ErrorCode } from '../.generated/shop-error-codes';
 
-/**
- * The Shop `ErrorCode` vocabulary a storefront faces once `ReorderPlugin` is registered.
+/*
+ * THE ARITHMETIC THE PAIR EVIDENCES, and where each half of it comes from. The imported enum carries 36
+ * members: the 32 the Shop API publishes without this plugin, plus the four upper-snake derivations of the
+ * error-result object types the plugin's SDL declares — `ReorderListNotFoundError`,
+ * `ReorderListNameConflictError`, `ReorderListLimitError` and `ReorderListLineNotFoundError` — produced by
+ * the platform's own conversion of each declared type name
+ * [packages/core/src/api/config/generate-error-code-enum.ts:L31-L33]. Nothing in this file names those four
+ * members, and nothing in it widens the enum: they are in scope only because the live schema published them,
+ * which is what makes 32-to-36 a measurement rather than a restatement. The specification that owns this
+ * pair asserts the count and the membership of the generated enum directly, before compiling either project.
  *
- * The arithmetic the pair evidences: 32 published members + 4 plugin-declared members = 36. No existing
- * member is removed or renamed, so the widening is additive — and an additive widening is still a
- * breaking change for a consumer that switches exhaustively without a `default` branch, while being
- * survivable for one that carries a `default`. That is precisely the difference the pair's two exit
- * statuses isolate, which is what turns the arithmetic into a number rather than a claim.
+ * No existing member is removed or renamed, so the widening is additive — and an additive widening is still
+ * a breaking change for a consumer that switches exhaustively without a `default` branch, while being
+ * survivable for one that carries a `default`. That is precisely the difference the pair's two exit statuses
+ * isolate.
  */
-type ShopErrorCodeWithReorder = ErrorCode | ReorderErrorCode;
 
 /**
  * A representative storefront consumer: it maps a Shop `ErrorCode` to a short description through a
@@ -154,13 +164,14 @@ type ShopErrorCodeWithReorder = ErrorCode | ReorderErrorCode;
  * removed platform member breaks both halves loudly instead of silently degrading them into a set of
  * unreachable string comparisons.
  *
- * @param code A published Shop error code, or one of the four this plugin adds.
+ * @param code A published Shop error code, taken from the generated enum — which includes the four this
+ * plugin adds.
  * @returns A short description of the supplied code. In the defaulted half a code with no arm of its own
  * is described generically, which is what makes that consumer forward-compatible as the enum grows; in
- * the exhaustive half every code the union admits must have an arm of its own, which is exactly what the
+ * the exhaustive half every member the enum admits must have an arm of its own, which is exactly what the
  * four added members make impossible.
  */
-export function describeShopErrorCode(code: ShopErrorCodeWithReorder): string {
+export function describeShopErrorCode(code: ErrorCode): string {
     switch (code) {
         case ErrorCode.ALREADY_LOGGED_IN_ERROR:
             return 'already logged in';

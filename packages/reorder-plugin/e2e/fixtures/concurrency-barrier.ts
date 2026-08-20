@@ -94,6 +94,7 @@
  * symbol, deterministic teardown on every path, loud named failure instead of a silent hang, no
  * console output, no swallowed rejection.
  */
+import { RequestContext, TransactionalConnection } from '@vendure/core';
 import { DataSource, EntityManager, QueryRunner } from 'typeorm';
 
 /**
@@ -121,6 +122,21 @@ export const FORCED_INTERLEAVING_ENGINES: readonly string[] = ['postgres', 'mysq
  * concurrent path is broken. Use {@link runSequentialPair} on these engines instead.
  */
 export const SINGLE_CONNECTION_ENGINES: readonly string[] = ['sqljs', 'sqlite', 'better-sqlite3'];
+
+/**
+ * @description
+ * The engines on which a transaction that will write only a reorder list LINE holds the parent list row
+ * EXCLUSIVELY rather than shared.
+ *
+ * Declared here beside the other engine sets so a suite asserting a lock clause and the service choosing one
+ * cannot drift apart silently. The reason is measured rather than preferential: on the MySQL family two
+ * transactions holding the parent shared deadlock at the line row once that row has been removed beneath
+ * them, and because every mutation runs inside a nested savepoint scope, such a deadlock destroys the
+ * savepoint and the platform's unwind then reports `SAVEPOINT typeorm_1 does not exist` instead of the
+ * retriable deadlock. The plugin's own account of it is at
+ * `ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES` in `src/service/reorder-list.service.ts`.
+ */
+export const EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES: readonly string[] = ['mysql', 'mariadb'];
 
 /**
  * @description
@@ -609,6 +625,242 @@ export interface BarrierWriteContext<P> extends BarrierParticipantContext {
 
 /**
  * @description
+ * Binds a request context to one participant's own open transaction, so that a **real service
+ * operation** invoked from a write phase runs on the connection the barrier is holding.
+ *
+ * Obtained from {@link createTransactionBinder}, which verifies the mechanism before returning one.
+ */
+export interface TransactionBinder {
+    /**
+     * Returns a **copy** of `ctx` bound to `manager`'s transaction. The context is copied rather than
+     * mutated, exactly as the platform's own wrapper does, so one authenticated context can be bound
+     * independently for each of the two participants.
+     */
+    bind(ctx: RequestContext, manager: EntityManager): RequestContext;
+    /**
+     * The entity manager a context is bound to, or `undefined` for a context carrying no transaction.
+     *
+     * Exported so a suite can assert the binding rather than trust it: a write phase that silently lost
+     * its binding would run the operation under test on a connection of the platform's choosing, and the
+     * run would report a clean serialisation while evidencing nothing.
+     */
+    managerOf(ctx: RequestContext): EntityManager | undefined;
+}
+
+/**
+ * @description
+ * Builds a {@link TransactionBinder} for the **running** server, and proves it works before returning it.
+ *
+ * ## Why binding matters at all
+ *
+ * A race claim is about the implementation only if the rendezvous sits inside the operation under test.
+ * Without binding, a write phase can only issue statements itself — measuring a statement a test author
+ * wrote rather than the one the service issues — or call the published operation over HTTP, which opens a
+ * transaction of the server's own choosing on a connection this module has never touched. Two such calls
+ * can be serialised end to end by the server, and then a count-then-insert with no lock, a
+ * read-compute-save accumulation, or a write reported as applied over a row it never matched all pass,
+ * because the two writes never overlapped in the first place.
+ *
+ * ## The mechanism
+ *
+ * It is the platform's own. `TransactionalConnection` resolves the entity manager for every read and write
+ * from a symbol on the request context, and `TransactionWrapper` reads that same symbol before deciding
+ * whether to open a connection: where it finds a manager whose query runner is still live it **inherits**
+ * that runner, opens a savepoint rather than a transaction, and — the part that matters here — does not
+ * release it afterwards, leaving the barrier in charge of the commit
+ * (`packages/core/src/connection/transaction-wrapper.ts`,
+ * `packages/core/src/connection/transactional-connection.ts`).
+ *
+ * ## Why the symbol is discovered rather than imported
+ *
+ * That symbol is `Symbol('TRANSACTION_MANAGER')`, created when `packages/core/src/common/constants.ts` is
+ * evaluated, and it is deliberately not re-exported from the package root. Importing it by a deep path
+ * type-checks and yields a symbol — but a symbol is only ever equal to itself, so if the test runner's
+ * module graph evaluates that file in a second instance the imported symbol is a DIFFERENT symbol from the
+ * one the running server reads. Binding with it then sets a property nothing looks at: every operation
+ * quietly opens its own transaction on its own connection, the pair does not interleave, and the symptom is
+ * a pair of writes that either serialise silently or block until this harness's deadline. That is not
+ * hypothetical — it is what an earlier revision of this module did, measured by two participants whose
+ * statements were logged against query runners the barrier had never opened. So the key is taken from the
+ * platform at run time instead, and nothing is imported that could be stale.
+ *
+ * ## Why it is verified here
+ *
+ * The verification is why this function returns a value rather than exporting a free function. A binder is
+ * built, a context is bound to a query runner this function owns, a transaction is opened on that context,
+ * and the runner the platform actually used is compared against the one supplied. A mismatch throws a named
+ * error from whichever `beforeAll` called this — loudly, once, at setup — rather than leaving every race in
+ * the suite silently unbound.
+ *
+ * @example
+ * ```ts
+ * // in beforeAll
+ * binder = await createTransactionBinder(server.app.get(TransactionalConnection));
+ * // in a write phase
+ * write: async ctx => service.createReorderList(binder.bind(shopCtx, ctx.manager), { name }),
+ * ```
+ */
+/**
+ * @description
+ * Returns the given context as the **Shop API** context the operation under test is only ever reached
+ * through, leaving the original untouched.
+ *
+ * ★ WHY THIS EXISTS AT ALL. A barriered race invokes the service directly, so no GraphQL execution takes
+ * place — and the platform derives the API type from the resolver's `info` argument, not from the request:
+ * `getApiType()` reads `info.schema.getQueryType()` and answers `admin` or `shop` by whether that type has an
+ * `administrators` field, falling through to **`custom`** when there is no `info` at all
+ * (`packages/core/src/api/common/get-api-type.ts:L15-L20`). `RequestContextService.fromRequest(req, undefined,
+ * …)` therefore yields `apiType: 'custom'`, while the real Shop `AuthGuard` — which does pass `info` — yields
+ * `'shop'`.
+ *
+ * That difference is not cosmetic. It decides which branch of any api-type-sensitive code a race exercises, so
+ * a regression that skipped a lock, an atomic accumulation or a limit check *only* on the Shop API would leave
+ * every forced ordering green: the races would be proving the `custom` branch, and the sequential HTTP tests
+ * that do go through the Shop API cannot force an interleaving. The whole point of driving these races at the
+ * service seam is to exercise the path a buyer reaches, and an api type no buyer's request produces defeats
+ * it as surely as the wrong permission set would.
+ *
+ * WHY THE VALUE IS STATED RATHER THAN DERIVED. Deriving it would mean handing `fromRequest` a
+ * `GraphQLResolveInfo`, which only a real GraphQL execution has. Manufacturing one would mean building a
+ * schema object whose query type happens to lack `administrators` — an invented schema that is not the Shop
+ * schema, presented as though the platform had derived something from it. Stating the value is the more honest
+ * of the two, and it is checked rather than trusted: this function asserts the result reports `'shop'` and that
+ * the context it was given still reports whatever it reported before, so a copy that failed to take, or one
+ * that mutated its source and contaminated every later use of it, throws here instead of passing quietly.
+ * Everything else — the session, the channel, the owner-only authorization state `Permission.Owner` produces,
+ * the request object — is exactly what `fromRequest` built and is not re-derived.
+ *
+ * @example
+ * ```ts
+ * const shopCtx = asShopApiContext(await requestContextService.fromRequest(req, undefined, [Permission.Owner], session));
+ * expect(shopCtx.apiType).toBe('shop');
+ * ```
+ */
+export function asShopApiContext(ctx: RequestContext): RequestContext {
+    const before = ctx.apiType;
+    // `copy()` is the platform's own shallow copy, which is what the transaction binder also builds on, so the
+    // private field carrying the api type is an own property of the copy and reassigning it cannot reach the
+    // original. The cast is confined to this one line.
+    const shopCtx = ctx.copy();
+    (shopCtx as unknown as { _apiType: RequestContext['apiType'] })._apiType = 'shop';
+    if (shopCtx.apiType !== 'shop') {
+        throw new Error(
+            'asShopApiContext could not set the api type: the copy still reports ' +
+                `'${shopCtx.apiType}'. RequestContext no longer carries the api type where this fixture ` +
+                'writes it, so every barriered race would run as the Custom API rather than the Shop API ' +
+                'that a buyer reaches — which is the one thing this helper exists to prevent.',
+        );
+    }
+    if (ctx.apiType !== before) {
+        throw new Error(
+            `asShopApiContext mutated the context it was given: it reported '${before}' before the copy and ` +
+                `'${ctx.apiType}' after. RequestContext.copy() is no longer producing an independent object, ` +
+                'so a single call would silently change the api type of every other use of that context.',
+        );
+    }
+    return shopCtx;
+}
+
+export async function createTransactionBinder(
+    connection: TransactionalConnection,
+): Promise<TransactionBinder> {
+    const key = await discoverTransactionManagerKey(connection);
+    const binder: TransactionBinder = {
+        bind(ctx: RequestContext, manager: EntityManager): RequestContext {
+            const bound = ctx.copy();
+            (bound as unknown as Record<symbol, EntityManager>)[key] = manager;
+            return bound;
+        },
+        managerOf(ctx: RequestContext): EntityManager | undefined {
+            return (ctx as unknown as Record<symbol, EntityManager | undefined>)[key];
+        },
+    };
+    await assertBindingIsHonoured(connection, binder);
+    return binder;
+}
+
+/**
+ * Asks the platform which symbol it stores a transaction's entity manager under.
+ *
+ * One transaction is opened and immediately closed having done nothing; the inner context the platform hands
+ * the callback is the one it has just written the manager onto, so that context's own symbol keys are the
+ * answer. The candidate is identified by SHAPE rather than by `instanceof`, because TypeORM's
+ * `EntityManager` class is subject to the same second-instance hazard as the symbol itself.
+ */
+async function discoverTransactionManagerKey(connection: TransactionalConnection): Promise<symbol> {
+    let discovered: symbol | undefined;
+    await connection.withTransaction(RequestContext.empty(), innerCtx => {
+        for (const candidate of Object.getOwnPropertySymbols(innerCtx)) {
+            const value = (innerCtx as unknown as Record<symbol, unknown>)[candidate];
+            if (
+                typeof value === 'object' &&
+                value !== null &&
+                typeof (value as { getRepository?: unknown }).getRepository === 'function' &&
+                (value as { queryRunner?: unknown }).queryRunner !== undefined
+            ) {
+                discovered = candidate;
+            }
+        }
+        return Promise.resolve();
+    });
+    if (discovered === undefined) {
+        throw new Error(
+            'createTransactionBinder could not discover the symbol the platform stores a transactional ' +
+                'entity manager under: no symbol-keyed entity manager was present on a context inside ' +
+                'TransactionalConnection.withTransaction. The transaction contract this fixture binds to ' +
+                'has changed, and every barriered race invoking a service directly would otherwise run ' +
+                'unbound.',
+        );
+    }
+    return discovered;
+}
+
+/**
+ * Proves, once, that a context bound by this binder is honoured: a transaction opened on it inherits the
+ * very query runner supplied rather than taking one of its own.
+ */
+async function assertBindingIsHonoured(
+    connection: TransactionalConnection,
+    binder: TransactionBinder,
+): Promise<void> {
+    const runner = connection.rawConnection.createQueryRunner();
+    try {
+        // CONNECTED AND OPENED INSIDE the protected region. A `startTransaction` that throws after `connect`
+        // succeeded would otherwise leave a connected runner with no `finally` to reclaim it, and this helper
+        // runs once per suite that uses the barrier — so the leak would be permanent for that run.
+        await runner.connect();
+        await runner.startTransaction();
+
+        let observed: QueryRunner | undefined;
+        await connection.withTransaction(binder.bind(RequestContext.empty(), runner.manager), innerCtx => {
+            observed = binder.managerOf(innerCtx)?.queryRunner;
+            return Promise.resolve();
+        });
+        if (observed !== runner) {
+            throw new Error(
+                'createTransactionBinder produced a binding the platform did not honour: a transaction ' +
+                    'opened on a bound context ran on a different query runner than the one supplied, so a ' +
+                    'barriered race invoking a service directly would not interleave at all.',
+            );
+        }
+    } finally {
+        // NESTED, so the release is not conditional on the rollback succeeding. A rollback can fail on a
+        // connection the server has already closed, and that is exactly the moment the runner most needs
+        // reclaiming: a leaked one holds a pool slot for the rest of the suite.
+        try {
+            if (runner.isTransactionActive) {
+                await runner.rollbackTransaction();
+            }
+        } finally {
+            if (!runner.isReleased) {
+                await runner.release();
+            }
+        }
+    }
+}
+
+/**
+ * @description
  * The read or precheck the race is about, run **before** the rendezvous. Whatever it returns is
  * handed to the write phase as {@link BarrierWriteContext.precheckResult}, so the two phases need no
  * shared mutable variable between them.
@@ -982,16 +1234,18 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     const claims: CleanupClaim[] = [
         {
             claimed: false,
-            baseline: { active: false, depth: undefined },
+            baseline: { active: false, depth: undefined, certain: false },
             ownsTransaction: false,
             ownsRunner: false,
+            connectionAcquired: false,
             completion: undefined,
         },
         {
             claimed: false,
-            baseline: { active: false, depth: undefined },
+            baseline: { active: false, depth: undefined, certain: false },
             ownsTransaction: false,
             ownsRunner: false,
+            connectionAcquired: false,
             completion: undefined,
         },
     ];
@@ -1371,6 +1625,12 @@ interface CleanupClaim {
      */
     ownsRunner: boolean;
     /**
+     * Whether the chain got as far as `connect()`, so a watchdog can tell a runner that is holding a pool
+     * connection from one that never took one. The two need opposite handling when the runner's state
+     * cannot be read: the first must be quarantined, the second must be left alone.
+     */
+    connectionAcquired: boolean;
+    /**
      * The cleanup the claim's owner is running, once it has started.
      *
      * ★ Assigned synchronously in the same turn as the claim, so a watchdog that finds the claim taken
@@ -1467,6 +1727,30 @@ async function awaitClaimedCleanup(
  *    and leaves the outer transaction active at the depth it was found. Releasing it would publish a
  *    foreign transaction and its locks to the next borrower; destroying the pool would take down a
  *    legitimate outer run. Its failure to return to baseline is still reported, loudly.
+ * 7. **"Foreign" must have been observed, never merely substituted — at the baseline *and* now.** Rule 2's
+ *    fail-closed value makes an unreadable flag read as active, which is right for every close and release
+ *    — but it is not evidence of an owner, and rule 6 must not be applied to it. `TransactionState.certain`
+ *    keeps the two apart, and this function checks it on BOTH readings before rule 6 is allowed to run:
+ *    `baseline.certain` for a runner that was already unreadable when the participant began, and the state
+ *    read here for one that has *become* unreadable since. Both are uncertifiable, and both are disposed of
+ *    by what the harness actually holds rather than by which flag was unreadable:
+ *
+ *    - **Nothing was borrowed** — reported, and the runner left exactly as it was handed over. This is the
+ *      `!baseline.certain` case: the chain refuses before `connect()`, so there is nothing to give back.
+ *    - **The harness borrowed the connection** (`ownsRunner`) — quarantined under rule 5: reported by name,
+ *      not released, and the owning pool destroyed. Its state cannot be certified and it is ours, so
+ *      handing it on is the one thing that must not happen.
+ *    - **The connection is genuinely somebody else's** — reported loudly, and neither released nor
+ *      destroyed, exactly as rule 6 requires. "Genuinely" is the operative word: this branch is reached
+ *      only where the baseline flag was *observed* active, so an owner was seen rather than assumed.
+ *      Releasing would publish live foreign work to the next borrower, and destroying the pool would end a
+ *      legitimate outer run over a counter this harness merely lost sight of.
+ *
+ *    Without that split, a runner this harness had connected and could no longer read would be classified
+ *    as somebody else's and then, by rule 6, neither released nor quarantined — a pool connection nobody
+ *    gives back, which is the exact leak this file exists to prevent. The reading is taken BEFORE rule 3's
+ *    restoration for the same reason: an unreadable runner must not first be driven through rollbacks
+ *    measured against a state nobody can see.
  *
  * Diagnostics are appended to `errors` rather than thrown, so a participant's own outcome — the thing the
  * test is actually about — survives, and every teardown failure still reaches the reader.
@@ -1478,10 +1762,55 @@ async function settleRunner(
     dataSource: DataSource,
     baseline: TransactionState,
     ownsRunner: boolean,
+    connectionAcquired: boolean,
 ): Promise<void> {
     if (readRunnerFlag(() => queryRunner.isReleased, false)) {
         // Already released, by this path or the other side of the claim. Nothing left to do, and
         // "unreadable" resolves to "not released" so a leak is attempted rather than assumed away.
+        return;
+    }
+    // ★ READ THE STATE BEFORE ACTING ON IT. Rule 7 has to know whether the thing it is about to restore
+    // and certify can be read at all, and it has to know that before rule 3 issues a single rollback
+    // against a state nobody can see. Reading here rather than inside the certification is also what makes
+    // the *transition* case reachable: a flag that was observed at the baseline and has since stopped
+    // reading leaves `baseline.certain` true, so nothing but this reading can notice it.
+    const observed = readTransactionState(queryRunner);
+    if (!baseline.certain || !observed.certain) {
+        // RULE 7. Uncertifiable, from whichever end. What happens next is decided by what this harness is
+        // actually holding, never by rule 2's substituted value — see the rule's own text above.
+        const when = baseline.certain
+            ? 'was readable when this participant began and cannot be read now'
+            : 'could not be read when this participant began';
+        if (!connectionAcquired) {
+            // Nothing was ever taken out of the pool, so there is nothing to give back, quarantine or leak.
+            state.teardownErrors.push(
+                `the transaction state of the runner for '${label}' ${when}, so this participant was ` +
+                    'refused before it took a pool connection. Nothing was acquired, nothing is open and ' +
+                    'nothing is being held: the runner is left exactly as it was handed over',
+            );
+            return;
+        }
+        if (baseline.certain && !ownsRunner) {
+            // Genuinely foreign, and known to be so because the baseline flag was OBSERVED active. Rule 6
+            // governs: releasing would publish live foreign work to the next borrower, and destroying the
+            // pool would end an outer run this harness never started, so it does neither — loudly.
+            state.teardownErrors.push(
+                `the runner for '${label}' arrived inside a transaction this harness did not open, and ` +
+                    `its transaction state ${when}, so nothing above that outer transaction can be ` +
+                    'certified as closed. It was neither released nor quarantined, because the connection ' +
+                    'belongs to that owner and this harness only lost sight of it',
+            );
+            return;
+        }
+        // Ours — or, where the baseline itself was substituted, not demonstrably anybody else's while a
+        // connection is out. Either way rule 5 applies: reported by name, not released, and the owning pool
+        // destroyed, so a later test fails on a closed connection instead of inheriting this one.
+        state.teardownErrors.push(
+            `the transaction state of the runner for '${label}' ${when}, so the connection it is holding ` +
+                'cannot be certified as clean, and cannot be shown to belong to anybody else either. It is ' +
+                'quarantined rather than released',
+        );
+        await quarantineRunner(label, state.teardownErrors, dataSource);
         return;
     }
     // Bounded, and only ever the levels above the baseline. `restoreTransactionBaseline` records its own
@@ -1506,7 +1835,9 @@ async function settleRunner(
     const quiescent = restored.outcome === 'settled' && isCertainlyAtBaseline(queryRunner, baseline);
 
     if (!ownsRunner) {
-        // Rule 6. Not ours to return, and not ours to destroy the pool over.
+        // Rule 6. Not ours to return, and not ours to destroy the pool over. Reached only where the
+        // baseline was genuinely OBSERVED to be active, so "belongs to that owner" is a fact rather than a
+        // fallback — the uncertain case is handled above and never lands here.
         if (!quiescent) {
             state.teardownErrors.push(
                 `the runner for '${label}' arrived inside a transaction this harness did not open and ` +
@@ -1619,9 +1950,12 @@ async function reclaimAbandonedRunners(
                 dataSource,
                 // The real facts, published by the chain, rather than assumptions. A runner still stalled
                 // in `connect()` reaches here with its recorded baseline and with `ownsRunner` false if it
-                // arrived carrying a foreign transaction, so nothing of its owner's is touched.
-                claim === undefined ? { active: false, depth: undefined } : claim.baseline,
+                // arrived carrying a foreign transaction, so nothing of its owner's is touched — and with
+                // `connectionAcquired` telling this side whether a pool connection is actually out, which
+                // is what decides between quarantining an uncertain runner and leaving it alone.
+                claim === undefined ? { active: false, depth: undefined, certain: false } : claim.baseline,
                 claim === undefined ? true : claim.ownsRunner,
+                claim === undefined ? false : claim.connectionAcquired,
             ),
         );
     }
@@ -1770,16 +2104,26 @@ async function runParticipantChain<T>(
     };
     // The transaction state of the runner as this participant found it. Everything this chain closes
     // is measured against it, so a level that was already open is never this participant's to end.
-    let baseline: TransactionState = { active: false, depth: undefined };
+    let baseline: TransactionState = { active: false, depth: undefined, certain: false };
     // Whether the CONNECTION is this participant's to give back, which is a different question from
     // whether a transaction level is its to close. A runner that arrived already inside a transaction
     // belongs to an outer owner: releasing it would return a connection to the pool with somebody
     // else's transaction (and its locks) still open on it, and would leave that owner holding a
     // runner it can no longer use. Such a runner is restored to its baseline and then left alone.
     //
-    // Decided here, from the flag alone, so that even a `connect()` that throws cannot reach the
-    // teardown with the question still open; refined from the full baseline reading below.
-    let ownsRunner = !queryRunner.isTransactionActive;
+    // ★ FOREIGN UNTIL PROVEN OTHERWISE, and decided WITHOUT TOUCHING THE RUNNER HERE. Reading a runner
+    // accessor before the `try` below is entered is the one read this function cannot afford: an accessor
+    // that throws — a driver double, or a driver whose connection object has gone — would propagate out of
+    // this call before any cleanup ownership exists, so the runner would be neither restored, released nor
+    // quarantined and its pool connection would simply be gone. `false` is the conservative answer because
+    // it can only ever suppress a release, never cause one, which is the direction that cannot corrupt a
+    // pool. The first inspection happens inside the protected lifecycle instead, through the total
+    // {@link readTransactionState}, and both this flag and the shared claim are refined from it there.
+    let ownsRunner = false;
+    // Whether this chain got as far as taking a pool connection. Distinct from every ownership question
+    // above: a runner that was never connected has nothing to release and nothing to quarantine, while one
+    // that was connected must reach exactly one of those two outcomes.
+    let connectionAcquired = false;
     // Whether this chain still has a transaction level of its own open. Derived from OBSERVED runner
     // state rather than from whether startTransaction() resolved — see the inner catch — and cleared
     // the moment everything this chain added has been closed, so the teardown can never reinterpret
@@ -1836,25 +2180,65 @@ async function runParticipantChain<T>(
         // state it cannot certify.
     };
     try {
-        // connect() is called explicitly so that this participant is holding a pool connection of
-        // its own before its transaction opens. Two participants must never share one connection:
-        // a single connection cannot hold two open transactions, so it cannot interleave, and a
-        // test built on it would prove serialisation.
-        await queryRunner.connect();
-        // Read the transaction state BEFORE opening one. A level that is already open belongs to
-        // somebody else, and every close below is measured against this reading.
+        // Read the transaction state FIRST, inside this `try` and before anything else touches the
+        // runner. A level that is already open belongs to somebody else, and every close below is
+        // measured against this reading. Two properties make this the right position for it. It is
+        // still "before anything was opened", because `connect()` takes a pool connection and opens no
+        // transaction — so the baseline means exactly what the closes below assume. And it is inside
+        // the protected lifecycle, so a `connect()` that throws now reaches the teardown carrying REAL
+        // facts rather than assumed ones, which is what lets that path give a connection back instead
+        // of stranding it.
         baseline = readTransactionState(queryRunner);
         // An already-open transaction makes the CONNECTION foreign too, not just the level. This is
         // decided here, before anything is opened on the runner and before any path can release it,
         // so the refusals below are genuinely refusals to touch it.
         ownsRunner = !baseline.active;
-        // Published to the shared record in the same synchronous step, so the watchdog measures against
-        // the same baseline and the same connection ownership this chain would, rather than assuming
-        // either. A deadline that fires while this chain is still stalled would otherwise have to guess,
-        // and guessing here means rolling back or releasing work that was never this harness's.
+        // Published to the shared record in the same synchronous step as the reading, so the watchdog
+        // measures against the same baseline and the same connection ownership this chain would, rather
+        // than assuming either. A deadline that fires while this chain is still stalled — in `connect()`
+        // as much as anywhere later — would otherwise have to guess, and guessing here means rolling
+        // back or releasing work that was never this harness's.
         if (claim !== undefined) {
             claim.baseline = baseline;
             claim.ownsRunner = ownsRunner;
+        }
+        if (!baseline.certain) {
+            // ★ REFUSED BEFORE A CONNECTION IS TAKEN, because an unreadable flag is not evidence of
+            // anything. The fail-closed value says `active: true` so that no later step can release live
+            // work, but that value is a substitution rather than an observation — and proceeding on it
+            // would mean classifying this runner as somebody else's on the strength of a fact nobody
+            // established. That classification is what rule 6 then acts on: a "foreign" runner is
+            // deliberately neither released nor quarantined, so a runner this harness had connected would
+            // be left holding a pool connection that no side would ever give back.
+            //
+            // Refusing HERE closes that hole by construction rather than by careful teardown: `connect()`
+            // has not run, so no connection was acquired, nothing is open, and there is nothing to
+            // reclaim. If the state becomes unreadable later, while this chain does hold a connection,
+            // {@link settleRunner} quarantines instead — loudly — rather than releasing what it cannot
+            // certify.
+            throw new Error(
+                `Participant '${label}' was handed a query runner whose transaction flag could not be ` +
+                    'read at all, so nothing about its state can be certified: this harness cannot tell a ' +
+                    'connection with nothing open on it from one already carrying somebody else\u2019s ' +
+                    'transaction, and every close, commit and release it performs is measured against ' +
+                    'that reading. It refuses BEFORE taking a pool connection, so nothing was acquired ' +
+                    'and nothing is left open or held. Hand it a runner whose `isTransactionActive` can ' +
+                    'be read, or investigate the driver: a getter that throws usually means the ' +
+                    'connection behind it has already gone.',
+            );
+        }
+        // connect() is called explicitly so that this participant is holding a pool connection of
+        // its own before its transaction opens. Two participants must never share one connection:
+        // a single connection cannot hold two open transactions, so it cannot interleave, and a
+        // test built on it would prove serialisation.
+        await queryRunner.connect();
+        // Recorded the moment the connection is genuinely this chain's, and published for the watchdog in
+        // the same step. It is what lets the teardown distinguish "nothing was ever acquired" from "a
+        // connection is out and its state can no longer be read", which are the same `ownsRunner` and
+        // demand opposite treatment: report and leave alone, versus quarantine.
+        connectionAcquired = true;
+        if (claim !== undefined) {
+            claim.connectionAcquired = true;
         }
         if (baseline.active && baseline.depth === undefined) {
             // ★ Refused in BOTH modes, including the sequential nesting this module otherwise
@@ -2089,7 +2473,15 @@ async function runParticipantChain<T>(
             // than returning while it is still in flight and losing every diagnostic appended after.
             const cleanup = (async (): Promise<void> => {
                 await restoreBaseline();
-                await settleRunner(queryRunner, label, state, dataSource, baseline, ownsRunner);
+                await settleRunner(
+                    queryRunner,
+                    label,
+                    state,
+                    dataSource,
+                    baseline,
+                    ownsRunner,
+                    connectionAcquired,
+                );
             })();
             if (claim !== undefined) {
                 claim.completion = cleanup;
@@ -2157,6 +2549,26 @@ function normaliseParticipantSpec<T, P>(spec: BarrierParticipantSpec<T, P>): Nor
 interface TransactionState {
     active: boolean;
     depth: number | undefined;
+    /**
+     * Whether `active` was **observed** rather than substituted.
+     *
+     * ★ This is the difference between "there is a transaction" and "there might be one, and this harness
+     * cannot tell": both read `active: true`, and confusing them is how an unreadable runner came to be
+     * treated as *proof* of a foreign owner and then left holding a pool connection that nobody would give
+     * back. The fail-closed value keeps every close and release safe; this flag keeps the *reasoning* honest,
+     * so a chain can refuse a runner it cannot certify instead of proceeding on a fabricated fact.
+     *
+     * It is read on **every** state reading and not only on the baseline one, because a getter can start
+     * throwing at any point: a runner whose connection object is torn out mid-chain was readable when the
+     * participant began and is not readable when its teardown runs. Both {@link isCertainlyAtBaseline} and
+     * rule 7 of {@link settleRunner} therefore consult the reading in front of them rather than trusting
+     * that the first one still holds.
+     *
+     * `depth` needs no equivalent. A driver that publishes no nesting counter is a SUPPORTED driver — the
+     * SQLite family among them — so an absent depth is an ordinary observation rather than a loss of
+     * information, and `undefined` already says so everywhere it matters.
+     */
+    certain: boolean;
 }
 
 /**
@@ -2180,11 +2592,43 @@ const MAX_TRANSACTION_UNWIND_STEPS = 8;
 /**
  * Reads the state a participant is measured against. Total: never throws, and never assumes the
  * depth counter exists.
+ *
+ * ★ BOTH READS ARE GUARDED, and total is a promise this function has to keep rather than a description of
+ * a happy path. Every decision in the teardown is taken from what this returns, and it is called from
+ * inside `finally` blocks and from the pair watchdog — so an accessor that throws here does not produce a
+ * wrong answer, it produces no answer at all, and a connection is then neither released nor quarantined.
+ * A driver double, a runner whose connection object has been torn out from under it, or a getter that
+ * consults a closed pool can all throw.
+ *
+ * The fallbacks are the fail-closed answers of rule 2 of the teardown contract, and they differ per field
+ * because the safe direction differs. An unreadable `isTransactionActive` reads as **active**, so live work
+ * is never handed back to the pool. An unreadable depth reads as **unknown**, which is weaker than any
+ * number: {@link isCertainlyAtBaseline} cannot certify a runner on a counter it could not see, so the
+ * combination makes an unreadable runner QUARANTINE rather than release — loudly, and without ending
+ * anything that might belong to somebody else.
  */
 function readTransactionState(queryRunner: QueryRunner): TransactionState {
-    const depth = (queryRunner as unknown as TransactionDepthCarrier).transactionDepth;
+    let depth: unknown;
+    try {
+        depth = (queryRunner as unknown as TransactionDepthCarrier).transactionDepth;
+    } catch {
+        depth = undefined;
+    }
+    let active: boolean;
+    let certain: boolean;
+    try {
+        active = queryRunner.isTransactionActive;
+        certain = true;
+    } catch {
+        // Fail closed on the VALUE, and say so in the same breath: `certain: false` is what stops a caller
+        // treating this substitution as an observation. {@link readRunnerFlag} states the same rule for the
+        // reads that only need the value.
+        active = true;
+        certain = false;
+    }
     return {
-        active: queryRunner.isTransactionActive,
+        active,
+        certain,
         depth: typeof depth === 'number' && isFinite(depth) ? depth : undefined,
     };
 }
@@ -2218,8 +2662,18 @@ function hasStateAboveBaseline(queryRunner: QueryRunner, baseline: TransactionSt
  * baseline and this reports nothing certifiably at it, and a caller that needs proof rather than the
  * absence of contrary proof asks this one. A participant is only reported fulfilled where this holds.
  *
- * Proof takes one of two forms, and which one applies is decided by the baseline alone rather than by
- * what happens to be readable afterwards:
+ * ★ THE CURRENT FLAG MUST HAVE BEEN OBSERVED, and this is the first thing checked. Rule 2 substitutes
+ * "active" for a flag that cannot be read, which is the right value for deciding whether to close or
+ * release something — but it is a substitution, and a substitution can never be an ingredient of a
+ * *positive* proof. Without this check the substitution certifies the very state it was invented to
+ * protect against: against a baseline of `{ active: true, depth: 1 }`, a flag that has since become
+ * unreadable yields `{ active: true, depth: 1, certain: false }`, both comparisons below match, and a
+ * runner nobody can read is declared clean. `TransactionState.certain` is what keeps the substituted
+ * value out, and every caller of this function is asking for proof, so the check belongs here rather
+ * than in each of them.
+ *
+ * Beyond that, proof takes one of two forms, and which one applies is decided by the baseline alone
+ * rather than by what happens to be readable afterwards:
  *
  * - A baseline that **had** a readable depth is only matched by a readable, equal depth with the flag as
  *   it was. A depth that has since become unreadable is not proof of anything and does not fall back to
@@ -2232,6 +2686,10 @@ function hasStateAboveBaseline(queryRunner: QueryRunner, baseline: TransactionSt
  */
 function isCertainlyAtBaseline(queryRunner: QueryRunner, baseline: TransactionState): boolean {
     const current = readTransactionState(queryRunner);
+    if (!current.certain) {
+        // The flag was substituted rather than read. Nothing certifiable follows from it.
+        return false;
+    }
     if (baseline.depth !== undefined) {
         return (
             current.depth !== undefined &&
@@ -2729,4 +3187,436 @@ function describeUnknown(value: unknown): string {
     } catch {
         return '[a value that could not be described]';
     }
+}
+
+/**
+ * @description
+ * One participant's hold, installed on its own query runner and reporting whether it actually fired.
+ */
+export interface PreWriteHold {
+    /**
+     * Whether the participant was actually held. A race whose hold never fired proves nothing at all, so
+     * this is asserted rather than assumed: a service that changed shape and stopped writing through this
+     * runner would otherwise leave the pair looking interleaved when it never was.
+     */
+    readonly held: () => boolean;
+    /** The statement the hold fired on, for a diagnostic that names what was about to run. */
+    readonly heldBefore: () => string | undefined;
+    /**
+     * `'arrival'` when this hold was let go because every required participant had arrived AND every
+     * participant that arrived earlier was still waiting at that moment; `undefined` otherwise.
+     *
+     * THIS IS THE ONLY THING THAT CERTIFIES A HOLD, and a whole-rendezvous flag is not a substitute for
+     * it. A rendezvous that timed out one participant and then received the other's arrival later has
+     * seen every participant arrive without any two of them ever overlapping, so a count of arrivals
+     * cannot tell the two runs apart. This value can only be `'arrival'` for a hold that was still
+     * waiting when the set completed.
+     */
+    readonly releasedBy: () => 'arrival' | undefined;
+    /** Puts the runner's own `query` back. Call it in a `finally`. */
+    readonly restore: () => void;
+}
+
+/**
+ * @description
+ * A rendezvous **inside** the operation under test, tripped immediately before its first write.
+ */
+export interface PreWriteRendezvous {
+    /** Patches one participant's query runner. Returns the hold, which the caller must restore. */
+    readonly install: (ctx: BarrierParticipantContext) => PreWriteHold;
+    /** Every hold installed so far, so a test can certify each one rather than a whole-pair aggregate. */
+    readonly holds: () => readonly PreWriteHold[];
+    /** How many arrivals — held participants plus {@link PreWriteRendezvous.arriveExternally} — occurred. */
+    readonly arrivedCount: () => number;
+    /** How many holds were installed, so a test can assert every participant it patched actually fired. */
+    readonly installedCount: () => number;
+    /**
+     * How many holds are still waiting. Asserted by the fixture's own self-checks so that a hold which was
+     * rejected is proved to have left the waiting set with its timer cleared, rather than merely to have
+     * rejected — a retained waiter would keep a timer alive past the end of the test that created it.
+     */
+    readonly waitingCount: () => number;
+    /**
+     * Whether the release came from the complete arrival set with every earlier participant still waiting.
+     *
+     * Latched: once the rendezvous has failed it can never become `true`, and it is never set by an arrival
+     * that completed the count after an earlier participant had already been let go.
+     */
+    readonly releasedByArrival: () => boolean;
+    /**
+     * Why the rendezvous failed, or `undefined` while it is sound. A failure is **permanent**: every hold
+     * still waiting is rejected, every later arrival throws, and no held write is ever delegated.
+     */
+    readonly failureReason: () => Error | undefined;
+    /**
+     * Counts an arrival made from OUTSIDE a held participant, releasing the pair once the threshold is met.
+     *
+     * This is what lets a rendezvous hold ONE real operation while the test itself supplies the conflicting
+     * state the operation is about to collide with. Some operations cannot be held two at a time and the
+     * reason is a property of the operation rather than of this harness: `createReorderList` takes a
+     * pessimistic write lock on the owning customer row as its FIRST statement, so a second caller for the
+     * same customer blocks there and can never reach its own write while the first is held. Holding one
+     * caller and introducing the conflict from the test is the only way to put a real operation inside the
+     * window between its own duplicate lookup and its own insert.
+     *
+     * Throws if the rendezvous has already failed, so a test cannot carry on against a hold that is gone.
+     */
+    readonly arriveExternally: () => void;
+    /**
+     * Waits until at least `count` arrivals have occurred, resolving `true` if they did and `false` if the
+     * wait expired or the rendezvous failed first. Returned rather than thrown so the caller can assert on
+     * it: a test that carried on regardless would introduce its conflicting state before the operation had
+     * reached its hold, and would then be exercising the ordinary pre-check path while claiming to exercise
+     * the constraint.
+     */
+    readonly waitForArrivals: (count: number, timeoutMs?: number) => Promise<boolean>;
+}
+
+/** One waiting hold's internal state: how to let it go, how to refuse it, and its own timer. */
+interface PreWriteHoldState {
+    resolve: () => void;
+    reject: (reason: Error) => void;
+    timer: ReturnType<typeof setTimeout> | undefined;
+    releasedBy: 'arrival' | undefined;
+}
+
+/**
+ * @description
+ * Holds every participant immediately before its FIRST WRITE, so that two real service operations are
+ * simultaneously past their own reads and short of their own writes.
+ *
+ * WHY THE OUTER RENDEZVOUS IS NOT ENOUGH, WHICH IS THE WHOLE REASON THIS EXISTS. {@link runBarrieredPair}
+ * holds both participants between their precheck and their write phase, so both service calls *start*
+ * together. That is necessary and not sufficient: the operation's own duplicate lookup, quantity read or
+ * capacity claim happens after the release, so the two operations may still run one after the other. A
+ * service that counted and then inserted without a constraint, or read-computed-and-saved a quantity, would
+ * then have the second caller observe the first caller's commit and produce a correct-looking final state —
+ * the exact defect the race is supposed to catch, passing.
+ *
+ * WHY THE HOLD IS PLACED BEFORE THE FIRST WRITE RATHER THAN AFTER A NAMED READ. "After its own read" would
+ * require this harness to know how many reads each operation issues and which one is last —
+ * `createReorderList` takes a lock and then two counts, `addItemToReorderList` resolves a line and then
+ * claims capacity — and a service that gained a read would silently start holding too early. The first write
+ * is the same boundary approached from the other side and needs no such knowledge: when it is reached, every
+ * read that operation performs has already happened and nothing it does has been written. Holding there puts
+ * both callers inside the window their invariant has to survive, whatever the shape of the reads before it.
+ *
+ * ## A HOLD THAT IS NOT RELEASED BY ARRIVAL IS A FAILURE, NEVER A PASS-THROUGH
+ *
+ * This is the property the whole instrument rests on, and getting it wrong makes the instrument worse than
+ * useless — it certifies the very serialisation it exists to detect. Consider a deadlock-prone shape: caller
+ * A takes a lock, reaches its hold and waits; caller B blocks on that lock and cannot reach its hold at all.
+ * If the hold merely *expired* and let A's write run, then A would write and commit, B would unblock, read
+ * A's committed state, reach its own hold, and complete the arrival count. Every aggregate would look
+ * perfect — two installs, two arrivals, a release "by arrival" — while the two callers were never
+ * simultaneously inside the window, and a read-compute-save accumulation would leave the correct total
+ * purely by serialisation.
+ *
+ * So a timeout and a pair cancellation both **fail the rendezvous permanently**. The waiting hold is
+ * rejected rather than resolved, so the intercepted statement is never delegated and the participant rejects
+ * with the reason; every later arrival throws the same reason instead of counting; `releasedByArrival` can
+ * never become `true` afterwards; and every timer is cleared as its hold leaves the waiting set. On top of
+ * that, {@link PreWriteHold.releasedBy} is per hold and can only read `'arrival'` for a hold that was still
+ * waiting at the moment the set completed — so a test certifies each participant individually rather than
+ * trusting one shared flag.
+ *
+ * The statement is executed AFTER the release, never before, so the hold is genuinely pre-write.
+ *
+ * @param options - `participants` is how many arrivals must occur before any hold is released; `tables`
+ * restricts the hold to writes naming one of them, so a platform write elsewhere in the transaction cannot
+ * trip it; `timeoutMs` bounds how long one hold may wait before the rendezvous is failed.
+ */
+export function createPreWriteRendezvous(options: {
+    participants: number;
+    tables: readonly string[];
+    timeoutMs?: number;
+}): PreWriteRendezvous {
+    const timeoutMs = options.timeoutMs ?? DEFAULT_BARRIER_TIMEOUT_MS;
+    const waiting = new Set<PreWriteHoldState>();
+    const arrivalWatchers = new Set<{
+        readonly count: number;
+        readonly notify: (reached: boolean) => void;
+    }>();
+    const installedHolds: PreWriteHold[] = [];
+    let arrived = 0;
+    let holdArrivals = 0;
+    let releasedByArrival = false;
+    let failure: Error | undefined;
+
+    /** Wakes every observer whose arrival threshold the current count has reached. */
+    const notifyArrivalWatchers = (): void => {
+        for (const watcher of [...arrivalWatchers]) {
+            if (arrived >= watcher.count) {
+                arrivalWatchers.delete(watcher);
+                watcher.notify(true);
+            }
+        }
+    };
+
+    /**
+     * Refuses ONE hold: takes it out of the waiting set, clears its timer, and rejects it.
+     *
+     * The `delete` result is the idempotence guard, so a hold that has already been released or refused is
+     * left alone — which matters because a cancellation and a timeout can both fire for the same hold, and
+     * because a hold refused synchronously during its own registration must not then be refused again.
+     */
+    const discardHold = (state: PreWriteHoldState, reason: Error): void => {
+        if (!waiting.delete(state)) {
+            return;
+        }
+        if (state.timer !== undefined) {
+            clearTimeout(state.timer);
+            state.timer = undefined;
+        }
+        state.reject(reason);
+    };
+
+    /**
+     * Fails the rendezvous once and for all: every waiting hold is REJECTED (so its statement is never
+     * delegated), every timer is cleared, and every watcher is woken with `false`.
+     */
+    const failRendezvous = (reason: Error): void => {
+        if (failure !== undefined) {
+            return;
+        }
+        failure = reason;
+        for (const state of [...waiting]) {
+            discardHold(state, reason);
+        }
+        for (const watcher of [...arrivalWatchers]) {
+            arrivalWatchers.delete(watcher);
+            watcher.notify(false);
+        }
+    };
+
+    /** Lets every waiting hold go, recording on each one that ARRIVAL is what released it. */
+    const releaseAllByArrival = (): void => {
+        releasedByArrival = true;
+        for (const state of [...waiting]) {
+            waiting.delete(state);
+            if (state.timer !== undefined) {
+                clearTimeout(state.timer);
+                state.timer = undefined;
+            }
+            state.releasedBy = 'arrival';
+            state.resolve();
+        }
+    };
+
+    /**
+     * Registers one arrival and says whether it completed the set.
+     *
+     * The completeness test is not "have `participants` arrivals happened" but "have they happened while
+     * every participant that arrived earlier was still waiting". Those differ in exactly the run this
+     * instrument exists to reject, so the weaker one is not used: `waiting.size` must equal the number of
+     * hold arrivals that preceded this one, or the arrivals were sequential and the rendezvous is failed.
+     */
+    const countArrival = (isHold: boolean): boolean => {
+        if (failure !== undefined) {
+            throw asError(failure, 'The pre-write rendezvous has already failed');
+        }
+        const earlierHoldArrivals = holdArrivals;
+        if (isHold) {
+            holdArrivals += 1;
+        }
+        arrived += 1;
+        notifyArrivalWatchers();
+        if (arrived < options.participants) {
+            return false;
+        }
+        if (waiting.size !== earlierHoldArrivals) {
+            failRendezvous(
+                new Error(
+                    'The pre-write rendezvous completed its arrival count without the participants ever ' +
+                        `overlapping: ${String(earlierHoldArrivals)} participant(s) had arrived earlier but ` +
+                        `only ${String(waiting.size)} were still waiting, so at least one had already been ` +
+                        'let go. A run in which the callers reached their writes one after the other is not ' +
+                        'evidence of an interleaving and is refused rather than reported.',
+                ),
+            );
+            throw asError(failure, 'The pre-write rendezvous refused a sequential arrival set');
+        }
+        return true;
+    };
+
+    const isTargetedWrite = (statement: string): boolean => {
+        if (!/^\s*(?:insert|update|delete)\b/i.test(statement)) {
+            return false;
+        }
+        const lowered = statement.toLowerCase();
+        return options.tables.some(table => lowered.includes(table.toLowerCase()));
+    };
+
+    const arrive = async (ctx: BarrierParticipantContext, state: PreWriteHoldState): Promise<void> => {
+        if (countArrival(true)) {
+            // This arrival completed the set, so it is released by arrival exactly as its siblings are —
+            // including the one-participant case, where it never joins the waiting set at all.
+            state.releasedBy = 'arrival';
+            releaseAllByArrival();
+            return;
+        }
+        await new Promise<void>((resolve, reject) => {
+            state.resolve = resolve;
+            state.reject = reject;
+            // ★ IN THE WAITING SET BEFORE ANYTHING THAT CAN FAIL THE RENDEZVOUS, AND THE ORDER IS THE WHOLE
+            // POINT. `onCancelled` invokes its listener SYNCHRONOUSLY when the pair has already been
+            // abandoned, so registering before joining the set would run `failRendezvous` over an empty set,
+            // latch the failure, and then add this state to a set nothing will ever visit again — leaving the
+            // intercepted statement pending for ever and hanging the suite's teardown rather than failing it.
+            // Joining first means every path that fails the rendezvous, synchronous or later, finds this hold
+            // and rejects it.
+            waiting.add(state);
+            try {
+                // Two ways this hold can be FAILED — never satisfied: its own bound, and the whole-pair
+                // deadline this harness already owns. Both reject, so the intercepted write does not run.
+                state.timer = setTimeout(() => {
+                    failRendezvous(
+                        new Error(
+                            `A pre-write hold for '${ctx.label}' waited ${String(timeoutMs)}ms without ` +
+                                'every participant arriving. The rendezvous is failed rather than released: ' +
+                                'letting this write proceed would allow a later arrival to complete the ' +
+                                'count and report an overlap that never happened.',
+                        ),
+                    );
+                }, timeoutMs);
+                state.timer.unref?.();
+                ctx.onCancelled(() => {
+                    failRendezvous(
+                        new Error(
+                            `The pair was abandoned while a pre-write hold for '${ctx.label}' was waiting, ` +
+                                'so the rendezvous is failed rather than released.',
+                        ),
+                    );
+                });
+            } catch (registrationFailure: unknown) {
+                // A context that cannot register a timer or a cancellation listener leaves this hold with no
+                // way to ever be woken, so it is refused here rather than left to hang. Deterministic, and it
+                // takes the rendezvous with it: a participant this harness cannot supervise must not write.
+                failRendezvous(
+                    asError(
+                        registrationFailure,
+                        `A pre-write hold for '${ctx.label}' could not register its own escapes, so it ` +
+                            'cannot be supervised and is refused.',
+                    ),
+                );
+            }
+            if (failure !== undefined) {
+                // Already failed — by a synchronous cancellation above, by the registration failure above, or
+                // by a sibling between this hold's arrival and its registration. Refused now rather than left
+                // waiting for an event that has already happened.
+                discardHold(state, failure);
+            }
+        });
+    };
+
+    return {
+        arrivedCount: () => arrived,
+        installedCount: () => installedHolds.length,
+        waitingCount: () => waiting.size,
+        holds: () => installedHolds,
+        releasedByArrival: () => releasedByArrival && failure === undefined,
+        failureReason: () => failure,
+        arriveExternally: () => {
+            if (countArrival(false)) {
+                releaseAllByArrival();
+            }
+        },
+        waitForArrivals: (count: number, waitMs?: number): Promise<boolean> => {
+            if (failure !== undefined) {
+                return Promise.resolve(false);
+            }
+            if (arrived >= count) {
+                return Promise.resolve(true);
+            }
+            return new Promise<boolean>(resolve => {
+                // ONE-SHOT, AND IT RELEASES BOTH ESCAPES ON WHICHEVER PATH ANSWERS FIRST.
+                //
+                // A wait installs two of them — a watcher in `arrivalWatchers` and a bounded timer — and
+                // exactly one is ever going to fire. An earlier revision resolved the promise and left the
+                // other one alive: when an ARRIVAL answered the wait, its timer stayed pending for the whole
+                // of `waitMs`, holding this closure and the rendezvous state it captures reachable, and then
+                // firing inside whichever LATER test happened to be running by the time it elapsed. It was
+                // harmless to this wait, which had already settled, and that is exactly what made it worth
+                // guarding: an escape that outlives the thing it was guarding is invisible until it fires
+                // somewhere it was never meant to.
+                //
+                // Clearing both here means a wait owns nothing once it has answered. `Set.delete` and
+                // `clearTimeout` are each a no-op on something already gone, so this is safe on every path —
+                // including the timer's own, which reaches `settle` after the watcher has been removed by
+                // whoever notified it.
+                let settled = false;
+                let expiry: ReturnType<typeof setTimeout> | undefined;
+                let watcher:
+                    | { readonly count: number; readonly notify: (reached: boolean) => void }
+                    | undefined;
+                const settle = (reached: boolean): void => {
+                    if (settled) {
+                        return;
+                    }
+                    settled = true;
+                    if (watcher !== undefined) {
+                        arrivalWatchers.delete(watcher);
+                        watcher = undefined;
+                    }
+                    if (expiry !== undefined) {
+                        clearTimeout(expiry);
+                        expiry = undefined;
+                    }
+                    resolve(reached);
+                };
+                watcher = { count, notify: settle };
+                arrivalWatchers.add(watcher);
+                // Bounded, so a run in which the held operation never reaches its write reports a failed
+                // wait rather than hanging the suite until its whole-file timeout.
+                expiry = setTimeout(
+                    () => settle(failure === undefined && arrived >= count),
+                    waitMs ?? timeoutMs,
+                );
+                expiry.unref?.();
+            });
+        },
+        install: (ctx: BarrierParticipantContext): PreWriteHold => {
+            const runner = ctx.queryRunner;
+            const original = runner.query.bind(runner);
+            const state: PreWriteHoldState = {
+                resolve: () => undefined,
+                reject: () => undefined,
+                timer: undefined,
+                releasedBy: undefined,
+            };
+            let heldBefore: string | undefined;
+            const patched = async (
+                statement: string,
+                parameters?: unknown[],
+                useStructuredResult?: boolean,
+            ): Promise<unknown> => {
+                if (heldBefore === undefined && isTargetedWrite(statement)) {
+                    heldBefore = statement;
+                    // Throws when the rendezvous fails, so the statement below is NOT reached. That is the
+                    // whole point: a hold that was not released by arrival must not write.
+                    await arrive(ctx, state);
+                }
+                return original(statement, parameters as never, useStructuredResult as never);
+            };
+            (runner as unknown as { query: typeof patched }).query = patched;
+            const hold: PreWriteHold = {
+                held: () => heldBefore !== undefined,
+                heldBefore: () => heldBefore,
+                releasedBy: () => state.releasedBy,
+                restore: () => {
+                    // The hold has already settled by the time a `finally` runs it, so this is the cleanup
+                    // of last resort: it clears any timer that outlived its hold and takes the state out of
+                    // the waiting set, so nothing this rendezvous created survives the test that made it.
+                    if (state.timer !== undefined) {
+                        clearTimeout(state.timer);
+                        state.timer = undefined;
+                    }
+                    waiting.delete(state);
+                    (runner as unknown as { query: typeof original }).query = original;
+                },
+            };
+            installedHolds.push(hold);
+            return hold;
+        },
+    };
 }

@@ -46,8 +46,8 @@
  * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires a
  * new public API to carry a `@since` tag naming what will be the next minor version, and its own literal
  * example names a different version entirely. This checkout declares 3.7.0, so the next minor derives to
- * 3.8.0. That string appears nowhere in this repository and is therefore not a quotation from it; it is
- * computed from the checkout's declared version plus the guide's rule.
+ * 3.8.0 — computed from the checkout's declared version plus the guide's rule, and never a quotation from
+ * the guide, which does not state that value. The authoritative tickets record the same derivation.
  */
 
 import { UserInputError } from '@vendure/core';
@@ -513,8 +513,8 @@ export function toNameKey(displayName: string): string {
  * alike. Because it is the only producer of the display value and the canonical key, the two can never
  * drift apart: no caller composes the pipeline itself, and no code path writes one without the other.
  *
- * The full pipeline runs in its stated order — trim, collapse, NFC, lower-case — and the three rejections
- * are evaluated against the **canonical** form rather than against the raw input:
+ * The full pipeline runs in its stated order — trim, collapse, NFC, lower-case — and the four rejections
+ * are evaluated against the **canonical** forms rather than against the raw input:
  *
  * 1. **An empty canonical form is refused.** This is what makes a blank or whitespace-only name a rejection
  *    rather than a stored empty string.
@@ -532,9 +532,19 @@ export function toNameKey(displayName: string): string {
  *    the C1 block, the zero-widths and the byte order mark, the bidirectional marks, embeddings, overrides
  *    and isolates, the invisible operators, the soft hyphen, the combining grapheme joiner and the
  *    variation selectors. See {@link DISALLOWED_CHARACTER_CLASS} for why they are one class rather than a
- *    list of blocks, and {@link findDisallowedCharacter} for why this test necessarily runs last.
+ *    list of blocks, and {@link findDisallowedCharacter} for why this test of the *display* value
+ *    necessarily runs last among the three above.
+ * 4. **A derived `nameKey` longer than the same maximum is refused, even where the display value fitted.**
+ *    Both stored values are bounded because both occupy a `varchar(191)` column, and normalisation is not
+ *    guaranteed to shorten: NFC canonical composition can *lengthen* a string, so a display value at or
+ *    under the bound can still yield an over-long key. 191 repetitions of U+0344 COMBINING GREEK DIALYTIKA
+ *    TONOS is the worked case — 191 code points, so it passes rejections 1 to 3, and NFC expands it to 382,
+ *    which this rejection refuses. It is necessarily evaluated after the three above, because the key does
+ *    not exist until the display value has been accepted. For a name composed of characters NFC leaves
+ *    alone the two measurements are equal, so this bound moves nothing about where the documented 190 / 191
+ *    / 192 boundary falls; it closes the case where the two measurements differ.
  *
- * All three raise the platform's `UserInputError`, so the caller observes exactly one entry in the
+ * All four raise the platform's `UserInputError`, so the caller observes exactly one entry in the
  * response's top-level `errors` array whose `extensions.code` is exactly `USER_INPUT_ERROR`, with the
  * operation's own field null and no row written. None is a member of any result union: a name that cannot
  * be stored is a malformed request, not a business outcome.

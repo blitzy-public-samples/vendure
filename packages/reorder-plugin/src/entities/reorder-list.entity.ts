@@ -39,8 +39,18 @@ const ACCENT_SENSITIVE_NAME_KEY_COLLATIONS: ReadonlyMap<string, string> = new Ma
  * @description
  * Returns the collation {@link ReorderList.nameKey} must carry on the given database engine for the named
  * unique constraint over it to be accent-preserving, or `undefined` where the engine's own default already
- * is. It is exported so that the migration which creates the table — and any test asserting the shape of
- * that table — derives the value from this one declaration rather than restating it.
+ * is.
+ *
+ * **It states what the RUNNING schema must have, and it is deliberately not what the migration reads.** The
+ * migration that created this table froze its own copy of these values as literals at its own timestamp
+ * (`NAME_KEY_COLLATIONS` in `src/migrations/`), precisely so that a later change here cannot alter what an
+ * already-applied migration is recorded as having created — a change to this resolver belongs to a new
+ * migration of its own. The two are held in step by comparison rather than by sharing: the migration's own
+ * suite translates each entity's live metadata into a table description and requires it to equal the frozen
+ * one, so a divergence fails a test instead of silently rewriting history.
+ *
+ * It is exported so that a consumer configuring these entities, and any test asserting the shape of the
+ * running table, reads the value from this one declaration rather than restating it.
  *
  * @param engine - The TypeORM engine identifier. Defaults to the configured one, read through the
  * platform's own pre-bootstrap config accessor.
@@ -109,6 +119,16 @@ const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
  *    every write filters on all three, and `IDX_reorder_list_customer_channel` is the index that
  *    predicate is served by.
  * 3. `lineCount` is stored rather than derived. See that property's own description.
+ * 4. **Both foreign keys are indexed, and the second index exists for a predicate no request issues.**
+ *    `IDX_reorder_list_customer_channel` leads with `customerId`, so it serves both the ownership
+ *    predicate and any probe for a customer's rows. Nothing led with `channelId`, though — and the
+ *    engine needs one, because `ON DELETE CASCADE` on {@link ReorderList.channel} means deleting a
+ *    channel makes the engine find every row of this table referencing it. PostgreSQL and SQLite index
+ *    the *referenced* key automatically and the *referencing* column not at all, so that probe would
+ *    scan the whole table — a cost that grows with every buyer's lists while the deletion it serves
+ *    stays a single administrative act. `IDX_reorder_list_channel` is the index for it. (The MySQL
+ *    family creates an index for a foreign key of its own accord, so there the declaration is
+ *    redundant rather than wrong; declaring it keeps the four engines' schemas the same shape.)
  *
  * `id`, `createdAt` and `updatedAt` are inherited from {@link VendureEntity} and are deliberately not
  * re-declared here, though all three are part of this entity's published contract.
@@ -125,6 +145,7 @@ const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
 @Entity()
 @Unique('UQ_reorder_list_customer_channel_name_key', ['customerId', 'channelId', 'nameKey'])
 @Index('IDX_reorder_list_customer_channel', ['customerId', 'channelId'])
+@Index('IDX_reorder_list_channel', ['channelId'])
 @Check('CHK_reorder_list_line_count_non_negative', '"lineCount" >= 0')
 export class ReorderList extends VendureEntity {
     constructor(input?: DeepPartial<ReorderList>) {
