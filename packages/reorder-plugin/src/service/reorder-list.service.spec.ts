@@ -168,6 +168,31 @@ function escaped(identifier: string): string {
 }
 
 /**
+ * The shape of the correlation id the module appends to every internal diagnostic — a v4 UUID, as
+ * `crypto.randomUUID` produces it.
+ */
+const CORRELATION_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * Splits a logged diagnostic into its prose and its correlation id.
+ *
+ * An assertion that a diagnostic does not ECHO some value has to be made against the prose alone. The
+ * correlation id is random hexadecimal, so it contains short substrings by chance — every one of a UUID's
+ * four hyphens is followed by a hex digit, which puts `-1` inside roughly a fifth of them — and asserting
+ * over the whole line would then fail on the identifier rather than on an echoed value. Returning the two
+ * parts separately lets the caller assert the prose carries no value AND that the identifier is present and
+ * well formed, so nothing can hide in the part that was set aside.
+ *
+ * @returns the prose with the trailing `(correlation id …)` removed, and the identifier itself. Where the
+ * line carries no correlation id the identifier is the empty string, which fails
+ * {@link CORRELATION_ID_SHAPE} rather than passing silently.
+ */
+function splitCorrelationId(message: string): [prose: string, correlationId: string] {
+    const match = /^(.*?)\s*\(correlation id ([^)]*)\)\s*$/s.exec(message);
+    return match ? [match[1], match[2]] : [message, ''];
+}
+
+/**
  * The property names each plugin entity declares, used by the metadata double to answer the column
  * look-ups the raw fragments perform. Declared as data rather than derived from TypeORM metadata, because
  * building real metadata would require a connection and this file has none by design.
@@ -4752,10 +4777,17 @@ describe('ReorderListService', () => {
             expect((rejection as Error).message).toBe(UNCLASSIFIED_FAILURE_MESSAGE);
             expect((rejection as Error).message).not.toContain(String(storedValue));
             // The diagnostic that names what happened goes to the log, with a correlation id, and it
-            // carries no value either.
+            // carries no value either. The value assertion is made against the PROSE alone, because the
+            // correlation id is a fresh v4 UUID and every one of its four hyphens is followed by a hex
+            // digit — so a UUID contains the two characters "-1" about a fifth of the time, and asserting
+            // over the whole line would fail on the identifier rather than on an echoed value. Splitting
+            // the two apart is what makes the claim about the value rather than about luck, and the
+            // parenthetical is asserted on its own so nothing can hide inside the part that was removed.
             expect(loggedErrors).toHaveLength(1);
-            expect(loggedErrors[0].message).toContain('not a non-negative safe integer');
-            expect(loggedErrors[0].message).not.toContain(String(storedValue));
+            const [prose, correlation] = splitCorrelationId(loggedErrors[0].message);
+            expect(correlation, 'the diagnostic must carry a correlation id').toMatch(CORRELATION_ID_SHAPE);
+            expect(prose).toContain('not a non-negative safe integer');
+            expect(prose).not.toContain(String(storedValue));
             expect(loggedErrors[0].context).toBe(loggerCtx);
             // The compare-and-set was attempted and the read-back happened; no second write followed.
             expect(statementsOfKind(harness, 'ReorderList', 'update')).toHaveLength(1);
