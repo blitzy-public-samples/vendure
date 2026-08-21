@@ -197,8 +197,12 @@ const ID_VARIABLE = 'id';
  * to agree with the implementation about which engines have an order to impose, and a second literal would
  * be one more place to keep in step. It is not part of the package's published surface, this module being
  * absent from the root barrel.
+ *
+ * `readonly` because export plus mutability is a defect however narrow the audience: an importer that pushed
+ * or spliced would change which engines this plugin locks on, process-wide, for every request. Nothing
+ * mutates it — every reader calls `includes` — so the type states what the code already does.
  */
-export const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: string[] = ['postgres', 'mysql', 'mariadb'];
+export const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: readonly string[] = ['postgres', 'mysql', 'mariadb'];
 
 /**
  * The engines on which a transaction that will write a LINE must hold the parent list row exclusively rather
@@ -234,12 +238,13 @@ export const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: string[] = ['postgres', 'my
  * engine by the sequential pair, whereas an unclassified failure reaching a buyer is not recoverable at all.
  * Nothing upgrades under either mode: the exclusive lock is taken at admission, before any line statement.
  *
- * Exported for the same reason {@link ENGINES_SUPPORTING_PESSIMISTIC_LOCKING} is: the unit spec's lock-order
- * replay has to read the SAME list rather than a copy of it. The e2e fixture publishes its own
- * `EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES` over the same two engines, an `e2e/` module being unreachable
+ * Exported for the same reason {@link ENGINES_SUPPORTING_PESSIMISTIC_LOCKING} is, and `readonly` for the same
+ * reason: the unit spec's lock-order replay has to read the SAME list rather than a copy of it, and an
+ * importer must not be able to mutate the locking model of a running process. The e2e fixture publishes its
+ * own `EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES` over the same two engines, an `e2e/` module being unreachable
  * from `src/`.
  */
-export const ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES: string[] = ['mysql', 'mariadb'];
+export const ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES: readonly string[] = ['mysql', 'mariadb'];
 
 /*
  * The alias, column names and bound parameters the nested-lines read gives its per-parent ranking subquery.
@@ -312,15 +317,6 @@ const OWNER_SCOPE_CACHE_KEY_PREFIX = 'ReorderListService.ownerScope';
 const UNCLASSIFIED_FAILURE_MESSAGE = 'The reorder list request could not be completed';
 
 /**
- * The one other internal failure this service raises deliberately: an authenticated session whose user has
- * no `Customer` row. Declared rather than written inline at its two throw sites because
- * {@link ReorderListService.rethrowSanitisedFailure} has to be able to recognise this service's own internal
- * errors, and recognising them by a shared constant is checkable in a way that recognising them by a repeated
- * string literal is not.
- */
-const NO_CUSTOMER_FOR_USER_MESSAGE = 'The authenticated user has no associated Customer';
-
-/**
  * The complete set of internal-error messages this module authors.
  *
  * An `INTERNAL_SERVER_ERROR` arriving at the sanitiser is forwarded only if its message is one of these. The
@@ -329,11 +325,13 @@ const NO_CUSTOMER_FOR_USER_MESSAGE = 'The authenticated user has no associated C
  * configuration key or a strategy class. Forwarding it unchanged would publish that wording to the caller and
  * log it, which is exactly what the surrounding sanitisation exists to prevent, so an internal error this
  * module did not write is reported as this module's own generic failure instead.
+ *
+ * There is exactly one member, and that is the point rather than an accident of the current code: this module
+ * authors one internal failure, the unclassified database one. Every other refusal it raises is a caller-level
+ * outcome — a `ForbiddenError` for a session that is not this feature's buyer, a `UserInputError` for a
+ * malformed name or quantity, or one of the four published error results.
  */
-const OWN_INTERNAL_MESSAGES: ReadonlySet<string> = new Set([
-    UNCLASSIFIED_FAILURE_MESSAGE,
-    NO_CUSTOMER_FOR_USER_MESSAGE,
-]);
+const OWN_INTERNAL_MESSAGES: ReadonlySet<string> = new Set([UNCLASSIFIED_FAILURE_MESSAGE]);
 
 /**
  * The platform error code an internal failure carries, matched rather than imported because the platform
@@ -1313,11 +1311,22 @@ export class ReorderListService {
             return this.rethrowSanitisedFailure(err, operation);
         }
         if (!customer) {
-            // An active user with no customer row is a broken invariant rather than a caller error: the
-            // session authenticated successfully, so something upstream created a user without its customer.
-            // Reported as an internal error rather than a refusal, so it is not mistaken for a permission
-            // problem, and carrying no identifier so nothing about the session is echoed to the caller.
-            throw withoutStackFrames(new InternalServerError(NO_CUSTOMER_FOR_USER_MESSAGE));
+            // ★ AN AUTHENTICATED USER WITH NO CUSTOMER ROW IS A GUARD FAILURE, NOT A BROKEN INVARIANT, AND
+            // THE DIFFERENCE IS OBSERVABLE. It is a NORMAL platform state rather than upstream corruption:
+            // the Shop API's own `login` applies no restriction on which `User` may authenticate
+            // (`packages/core/src/service/services/auth.service.ts`), so an administrator's session — or one
+            // from a custom `AuthenticationStrategy` that creates no customer — reaches here with
+            // `activeUserId` set and no customer row. The platform answers exactly this case by returning
+            // nothing (`packages/core/src/api/resolvers/shop/shop-customer.resolver.ts` answers `undefined`
+            // for `activeCustomer`), and classifying it as internal instead would answer all eight
+            // operations with a 500 for a session that is simply not a buyer.
+            //
+            // So it is the same refusal as an absent session, raised through the same error class, which is
+            // what makes the read/write convention apply to it without a second branch anywhere: a read
+            // catches `ForbiddenError` and answers the empty page or `null` (AAP section 0.5.2.3), and a
+            // write lets it propagate as one top-level `FORBIDDEN` entry. Nothing about the session is
+            // echoed — the platform's `ForbiddenError` takes neither a message nor variables.
+            throw withoutStackFrames(new ForbiddenError());
         }
         return this.rememberOwnerScope(ctx, {
             customerId: customer.id,
@@ -1449,7 +1458,10 @@ export class ReorderListService {
             return this.rethrowSanitisedFailure(err, operation);
         }
         if (!customer) {
-            throw withoutStackFrames(new InternalServerError(NO_CUSTOMER_FOR_USER_MESSAGE));
+            // The same refusal, for the same reason, as the plain resolver's — see {@link
+            // ReorderListService.getOwnerScope}. A session that is not a buyer is refused rather than
+            // reported as an internal failure, and this is a write path, so it propagates as `FORBIDDEN`.
+            throw withoutStackFrames(new ForbiddenError());
         }
         return {
             customerId: customer.id,
@@ -2260,8 +2272,11 @@ export class ReorderListService {
      * @param storedLineCount - The counter value that arrived with the row, and the guard the update compares.
      * @param observedTotal - The line total this request actually observed. A value that is not a non-negative
      * safe integer is a defect in the caller, and is refused rather than written.
-     * @returns The value the caller should report: the observed total when the two disagreed, and the stored
-     * value when they agreed or when the observed total was refused.
+     * @returns The value the caller should report, which is the stored column in every case the column can be
+     * established: the stored value when the two agreed or when the observed total was refused; the observed
+     * total once this method has written it; and, where the compare-and-set lost its race, the column as it
+     * now stands, read back under the same ownership conjuncts — falling back to the observed total only when
+     * the row no longer exists within this scope and there is therefore no stored value to report.
      * @throws The generic internal failure when the row carries no owner provenance, or provenance that
      * disagrees with the request — no statement is issued on that path.
      *
@@ -2321,17 +2336,45 @@ export class ReorderListService {
             return this.rethrowSanitisedFailure(err, 'reconcileLineCount');
         }
         if (!result.affected) {
-            // The guarded row did not match. Either a competing writer moved the counter between the read and
-            // this statement, or the row is no longer reachable under this owner scope at all — a list deleted
-            // in the same window matches neither guard. Both are answered the same way and neither is retried:
-            // the observed total is still the truthful answer for what this request saw, and whatever now
-            // stands in the row was put there by something with a better claim than a repair.
+            // ★ THE GUARDED ROW DID NOT MATCH, SO THIS REQUEST'S OBSERVED TOTAL IS NO LONGER THE COLUMN'S
+            // VALUE — AND THE COLUMN IS THE AUTHORITY. Either a competing writer moved the counter between
+            // the read and this statement, or the row is no longer reachable under this owner scope at all: a
+            // list deleted in the same window matches neither guard. Nothing is retried, because whatever
+            // now stands in the row was put there by something with a better claim than a repair.
+            //
+            // What is NOT done is report `observedTotal` anyway. A repair that lost its race has established
+            // exactly one thing — that it does not know the counter — and answering with the total it counted
+            // before the competing write would publish a number that is neither the stored column nor the
+            // value the winner committed. So the column is read back, once, under the same three ownership
+            // conjuncts the update carried, and that is what the caller reports.
             Logger.debug(
                 `Skipped a lineCount repair on reorder list ${String(listId)} because the guarded row no ` +
                     `longer matched — its stored value changed concurrently, or the row is no longer within ` +
                     `the owner scope it was read under`,
                 loggerCtx,
             );
+            let current: ReorderList | null;
+            try {
+                current = await this.connection.getRepository(ctx, ReorderList).findOne({
+                    where: {
+                        id: listId,
+                        customerId: scope.customerId,
+                        channelId: scope.channelId,
+                    },
+                    select: { id: true, lineCount: true },
+                    loadEagerRelations: false,
+                });
+            } catch (err: unknown) {
+                return this.rethrowSanitisedFailure(err, 'reconcileLineCount');
+            }
+            if (current === null) {
+                // The row is gone, or has left this scope, so there is no stored value to report at all. The
+                // total this request observed is then the only answer it has, and it is the one consistent
+                // with the page it is about to return.
+                return observedTotal;
+            }
+            const currentStored = Number(current.lineCount);
+            return Number.isSafeInteger(currentStored) && currentStored >= 0 ? currentStored : observedTotal;
         }
         return observedTotal;
     }

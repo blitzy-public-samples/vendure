@@ -28,39 +28,12 @@ The floor is deliberately left at the 3.3 line rather than narrowed to exclude t
 releases: narrowing it would refuse to boot on the whole 3.3–3.7.1 range, which is a support-policy
 decision for the maintainers rather than a change this package should make on its own.
 
-**The plugin also says this at run time, not only here.** During bootstrap it writes one `warn` line
-under the `ReorderPlugin` log context unless the platform it is running on is a release known to carry
-the fixes. It reads the platform's own `VENDURE_VERSION`, so it reports the server it is in rather than
-whatever a manifest says. A document is read once, by whoever installs the package; a deployment that
-inherits an old platform months later has nothing telling it so, and the compatibility range cannot,
-because that mechanism only refuses versions below its floor.
-
-It says only what the version establishes, which is three different things and not one:
-
-| Running version                            | What the line says                                                                                                  |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| Below 3.7.2 — e.g. `3.7.0`                 | The release is affected by the four advisories, named individually.                                                 |
-| A pre-release of 3.7.2 — e.g. `3.7.2-rc.1` | Semantic versioning orders it **before** 3.7.2, so it is **not established** that the build carries all four fixes. |
-| Not a valid version — e.g. `03.8.0`        | The posture **could not be determined** and must be checked by hand.                                                |
-| 3.7.2 or later, including `3.8.0-alpha.2`  | Nothing. A pre-release of a later release still orders above 3.7.2, so it carries the fixes and produces no line.   |
-
-The middle two matter because the alternatives are both dishonest: calling an unreadable version
-affected asserts a vulnerability from ignorance, and calling it fixed asserts safety from the same
-ignorance. Build metadata is ignored, as semantic versioning requires — `3.7.2+build.5` is `3.7.2`,
-and `3.7.2+0.build.01` is too, since build identifiers may carry leading zeros.
-
-The version is checked against the **full Semantic Versioning 2.0.0 grammar** before any comparison,
-because precedence is only defined between two valid versions. That is not pedantry: `03.8.0` is not a
-version, but a permissive `major.minor.patch` shape reads it as major 3 — _later_ than the floor — and
-so goes quiet. The same is true of `3.8.0-..` and `3.8.0+.`, which carry empty identifiers the
-specification forbids, and of `3.7.2-01`, whose numeric pre-release identifier may not carry a leading
-zero even though a build identifier may. Every one of those becomes "could not be determined", which
-speaks, rather than "fixed", which does not.
-
-The line is a **warning and never a refusal**: a plugin that declined to start over its host's patch
-level would convert a documented risk into a certain outage and would take an availability decision
-belonging to the deployment. It also states in terms that the defects are the platform's and are
-neither introduced nor fixable by this plugin, so it cannot send an investigation to the wrong place.
+This is stated here, in the package's own documentation, and deliberately nowhere else. An earlier
+revision also wrote a `warn` line at every boot naming the four advisories and the release that fixes
+them. It was accurate, and it was withdrawn: a hardcoded advisory list and version floor inside a
+feature plugin has no way to refresh itself, so it would eventually tell an operator something that had
+stopped being true, and a plugin's bootstrap log is not where a platform's patch posture belongs.
+Follow Vendure's own release and advisory notes, which are current by construction.
 
 ## Usage
 
@@ -112,8 +85,21 @@ created, so after adding the plugin to your configuration you must register and 
 package ships before the new operations will work.
 
 The plugin ships that migration. It is compiled into the published package at
-`lib/src/migrations/`, and lives at `src/migrations/` in a source checkout. The supported way to
-register it is by value, from the package root:
+`lib/src/migrations/`, and lives at `src/migrations/` in a source checkout.
+
+> **Read this before you register it: the shipped file is PostgreSQL DDL, and applies on PostgreSQL
+> only.** It is the platform migration generator's own output, and `generateMigration` serialises the
+> statements one configured engine's schema builder logged into `queryRunner.query(<SQL>)` calls — so an
+> emitted migration is bound to the engine it was generated against, and this one was generated against
+> PostgreSQL. Applying it on MySQL, MariaDB or the SQLite family fails: `SERIAL`,
+> `TIMESTAMP … DEFAULT now()` and `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` are not all legal on
+> those engines, and a double-quoted identifier is a string literal on the MySQL family. **If you deploy
+> on any other engine, generate your own file** — see
+> [If you deploy on another engine](#if-you-deploy-on-another-engine) below. This is a property of the
+> emitted form rather than an omission: the platform's migration lifecycle is the only sanctioned way to
+> produce one of these files, and one run of it produces one dialect.
+
+On PostgreSQL, the supported way to register the shipped file is by value, from the package root:
 
 ```ts
 import type { VendureConfig } from '@vendure/core';
@@ -130,10 +116,12 @@ export const config: VendureConfig = {
 };
 ```
 
-Registering the classes rather than a path is what makes one registration correct in both layouts this
+Registering the class rather than a path is what makes one registration correct in both layouts this
 package runs in: TypeORM accepts a migration class wherever it accepts a glob, and a class is resolved
 by the module system, so no path arithmetic over `src/` versus `lib/src/` is needed. A deployment that
-prefers globs can name the emitted files instead, and one pattern serves both layouts:
+prefers globs can name the emitted file instead — an installed package carries only the compiled
+layout, so one pattern is enough — but resolve it through the module system rather than writing a
+relative path from your own configuration file:
 
 ```ts
 import path from 'path';
@@ -164,114 +152,91 @@ deployment should be — the order is simply:
 
 Against a **synchronization-driven** database the order is not available, and this is worth stating
 plainly rather than leaving to be discovered. A connection with `synchronize: true` lets the schema
-builder create these two tables from the entity metadata, after which running the migration will
-verify that schema and record itself as applied rather than create anything. That is a supported
-outcome — the migration checks the tables it finds against its own frozen minimum and refuses if they
-fall short of it — but the schema builder, not the migration, is what authored them. Do not mix the two
-in one startup sequence: a migration run that precedes schema creation cannot succeed, and
-`runMigrations` reports such a failure by setting `process.exitCode` rather than by throwing, so a
-startup chain that ignores the exit code will carry on and synchronize regardless.
+builder create these two tables from the entity metadata, at which point the migration has nothing left
+to create: its first `CREATE TABLE` fails on an object that already exists, `runMigrations` logs the
+failure and the schema is the schema builder's rather than the migration's. There is no adopt-what-you-
+find path — the file is a list of statements, not a reconciler — so the two mechanisms must not be mixed
+in one startup sequence in either order. Note also how such a failure is reported: `runMigrations` sets
+`process.exitCode` rather than throwing, so a startup chain that ignores the exit code carries on and
+synchronizes regardless.
 
 `packages/dev-server` in this repository is exactly such a synchronization-driven harness — it ships no
-core migrations of its own — so it registers this plugin's migration only for the migration commands
-and never for a server boot or a population run. Making that harness migration-owned end to end would
-mean authoring core migrations for it, which are files outside this package and therefore outside what
-this change may add; the harness's synchronization-driven boot is its own long-standing design and is
-left as it is.
+core migrations of its own, and every engine branch of its own configuration turns `synchronize` on. It
+registers this plugin's migration in the one place a registration belongs, `dbConnectionOptions.migrations`,
+and its start script calls `runMigrations` before `bootstrap`. **The visible consequence is worth stating
+rather than leaving to be met in a log**: on that harness's default MariaDB the boot-time `runMigrations`
+refuses the shipped PostgreSQL DDL, logs the refusal, leaves `process.exitCode` at `1` without throwing,
+and `bootstrap` then synchronizes the two tables exactly as it always has — so the server comes up and
+serves, with one failed migration reported on the way past. That is noise in a development harness rather
+than a fault in either half, and it is the same reporting behaviour a production startup chain has to
+account for. Making the harness migration-owned end to end would mean authoring core migrations for it,
+which are files outside this package; its synchronization-driven boot is its own long-standing design and
+is left as it is.
 
 The three-step order above is not only documented, it is **executed**: an end-to-end test drops the
 tables synchronization created, applies this migration with `synchronize` off, and then drives
 `createReorderList`, `addItemToReorderList` and `activeCustomerReorderList` over a Shop API whose
 connection can no longer create anything — so what those operations run against is provably the
-migration's own output. It runs on PostgreSQL, MySQL, MariaDB and sql.js alike.
+migration's own output. That case runs on PostgreSQL, because the shipped file is PostgreSQL DDL.
 
-**The migration is engine-portable, and no SQL appears in it.** Rather than carrying the DDL of one
-engine, it describes the two tables it creates and hands that description to the same query-runner
-API the platform's schema builder uses, which renders the right DDL for PostgreSQL, MySQL, MariaDB
-and the SQLite family. It also honours a configured non-default database schema in both directions.
-You do not need to generate a migration of your own for these two tables.
+**The statements are frozen in the file, not read from the entity classes.** Every table, column,
+width, named unique, named index, named check constraint and cascading reference is written out as
+literal SQL, so what the migration creates is fixed at its own timestamp and cannot drift when a later
+release adds a column to one of these entities — that column belongs to that release's own migration.
+Nothing in the file is resolved at run time, and that includes the things a deployment might reasonably
+expect to be: the identifier columns are `SERIAL` and `integer` because that is what the generating
+connection's `EntityIdStrategy` produced, and `down()` names the `public` schema its own connection was
+configured with when it drops the index by name. A deployment on another identifier strategy or another
+schema regenerates the file against its own connection, which is the same answer as for another engine.
 
-**The description is frozen in the migration itself, not read from the entity classes.** Every table,
-column, width, named unique, named index, named check constraint and cascading reference is written
-out as a literal in the file, so what the migration creates is fixed at its own timestamp and cannot
-drift when a later release adds a column to one of these entities — that column belongs to that
-release's own migration. Only three things are resolved when the migration runs, because only three
-depend on the deployment rather than on the schema: the identifier columns' physical type and
-generation strategy, taken from the platform's own `Customer.id`, which these tables reference; the
-inherited `createdAt` / `updatedAt` type, precision and default, taken from the driver's declaration
-of them; and the qualified table names, built through the driver so a configured schema is honoured.
+One operational note for a test harness rather than a deployment. `@vendure/testing`'s sql.js initializer
+caches a populated database per spec file and, **when that cache exists, disables synchronization while
+loading it** — so a snapshot captured before these two tables existed is restored without them and every
+case then fails on a missing table. After adding this plugin, or after any change to its two entities,
+delete the cached seed data for the affected package (`<package>/e2e/__data__`) once. It is regenerated on
+the next run.
 
-Because of that, running the migration against a database whose tables already exist does not
-silently adopt them. It compares what it finds against a **frozen minimum** and refuses to be recorded
-as applied if anything falls short of it, naming each shortfall.
+### If you deploy on another engine
 
-What that minimum covers: every frozen column, with every attribute the engine reports for it — type,
-declared and display width, precision, scale, default, character set, collation, nullability,
-membership of the row identifier, generation and identity generation, generated expression and
-storage, scalar-versus-array value shape, signedness, zero fill, enumerated members and type name, and
-spatial type and reference identifier; every named unique by its subject and its deferrability; every
-named index by its ordered subject, its uniqueness, its partial-index predicate, its spatial,
-full-text and null-filtered kinds and its full-text parser; every named check by its condition; and
-every reference by its name, its leaving columns, its target table and columns, both referential
-actions, its deferrability and the schema and database its target sits in.
+Generate your own file, through the same platform lifecycle, and register that instead of the one this
+package ships. Nothing about it is special: it is what the shipped file is, run against your connection
+rather than against PostgreSQL.
 
-**Deferrability is read from each engine's own catalogue, not from TypeORM's table view.** It deserves
-its own note because it is the one property where "TypeORM reported nothing" and "the engine holds
-nothing" are different facts, and treating them as one would let a real deferred constraint pass. Two
-gaps in TypeORM 0.3.x make that concrete: the SQLite family _writes_ a reference's `DEFERRABLE` clause
-into the table definition it stores and has no loader that reads it back, and PostgreSQL's unique
-loader reads deferrability fields that its own constraints query never selects. So on those two, a
-genuinely deferred constraint is invisible to the generic view.
+```ts
+import { generateMigration } from '@vendure/core';
 
-The migration therefore consults the engine directly, and what it can establish is different per engine
-because the engines themselves are different — each of these was measured, not cited:
+// `config` is your own VendureConfig with ReorderPlugin registered and this package's
+// `reorderPluginMigrations` NOT in `dbConnectionOptions.migrations` — the generator must not be
+// handed the migration it is being asked to decide the need for.
+await generateMigration(config, { name: 'add-reorder-lists', outputDir: './src/migrations' });
+```
 
-| Engine          | Where a deferred constraint can exist                                                                                                 | How the migration establishes it              |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| PostgreSQL      | references and uniques                                                                                                                | `pg_constraint.condeferrable` / `condeferred` |
-| SQLite family   | references (a unique admits no such clause)                                                                                           | the definition stored in `sqlite_master`      |
-| MySQL / MariaDB | neither — the grammar refuses the clause outright, answering `ER_PARSE_ERROR`, and the driver has no notion of it in either direction | nothing to establish                          |
-| anything else   | unknown                                                                                                                               | **refused** rather than assumed immediate     |
+Run it against a database that carries your core schema and neither plugin table, which is the position
+a first deployment of this plugin is in. The output creates `reorder_list` and then `reorder_list_line`
+with every column, named unique, named index and cascading reference this package declares — and every
+named check constraint the engine can carry, which on MySQL and MariaDB is none, for the reason the
+[limitation note](#one-documented-limitation) records. Apply and reverse it with `runMigrations` and
+`revertLastMigration` exactly as above.
 
-That last row is deliberate. On an engine this package makes no claim about, an existing table is not
-recorded as this migration's work at all, because there is no way to show its constraints fire when the
-plugin's error handling needs them to. A fresh database is unaffected — the check runs only where a
-table of the name already stands.
+This is not advice given untested. The plugin's own migration end-to-end suite takes that route on every
+engine it runs on: where the shipped file's dialect matches the connection it applies the shipped file,
+and everywhere else it generates the engine's own emission at the top of the run and applies that. The
+whole data-bearing up → down → up cycle, every named object read back out of the engine's own catalogue,
+and the write each named constraint forbids are measured that way on **sql.js, MariaDB, MySQL and
+PostgreSQL** — so what differs between engines is the file, not the coverage. Native SQLite is
+unverified, and named as such rather than implied: `@vendure/testing` exports no initializer for it.
 
-It matters rather than being a curiosity: a deferred constraint is checked at `COMMIT` instead of at the
-statement, so a deferred unique moves the violation past the `catch` that turns
-`UQ_reorder_list_customer_channel_name_key` into `ReorderListNameConflictError`, and a deferred cascade
-lets a parent delete and its child cascade sit apart until commit.
+### One documented limitation
 
-The evidence is split accordingly, and the split is worth knowing if you read the suite. Cases that
-genuinely defer a live constraint and then read the engine back cover PostgreSQL for both classes and
-the SQLite family for references; a further case removes the catalogue reading entirely to show an
-unanswerable question is refused rather than defaulted. Cases that hand a deferred reading to the
-comparator cover the same code path on MySQL and MariaDB, where no live deferral is possible to create —
-those are evidence about the comparison, not about a live schema, and the suite says so.
-
-What it deliberately tolerates: a **surplus**. An extra column, index, constraint or reference belongs
-to a later migration, or to a newer entity synchronised into the same table, and is not this
-migration's business — so the check is "does the table carry everything this timestamp created, as this
-timestamp created it", not "is the table identical to what this timestamp created".
-
-What it excludes, and why: a column's `ON UPDATE` clause, which two of the four engines do not report
-at all; a column's comment, which the SQLite family reports as an empty string and which changes
-nothing about the stored value; a column's single-column uniqueness flag, since both uniques here are
-composite and are checked as named objects; an index's "built concurrently" flag, which describes the
-statement that built an index rather than the index itself and which no engine stores; and named check
-constraints on MySQL and MariaDB, where TypeORM never created them — see the limitation note below.
-Those four are the whole of the exclusion list: every other property TypeORM reports for a column,
-unique, index, check or reference is compared.
-
-One documented limitation, on the MySQL family only: TypeORM 0.3.x cannot create `CHECK`
-constraints there and discards them silently, so the two named check constraints on these tables are
-created on PostgreSQL and the SQLite family and **not** on MySQL or MariaDB. Nothing stops you
-provisioning them yourself on those two engines — the plugin's own existing-table check tolerates
-objects it did not create — but this plugin will not create them and does not look to see whether you
-have. The two named unique constraints and the named index do exist on all four engines (the MySQL
-family stores each unique constraint as a named unique index, keeping both the name and the
-guarantee).
+On the MySQL family only: TypeORM 0.3.x cannot create `CHECK` constraints there and discards them
+silently, so the two named check constraints on these tables are created on PostgreSQL and the SQLite
+family and **not** on MySQL or MariaDB. That is measured rather than inferred — the emission this
+package's own suite generates for those two engines carries neither constraint, because TypeORM returns
+early before a check ever reaches the statement log. Nothing stops you provisioning them yourself on
+those two engines, but **this plugin will not create them and never looks to see whether you have**: it
+carries no reconciler and inspects no existing table. The two named unique constraints and the named
+index do exist on all four engines (the MySQL family stores each unique constraint as a named unique
+index, keeping both the name and the guarantee).
 
 **What still holds on every engine, and what does not.** Both invariants the missing constraints
 express are enforced twice over by the plugin, and neither enforcement depends on a check
@@ -307,24 +272,11 @@ engines is engine-specific DDL added to the migration by hand, which the project
 policy forbids. See the plugin's migration end-to-end suite, which states the conflict in full and
 asserts the gap positively rather than skipping over it.
 
-**The plugin says this at run time too, on the engines where it applies.** Booting on MySQL or MariaDB
-writes one `warn` line under the `ReorderPlugin` log context, naming both constraints exactly and
-attributing the shortfall to the object-relational mapper rather than the engine, which supports them.
-It states the consequence in the terms that matter — everything the plugin serves is still guarded, and
-what is missing is the backstop against a write that does not come through the plugin. The reason it
-exists is that the person who later points a reporting job or a repair script at these tables is
-usually not the person who read this file, and the schema does not tell them.
-
-It reads the configured engine type, issues no statement of any kind, and never refuses to start. That
-also bounds what it is entitled to claim: engine type establishes what the mapper does, not what is in
-your catalogue, so the line says the constraints are absent **unless something outside this plugin
-provisioned them** and says outright that it did not look. If you provisioned them yourself they are in
-force and the line does not apply to you.
-
-That mechanism was built and measured against MySQL 8.0.43 and MariaDB 11.5.2 before being withdrawn,
-and the migration's own header records what a ruling on it would have to weigh, so the decision can be
-taken on facts rather than re-measured. In short: the frozen conditions cannot be reused verbatim,
-because both engines accept an ANSI-quoted `CHECK` and then read the quoted column as a _string
+Two mechanisms for closing the gap were built and measured against MySQL 8.0.43 and MariaDB 11.5.2
+before being withdrawn — engine-specific `CHECK` DDL in the migration, and a boot-time `warn` line
+reporting the shortfall — and the migration's own header records what a ruling on the first would have
+to weigh, so the decision can be taken on facts rather than re-measured. In short: the frozen
+conditions cannot be reused verbatim, because both engines accept an ANSI-quoted `CHECK` and then read the quoted column as a _string
 literal_, producing a correctly named constraint that refuses every valid row; a check can be present
 and inert on MySQL, which records `NOT ENFORCED` while still reporting the original condition, in a
 column MariaDB does not have at all; and covering the `synchronize` provisioning path as well as the
@@ -444,6 +396,15 @@ submitted, byte for byte. Uniqueness is enforced per customer and channel by a d
 over a canonicalised form of the name, which makes the comparison case-insensitive but
 accent-preserving, so `Café` and `Cafe` remain two distinct lists.
 
+A name is refused as malformed on exactly four grounds, and it is worth knowing the list is that short.
+Its canonical form must not be empty and must not exceed 191 characters, and the submitted text may
+carry none of: a C0 control character (`U+0000`–`U+001F`, less the tab, newline and carriage return that
+whitespace canonicalisation itself consumes), `U+007F`–`U+009F`, `U+200B` zero-width space, or `U+FEFF`.
+Everything else is stored. In particular an emoji sequence, a variation selector, a zero-width joiner or
+non-joiner, a soft hyphen, a bidirectional mark and a combining grapheme joiner are all accepted and
+round-trip code point for code point — a name is buyer-supplied text, and refusing characters that
+ordinary orthography and ordinary emoji are built from would reject names a buyer legitimately typed.
+
 Because the stored name is buyer-supplied free text that is returned verbatim, it is data rather
 than markup, and a consumer that displays it is responsible for escaping it on output.
 
@@ -462,3 +423,31 @@ they reference is removed, and deleting a list removes its lines. Note that this
 cascade, and that deleting a customer through the platform is a _soft_ delete — so it does not fire,
 and a soft-deleted customer's list rows persist. This plugin ships no retention, anonymisation or
 purge behaviour of its own to remove them.
+
+## Package scripts
+
+Beyond the conventional `build`, `watch`, `lint`, `test`, `e2e` and `ci`, this package declares two
+scripts that behave unlike the rest and are documented here so their exit status is not misread:
+
+| Script                            | What it asserts                                                                          |
+| --------------------------------- | ---------------------------------------------------------------------------------------- |
+| `typecheck:error-code-exhaustive` | Type-checks `e2e/error-code-exhaustive.fixture.ts`, and is expected to exit **non-zero** |
+| `typecheck:error-code-defaulted`  | Type-checks `e2e/error-code-defaulted.fixture.ts`, and is expected to exit **zero**      |
+
+The two fixtures are byte-identical apart from one terminal branch: an exhaustive `switch` over the
+published Shop `ErrorCode` with no `default`, versus the same `switch` with one. A non-zero status on the
+first is therefore the evidence rather than a defect — it is what shows the enum grew when this plugin
+declared its four error results — and a clean compile there would be the regression. Each is the single
+entry of its own compiler project (`e2e/tsconfig.error-code-*.json`), because one invocation cannot
+produce two opposite statuses.
+
+**They are only meaningful inside a generation window, and outside it they fail for an unrelated
+reason.** Both fixtures import `../.generated/shop-error-codes`, which is a build product rather than a
+checked-in file: the read suite's own case introspects a running server, generates that module from the
+live schema, invokes these two scripts, asserts the two statuses, and removes the module again. Run
+either script on its own and it exits non-zero with `error TS2307: Cannot find module
+'../.generated/shop-error-codes'` — the module is simply absent, which says nothing about
+exhaustiveness. That distinction is itself asserted rather than left to a reader: the exhaustive
+project's failure is required to carry `TS2322` and **not** `TS2307`, so a missing module can never be
+mistaken for the evidence. Run them through `npm run e2e` instead, which is where the window exists —
+and where the resolved compiler is asserted to be the version the workspace pins.

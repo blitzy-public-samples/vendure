@@ -13,12 +13,14 @@
  * enables it only while it populates. Every functional sibling suite therefore runs against a synchronised
  * schema and never touches the migration file. This suite constructs the migration path itself.
  *
- * The engine scope is split, and the split is documented rather than incidental. Obligation 3 and the
- * declaring half of obligation 2 read the artefact's own text, so they run on every engine. The cycle and
- * the catalogue and refusal halves EXECUTE the artefact, and the artefact is the migration generator's
- * PostgreSQL output — engine-specific by construction, which plan section 0.2.3.1 records as a known
- * limitation of the form section 0.5.2.2 prescribes — so those run on PostgreSQL alone. See
- * {@link MIGRATION_GENERATION_ENGINE} for what that does and does not leave unexercised.
+ * **Every obligation in this file runs on every engine**, and the thing that differs between engines is the
+ * artefact, not the coverage. The declaring halves read the CHECKED-IN file's own text, which is one
+ * generation and therefore one dialect. The cycle and the catalogue and refusal halves EXECUTE a migration,
+ * and the one they execute is chosen the way a deployment chooses it: the checked-in artefact where its
+ * dialect matches the connection, and otherwise **the migration this engine's own lifecycle emits**, produced
+ * through `generateMigration` from the same two entity classes. See {@link MIGRATION_UNDER_TEST_CITATION} for
+ * why that is the honest shape of a four-engine obligation rather than a weakening of it, and
+ * `describe('the migration this engine applies')` for the case that states which artefact ran and why.
  *
  * What they are not is concurrency evidence: these are sequential single writes rather than interleavings
  * (EPIC-001 section 11.6.3, whose ruling is that "the four-job list is the default for every sequential,
@@ -28,17 +30,25 @@
  *
  * ## The schema under test is always the migration's own — read this before changing anything below
  *
- * **There is no schema-builder fallback in this file, on any engine that executes here.** The migration
- * under test is the output of the platform migration generator, which serialises the statements the schema
- * builder logged into `queryRunner.query(<SQL>)` calls (`packages/core/src/migrate.ts:L127-L179`). Every
+ * **There is no schema-builder fallback in this file, on any engine.** The migration under test is always
+ * the output of the platform migration generator, which serialises the statements the schema builder logged
+ * into `queryRunner.query(<SQL>)` calls (`packages/core/src/migrate.ts:L127-L179`) — either the generation
+ * that is checked in, or the generation this engine's own lifecycle produces at the top of the run. Every
  * executing assertion below reads a schema that `runMigrations` created from those statements, and the suite
- * fails rather than substituting anything if it did not.
+ * fails rather than substituting anything if it did not. **Nothing here hand-writes DDL and nothing here may:
+ * the lifecycle is the only sanctioned mechanism** (EPIC-001 section 7.8).
  *
- * **Why nothing has to be arranged between the two connections here.** `runMigrations` builds its own data
- * source (`packages/core/src/migrate.ts:L42`), so the connection that applies the migration is not the
- * connection that reads the result. On the generation engine both address the same physical database, so the
- * apply is observable to this file's assertions without any arrangement. The harness's own cached snapshot
- * under `e2e/__data__` is never written to.
+ * **How the two connections hand the database over.** `runMigrations` builds its own data source
+ * (`packages/core/src/migrate.ts:L42`), so the connection that applies a migration is never the connection
+ * that reads the result. On the three server engines both address the same physical database and the apply is
+ * observable immediately. On the SQLite family they do not: the in-process engine's "database" is a file, two
+ * connections each hold their own copy of it in memory, and the harness's connection has auto-save disabled
+ * once populating is finished — so an apply on one connection is invisible to the other unless the file itself
+ * is the medium. This file therefore works against a **temporary copy of the seeded snapshot with auto-save
+ * on**, and closes its own assertion connection around every migration entry-point call so the file is handed
+ * over cleanly in both directions ({@link migrationTargetHandedOver}). Two consequences are deliberate: the
+ * harness's cached snapshot under `e2e/__data__` is **never written to**, so a later run still starts from a
+ * schema with no plugin table in it; and the copy is removed in `afterAll`.
  *
  * **Half one of each named-object claim reads the artefact's text, because the artefact IS the DDL.** An
  * emitted migration spells every column and its width, every named unique, index and check, every cascading
@@ -59,28 +69,29 @@
  *
  * **This is conflict C-E in the plan's section 0.8.3.5, it requires a maintainer ruling, and it is NOT
  * settled.** This suite therefore records the gap as the positive statement of a known limitation on the
- * MySQL family, and never skips the assertion. It also localises the gap precisely: **the checked-in
- * PostgreSQL emission carries both named checks**, inline in its two `CREATE TABLE` statements, and the text
- * assertions that read them run wherever this file does. What the MySQL family loses is upstream of any
- * migration — a check never reaches the statement log there, so a file generated for it carries none. Where
- * the invariant is upheld instead: the quantity bound by
- * the service-level `UserInputError` on every write path, and the `lineCount` floor by the service's
- * conditional counter update together with its compare-and-set repair. Both are portable and neither
- * depends on a check constraint existing on any engine.
+ * MySQL family, and never skips the assertion. It also localises the gap precisely, and now measures the
+ * localisation on each engine rather than inferring it: **the checked-in PostgreSQL emission carries both
+ * named checks**, inline in its two `CREATE TABLE` statements, and the text assertions that read them run
+ * wherever this file does — while the MySQL family's own emission, generated here at the top of the run,
+ * carries neither, because a check never reaches the statement log there at all. Where the invariant is upheld
+ * instead: the quantity bound by the service-level `UserInputError` on every write path, and the `lineCount`
+ * floor by the service's conditional counter update together with its compare-and-set repair. Both are
+ * portable and neither depends on a check constraint existing on any engine.
  *
  * Named `UNIQUE` constraints behave differently and better: the MySQL family turns each into a named unique
  * **index**, preserving both the exact name and the uniqueness guarantee. So the two `UQ_` names and the
  * `IDX_` name are asserted present under their exact names through the engine's own catalogue rather than
  * through one portable "constraint type" lookup, because the catalogue object class differs while the name
  * and the guarantee do not. A reader for each family is implemented — `pg_constraint` and `pg_indexes`,
- * `sqlite_master`, `information_schema.STATISTICS` — and the one that runs here is PostgreSQL's; each other
- * family's reader is exercised where that family's own emission is applied, through
- * `withIsolatedMigrationState` in `e2e/fixtures/migration-state.ts`.
+ * `sqlite_master`, `information_schema.STATISTICS` and `information_schema.TABLE_CONSTRAINTS` — and **each
+ * one runs on its own family**, against the schema that family's own migration built.
  *
  * ## Lifecycle and isolation (EPIC-001 section 11.6.1)
  *
  * One `TestServer`, created and initialised in `beforeAll` under `TEST_SETUP_TIMEOUT_MS`, with
- * `await server.destroy()` called **unconditionally** in `afterAll`. Every query runner and every data
+ * `await server.destroy()` **attempted unconditionally** in `afterAll` — through `attemptEveryCleanup`, so
+ * that a failure releasing the generated migration's directory or the snapshot copy cannot be what leaks a
+ * listening port into the next file. Every query runner and every data
  * source this file opens is released in a `finally`. Each test seeds only its own fixture and `afterEach`
  * removes every row it created, `reorder_list_line` **before** `reorder_list`, so a foreign key is never
  * what fails a cleanup. `process.exitCode` and the platform's module-level configuration are both mutated by
@@ -108,17 +119,16 @@ import {
     DataSource,
     DataSourceOptions,
     getMetadataArgsStorage,
+    MigrationInterface,
     QueryRunner,
     Table,
-    TableColumn,
     TableForeignKey,
 } from 'typeorm';
-import ts from 'typescript';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
-import { ReorderList, ReorderListLine, ReorderPlugin } from '../index';
+import { ReorderList, ReorderListLine, ReorderPlugin, reorderPluginMigrations } from '../index';
 import { AddReorderLists1786838400000 } from '../src/migrations/1786838400000-add-reorder-lists';
 
 import {
@@ -126,6 +136,13 @@ import {
     NO_ROW_DIFFERENCE,
     redactTeardownDiagnostic,
 } from './fixtures/diagnostic-redaction';
+import {
+    attemptEveryCleanup,
+    committedMigrationApplies,
+    extractGeneratedStatements,
+    generateLifecycleMigration,
+    LifecycleMigration,
+} from './fixtures/migration-state';
 import { resolveConfiguredEngine } from './fixtures/query-capture';
 
 const MIGRATIONS_DIR = path.join(__dirname, '../src/migrations');
@@ -147,138 +164,37 @@ const BUILT_MIGRATION_GLOB_DIR = path.join(__dirname, '../lib/src/migrations');
  */
 const DEV_CONFIG_FILE_PATH = path.join(__dirname, '../../dev-server/dev-config.ts');
 
-const LAYOUT_SELECTOR_NAME = 'selectReorderPluginMigrationGlob';
+/**
+ * The CHECKED-IN migration's class name, **derived from the imported class rather than restated as a
+ * string**.
+ *
+ * A rename therefore breaks this file at compile time instead of silently weakening an assertion. This is the
+ * name every assertion about the artefact's own TEXT uses; the name TypeORM records in its bookkeeping table
+ * is {@link migrationUnderTestName}, which is this one on the engine the artefact was generated for and the
+ * generated class's own name elsewhere.
+ */
+const SHIPPED_MIGRATION_CLASS_NAME = AddReorderLists1786838400000.name;
 
 /**
- * A package root that exists nowhere, used to ask the selector about layouts this machine is not in.
+ * The text of `dbConnectionOptions: { … }` as `packages/dev-server/dev-config.ts` declares it.
  *
- * The selector takes its existence test as an argument precisely so that an installed package and an unbuilt
- * checkout can both be exercised from a built checkout, and a path that cannot accidentally exist keeps the
- * injected answer the only thing the selector can be responding to.
+ * Read as text rather than by importing the configuration, because the dev-server package cannot be imported
+ * from here — it pulls in `@vendure/dashboard/plugin` and two other packages that need not be built in this
+ * environment, so an import fails at module load for reasons that have nothing to do with migrations. What
+ * the assertions want anyway is the DECLARATION rather than the resolved value: whether a key sits before or
+ * after the engine spread is invisible once the object is evaluated, and it is precisely what decides which
+ * of the two wins.
+ *
+ * @param devConfigSource - The whole file's text.
+ * @returns The slice from `dbConnectionOptions: {` to the closing brace of that object.
  */
-const SELECTOR_PROBE_ROOT = path.join(path.sep, 'nonexistent-probe-root', 'reorder-plugin');
-
-type LayoutSelector = (packageRoot: string, directoryExists: (candidate: string) => boolean) => string[];
-
-let extractedLayoutSelector: LayoutSelector | undefined;
-
-/**
- * Every temporary directory {@link devConfigLayoutSelector} created, so that every one of them is removed.
- *
- * ★ IT IS A LIST AND IT IS APPENDED TO BEFORE THE DIRECTORY IS USED. The memoisation above means one directory
- * per run on the ordinary path, but "one" is a property of the happy path rather than of the code: a failure
- * between creating the directory and assigning the memo leaves the memo unset and the next call creates
- * another. Recording the path the instant it exists — before anything is written into it, and before anything
- * that can throw — is what makes the teardown's coverage independent of which step failed.
- */
-const temporaryModuleDirectories: string[] = [];
-
-/**
- * Removes every directory {@link devConfigLayoutSelector} created, whatever happened in the cases that used
- * them.
- *
- * ★ WHY THIS MATTERS BEYOND TIDINESS. What is written into those directories is an EXECUTABLE module — source
- * transpiled out of `dev-server/dev-config.ts` at run time and then `require`d. Leaving it behind leaves a
- * loadable `.js` file, named predictably, in a world-readable temporary directory on whatever machine ran the
- * suite, once per run, indefinitely: a CI worker accumulates them and a shared host lets anything that can
- * read `/tmp` read them. Removing them is therefore part of the test's contract rather than housekeeping.
- *
- * ★ AND IT IS SAFE TO REMOVE A MODULE THAT WAS REQUIRED. Node caches the evaluated module in `require.cache`
- * keyed on the resolved path, so the selector this suite holds keeps working after its file is gone; nothing
- * re-reads it.
- *
- * Declared at the file's top level rather than inside the suite, so it runs even if the suite's own teardown
- * throws — and `force` is set so a directory something else already removed is not an error.
- */
-afterAll(async () => {
-    const directories = temporaryModuleDirectories.splice(0, temporaryModuleDirectories.length);
-    extractedLayoutSelector = undefined;
-    let survivors = 0;
-    for (const directory of directories) {
-        try {
-            await fs.remove(directory);
-        } catch {
-            // ★ THE FAILURE IS SWALLOWED AND THE OUTCOME IS NOT. `fs.remove`'s own error carries the
-            // ABSOLUTE PATH it could not remove, and this hook runs in a build log — a path is a disclosure
-            // about the host that the assertion has no use for. Nothing is lost by dropping it: the
-            // existence check below is what decides whether the removal worked, and it is checked for every
-            // directory whether or not the call raised.
-        }
-        // ASSERTED, NOT ASSUMED. A removal that silently did nothing would leave the executable behind and
-        // nothing would say so, so the suite checks its own cleanup and fails if anything survived. Every
-        // directory is attempted before the failure is raised, so one stubborn path cannot strand the others.
-        if (await fs.pathExists(directory)) {
-            survivors += 1;
-        }
-    }
-    // A COUNT, not the paths: `toEqual([...])` would print every surviving absolute path on failure. The
-    // count plus this message is enough to act on, since the directories are the suite's own `mkdtemp`
-    // children under the OS temporary directory.
-    expect(survivors, 'a transpiled selector module was left on disk').toBe(0);
-});
-
-/**
- * Reads the layout selector out of `packages/dev-server/dev-config.ts` and returns it as a callable function.
- *
- * **Why extraction rather than an import.** The decision under test lives in the dev-server package, which
- * cannot be imported from here: it pulls in `@vendure/dashboard/plugin` and two other packages that are not
- * built in this environment, so importing it fails at module load for reasons that have nothing to do with
- * migrations. Restating the selector in this file instead would assert only that the copy agrees with itself.
- * Extracting the declaration and executing it tests the shipped decision, and a rename or a rewrite of it
- * surfaces here as a failure rather than as a silently weakened assertion.
- *
- * @returns The selector, taking a package root and a directory-existence predicate.
- */
-async function devConfigLayoutSelector(): Promise<LayoutSelector> {
-    if (extractedLayoutSelector) {
-        return extractedLayoutSelector;
-    }
-    const source = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
-    const start = source.indexOf(`function ${LAYOUT_SELECTOR_NAME}(`);
-    expect(
-        start,
-        `${DEV_CONFIG_FILE_PATH} must declare ${LAYOUT_SELECTOR_NAME}, which is where the choice of ` +
-            'migration layout is made',
-    ).toBeGreaterThan(-1);
-    const bodyStart = source.indexOf('{', start);
-    let depth = 0;
-    let end = -1;
-    for (let index = bodyStart; index < source.length; index++) {
-        if (source[index] === '{') {
-            depth++;
-        } else if (source[index] === '}') {
-            depth--;
-            if (depth === 0) {
-                end = index + 1;
-                break;
-            }
-        }
-    }
-    expect(end, `${LAYOUT_SELECTOR_NAME} is not brace-balanced`).toBeGreaterThan(bodyStart);
-
-    const transpiled = ts.transpileModule(
-        `const path = require('path');\n${source.slice(start, end)}\n` +
-            `module.exports = ${LAYOUT_SELECTOR_NAME};\n`,
-        { compilerOptions: { target: ts.ScriptTarget.ES2019, module: ts.ModuleKind.CommonJS } },
-    ).outputText;
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-plugin-layout-'));
-    // REGISTERED BEFORE IT IS USED, so a failure in either of the two steps below still leaves it queued for
-    // removal. See {@link temporaryModuleDirectories}.
-    temporaryModuleDirectories.push(directory);
-    const modulePath = path.join(directory, 'layout-selector.js');
-    await fs.writeFile(modulePath, transpiled);
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    extractedLayoutSelector = require(modulePath) as LayoutSelector;
-    return extractedLayoutSelector;
+function dbConnectionOptionsBlockOf(devConfigSource: string): string {
+    const optionsStart = devConfigSource.indexOf('dbConnectionOptions: {');
+    expect(optionsStart, 'dev-config must declare dbConnectionOptions').toBeGreaterThan(-1);
+    const optionsEnd = devConfigSource.indexOf('\n    },', optionsStart);
+    expect(optionsEnd, 'the dbConnectionOptions object must be brace-balanced').toBeGreaterThan(optionsStart);
+    return devConfigSource.slice(optionsStart, optionsEnd);
 }
-
-/**
- * The migration's class name, **derived from the imported class rather than restated as a string**.
- *
- * A rename therefore breaks this file at compile time instead of silently weakening an assertion, and the
- * name TypeORM records in its own bookkeeping table is by construction the name asserted here.
- */
-const MIGRATION_CLASS_NAME = AddReorderLists1786838400000.name;
 
 /**
  * Query-runner table-API calls that must appear **nowhere** in the migration's text.
@@ -391,23 +307,17 @@ const CHK_LINE_QUANTITY_POSITIVE = 'CHK_reorder_list_line_quantity_positive';
 const CHK_LIST_LINE_COUNT_NON_NEGATIVE = 'CHK_reorder_list_line_count_non_negative';
 
 /**
- * The frozen name of the cascading reference from `reorder_list.customerId` to `customer.id`.
+ * The frozen names of the two cascading references whose referent is not implied by their own column.
+ *
+ * TypeORM derives a foreign-key name by hashing the table and column it is declared on, so the name is
+ * deterministic rather than arbitrary and identical in every engine's emission — which is exactly why it is
+ * worth pinning: a rename of either column silently produces a different name, and a migration whose `down()`
+ * drops a constraint by a name the `up()` no longer creates fails only when someone reverts. These two are
+ * pinned rather than all four because they are the two the down-path names explicitly.
  */
 const FK_LIST_CUSTOMER = 'FK_0c7c5c80bfaa5a02595fd089bb8';
 
 const FK_LINE_LIST = 'FK_19a7479a99a7bd9f3e3b6ecd97c';
-
-function bareSchemaOf(name: string): string | undefined {
-    const segments = name.split('.');
-    return segments.length > 1 ? segments[segments.length - 2] : undefined;
-}
-
-/** One named column of a catalogue reading, failing the case rather than throwing when it is absent. */
-function columnOf(table: Table, name: string): TableColumn {
-    const column = table.columns.find(candidate => candidate.name === name);
-    expect(column, `"${bareTableName(table.name)}" carries no "${name}" column`).toBeDefined();
-    return column as TableColumn;
-}
 
 /** One named cascading reference of a catalogue reading, failing the case when it is absent. */
 function referenceOf(table: Table, name: string): TableForeignKey {
@@ -562,30 +472,41 @@ const GENERATED_FORM_CITATION =
     'statements the schema builder logged into queryRunner.query(<SQL>) calls ' +
     '(packages/core/src/migrate.ts:L127-L179), so the artefact is PostgreSQL DDL and is bound to that ' +
     'engine. Plan section 0.2.3.1 records that engine specificity as a known limitation of the form ' +
-    'section 0.5.2.2 prescribes. A deployment on another engine generates its own file the same way from ' +
-    'the same two entity classes, so the executing evidence in this file runs on PostgreSQL and is skipped ' +
-    'elsewhere — the same engine-conditional treatment section 0.7.5 prescribes for the check constraints.';
+    'section 0.5.2.2 prescribes.';
 
 /**
- * The engine the shipped migration was generated against, and therefore the only one it applies on.
+ * Which artefact this run executes, and why that is the whole four-engine obligation rather than part of it.
  *
- * Resolved from the run's own configuration at collection time, because `describe.skipIf` is evaluated then
- * and a value read inside `beforeAll` would arrive too late to skip anything. The consequence is that this
- * file has two halves with different engine scopes: the artefact's text is read on every engine, and its
- * statements are executed on PostgreSQL alone. Plan section 0.7.5 prescribes exactly this treatment for the
- * two check constraints, and the reason it now reaches the executing evidence as well is
- * {@link GENERATED_FORM_CITATION} — an emitted migration is engine-specific by construction, which plan
- * section 0.2.3.1 records as a known limitation rather than something to discover in CI. A deployment on
- * another engine generates its own file from the same two entity classes, so what goes unexercised elsewhere
- * is the serialisation and never the schema: every named object, column, width and referential action is also
- * asserted from the text, and the schema the plugin's functional suites run against is the schema builder's.
+ * Carried into the messages of every executing assertion, so a reader looking at a failure knows which file's
+ * statements produced the schema being complained about — the two answers are spelled differently and fail
+ * differently, and guessing between them is the one thing a failure here must not require.
+ *
+ * The reasoning: one generation carries the DDL of exactly one engine, so the checked-in artefact applies on
+ * the engine it was generated for and nowhere else ({@link GENERATED_FORM_CITATION}). Skipping the executing
+ * evidence elsewhere would leave plan section 0.7.5's four-engine cycle claim unmeasured on three engines.
+ * Hand-adding dialect branches to the artefact is forbidden outright (EPIC-001 section 7.8: the lifecycle is
+ * the only sanctioned mechanism). What remains is what a DEPLOYMENT on another engine does — generate its own
+ * file from the same two entity classes through the same `generateMigration` entry point, and run that. So
+ * this suite does exactly that, at the top of the run, against the same core-only schema the assertions then
+ * read. What differs by engine is therefore the serialisation under test and never the coverage.
  */
-const MIGRATION_GENERATION_ENGINE = 'postgres';
+const MIGRATION_UNDER_TEST_CITATION =
+    'The migration under test is chosen the way a deployment chooses it: the CHECKED-IN artefact where its ' +
+    "dialect matches this connection, and otherwise the migration THIS ENGINE'S OWN LIFECYCLE emits, " +
+    'generated at the top of this run by generateMigration from the same two entity classes and applied ' +
+    'through the same runMigrations entry point. Nothing here hand-writes DDL. See the provenance case in ' +
+    "describe('the migration this engine applies') for which of the two ran.";
 
 const activeConfiguredEngine = String((testConfig().dbConnectionOptions as unknown as { type: string }).type);
 
-/** Whether this run can execute the shipped artefact, as opposed to only reading it. */
-const appliesShippedMigration = activeConfiguredEngine === MIGRATION_GENERATION_ENGINE;
+/**
+ * Whether this run executes the CHECKED-IN artefact, as opposed to the one this engine's lifecycle emits.
+ *
+ * Read through the predicate five sibling suites share, so the dialect question has exactly one authority in
+ * the package rather than a second spelling here. It no longer gates anything — every executing describe runs
+ * on every engine — and is asserted against the observed provenance instead.
+ */
+const appliesShippedMigration = committedMigrationApplies(activeConfiguredEngine);
 
 /** The TypeORM engine identifiers of the MySQL family, on which TypeORM 0.3.28 skips check constraints. */
 const MYSQL_FAMILY_ENGINES: readonly string[] = ['mysql', 'mariadb'];
@@ -601,71 +522,6 @@ function isMysqlFamily(engine: string): boolean {
 /** Whether the given engine stores its schema as parseable DDL text in `sqlite_master`. */
 function isSqliteFamily(engine: string): boolean {
     return SQLITE_FAMILY_ENGINES.indexOf(engine) !== -1;
-}
-
-/** The TypeORM engine identifiers whose catalogue answers a deferrability question through `pg_catalog`. */
-const POSTGRES_FAMILY_ENGINES: readonly string[] = ['postgres', 'aurora-postgres'];
-
-/** Whether the given engine records constraint deferrability in `pg_constraint`. */
-function isPostgresFamily(engine: string): boolean {
-    return POSTGRES_FAMILY_ENGINES.indexOf(engine) !== -1;
-}
-
-/**
- * What enforcement timing the ENGINE ITSELF holds for one named constraint, read independently of both
- * TypeORM's generic table view and the migration under test.
- *
- * @param queryRunner - A runner on the assertion connection.
- * @param table - The bare table name the constraint belongs to.
- * @param name - The constraint's name.
- * @returns The deferrability clause the engine holds, `'NOT DEFERRABLE'` when it holds none, or `undefined`
- *   on an engine whose catalogue this oracle does not read — which is every engine whose grammar refuses the
- *   clause outright, so there is nothing there to read.
- */
-async function liveEnforcementTiming(
-    queryRunner: QueryRunner,
-    table: string,
-    name: string,
-): Promise<string | undefined> {
-    const engine = resolveConfiguredEngine();
-    if (isPostgresFamily(engine)) {
-        const rows: Array<{ deferrable: unknown; deferred: unknown }> = await queryRunner.query(
-            'SELECT "con"."condeferrable" AS "deferrable", "con"."condeferred" AS "deferred" ' +
-                'FROM "pg_catalog"."pg_constraint" "con" ' +
-                'INNER JOIN "pg_catalog"."pg_class" "cls" ON "cls"."oid" = "con"."conrelid" ' +
-                'WHERE "cls"."relname" = $1 AND "con"."conname" = $2',
-            [table, name],
-        );
-        if (!rows.length) {
-            return undefined;
-        }
-        return rows[0].deferrable === true
-            ? rows[0].deferred === true
-                ? 'INITIALLY DEFERRED'
-                : 'INITIALLY IMMEDIATE'
-            : 'NOT DEFERRABLE';
-    }
-    if (isSqliteFamily(engine)) {
-        const rows: Array<{ ddl: string | null }> = await queryRunner.query(
-            'SELECT "sql" AS "ddl" FROM "sqlite_master" WHERE "name" = ?',
-            [table],
-        );
-        const ddl = rows[0]?.ddl;
-        if (!ddl) {
-            return undefined;
-        }
-        const marker = `CONSTRAINT "${name}"`;
-        const at = ddl.indexOf(marker);
-        if (at < 0) {
-            return undefined;
-        }
-        const rest = ddl.slice(at + marker.length);
-        const next = rest.indexOf('CONSTRAINT "');
-        const segment = next < 0 ? rest : rest.slice(0, next);
-        const deferred = /\bDEFERRABLE\s+INITIALLY\s+(DEFERRED|IMMEDIATE)\b/i.exec(segment);
-        return deferred ? `INITIALLY ${deferred[1].toUpperCase()}` : 'NOT DEFERRABLE';
-    }
-    return undefined;
 }
 
 /**
@@ -739,12 +595,25 @@ function emittedStatements(source: string, direction: 'up' | 'down'): string[] {
     return statements;
 }
 
+/**
+ * The tables one verb addresses, in the order the statements were serialised, **whatever quotes them**.
+ *
+ * The quoting has to be part of the pattern rather than assumed, because this reads two different emissions.
+ * PostgreSQL and the SQLite family quote an identifier with `"`; the MySQL family quotes it with a backtick,
+ * and a pattern that only knew about `"` would silently match nothing there and report an empty list — which
+ * reads as "the migration creates no table" rather than as "this helper cannot read this dialect".
+ *
+ * @param statements - The serialised statements, in order.
+ * @param verb - The addressing verb, e.g. `CREATE TABLE`.
+ */
 function tablesInOrder(statements: readonly string[], verb: string): string[] {
     const names: string[] = [];
     for (const statement of statements) {
-        const match = new RegExp(`${verb} "([^"]+)"`).exec(statement);
+        const match = new RegExp(`${verb} (?:IF (?:NOT )?EXISTS )?(?:"([^"]+)"|\`([^\`]+)\`)`).exec(
+            statement,
+        );
         if (match !== null) {
-            names.push(match[1]);
+            names.push(match[1] ?? match[2]);
         }
     }
     return names;
@@ -1032,8 +901,39 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     /** The configuration the migration lifecycle is driven with. Built in `beforeAll`, never at module load. */
     let migrationConfig: Required<VendureConfig>;
 
+    /**
+     * The migration class this run applies — the checked-in artefact, or this engine's own emission.
+     *
+     * See {@link MIGRATION_UNDER_TEST_CITATION}. Held as a class rather than as a glob for the reason
+     * `beforeAll` states, and named by {@link migrationUnderTestName} wherever an assertion needs the string
+     * TypeORM records in its bookkeeping table.
+     */
+    let migrationUnderTest: new () => MigrationInterface;
+
+    /** The name TypeORM records as applied, which is {@link migrationUnderTest}'s own class name. */
+    let migrationUnderTestName: string;
+
+    /** Which of the two artefacts {@link migrationUnderTest} is, observed rather than assumed. */
+    let migrationProvenance: 'committed-migration' | 'lifecycle-generated';
+
+    /**
+     * The generated migration, on the engines that need one — its class, its text and its temporary directory.
+     *
+     * `undefined` where the checked-in artefact applied, which is the same fact
+     * {@link migrationProvenance} carries and is why the provenance case asserts the two agree.
+     */
+    let generatedMigration: LifecycleMigration | undefined;
+
     /** The data source this file owns. Every shape read, raw read and direct write below goes through it. */
     let assertionDataSource: DataSource;
+
+    /**
+     * The temporary directory holding the SQLite-family snapshot copy, or `undefined` on a server engine.
+     *
+     * Removed in `afterAll`. Its existence is what keeps the harness's cached snapshot under `e2e/__data__`
+     * unwritten — see the file header.
+     */
+    let migrationTargetDirectory: string | undefined;
 
     /** Portable identifier quoting for the raw reads, taken from {@link assertionDataSource}'s own driver. */
     let esc: (name: string) => string;
@@ -1378,6 +1278,99 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         }
     }
 
+    /**
+     * The configuration this file drives the migration lifecycle with, pointed at the migration target.
+     *
+     * The plugin is always registered, because everything asked of this configuration is a question about its
+     * two entity declarations. Only `migrations` varies: the generator must not be handed the migration it is
+     * being asked to decide the need for, and the apply must be handed exactly one.
+     *
+     * **The migration is a CLASS rather than a glob, and the reason is environmental rather than stylistic.**
+     * TypeORM resolves a directory glob with `PlatformTools.load`, which is Node's own `require`; under this
+     * runner TypeORM is an externalised CommonJS dependency, so its `require` has no TypeScript loader
+     * registered and a `*.ts` glob resolves to nothing. The shipped command-line suite gets away with one only
+     * because it registers `ts-node` first (`packages/cli/src/shared/load-vendure-config-file.ts`), which this
+     * file must not do — it is a process-wide require hook every sibling suite in the worker would inherit.
+     * The class reference is also the stronger evidence: where it is the checked-in artefact it is imported
+     * from the very path under test, so what applied is provably that file's export, and where it is a
+     * generated one it is the class loaded out of the file the generator just wrote. A glob could match a
+     * second file or none. The glob's own contract is asserted separately, against the directory listing.
+     *
+     * @param targetConnectionOptions - The migration target's connection options, resolved in `beforeAll`.
+     * @param migrations - The migration classes to register, which is none or exactly one.
+     */
+    function migrationTargetConfig(
+        targetConnectionOptions: Record<string, unknown>,
+        migrations: Array<new () => MigrationInterface>,
+    ): Required<VendureConfig> {
+        return {
+            ...serverConfig,
+            plugins: [ReorderPlugin.init(DECLARED_OPTIONS)],
+            dbConnectionOptions: {
+                ...targetConnectionOptions,
+                synchronize: false,
+                migrations,
+            } as unknown as DataSourceOptions,
+        };
+    }
+
+    /**
+     * Opens the data source this file reads and writes the migration target through.
+     *
+     * `preBootstrapConfig` must run immediately before the data source is built. It resolves the plugin's
+     * entities into `dbConnectionOptions.entities` and applies the configured `EntityIdStrategy` to their
+     * `@EntityId()` columns (`packages/core/src/bootstrap.ts:L294-L314`). It also re-establishes the
+     * platform's module-level configuration, which every migration entry point resets in its own `finally`
+     * (`packages/core/src/migrate.ts:L63`) — and that matters here for one specific reason:
+     * `ReorderList.nameKey` carries an engine-resolved collation read through `getConfig()` when column
+     * metadata is built, so a data source created while the configuration sat at its default would ask for a
+     * MySQL collation on every engine.
+     */
+    async function openAssertionDataSource(): Promise<void> {
+        const resolved = await preBootstrapConfig(migrationConfig);
+        assertionDataSource = new DataSource({
+            ...resolved.dbConnectionOptions,
+            synchronize: false,
+            migrationsRun: false,
+            dropSchema: false,
+            // The same four overrides the platform's own migration entry points apply
+            // (`packages/core/src/migrate.ts:L197-L205`). Subscribers are dropped because they are Vendure's
+            // dependency-injected entity subscribers and nothing here resolves a Nest container.
+            subscribers: [],
+            logging: false,
+        } as DataSourceOptions);
+        await assertionDataSource.initialize();
+        esc = (name: string): string => assertionDataSource.driver.escape(name);
+    }
+
+    /**
+     * Hands the migration target over to a migration entry point and takes it back afterwards.
+     *
+     * **Required on the SQLite family and harmless everywhere else, so it is applied everywhere.** An
+     * in-process SQLite database is a FILE that each connection loads its own copy of, so two connections
+     * only ever agree through the file: this file's own connection has to be closed — flushing whatever it
+     * wrote — before the entry point's connection loads it, and reopened afterwards so it loads what the entry
+     * point wrote. On the three server engines both connections address the same physical database and no
+     * arrangement is needed, but closing is still worth doing there: a pooled connection held open across a
+     * revert is enough to make the `DROP TABLE` block rather than fail, which is a hang instead of a
+     * diagnostic.
+     *
+     * @param work - The entry-point call. Runs with this file's connection closed.
+     */
+    async function migrationTargetHandedOver<T>(work: () => Promise<T>): Promise<T> {
+        const wasOpen = assertionDataSource !== undefined && assertionDataSource.isInitialized;
+        if (wasOpen) {
+            await assertionDataSource.destroy();
+        }
+        try {
+            return await work();
+        } finally {
+            if (wasOpen) {
+                await openAssertionDataSource();
+            }
+        }
+    }
+
     /** Applies pending migrations, reading the exit code the platform leaves behind and then restoring it. */
     async function applyMigrationsGuarded(): Promise<GuardedMigrationOutcome> {
         const saved = process.exitCode;
@@ -1385,7 +1378,7 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         let migrationsRan: string[] = [];
         let observedExitCode: number | string | undefined;
         try {
-            migrationsRan = await runMigrations(migrationConfig);
+            migrationsRan = await migrationTargetHandedOver(() => runMigrations(migrationConfig));
         } finally {
             observedExitCode = process.exitCode;
             process.exitCode = saved;
@@ -1404,7 +1397,7 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         process.exitCode = undefined;
         let observedExitCode: number | string | undefined;
         try {
-            await revertLastMigration(migrationConfig);
+            await migrationTargetHandedOver(() => revertLastMigration(migrationConfig));
         } finally {
             observedExitCode = process.exitCode;
             process.exitCode = saved;
@@ -1427,103 +1420,123 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         const rawConnection = server.app.get(TransactionalConnection).rawConnection;
         activeEngine = rawConnection.options.type;
 
-        // Everything below applies the shipped artefact, and the artefact is PostgreSQL DDL — see
-        // {@link MIGRATION_GENERATION_ENGINE}. On any other engine the four executing describes are skipped,
-        // so none of this arrangement would have a reader: the artefact's own text was loaded above, and the
-        // remaining halves read the migration source, the package layout and the dev-server configuration off
-        // the filesystem. The server is still created here and still destroyed in `afterAll`, because the
-        // harness contract is one server per file either way.
-        if (!appliesShippedMigration) {
-            return;
+        // STEP ONE — THE MIGRATION TARGET, which is the database every executing assertion below reads.
+        //
+        // On the three server engines it is the suite's own database, addressed exactly as the harness left
+        // it: a migration connection and this file's connection reach the same physical database, so there is
+        // nothing to arrange.
+        //
+        // On the SQLite family it CANNOT be. The engine's "database" is a file that each connection loads its
+        // own copy of, and the initializer disables auto-save once populating is finished
+        // (`packages/testing/src/initializers/sqljs-initializer.ts`), so a migration applied on the entry
+        // point's own connection would be discarded when that connection closed and this file would observe
+        // nothing. Turning auto-save on for the harness's own `location` is worse than useless: it would write
+        // the plugin tables into the CACHED SNAPSHOT under `e2e/__data__`, and the next run of this file would
+        // load a schema that already carried them — failing the up-path precondition below for a reason
+        // nothing in the file explains. So the seeded snapshot is COPIED to a temporary file, auto-save is
+        // enabled on the copy, and the copy is what both connections address and what `afterAll` removes.
+        const harnessConnectionOptions = serverConfig.dbConnectionOptions as unknown as Record<
+            string,
+            unknown
+        >;
+        let targetConnectionOptions: Record<string, unknown> = {
+            ...harnessConnectionOptions,
+            logging: false,
+        };
+        if (isSqliteFamily(activeEngine)) {
+            migrationTargetDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-migration-target-'));
+            const snapshotCopy = path.join(migrationTargetDirectory, 'migration-target.sqlite');
+            await fs.copy(String(harnessConnectionOptions.location), snapshotCopy);
+            targetConnectionOptions = {
+                ...targetConnectionOptions,
+                location: snapshotCopy,
+                autoSave: true,
+            };
         }
 
-        const escapeOnServer = (name: string): string => rawConnection.driver.escape(name);
-
-        const queryRunner = rawConnection.createQueryRunner();
+        // STEP TWO — THE PRECONDITION AND THE KNOWN-GOOD BASELINE, both read off the TARGET rather than off
+        // the server, so that on the SQLite family they describe the copy the cycle will actually run against
+        // rather than the snapshot it was taken from.
+        const baselineConfig = migrationTargetConfig(targetConnectionOptions, []);
+        const baselineResolved = await preBootstrapConfig(baselineConfig);
+        const baselineDataSource = new DataSource({
+            ...baselineResolved.dbConnectionOptions,
+            synchronize: false,
+            migrationsRun: false,
+            dropSchema: false,
+            subscribers: [],
+            logging: false,
+        } as DataSourceOptions);
+        await baselineDataSource.initialize();
         try {
-            // THE PRECONDITION THE UP-PATH NEEDS, observed rather than assumed. The harness configuration
-            // registers no plugin, so the initializer synchronised the core schema alone and neither plugin
-            // table can exist yet. If one did, the apply below would fail on an object that already exists and
-            // every assertion after it would be measuring the wrong thing.
-            pluginTablesBeforeAnyApply = [];
-            for (const table of PLUGIN_TABLES_CHILD_FIRST) {
-                if (await queryRunner.hasTable(table)) {
-                    pluginTablesBeforeAnyApply.push(table);
+            const escapeOnTarget = (name: string): string => baselineDataSource.driver.escape(name);
+            const queryRunner = baselineDataSource.createQueryRunner();
+            try {
+                // THE PRECONDITION THE UP-PATH NEEDS, observed rather than assumed. The harness configuration
+                // registers no plugin, so the initializer synchronised the core schema alone and neither
+                // plugin table can exist yet. If one did, the apply below would fail on an object that already
+                // exists — and the generator would find nothing to emit — so every assertion after it would be
+                // measuring the wrong thing.
+                pluginTablesBeforeAnyApply = [];
+                for (const table of PLUGIN_TABLES_CHILD_FIRST) {
+                    if (await queryRunner.hasTable(table)) {
+                        pluginTablesBeforeAnyApply.push(table);
+                    }
+                }
+
+                // THE KNOWN-GOOD BASELINE. Whole rows, not counts: the revert assertion is that every seeded
+                // core row survives field for field, and a count survives a down-path that corrupted a column.
+                for (const table of REFERENCED_CORE_TABLES) {
+                    baselineCoreRows[table] = normaliseRows(
+                        await queryRunner.query(
+                            `SELECT * FROM ${escapeOnTarget(table)} ORDER BY ${escapeOnTarget('id')} ASC`,
+                        ),
+                    );
+                    const coreTable = await queryRunner.getTable(table);
+                    expect(coreTable, `the seeded schema carries no "${table}" table`).toBeDefined();
+                    baselineCoreTableShapes[table] = describeTable(coreTable as Table);
+                }
+            } finally {
+                if (!queryRunner.isReleased) {
+                    await queryRunner.release();
                 }
             }
-
-            // THE KNOWN-GOOD BASELINE. Whole rows, not counts: the revert assertion is that every seeded core
-            // row survives field for field, and a count survives a down-path that corrupted a column.
-            for (const table of REFERENCED_CORE_TABLES) {
-                baselineCoreRows[table] = normaliseRows(
-                    await queryRunner.query(
-                        `SELECT * FROM ${escapeOnServer(table)} ORDER BY ${escapeOnServer('id')} ASC`,
-                    ),
-                );
-                const coreTable = await queryRunner.getTable(table);
-                expect(coreTable, `the seeded schema carries no "${table}" table`).toBeDefined();
-                baselineCoreTableShapes[table] = describeTable(coreTable as Table);
-            }
         } finally {
-            if (!queryRunner.isReleased) {
-                await queryRunner.release();
-            }
+            await baselineDataSource.destroy();
         }
 
         seededCustomerIds = baselineCoreRows.customer.map(row => Number(row.id));
         seededChannelId = Number(baselineCoreRows.channel[0].id);
         seededVariantIds = baselineCoreRows.product_variant.map(row => Number(row.id));
 
+        // STEP THREE — THE MIGRATION UNDER TEST. See {@link MIGRATION_UNDER_TEST_CITATION}: the checked-in
+        // artefact where its dialect matches this connection, and otherwise the one this engine's own
+        // lifecycle emits — generated from the core-only schema just observed above, which is the same
+        // precondition a deployment generating its first migration has. The generator is handed a
+        // configuration WITHOUT the migration registered, or it would be diffing against a schema it is
+        // about to be asked to create.
+        if (committedMigrationApplies(activeEngine)) {
+            migrationUnderTest = AddReorderLists1786838400000;
+            migrationProvenance = 'committed-migration';
+        } else {
+            generatedMigration = await generateLifecycleMigration(baselineConfig, 'add-reorder-lists');
+            migrationUnderTest = generatedMigration.migrationClass;
+            migrationProvenance = 'lifecycle-generated';
+        }
+        migrationUnderTestName = migrationUnderTest.name;
+
         // From this point the plugin-less server is NOT USED AGAIN — every statement below goes through the
-        // data source this file owns. The plan permits "destroy or stop using", and stopping using it is the
-        // choice taken deliberately: `afterAll` owes the contract exactly one unconditional
-        // `await server.destroy()`, and destroying here as well would run every module's shutdown hook twice.
-        migrationConfig = {
-            ...serverConfig,
-            plugins: [ReorderPlugin.init(DECLARED_OPTIONS)],
-            dbConnectionOptions: {
-                ...serverConfig.dbConnectionOptions,
-                synchronize: false,
-                // THE MIGRATION CLASS RATHER THAN A GLOB, and the reason is environmental rather than
-                // stylistic. TypeORM resolves a directory glob with `PlatformTools.load`, which is Node's own
-                // `require`; under this runner TypeORM is an externalised CommonJS dependency, so its `require`
-                // has no TypeScript loader registered and a `*.ts` glob resolves to nothing. The shipped
-                // command-line suite gets away with one only because it registers `ts-node` first
-                // (`packages/cli/src/shared/load-vendure-config-file.ts`), which this file must not do — it is a
-                // process-wide require hook every sibling suite in the worker would inherit. The class
-                // reference is also the stronger evidence: it is imported from the very path under test, so the
-                // artefact applied is provably that file's export, where a glob could match a second file or
-                // none. The glob's own contract is asserted separately, against the directory listing.
-                migrations: [AddReorderLists1786838400000],
-            } as DataSourceOptions,
-        };
+        // data source this file owns, addressing the target resolved in step one. The plan permits "destroy or
+        // stop using", and stopping using it is the choice taken deliberately: `afterAll` owes the contract
+        // exactly one `server.destroy()`, attempted however the rest of the teardown ends, and destroying here
+        // as well would run every module's shutdown hook twice.
+        migrationConfig = migrationTargetConfig(targetConnectionOptions, [migrationUnderTest]);
 
         // THE FIRST APPLY. Recorded rather than asserted here, because an assertion in `beforeAll` reports as a
         // suite-wide setup error rather than as the named case that owns the claim.
         firstApply = await applyMigrationsGuarded();
 
-        // `preBootstrapConfig` must run immediately before the data source is built. It resolves the plugin's
-        // entities into `dbConnectionOptions.entities` and applies the configured `EntityIdStrategy` to their
-        // `@EntityId()` columns (`packages/core/src/bootstrap.ts:L294-L314`). It also re-establishes the
-        // platform's module-level configuration, which `runMigrations` resets in its own `finally`
-        // (`packages/core/src/migrate.ts:L63`) — and that matters here for one specific reason:
-        // `ReorderList.nameKey` carries an engine-resolved collation read through `getConfig()` when column
-        // metadata is built, so a data source created while the configuration sat at its default would ask for
-        // a MySQL collation on every engine.
-        const resolved = await preBootstrapConfig(migrationConfig);
-        assertionDataSource = new DataSource({
-            ...resolved.dbConnectionOptions,
-            synchronize: false,
-            migrationsRun: false,
-            dropSchema: false,
-            // The same four overrides the platform's own migration entry points apply
-            // (`packages/core/src/migrate.ts:L197-L205`). Subscribers are dropped because they are Vendure's
-            // dependency-injected entity subscribers and nothing here resolves a Nest container.
-            subscribers: [],
-            logging: false,
-        } as DataSourceOptions);
-        await assertionDataSource.initialize();
-        esc = (name: string): string => assertionDataSource.driver.escape(name);
+        await openAssertionDataSource();
 
         pluginTablesAfterFirstAttempt = await existingPluginTables();
 
@@ -1547,17 +1560,42 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     });
 
     afterAll(async () => {
-        try {
-            if (assertionDataSource !== undefined && assertionDataSource.isInitialized) {
-                await assertionDataSource.destroy();
-            }
-        } finally {
-            process.exitCode = ambientExitCode;
-            resetConfig();
-            // UNCONDITIONAL, and reached however the teardown above ends. A suite that destroys the server
-            // only on its success path leaks a listening port into the next file.
-            await server.destroy();
-        }
+        // EVERY STEP IS ATTEMPTED, rather than awaited in a chain. This teardown now releases five
+        // independent things — a data source, the generated migration's temporary directory, the snapshot
+        // copy's temporary directory, two pieces of mutated process state, and a listening server — and a
+        // chain of awaits would let the least important of them decide whether the most important one is
+        // released. The server is LAST and is still reached however the four before it end, which is the
+        // property that keeps a leaked port out of the next file.
+        await attemptEveryCleanup([
+            {
+                what: "closing this file's own data source",
+                run: async () => {
+                    if (assertionDataSource !== undefined && assertionDataSource.isInitialized) {
+                        await assertionDataSource.destroy();
+                    }
+                },
+            },
+            {
+                what: "removing the generated migration's output directory",
+                run: async () => generatedMigration?.dispose(),
+            },
+            {
+                what: 'removing the migration target directory',
+                run: async () => {
+                    if (migrationTargetDirectory !== undefined) {
+                        await fs.remove(migrationTargetDirectory);
+                    }
+                },
+            },
+            {
+                what: 'restoring the process exit code and the platform configuration',
+                run: () => {
+                    process.exitCode = ambientExitCode;
+                    resetConfig();
+                },
+            },
+            { what: 'destroying the test server', run: () => server.destroy() },
+        ]);
     });
 
     // Half one of every named-object claim — what the migration itself asks the engine for
@@ -1598,14 +1636,16 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
         it('declares the migration class the lifecycle applies, under the name TypeORM records', () => {
             expect(migrationSource).toContain(
-                `export class ${MIGRATION_CLASS_NAME} implements MigrationInterface`,
+                `export class ${SHIPPED_MIGRATION_CLASS_NAME} implements MigrationInterface`,
             );
 
             // TypeORM orders migrations by the digits trailing the class name and records that name in its own
             // bookkeeping table, so the filename digits and the class-name digits must agree. A mismatch
             // silently reorders migrations rather than failing.
-            expect(MIGRATION_CLASS_NAME).toMatch(/\d+$/);
-            expect(MIGRATION_FILENAME.startsWith(MIGRATION_CLASS_NAME.replace(/^\D+/, ''))).toBe(true);
+            expect(SHIPPED_MIGRATION_CLASS_NAME).toMatch(/\d+$/);
+            expect(MIGRATION_FILENAME.startsWith(SHIPPED_MIGRATION_CLASS_NAME.replace(/^\D+/, ''))).toBe(
+                true,
+            );
         });
 
         it('is the generator emitted form, every statement issued through queryRunner.query', () => {
@@ -1761,8 +1801,8 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             // is what makes the claim hold wherever it is run. This claim is about the two entity CLASSES, so
             // it is engine-independent, but neither data source in this file can answer it on every engine:
             // the booted server deliberately registers no plugin at all, so it holds no metadata for these
-            // classes, and the plugin-registered `assertionDataSource` is built only on the engine the shipped
-            // artefact applies to. The args storage is the input `EntityMetadataBuilder` reads to produce that
+            // classes, and this file's own `assertionDataSource` is not open at collection time. The args
+            // storage is the input `EntityMetadataBuilder` reads to produce that
             // metadata, so it is the same declarations one step earlier, available with no connection open.
             // Its collections carry an unnamed entry as `undefined` where a built metadata would have
             // substituted a generated name, so the absence of one is asserted first — otherwise an unnamed
@@ -1851,9 +1891,10 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         it('carries both named check constraints, which generating against PostgreSQL is what buys', () => {
             // CONFLICT C-E, LOCATED RATHER THAN ASSUMED. Both checks are here, inline in the `CREATE TABLE`
             // statements, because the generation engine is PostgreSQL. A file generated for MySQL or MariaDB
-            // would carry neither: TypeORM 0.3.28 returns early for that family before a check reaches the
-            // statement log at all, so the gap is upstream of the migration rather than inside it. The
-            // catalogue half below is where the same objects are read back out of the engine.
+            // carries neither: TypeORM 0.3.28 returns early for that family before a check reaches the
+            // statement log at all, so the gap is upstream of the migration rather than inside it. That is not
+            // left as a claim either — the provenance case above reads it off THAT family's own emission when
+            // the run is on it, and the catalogue half below reads the same objects back out of the engine.
             const up = emittedStatements(migrationSource, 'up').join('\n');
             for (const namedObject of CHECK_NAMED_OBJECTS) {
                 expect(
@@ -1919,6 +1960,25 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     .slice()
                     .sort(),
             );
+
+            // AND THE TWO NAMES THE DOWN-PATH WILL LOOK FOR AGAIN, pinned. A constraint name TypeORM derives
+            // by hashing the table and column is deterministic but invisible in the entity source, so a
+            // renamed column changes it silently — and a `down()` that drops a constraint by a name its own
+            // `up()` no longer creates fails only when someone reverts, which is the worst moment to discover
+            // it. The reverse direction is asserted for the same two names below.
+            for (const [name, direction] of [
+                [FK_LIST_CUSTOMER, 'up'],
+                [FK_LINE_LIST, 'up'],
+                [FK_LIST_CUSTOMER, 'down'],
+                [FK_LINE_LIST, 'down'],
+            ] as const) {
+                expect(
+                    emittedStatements(migrationSource, direction).filter(
+                        statement => statement.indexOf(name) !== -1,
+                    ),
+                    `${direction}() must name ${name} exactly once, or the two directions disagree`,
+                ).toHaveLength(1);
+            }
         });
 
         it('alters no core table and drops no core object', () => {
@@ -1979,49 +2039,55 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         });
     });
 
-    // The layout the dev server registers
+    // How the dev server registers this plugin's migration
     //
     // The package ships its migration in two layouts — `src/migrations/*.ts` in a checkout and
-    // `lib/src/migrations/*.js` in the published artefact — and a built checkout carries BOTH. Registering
-    // both patterns is not a harmless superset: TypeORM loads every pattern and then refuses the whole
-    // configuration, because both files declare the same class.
+    // `lib/src/migrations/*.js` in the published artefact — and a built checkout carries BOTH. Registering a
+    // glob for each is not a harmless superset: TypeORM loads every pattern and then refuses the whole
+    // configuration, because both files declare the same class
+    // (`MigrationExecutor.checkForDuplicateMigrations`). Registering the CLASS instead is what makes one
+    // registration correct in both layouts, and it is what the shipped configuration does.
 
-    describe('the layout the dev server registers', () => {
-        const BUILT_LAYOUT_DIR = path.join(SELECTOR_PROBE_ROOT, 'lib/src/migrations');
-        const SOURCE_LAYOUT_DIR = path.join(SELECTOR_PROBE_ROOT, 'src/migrations');
+    describe('the registration the dev server carries', () => {
+        it('registers the migration class this package exports, not a per-layout glob', async () => {
+            const devConfigSource = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
+            const options = dbConnectionOptionsBlockOf(devConfigSource);
 
-        it('registers exactly one layout, in every layout the package can be installed in', async () => {
-            const select = await devConfigLayoutSelector();
-
-            const present =
-                (...directories: string[]) =>
-                (candidate: string) =>
-                    directories.includes(candidate);
-
+            // ONE APPENDED CLAUSE, and the pattern that was already there is still first. AAP section
+            // 0.4.1.1 permits exactly three changes to this file — an import line, the plugin registration,
+            // and one appended clause on this array — so the assertion is over the whole array rather than
+            // over the presence of the new member alone.
             expect(
-                select(SELECTOR_PROBE_ROOT, present(BUILT_LAYOUT_DIR)),
-                'an installed package must register its compiled migration',
-            ).toEqual([path.join(BUILT_LAYOUT_DIR, '*.js')]);
+                options,
+                "dev-config must append the plugin's own migration classes to the existing array",
+            ).toContain("migrations: [path.join(__dirname, 'migrations/*.ts'), ...reorderPluginMigrations],");
 
+            // And the symbol it appends is imported from the PACKAGE ROOT, which is the same specifier the
+            // plugin class itself arrives through. A deep path into this package's source tree would be a
+            // route the manifest resolves and the package makes no promise about.
+            expect(devConfigSource).toContain(
+                "import { ReorderPlugin, reorderPluginMigrations } from '@vendure/reorder-plugin';",
+            );
             expect(
-                select(SELECTOR_PROBE_ROOT, present(BUILT_LAYOUT_DIR, SOURCE_LAYOUT_DIR)),
-                'a built checkout must register one layout, not both',
-            ).toEqual([path.join(BUILT_LAYOUT_DIR, '*.js')]);
-
+                devConfigSource,
+                'the registration must not be built from a path relative to the dev server',
+            ).not.toContain("'../reorder-plugin");
             expect(
-                select(SELECTOR_PROBE_ROOT, present(SOURCE_LAYOUT_DIR)),
-                'an unbuilt checkout must register its source migration',
-            ).toEqual([path.join(SOURCE_LAYOUT_DIR, '*.ts')]);
-
-            expect(select(SELECTOR_PROBE_ROOT, () => false)).toEqual([]);
+                devConfigSource,
+                'a class registration needs no filesystem probe, so no such probe may appear',
+            ).not.toContain("import fs from 'fs'");
+            expect(
+                devConfigSource,
+                'the registration must not vary by which script Node was handed',
+            ).not.toContain('process.argv');
         });
 
-        it('never registers both layouts, because each declares the same migration class', async () => {
-            // WHY one had to be chosen, stated as evidence rather than as a comment. Both artefacts declare
-            // `AddReorderLists1786838400000`, so a configuration naming both hands TypeORM two migrations of
-            // one name and is rejected in full.
+        it('registers a class per layout that resolves to exactly one migration file', async () => {
+            // WHY a class rather than two globs, stated as evidence rather than as a comment: both artefacts
+            // declare `AddReorderLists1786838400000`, so a configuration naming both hands TypeORM two
+            // migrations of one name and is rejected in full.
             expect(migrationSource, 'the source layout must declare the migration class').toContain(
-                `export class ${MIGRATION_CLASS_NAME}`,
+                `export class ${SHIPPED_MIGRATION_CLASS_NAME}`,
             );
             const builtFile = path.join(BUILT_MIGRATION_GLOB_DIR, MIGRATION_FILENAME.replace(/\.ts$/, '.js'));
             expect(
@@ -2030,40 +2096,16 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             ).toBe(true);
             expect(
                 await fs.readFile(builtFile, 'utf-8'),
-                'the compiled layout must declare the same migration class, which is why both cannot be ' +
-                    'registered together',
-            ).toContain(MIGRATION_CLASS_NAME);
+                'the compiled layout must declare the same migration class, which is why two globs could ' +
+                    'not both be registered',
+            ).toContain(SHIPPED_MIGRATION_CLASS_NAME);
 
-            // And the shipped selection, run against THIS machine's real filesystem, yields one pattern whose
-            // directory holds exactly one migration file — so the duplicate-name rejection is unreachable.
-            const select = await devConfigLayoutSelector();
-            const selected = select(path.join(__dirname, '..'), candidate => fs.existsSync(candidate));
-            // COUNTS, and a FIXED message. `selected` holds absolute glob patterns rooted at the installed
-            // package, so both the array as a matcher actual and `selected[0]` interpolated into a message
-            // publish the layout of whatever machine ran the suite. The counts state the same claim.
-            expect(selected.length, 'exactly one pattern must be registered on this machine').toBe(1);
-            const selectedDir = path.dirname(selected[0]);
-            const selectedExtension = path.extname(selected[0]);
-            const matches = (await fs.readdir(selectedDir)).filter(entry =>
-                entry.endsWith(selectedExtension),
-            );
-            expect(matches.length, 'the registered pattern must resolve to exactly one migration file').toBe(
-                1,
-            );
-        });
-
-        it('anchors the pattern on the installed package root rather than on a relative path', async () => {
-            const devConfigSource = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
-
-            // `__dirname` is `packages/dev-server` from source and `packages/dev-server/dist` once built, so a
-            // relative `../reorder-plugin/...` pattern resolves to a directory that does not exist in the
-            // built layout. Resolving the package's own manifest is right in both, and in a consumer's
-            // `node_modules` too.
-            expect(devConfigSource).toContain("require.resolve('@vendure/reorder-plugin/package.json')");
-            expect(
-                devConfigSource,
-                'the migration pattern must not be built from a path relative to the dev server',
-            ).not.toContain("'../reorder-plugin");
+            // And what the package publishes for a deployment to register is that one class, so the
+            // duplicate-name rejection is unreachable by construction rather than by a layout choice.
+            expect(reorderPluginMigrations).toEqual([AddReorderLists1786838400000]);
+            expect(reorderPluginMigrations.map(migration => migration.name)).toEqual([
+                SHIPPED_MIGRATION_CLASS_NAME,
+            ]);
         });
     });
 
@@ -2101,120 +2143,188 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             }
 
             // And where this file drives the lifecycle itself, its own configuration says the same thing
-            // explicitly, so the apply the executing half measures cannot have been a synchronization pass
-            // wearing a migration's name. That configuration is built only on the engine that half runs on —
-            // see {@link MIGRATION_GENERATION_ENGINE} — and the platform guarantee above is what covers the
-            // rest, being the one that actually holds in production.
-            if (appliesShippedMigration) {
-                expect(migrationConfig.dbConnectionOptions.synchronize).toBe(false);
-            }
+            // explicitly, so the apply every executing case below measures cannot have been a synchronization
+            // pass wearing a migration's name. Asserted on every engine, because on every engine this file
+            // builds that configuration and applies a migration through it; the platform guarantee above is
+            // what covers a deployment that configures something else.
+            expect(migrationConfig.dbConnectionOptions.synchronize).toBe(false);
+            expect(
+                (migrationConfig.dbConnectionOptions as { migrations?: unknown[] }).migrations,
+                'exactly one migration is registered, and it is the one under test',
+            ).toEqual([migrationUnderTest]);
         });
 
-        it('declares synchronization after every spread, and disables it for the migration entry point', async () => {
+        it("leaves the dev server's own synchronization declaration exactly as it found it", async () => {
             const devConfigSource = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
-            const optionsStart = devConfigSource.indexOf('dbConnectionOptions: {');
-            expect(optionsStart, 'dev-config must declare dbConnectionOptions').toBeGreaterThan(-1);
-            const options = devConfigSource.slice(
-                optionsStart,
-                devConfigSource.indexOf('\n    },', optionsStart),
-            );
+            const options = dbConnectionOptionsBlockOf(devConfigSource);
 
-            // POSITION IS THE POINT. A later key wins, so a `synchronize` declared before the spread is dead.
+            // ★ THE DECLARATION IS THE HARNESS'S, NOT THIS FEATURE'S, AND THAT IS THE ASSERTION. AAP section
+            // 0.4.1.1 permits three changes to this file and a `synchronize` of its own is not one of them,
+            // so the key stays where the harness put it — first in the object, ABOVE the engine spread —
+            // and this feature adds none of its own. A second declaration after the spread would be a
+            // behavioural change to an existing value: `getDbConfig()`'s server branches each return
+            // `synchronize: true` and its `sqljs` branch returns no such key at all, so a derived value
+            // placed after the spread silently flips a `DB=sqljs` boot from the harness's `false` to `true`.
             expect(options, 'dbConnectionOptions must spread the engine configuration').toContain(
                 '...getDbConfig()',
             );
-            expect(options.indexOf('synchronize:')).toBeGreaterThan(options.indexOf('...getDbConfig()'));
+            const beforeSpread = options.slice(0, options.indexOf('...getDbConfig()'));
+            const afterSpread = options.slice(options.indexOf('...getDbConfig()'));
+            expect(beforeSpread, "the harness's own synchronize declaration must be left in place").toContain(
+                'synchronize: false',
+            );
             expect(
-                options.slice(0, options.indexOf('...getDbConfig()')),
-                'no synchronize declaration may sit before the spread, where it would be overwritten',
+                afterSpread,
+                'this feature declares no synchronize of its own, so nothing may follow the spread',
             ).not.toContain('synchronize');
 
-            // And the value is disabled for the migration entry point. The discriminator is lifted out of the
-            // shipped file and run, so this asserts the behaviour rather than the spelling.
-            expect(options).toContain('synchronize: !IS_MIGRATION_ENTRY_POINT');
-            const declaration = /const IS_MIGRATION_ENTRY_POINT = (\/.+\/)\.test\(process\.argv\[1\]/.exec(
-                devConfigSource,
-            );
-            expect(
-                declaration,
-                'IS_MIGRATION_ENTRY_POINT must be derived from the script Node was handed',
-            ).not.toBeNull();
-            const literal = (declaration as RegExpExecArray)[1];
-            const lastSlash = literal.lastIndexOf('/');
-            const isMigrationEntryPoint = new RegExp(
-                literal.slice(1, lastSlash),
-                literal.slice(lastSlash + 1),
-            );
-
-            for (const migrationEntryPoint of [
-                path.join('packages', 'dev-server', 'migration.ts'),
-                path.join('packages', 'dev-server', 'dist', 'migration.js'),
-            ]) {
-                expect(
-                    isMigrationEntryPoint.test(migrationEntryPoint),
-                    `${migrationEntryPoint} drives migrations, so synchronization must be off`,
-                ).toBe(true);
-            }
-            // Every server and population entry point keeps it on: this package ships no core migrations, so a
-            // blanket disable would leave `populate` and `dev` facing a database with no tables at all.
-            for (const serverEntryPoint of [
-                path.join('packages', 'dev-server', 'populate-dev-server.ts'),
-                path.join('packages', 'dev-server', 'index.ts'),
-                path.join('packages', 'dev-server', 'index-worker.ts'),
-                path.join('packages', 'cli', 'dist', 'cli.js'),
-                '',
-            ]) {
-                expect(
-                    isMigrationEntryPoint.test(serverEntryPoint),
-                    `${serverEntryPoint || '<no argv[1]>'} boots or populates a server, so synchronization ` +
-                        'must stay on',
-                ).toBe(false);
-            }
+            // AND THE SEQUENCING PROBLEM THAT DECLARATION LEAVES OPEN IS ANSWERED OPERATIONALLY, WHICH IS
+            // WHAT THE PLAN PRESCRIBES. On every engine branch that declares it the spread wins and a dev
+            // boot synchronizes, so the schema this plugin's migration must be the author of is created by
+            // THIS SUITE, on a connection this suite configures with synchronization off, rather than by
+            // asking the harness to boot differently. That connection is asserted by the case above; the
+            // platform's own force-assignment is what holds in production.
         });
 
-        it('registers this plugin migration only where synchronization is off', async () => {
-            // ONE RULE, NOT TWO. A connection is either migration-driven — synchronization off AND this
-            // plugin's migration registered — or a server connection, with synchronization on and no plugin
-            // migration registered at all. Half of that pairing is the incoherent state, and the shipped boot
-            // path is what makes it concrete: `packages/dev-server/index.ts:L8-L9` runs
-            // `runMigrations(devConfig)` before `bootstrap(devConfig)`, a migration connection is forced to
-            // `synchronize: false`, and on a fresh database this migration would therefore run before the three
-            // core tables its references point at exist. `runMigrations` does not rethrow outside the Vendure
-            // CLI — it logs, sets `process.exitCode = 1` and resolves
-            // (`packages/core/src/migrate.ts:L52-L59`) — so the chain continues, bootstrap synchronizes, the
-            // schema builder creates the two tables, and a later boot records this migration as applied
-            // against a schema it did not author, having already failed once without stopping anything.
+        it('carries the plugin registration and adds no custom field or permission', async () => {
             const devConfigSource = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
-            const optionsStart = devConfigSource.indexOf('dbConnectionOptions: {');
-            const options = devConfigSource.slice(
-                optionsStart,
-                devConfigSource.indexOf('\n    },', optionsStart),
+
+            // The registration itself, with the five declared option values. This is the second of the three
+            // changes AAP section 0.4.1.1 sanctions, and the values are the ones the plan supplies.
+            const registration = devConfigSource.slice(devConfigSource.indexOf('ReorderPlugin.init({'));
+            expect(
+                registration.slice(0, registration.indexOf('}')),
+                'the dev server must register the plugin with the five declared option values',
+            ).toContain('maxListsPerCustomer: 25');
+            for (const declaration of [
+                'maxLinesPerList: 200',
+                'maxQuantityPerLine: 999',
+                'defaultReorderListsPageSize: 25',
+                'defaultReorderListLinesPageSize: 50',
+            ]) {
+                expect(registration.slice(0, registration.indexOf('}'))).toContain(declaration);
+            }
+
+            // AND THE TWO NEIGHBOURING VALUES THAT MUST NOT MOVE. Ruling R1 forbids a custom field on any
+            // core entity and this feature registers no permission of its own, which is why the published
+            // `Permission` enum stays at its baseline width — a zero delta the read suite asserts rather
+            // than omits. Both are read here as the empty declarations the harness already had.
+            expect(devConfigSource, 'no custom field may be registered').toContain('customFields: {},');
+            expect(devConfigSource, 'no custom permission may be registered').toContain(
+                'customPermissions: [],',
             );
+        });
+    });
 
-            const registration = /\.\.\.\((\w+) \? reorderPluginMigrationGlobs\(\) : \[\]\)/.exec(options);
+    // WHICH ARTEFACT THIS RUN EXECUTED, AND WHY
+    //
+    // Everything below this point reads a schema a migration built. Which migration that was differs by
+    // engine — see {@link MIGRATION_UNDER_TEST_CITATION} — and a reader of a failure two hundred lines further
+    // down cannot tell which without being told. So the choice is not left implicit in a helper: it is
+    // asserted, against the same predicate five sibling suites read the dialect question through, and the
+    // generated artefact is checked to be a lifecycle emission rather than anything else.
+
+    describe('the migration this engine applies', () => {
+        it("applied the checked-in artefact where its dialect matches, and this engine's own emission otherwise", () => {
+            // THE CHOICE, OBSERVED AGAINST THE SHARED PREDICATE. `appliesShippedMigration` is read from
+            // `committedMigrationApplies` in `e2e/fixtures/migration-state.ts`, which is the one authority in
+            // the package for "can the checked-in file run here" and is what the create, add-item, mutate,
+            // read and compatibility suites branch on too. A second spelling of the same rule in this file is
+            // exactly how the two could drift apart, so there is not one.
             expect(
-                registration,
-                'the plugin migration must be registered only for a migration-driven connection, because a ' +
-                    'server boot that carries it can half-apply it and then let the schema builder finish',
-            ).not.toBeNull();
+                migrationProvenance,
+                `${activeEngine} must apply ${
+                    appliesShippedMigration ? 'the checked-in artefact' : 'its own lifecycle emission'
+                }. ${MIGRATION_UNDER_TEST_CITATION}`,
+            ).toBe(appliesShippedMigration ? 'committed-migration' : 'lifecycle-generated');
+            expect(appliesShippedMigration).toBe(committedMigrationApplies(activeEngine));
 
-            const guard = (registration as RegExpExecArray)[1];
+            // AND THE CLASS THAT RAN IS THE ONE THAT CHOICE NAMES, not merely a class of the right shape.
+            if (migrationProvenance === 'committed-migration') {
+                expect(migrationUnderTest).toBe(AddReorderLists1786838400000);
+                expect(migrationUnderTestName).toBe(SHIPPED_MIGRATION_CLASS_NAME);
+                expect(generatedMigration, 'nothing was generated on this engine').toBeUndefined();
+            } else {
+                expect(generatedMigration, 'this engine needed an emission of its own').toBeDefined();
+                expect(migrationUnderTest).toBe(generatedMigration?.migrationClass);
+                expect(migrationUnderTestName).toBe(generatedMigration?.className);
+                // TypeORM orders migrations by the trailing timestamp in the class name and refuses one
+                // without it, so this is the property that makes the emission runnable at all.
+                expect(migrationUnderTestName).toMatch(/^AddReorderLists\d+$/);
+            }
+
+            // AND WHAT `runMigrations` ITSELF RECORDED, which is the only name that reaches TypeORM's
+            // bookkeeping table and therefore the only one a revert can find again.
             expect(
-                options,
-                `the migration registration is gated on ${guard}, so synchronization must be gated on it too`,
-            ).toContain(`synchronize: !${guard}`);
+                firstApply.migrationsRan,
+                `runMigrations recorded a different migration than the one this file registered. ${MIGRATION_UNDER_TEST_CITATION}`,
+            ).toEqual([migrationUnderTestName]);
+        });
 
-            // `runMigrations` really does swallow a failure outside the CLI, which is why a boot must not be
-            // handed a migration it cannot apply. Read out of the platform rather than asserted from prose.
-            const migrateSource = await fs.readFile(
-                path.join(__dirname, '../../core/src/migrate.ts'),
-                'utf-8',
+        it('generated that emission through the platform lifecycle, outside this repository', async () => {
+            if (generatedMigration === undefined) {
+                // STATED RATHER THAN SKIPPED. On the engine the checked-in artefact was generated for there is
+                // nothing to generate, and the assertion that nothing was is the evidence — a run that
+                // quietly generated a second migration here would be measuring an artefact nobody reviewed.
+                expect(migrationProvenance).toBe('committed-migration');
+                expect(await fs.readdir(MIGRATIONS_DIR)).toEqual([MIGRATION_FILENAME]);
+                return;
+            }
+
+            // OUTSIDE THE REPOSITORY, so `git status --porcelain` is clean after a run on any engine and no
+            // unreviewed migration can be left under this package's own migrations directory.
+            expect(path.isAbsolute(generatedMigration.filePath)).toBe(true);
+            expect(generatedMigration.filePath.startsWith(path.join(__dirname, '..'))).toBe(false);
+            expect(await fs.readdir(MIGRATIONS_DIR)).toEqual([MIGRATION_FILENAME]);
+
+            // AND IT IS THE GENERATOR'S OWN OUTPUT, in the shape `generateMigration` writes: a class
+            // implementing `MigrationInterface` whose two directions issue nothing but
+            // `queryRunner.query(<SQL>)` calls (`packages/core/src/migrate.ts:L127-L179`). Nothing here is
+            // hand-written and nothing here may be — EPIC-001 section 7.8 makes the lifecycle the only
+            // sanctioned mechanism, on every engine.
+            expect(generatedMigration.source).toContain(
+                `export class ${migrationUnderTestName} implements MigrationInterface`,
             );
-            expect(migrateSource).toContain('process.exitCode = 1');
+            for (const call of TABLE_API_CALLS) {
+                expect(
+                    generatedMigration.source,
+                    `a lifecycle emission issues serialised SQL, never ${call}`,
+                ).not.toContain(call);
+            }
+
+            // THE STATEMENTS IT WILL ACTUALLY EXECUTE, read by undoing precisely the escaping the generator
+            // applied — a double-quoted literal with `"` escaped on the MySQL family and a template literal
+            // with a backtick escaped elsewhere. A source-text search cannot do this job on the MySQL family
+            // at all: its identifier quoting IS the backtick, so every statement is full of them.
+            const statements = extractGeneratedStatements(generatedMigration.source);
+            expect(tablesInOrder(statements.up, 'CREATE TABLE').slice(0, 2)).toEqual([
+                ...PLUGIN_TABLES_PARENT_FIRST,
+            ]);
             expect(
-                migrateSource,
-                'runMigrations rethrows only under the Vendure CLI; every other caller sees it resolve',
-            ).toContain('isRunningFromVendureCli()');
+                tablesInOrder(statements.down, 'DROP TABLE').slice(-2),
+                'the parent may only be dropped once nothing references it',
+            ).toEqual([...PLUGIN_TABLES_CHILD_FIRST]);
+
+            // AND EVERY NAMED OBJECT THIS ENGINE CAN MATERIALISE IS IN THAT EMISSION, under its exact name —
+            // which is where conflict C-E becomes a measurement rather than a citation: the MySQL family's own
+            // emission carries the three `UQ_`/`IDX_` names and NEITHER `CHK_`, because TypeORM returns early
+            // before a check ever reaches the statement log there.
+            const emitted = statements.up.join('\n');
+            for (const namedObject of ALL_NAMED_OBJECTS) {
+                const materialises = namedObject.kind !== 'check' || emitsNamedCheckConstraints(activeEngine);
+                expect(
+                    emitted.indexOf(namedObject.name) !== -1,
+                    `${activeEngine} must ${materialises ? 'emit' : 'NOT emit'} ${namedObject.name}. ${
+                        materialises ? '' : C_E_CITATION
+                    }`,
+                ).toBe(materialises);
+            }
+
+            // And neither withdrawn object, in the emission any engine produces — conflict C-A holds wherever
+            // the file came from, not only in the one that is checked in.
+            for (const withdrawn of [...WITHDRAWN_COLUMNS, WITHDRAWN_CHECK_CONSTRAINT]) {
+                expect(emitted, `a generated emission must not carry ${withdrawn}`).not.toContain(withdrawn);
+            }
         });
     });
 
@@ -2230,7 +2340,7 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         return column as ColumnSnapshot;
     }
 
-    describe.skipIf(!appliesShippedMigration)('the schema under test', () => {
+    describe('the schema under test', () => {
         it(
             'was created by the migration itself rather than by any schema builder',
             async () => {
@@ -2253,14 +2363,14 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     'the harness registers no plugin, so the initializer must have synchronised the core schema alone',
                 ).toEqual([]);
 
-                // AND THE MIGRATION IS WHAT CREATED THEM, on PostgreSQL, where this describe runs. There is
-                // no schema-builder fallback: the schema every shape, catalogue and forbidden-write assertion
-                // below reads is the one `runMigrations` built, and if it did not build it this case fails
-                // rather than substituting something that resembles it.
+                // AND THE MIGRATION IS WHAT CREATED THEM, on whichever engine this run configured. There is
+                // no schema-builder fallback on any of them: the schema every shape, catalogue and
+                // forbidden-write assertion below reads is the one `runMigrations` built, and if it did not
+                // build it this case fails rather than substituting something that resembles it.
                 expect(
                     pluginTablesAfterFirstAttempt.slice().sort(),
                     `the migration did not create both plugin tables on ${activeEngine}. ` +
-                        GENERATED_FORM_CITATION,
+                        MIGRATION_UNDER_TEST_CITATION,
                 ).toEqual(PLUGIN_TABLES_CHILD_FIRST.slice().sort());
 
                 expect((await existingPluginTables()).slice().sort()).toEqual(
@@ -2347,6 +2457,21 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     0,
                 );
                 expect(total).toBe(EXPECTED_FOREIGN_KEYS.length);
+
+                // AND THE TWO PINNED NAMES EXIST IN THE ENGINE'S OWN CATALOGUE, not only in the migration's
+                // text. The name is what a revert addresses, so a constraint that enforces the right rule
+                // under a name nothing will look for again is a defect the shape assertions above cannot see.
+                // These two are portable because TypeORM derives a foreign-key name from the table and column
+                // rather than from the dialect, so every engine's emission spells them identically.
+                for (const [table, name, column, references] of [
+                    [LIST_TABLE, FK_LIST_CUSTOMER, 'customerId', 'customer'],
+                    [LINE_TABLE, FK_LINE_LIST, 'reorderListId', LIST_TABLE],
+                ] as const) {
+                    const reference = referenceOf(await readTable(table), name);
+                    expect(reference.columnNames).toEqual([column]);
+                    expect(bareTableName(reference.referencedTableName)).toBe(references);
+                    expect(String(reference.onDelete ?? '').toUpperCase()).toBe('CASCADE');
+                }
             },
             CATALOGUE_READ_ABORT_AFTER_MS,
         );
@@ -2405,11 +2530,12 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     // Three catalogue readers, because the object CLASS differs between engines while the name and the
     // guarantee do not: a `UQ_` is a unique constraint on PostgreSQL and the SQLite family and a named unique
     // INDEX on the MySQL family, so a single "constraint type" lookup would report it missing while it was
-    // enforcing exactly the same rule. These cases execute on the generation engine and read PostgreSQL's
-    // catalogue; the reader for each other family is exercised where that family's own emission is applied,
-    // through `withIsolatedMigrationState` in `e2e/fixtures/migration-state.ts`.
+    // enforcing exactly the same rule. **Each reader runs on its own family**, against the schema that
+    // family's own migration built — PostgreSQL's on PostgreSQL, `sqlite_master` on the SQLite family, and
+    // `information_schema` on the MySQL family — which is what makes the C-E gap a measurement per engine
+    // rather than an inference from one.
 
-    describe.skipIf(!appliesShippedMigration)("the named objects, in the engine's own catalogue", () => {
+    describe("the named objects, in the engine's own catalogue", () => {
         for (const namedObject of PORTABLE_NAMED_OBJECTS) {
             it(
                 `${namedObject.name} exists on ${namedObject.table} in the engine's own catalogue`,
@@ -2534,9 +2660,9 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     //
     // Each case in its own `it`, each building its own precondition, each issued straight through the
     // repository. They are sequential single writes rather than interleavings, so there is no barrier
-    // anywhere in this file. They run against the schema the checked-in artefact built, which is the
-    // generation engine; the same refusals against another engine's own emission belong with that emission,
-    // in `withIsolatedMigrationState`.
+    // anywhere in this file. They run against the schema the migration under test built — the checked-in
+    // artefact where its dialect matches this connection, and this engine's own emission otherwise — so a
+    // refusal observed here is that engine's own enforcement of that engine's own DDL.
 
     // THE MIGRATION-OWNED DEPLOYMENT, AND WHERE ITS EXECUTED PROOF LIVES
     //
@@ -2547,7 +2673,7 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     // than here for a platform reason worth stating exactly, because it looks at first like something this
     // file could simply do.
 
-    describe.skipIf(!appliesShippedMigration)('the write each named constraint forbids', () => {
+    describe('the write each named constraint forbids', () => {
         it(
             `${UQ_LIST_OWNER_NAME_KEY} refuses a second row for one customer, channel and canonical name`,
             async () => {
@@ -2713,13 +2839,13 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     // self-contained: each builds its own precondition and leaves the schema as it found it, so running either
     // alone, or the file in reverse order, gives the same result.
 
-    describe.skipIf(!appliesShippedMigration)('the data-bearing up, down and up cycle', () => {
+    describe('the data-bearing up, down and up cycle', () => {
         it('applied cleanly through the platform lifecycle, on the engine the run configured', () => {
             expect(
                 firstApply.migrationsRan,
-                `runMigrations must report ${MIGRATION_CLASS_NAME} as applied on ${activeEngine}. ` +
-                    GENERATED_FORM_CITATION,
-            ).toContain(MIGRATION_CLASS_NAME);
+                `runMigrations must report ${migrationUnderTestName} as applied on ${activeEngine}. ` +
+                    MIGRATION_UNDER_TEST_CITATION,
+            ).toContain(migrationUnderTestName);
 
             // THE SILENT-FAILURE PATH, CLOSED. `runMigrations` does not throw: it logs and sets
             // `process.exitCode = 1` unless it is running from the Vendure CLI
@@ -2810,7 +2936,7 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 expect(
                     secondApply.migrationsRan,
                     `the second apply must succeed rather than failing on an object it believes already exists`,
-                ).toContain(MIGRATION_CLASS_NAME);
+                ).toContain(migrationUnderTestName);
                 expect(
                     secondApply.observedExitCode,
                     'the second apply signalled a failure through process.exitCode',

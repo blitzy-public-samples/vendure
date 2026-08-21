@@ -82,19 +82,18 @@ import {
  * tree and declares no `exports` map, so such a specifier does resolve for an installed consumer, but it
  * names an internal module carrying no compatibility guarantee. The root is the surface the package
  * documents and keeps. So this line is load-bearing twice over: it fails at resolution time if the root
- * barrel stops publishing one of the six symbols it names, and it fails at build time if
- * `tsconfig.build.json` stops emitting the module a symbol lives in. That file names TWO build roots, and
- * the distinction matters to this proof: the barrel is the public one, from which every symbol here is
- * reachable, and the plugin's single migration is the second. The migration is a root of its own so that its
- * compiled class is emitted into the published tree whatever the barrel happens to import — a module no root
- * reaches is not compiled, and a migration absent from `lib` cannot be registered by a consumer.
+ * barrel stops publishing one of the five symbols it names, and it fails at build time if
+ * `tsconfig.build.json` stops emitting the module a symbol lives in. That file names ONE build root — the
+ * barrel — and every module the published tree carries is reached from it through the import graph, the
+ * migration included: `reorderPluginMigrations` names the class, so the module that declares it is compiled
+ * whether or not any consumer imports it directly. A module no root reaches is not compiled, and a migration
+ * absent from `lib` cannot be registered by a consumer, which is what the emission case below reads back.
  */
 import { preBootstrapConfig } from '@vendure/core/dist/bootstrap';
 import {
     ReorderList,
     ReorderListLine,
     ReorderPlugin,
-    ReorderPluginConfigurationError,
     reorderPluginMigrations,
     type ReorderPluginOptions,
 } from '@vendure/reorder-plugin';
@@ -108,6 +107,16 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
 import { AddReorderLists1786838400000 } from '../src/migrations/1786838400000-add-reorder-lists';
+/**
+ * **Deliberately NOT from the package root, and the specifier is the assertion.**
+ *
+ * The root barrel publishes the five symbols a deployment configures this plugin through — `ReorderPlugin`,
+ * `ReorderPluginOptions`, both entities and `reorderPluginMigrations` — and nothing else, so
+ * `ReorderPluginConfigurationError` is reached here through the module that declares it. The case below
+ * therefore asserts two things at once: that the class behaves as its documentation says, and that it is
+ * absent from the root, which is what the surface assertion beside it reads back.
+ */
+import { ReorderPluginConfigurationError } from '../src/reorder.plugin';
 
 import { resolveConfiguredEngine } from './fixtures/concurrency-barrier';
 import { committedMigrationApplies } from './fixtures/migration-state';
@@ -448,11 +457,30 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         expect(options).toEqual(DECLARED_OPTIONS);
     });
 
-    it('publishes the configuration error class and the migration classes from the package root', () => {
+    it('publishes the migration classes, and exactly the documented surface, from the package root', () => {
+        // ★ THE SURFACE ITSELF, READ BACK. The root barrel publishes what a deployment configures this
+        // plugin through and nothing more: the plugin class, its options type (erased at run time), both
+        // entity classes, and the migration classes the AAP's conflict C-D option A has a deployment
+        // register. Anything else reachable from here would be a compatibility promise nobody asked for —
+        // `ReorderPluginConfigurationError` is the concrete case, published from the root by an earlier
+        // revision and now reached only through the module that declares it, which is how the import at
+        // the head of this file spells it.
+        //
+        // `require` rather than the static import above, because the surface is the question: a named
+        // import can only name what it expects, whereas the module object answers what the barrel actually
+        // publishes. The specifier is still the package root.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const rootModule = require('@vendure/reorder-plugin') as Record<string, unknown>;
+        expect(Object.keys(rootModule).sort()).toEqual(
+            ['ReorderList', 'ReorderListLine', 'ReorderPlugin', 'reorderPluginMigrations'].sort(),
+        );
+        expect(rootModule.ReorderPlugin).toBe(ReorderPlugin);
+        expect(rootModule.reorderPluginMigrations).toBe(reorderPluginMigrations);
+
         expect(typeof ReorderPluginConfigurationError).toBe('function');
         expect(ReorderPluginConfigurationError.prototype instanceof Error).toBe(true);
 
-        // The documented `instanceof` path itself, driven through the root-imported `init()`. `0` is
+        // The documented refusal path itself, driven through the root-imported `init()`. `0` is
         // below the minimum of every bound, so it is refused whichever key carries it, and a refused
         // call leaves the previously resolved options in force — which is why the harness's own
         // registration is unaffected by running this.
@@ -462,7 +490,16 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         } catch (e) {
             caught = e;
         }
-        expect(caught).toBeInstanceOf(ReorderPluginConfigurationError);
+
+        // ★ READ BY `name` AND `optionKey`, NOT BY `instanceof`, AND THE REASON IS THE POINT RATHER THAN A
+        // CONVENIENCE. `ReorderPlugin` above arrives through the package root, so it is the class the
+        // COMPILED `lib/` tree declares, while the import at the head of this file reaches the one the
+        // SOURCE tree declares — two distinct class objects, so `instanceof` between them is false however
+        // identical their behaviour. A consumer is in exactly that position for any module the barrel does
+        // not publish, which is why the two properties this asserts are the ones the class's own
+        // documentation tells a caller to branch on, and why they are asserted here rather than assumed.
+        expect((caught as Error).name).toBe('ReorderPluginConfigurationError');
+        expect(caught).toBeInstanceOf(Error);
         expect((caught as ReorderPluginConfigurationError).optionKey).toBe('maxLinesPerList');
         // Restores the declared set, so the assertion above cannot leave a rejected value — or an
         // unrelated one — in force for any test that follows: `init()` assigns the module-level slot
@@ -713,6 +750,15 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
      * field Mutation.createReorderList` while `activeCustomer` still resolves. This file's first bootstrap
      * registers the plugin, so its resolvers are live and the schema underneath them can be replaced with the
      * migration's own output.
+     *
+     * **Why it is engine-conditional, and what is NOT conditional.** It applies the CHECKED-IN artefact, which
+     * is one generation and therefore one dialect ({@link committedMigrationApplies} carries the citations), so
+     * it runs where that dialect matches. The migration's own lifecycle — the data-bearing up → down → up
+     * cycle, every named object and every write each constraint forbids — is measured on ALL FOUR engines by
+     * `e2e/reorder-list-migration.e2e-spec.ts`, which falls back to the migration this engine's own lifecycle
+     * emits. What this case adds beyond that is the SERVING half: that a deployment provisioned this way
+     * answers the published operations, which needs a plugin-enabled first bootstrap and therefore needs to be
+     * in this file.
      */
     describe.skipIf(!committedMigrationApplies(resolveConfiguredEngine()))(
         'a deployment provisioned by the migration alone',

@@ -19,6 +19,14 @@
  * prints its ACTUAL as well as its message, so redacting only the message leaves the raw value published
  * through the actual. Callers therefore pass a redacted string, a count or a boolean as the actual, and use
  * these helpers for the message.
+ *
+ * ★ **AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE.** AAP §0.5.1.8 enumerates two fixture modules —
+ * `e2e/fixtures/query-capture.ts` and `e2e/fixtures/concurrency-barrier.ts` — and this is neither, so it is
+ * an addition rather than a planned artefact. It is admitted by the in-scope pattern
+ * `packages/reorder-plugin/e2e/fixtures/*.ts` (AAP §0.6.1.2) and declared here under §0.8.2's
+ * no-silent-deviation obligation. It is kept because the alternative to one module is a copy in each suite,
+ * and the property at stake fails silently: a redaction that stops redacting still produces a string, so a
+ * divergence between copies would first be visible as a token in a build log.
  */
 
 /**

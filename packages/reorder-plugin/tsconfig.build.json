@@ -3,5 +3,5 @@
     "compilerOptions": {
         "outDir": "./lib"
     },
-    "files": ["./index.ts", "./src/migrations/1786838400000-add-reorder-lists.ts"]
+    "files": ["./index.ts"]
 }

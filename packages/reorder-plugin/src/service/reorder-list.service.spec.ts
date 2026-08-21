@@ -1865,16 +1865,28 @@ describe('ReorderListService', () => {
             });
         });
 
-        it('reports an authenticated user with no customer row as an internal failure, not a refusal', async () => {
+        it('answers an authenticated user with no customer row exactly as it answers an absent session', async () => {
+            // ★ A SESSION THAT IS NOT A BUYER IS REFUSED, NOT REPORTED AS A FAILURE, AND THE READ CONVENTION
+            // THEREFORE COVERS IT. The Shop API's `login` restricts nothing about which `User` may
+            // authenticate, so an administrator — or a user from a custom `AuthenticationStrategy` that
+            // creates no customer — holds a session with `activeUserId` set and no customer row. Classifying
+            // that as internal answered all eight operations with a 500 for a caller who simply owns no
+            // lists; it is now the same `ForbiddenError` an absent session raises, which is what makes the
+            // single read answer `null` and the collection read answer the empty page (AAP section 0.5.2.3).
             harness.plan.customerRow = null;
 
-            const failure = await captureRejection(() => service.getReorderList(ctx, LIST_ID));
+            expect(await service.getReorderList(ctx, LIST_ID)).toBeNull();
+            expect(await service.getReorderLists(ctx)).toEqual({ items: [], totalItems: 0 });
+            expect(harness.listQueryBuilder.build).not.toHaveBeenCalled();
 
-            expect(failure).toBeInstanceOf(InternalServerError);
-            expect(failure).not.toBeInstanceOf(ForbiddenError);
-            expect((failure as InternalServerError).message).toBe(
-                'The authenticated user has no associated Customer',
+            // And a WRITE lets the same refusal propagate, so the caller sees one top-level `FORBIDDEN`
+            // entry rather than an internal error.
+            const failure = await captureRejection(() =>
+                service.createReorderList(ctx, { name: 'Weekly kitchen restock' }),
             );
+
+            expect(failure).toBeInstanceOf(ForbiddenError);
+            expect(failure).not.toBeInstanceOf(InternalServerError);
         });
 
         it('succeeds for an ordinary customer session that holds no plugin-registered permission', async () => {
@@ -4425,13 +4437,15 @@ describe('ReorderListService', () => {
         it('never caches a refusal, so a failed scope resolution is re-attempted rather than remembered', async () => {
             harness.plan.customerRow = null;
 
-            const first = await captureRejection(() => service.getLinesForLists(ctx, [LIST_ID]));
-            const second = await captureRejection(() => service.getLinesForLists(ctx, [LIST_ID]));
+            const first = await service.getLinesForLists(ctx, [LIST_ID]);
+            const second = await service.getLinesForLists(ctx, [LIST_ID]);
 
-            expect(first).toBeInstanceOf(InternalServerError);
-            expect(second).toBeInstanceOf(InternalServerError);
-            // Two lookups for two asks: nothing about the failure was remembered, so no path can read a
-            // cached refusal in place of the check that would have decided.
+            // The refusal reaches the caller as the read convention's empty page, per parent, both times.
+            expect(first.get(LIST_ID)).toEqual({ items: [], totalItems: 0 });
+            expect(second.get(LIST_ID)).toEqual({ items: [], totalItems: 0 });
+            // Two lookups for two asks: nothing about the refusal was remembered, so no path can read a
+            // cached refusal in place of the check that would have decided. Only a RESOLVED scope is cached,
+            // which is what keeps this asymmetry from turning a transient failure into a request-long one.
             expect(statementsAgainst(harness, 'Customer')).toHaveLength(2);
         });
 
@@ -4669,15 +4683,46 @@ describe('ReorderListService', () => {
             expect(harness.journal).toHaveLength(statementsAfterRepair);
         });
 
-        it('reports the observed total and records the miss where the guarded row no longer matched', async () => {
+        it('reports the column as it now stands where the guarded row no longer matched', async () => {
+            // ★ A LOST RACE ESTABLISHES THAT THIS REQUEST DOES NOT KNOW THE COUNTER, so answering with the
+            // total it counted before the competing write would publish a number that is neither the stored
+            // column nor what the winner committed — and the stored column is the authority. The repair
+            // therefore reads the column back, once, under the same ownership conjuncts its update carried.
+            // The fixture row stores 0, so that is what a caller must be told.
             const list = await readList();
             harness.plan.listAffected = () => 0;
 
             const repaired = await service.reconcileLineCount(ctx, list, 4, 2);
 
-            expect(repaired).toBe(2);
+            expect(repaired).toBe(0);
             expect(statementsOfKind(harness, 'ReorderList', 'update')).toHaveLength(1);
             expect(loggedDebug.join(' ')).toContain('changed concurrently');
+
+            // ONE re-read, and it is scoped exactly as the write was: the row, the acting customer and the
+            // active channel. A read-back naming the identifier alone would answer from a neighbouring
+            // buyer's row, identifiers being sequential under the default id strategy.
+            const reads = rowLookupsAgainst(harness, 'ReorderList');
+            expect(reads).toHaveLength(1);
+            expect(reads[0].findOptions?.where).toEqual({
+                id: LIST_ID,
+                customerId: CUSTOMER_ID,
+                channelId: CHANNEL_ID,
+            });
+        });
+
+        it('falls back to the observed total where the row has left this scope entirely', async () => {
+            // The other half of a lost race: the row was deleted, or moved out of scope, in the same window.
+            // There is then no stored value to report at all, so the total this request observed is the only
+            // answer it has — and it is the one consistent with the page the read is about to return.
+            const list = await readList();
+            harness.plan.listAffected = () => 0;
+            harness.plan.listFindOne = () => null;
+
+            const repaired = await service.reconcileLineCount(ctx, list, 4, 2);
+
+            expect(repaired).toBe(2);
+            expect(statementsOfKind(harness, 'ReorderList', 'update')).toHaveLength(1);
+            expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
         });
 
         it('refuses to write an observed total that is not a non-negative integer', async () => {
@@ -5684,15 +5729,18 @@ describe('ReorderListService', () => {
             expect(loggedErrors[0].message).toContain('createReorderList');
         });
 
-        it('reports an authenticated user with no customer row from the locked lookup as an internal failure', async () => {
+        it('refuses rather than fails when the locked lookup finds no customer row for the user', async () => {
+            // The locked resolver answers the same way as the plain one: a session that is not this
+            // feature's buyer is refused, and a refusal is not something the sanitiser sees at all — it is a
+            // caller-level outcome carrying no driver text to withhold. Nothing is logged for it either,
+            // which is the second half of that distinction.
             harness.plan.customerRow = null;
 
             const thrown = await captureRejection(() => service.createReorderList(ctx, { name: 'Pantry' }));
 
-            expect(thrown).toBeInstanceOf(InternalServerError);
-            expect((thrown as InternalServerError).message).toBe(
-                'The authenticated user has no associated Customer',
-            );
+            expect(thrown).toBeInstanceOf(ForbiddenError);
+            expect(thrown).not.toBeInstanceOf(InternalServerError);
+            expect(loggedErrors).toEqual([]);
         });
 
         it('sanitises a metadata defect in its own raw fragments and names it in the log', async () => {

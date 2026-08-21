@@ -149,11 +149,19 @@ const DELETE_CODE_POINT = 0x7f;
  */
 const C1_CONTROL_LAST_CODE_POINT = 0x9f;
 
-/** U+200B ZERO WIDTH SPACE, the first of the three contiguous zero-width formatting characters. */
-const ZERO_WIDTH_FIRST_CODE_POINT = 0x200b;
-
-/** U+200D ZERO WIDTH JOINER, the last of them; U+200C ZERO WIDTH NON-JOINER sits between the two. */
-const ZERO_WIDTH_LAST_CODE_POINT = 0x200d;
+/**
+ * U+200B ZERO WIDTH SPACE — the one zero-width character this module refuses, and the one the requirements
+ * name [F-101-RQ-002].
+ *
+ * **Its two neighbours are deliberately NOT refused.** U+200C ZERO WIDTH NON-JOINER and U+200D ZERO WIDTH
+ * JOINER are invisible in the same way and are refused nowhere, because unlike this character they carry
+ * meaning: ZWNJ is required orthography in Persian and several Indic scripts, and ZWJ is what an emoji
+ * sequence is built from, so refusing the pair refuses legitimate names — a Persian name, and every family,
+ * flag and profession emoji. U+200B carries no such role: it is a line-break opportunity, it renders as
+ * nothing, and two names differing only by one are indistinguishable to a buyer while colliding with
+ * nothing.
+ */
+const ZERO_WIDTH_SPACE_CODE_POINT = 0x200b;
 
 /**
  * U+FEFF, the byte order mark, also known as ZERO WIDTH NO-BREAK SPACE. It is rejected here rather than
@@ -161,43 +169,37 @@ const ZERO_WIDTH_LAST_CODE_POINT = 0x200d;
  */
 const BYTE_ORDER_MARK_CODE_POINT = 0xfeff;
 
-/**
- * The general class of characters this module refuses: anything that is a control, a format character, or
- * default-ignorable.
+/*
+ * WHAT THIS MODULE DELIBERATELY DOES **NOT** REFUSE, recorded because an earlier revision did and the
+ * removal is a correction rather than a relaxation.
  *
- * **The enumerated bounds above are the documented MINIMUM, and this is the class actually enforced.** The
- * named constants were chosen because the acceptance criteria name U+0007 and U+200B specifically, but a set
- * that stops at those blocks leaves a wide seam open. Refused by this class and by no enumerated bound above
- * are, among others: U+00AD SOFT HYPHEN; U+034F COMBINING GRAPHEME JOINER; U+061C ARABIC LETTER MARK;
- * U+180E MONGOLIAN VOWEL SEPARATOR; U+200E and U+200F, the left- and right-to-left marks; U+202A to U+202E,
- * the bidirectional embedding and override controls; U+2060 WORD JOINER and U+2061 to U+2064, the invisible
- * mathematical operators; U+2066 to U+2069, the bidirectional isolates; the variation selectors U+FE00 to
- * U+FE0F; the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0; and the tag characters at U+E0000.
+ * The refusal is exactly the four enumerated ranges declared above — the C0 controls less the three
+ * characters the whitespace pipeline has already consumed, U+007F together with the C1 block, U+200B ZERO
+ * WIDTH SPACE, and U+FEFF. That set is what the input contract states: a display
+ * name is the submitted value with leading and trailing whitespace removed and internal runs collapsed and
+ * *nothing else* [AAP §0.1.2.5], and the only characters the requirements name are U+0007 and U+200B
+ * [F-101-RQ-002].
  *
- * **Why they belong in one class rather than a longer list of ranges.** Each is invisible, or reorders the
- * visible text around it without being visible itself. A name is displayed to a buyer and read back by them
- * as the thing that identifies one of their lists, so two names that render identically but store differently
- * — or one that renders in an order its stored characters do not describe — is a deception vector rather than
- * a typography preference. `\p{Cc}` covers the control characters, `\p{Cf}` the format characters including
- * every bidirectional control and every zero-width, and `\p{Default_Ignorable_Code_Point}` closes the
- * remainder, which is the only class that reaches U+034F (a nonspacing MARK, so neither `Cc` nor `Cf`) and
- * the variation selectors.
+ * The zero-width joiner and non-joiner are accepted for the reason {@link ZERO_WIDTH_SPACE_CODE_POINT}
+ * gives: they are content rather than noise, and refusing them refuses a Persian name and every emoji
+ * sequence built with one.
  *
- * **The consequence for emoji is stated rather than discovered.** A variation selector is default-ignorable,
- * so an emoji written with an explicit presentation selector — `U+2764 U+FE0F`, the red heart — is refused,
- * while the same emoji written without one, and every emoji that has its own code point such as U+1F600, is
- * accepted. That is the intended reading of "refuse the invisible": a selector is invisible and changes what
- * renders.
+ * A general `/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u` class stood here as well, and it refused a
+ * great deal the contract never authorised. `Default_Ignorable_Code_Point` covers the variation selectors,
+ * so **every emoji written with an explicit presentation selector was refused** — "Favourites ❤️" (U+2764
+ * U+FE0F) and "Notes ✏️" among them — and `\p{Cf}` adds U+00AD SOFT HYPHEN, so a hyphenated paste was
+ * refused too. Those are plausible, non-hostile list names, and the registered message ("must not contain
+ * control or zero-width characters") did not describe them either, so the refusal a buyer saw did not match
+ * the rule they had broken.
  *
- * **It is applied to the canonical form, after trim-and-collapse, for the reason
- * {@link findDisallowedCharacter} sets out.** `\p{Cc}` matches tab, line feed and carriage return, all three
- * of which are legitimate whitespace the pipeline has already consumed by the time this runs. Applied to raw
- * input it would refuse a name pasted with a tab between two words.
- *
- * Compiled once at module load. The `u` flag is required for property escapes and is what makes the class
- * iterate by code point rather than by UTF-16 unit.
+ * The characters that class also caught and this one does not — U+034F COMBINING GRAPHEME JOINER, the
+ * bidirectional marks, embeddings, overrides and isolates, U+2060 WORD JOINER and the invisible mathematical
+ * operators, U+180E, the Hangul fillers, the tag characters — are stored verbatim, exactly as every other
+ * character is. That is the contract's own position on hostile input: a name round-trips byte-for-byte after
+ * whitespace canonicalisation only, is neither escaped nor stripped nor entity-encoded at rest, and its
+ * PRESENTATION is the storefront's to make safe [FEATURE-001-01:§2.10]. This module is the transport half of
+ * that guarantee, and widening it into a presentation policy is what produced the defect above.
  */
-const DISALLOWED_CHARACTER_CLASS = /[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u;
 
 /**
  * @description
@@ -283,13 +285,11 @@ function countCodePoints(value: string): number {
  * rejection below would be unreachable code, which is why the exclusion and this test are one decision
  * rather than two.
  *
- * **What is refused is every control, format and default-ignorable character, not only the blocks the
- * requirements name.** The requirements name U+0007 and U+200B because those are the cases they assert; the
- * class enforced here also covers the bidirectional controls and isolates, the invisible operators, the soft
- * hyphen, the combining grapheme joiner and the variation selectors — all of which are invisible or reorder
- * the visible text around them, and every one of which would otherwise be storable in a name a buyer reads
- * back as the identity of one of their lists. {@link DISALLOWED_CHARACTER_CLASS} states the class and its
- * consequences, including the deliberate refusal of an emoji written with a presentation selector.
+ * **What is refused is four enumerated bounds and nothing more** — the C0 controls less the whitespace the
+ * pipeline has already consumed, U+007F with the C1 block, U+200B ZERO WIDTH SPACE, and U+FEFF. The
+ * requirements name U+0007 and U+200B and those bounds carry them; every other character, printing or not,
+ * is stored exactly as submitted. See {@link isDisallowedCodePoint} for the set and the note beside it for
+ * what was deliberately removed from it and why.
  *
  * The offending character is returned rather than a boolean so that the caller can report or log which
  * character was at fault. It is deliberately **not** interpolated into the error message: the registered
@@ -313,17 +313,13 @@ function findDisallowedCharacter(value: string): string | undefined {
  * telling them, and the acceptance criteria settle the choice explicitly: a name carrying U+0007 and a name
  * carrying U+200B each write no row and are reported to the caller.
  *
- * **Two tests, and they are not redundant.** The first four clauses are the enumerated minimum the input
- * contract names — the C0 block, DELETE with C1, the three contiguous zero-widths, and the byte order mark —
- * written as explicit bounds so the documented contract is legible in code and does not depend on a Unicode
- * table for the cases the requirements state by number. The last clause is the general class,
- * {@link DISALLOWED_CHARACTER_CLASS}, which is what actually closes the seam: without it U+061C, U+180E,
- * U+202A to U+202E, U+2060, U+2061, U+2066 to U+2069, U+034F, U+00AD and every variation selector are all
- * storable, each of them invisible or capable of reordering the visible text around it, which is precisely
- * the deception a name's input contract exists to refuse.
- *
- * The general class subsumes the enumerated bounds. Keeping both is deliberate: if a future Unicode revision
- * moved one of the named characters out of its property class, the enumerated clause would still refuse it.
+ * **Four clauses, all of them enumerated bounds, and that is the whole set.** They are the minimum the input
+ * contract names — the C0 block, DELETE with C1, U+200B, and the byte order mark —
+ * written as explicit ranges so the documented contract is legible in code and does not depend on a Unicode
+ * property table for cases the requirements state by number. There is deliberately no general
+ * control/format/default-ignorable class beside them; the note above the ranges records what such a class
+ * refused, why that over-reached the contract, and why the presentation concern it was reaching for belongs
+ * to the storefront rather than to storage.
  */
 function isDisallowedCodePoint(codePoint: number): boolean {
     return (
@@ -333,14 +329,11 @@ function isDisallowedCodePoint(codePoint: number): boolean {
         codePoint <= C0_CONTROL_LAST_CODE_POINT ||
         // U+007F DELETE together with the C1 control block U+0080 to U+009F, one contiguous range.
         (codePoint >= DELETE_CODE_POINT && codePoint <= C1_CONTROL_LAST_CODE_POINT) ||
-        // The zero-width formatting characters U+200B, U+200C and U+200D.
-        (codePoint >= ZERO_WIDTH_FIRST_CODE_POINT && codePoint <= ZERO_WIDTH_LAST_CODE_POINT) ||
+        // U+200B ZERO WIDTH SPACE, and not its two neighbours — see the constant for why the joiner and
+        // the non-joiner are legitimate content rather than invisible noise.
+        codePoint === ZERO_WIDTH_SPACE_CODE_POINT ||
         // U+FEFF, the byte order mark, which the whitespace class excludes so that it reaches this test.
-        codePoint === BYTE_ORDER_MARK_CODE_POINT ||
-        // Every other control, format and default-ignorable character: bidirectional controls and
-        // isolates, invisible operators, variation selectors, the soft hyphen, the combining grapheme
-        // joiner, the Hangul fillers and the tag characters.
-        DISALLOWED_CHARACTER_CLASS.test(String.fromCodePoint(codePoint))
+        codePoint === BYTE_ORDER_MARK_CODE_POINT
     );
 }
 
@@ -514,17 +507,18 @@ export function toNameKey(displayName: string): string {
  *    a constant equal to the width of the columns the values are stored in, and there is deliberately no
  *    option to configure it — a value above the column width would turn a rejection a buyer can act on into
  *    an opaque driver error, and a value below it would restrict what no engine restricts.
- * 3. **An invisible or direction-changing character is refused.** Such characters are rejected rather than
- *    stripped, so that nothing reaches storage that the buyer did not knowingly submit and nothing is
- *    silently altered. The refused class is every control, format and default-ignorable character: the C0
- *    block U+0000 to U+001F in full apart from the three members the collapse step legitimately consumes —
- *    tab U+0009, line feed U+000A and carriage return U+000D, so U+000B vertical tab and U+000C form feed
- *    are refused here even though JavaScript's `\s` would call them whitespace — together with DELETE and
- *    the C1 block, the zero-widths and the byte order mark, the bidirectional marks, embeddings, overrides
- *    and isolates, the invisible operators, the soft hyphen, the combining grapheme joiner and the
- *    variation selectors. See {@link DISALLOWED_CHARACTER_CLASS} for why they are one class rather than a
- *    list of blocks, and {@link findDisallowedCharacter} for why this test of the *display* value
- *    necessarily runs last among the three above.
+ * 3. **A control or zero-width character is refused.** Such characters are rejected rather than stripped, so
+ *    that nothing reaches storage that the buyer did not knowingly submit and nothing is silently altered.
+ *    The refused set is exactly four enumerated ranges: the C0 block U+0000 to U+001F in full apart from the
+ *    three members the collapse step legitimately consumes — tab U+0009, line feed U+000A and carriage
+ *    return U+000D, so U+000B vertical tab and U+000C form feed are refused here even though JavaScript's
+ *    `\s` would call them whitespace — DELETE with the C1 block U+007F to U+009F, U+200B ZERO WIDTH SPACE,
+ *    and U+FEFF the byte order mark. Nothing else is refused: an emoji carrying a presentation selector or a
+ *    zero-width joiner, a soft hyphen, a bidirectional mark and a combining grapheme joiner are all
+ *    stored verbatim, because a display name is trim-and-collapse and *nothing else* and the safety of the
+ *    RENDERING is the storefront's. See {@link isDisallowedCodePoint} for the set and the note beside it for
+ *    what an earlier revision refused here and why that over-reached, and {@link findDisallowedCharacter}
+ *    for why this test of the *display* value necessarily runs last among the three above.
  * 4. **A derived `nameKey` longer than the same maximum is refused, even where the display value fitted.**
  *    Both stored values are bounded because both occupy a `varchar(191)` column, and normalisation is not
  *    guaranteed to shorten: NFC canonical composition can *lengthen* a string, so a display value at or

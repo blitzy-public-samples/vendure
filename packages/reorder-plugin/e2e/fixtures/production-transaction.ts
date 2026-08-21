@@ -57,6 +57,14 @@
  * The obligations it serves are EPIC-001 section 7.8's requirement that a race claim rest on an explicit
  * barrier and section 11.6.3's exclusion of `e2e-sqljs` from concurrency evidence.
  *
+ * AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE. AAP section 0.5.1.8 enumerates two fixture modules —
+ * `e2e/fixtures/query-capture.ts` and `e2e/fixtures/concurrency-barrier.ts` — and this is a third, so it is
+ * an addition rather than a planned artefact. It is admitted by the in-scope pattern
+ * `packages/reorder-plugin/e2e/fixtures/*.ts` (AAP section 0.6.1.2) and declared here under section 0.8.2's
+ * no-silent-deviation obligation. It is kept because the barrier alone does not satisfy the evidence rule it
+ * serves: without this module a participant's precheck and its write land on different connections, and the
+ * two transactions the barrier held are then not the two transactions the claim is about.
+ *
  * @since 3.8.0
  */
 import { Type } from '@nestjs/common';

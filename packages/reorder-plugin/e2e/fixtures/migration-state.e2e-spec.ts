@@ -14,6 +14,13 @@
  * `concurrency-barrier.e2e-spec.ts`. It is therefore free of the port and database contention the
  * server-bearing suites carry.
  *
+ * AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE. AAP section 0.5.1.8 enumerates neither this file nor the
+ * module it covers, so both are additions rather than planned artefacts — admitted by the in-scope pattern
+ * `packages/reorder-plugin/e2e/fixtures/*.ts` (AAP section 0.6.1.2) and declared here under section 0.8.2's
+ * no-silent-deviation obligation. It is kept because a teardown primitive that six suites release their
+ * resources through, and whose failure mode is a resource silently left behind, cannot be left to be
+ * exercised only on the happy path.
+ *
  * @since 3.8.0
  */
 import { describe, expect, it } from 'vitest';

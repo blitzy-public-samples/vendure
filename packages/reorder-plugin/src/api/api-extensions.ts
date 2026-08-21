@@ -130,7 +130,17 @@ export const shopApiExtensions = gql`
         id: ID!
         createdAt: DateTime!
         updatedAt: DateTime!
-        "NULLABLE, and that is a contract rather than an oversight. Null means exactly one thing: the variant is no longer RESOLVABLE in the active channel — it has been soft-deleted, it belongs to another channel, or the stored identifier answers to nothing. The line itself is RETAINED in every one of those cases, because a non-null field would have to expose a withdrawn catalogue object or null-bubble the whole line out of its page. A variant that is merely DISABLED is NOT one of those cases and resolves normally, carrying enabled: false for a client to read: a saved list records intent rather than availability, so this payload reports the variant as the catalogue has it and adds no availability field of its own."
+        # TRANSCRIBED VERBATIM from FEATURE-001-01 section 2.6, which is the single authority for this
+        # contract: a description is introspectable, so it is part of the published surface and is quoted
+        # rather than improved. One nuance the contract's wording leaves open is recorded here, in a
+        # comment the schema does not publish, so that the published text stays the ticket's own. Of the
+        # two states the sentence names, only a soft-deleted variant actually yields null. A variant that
+        # is merely DISABLED resolves normally and carries enabled: false for a client to read, because
+        # a saved list records intent rather than availability and this payload adds no availability
+        # field of its own. A variant belonging to another channel, and a stored identifier that answers
+        # to nothing, resolve to null for the same reason a soft-deleted one does: they are not
+        # resolvable in the active channel.
+        "NULLABLE, and that is a contract rather than an oversight: a line whose variant has been soft-deleted or disabled since it was saved is RETAINED, and a non-null field would have to expose a withdrawn catalogue object or null-bubble the whole line out of the page. Null means the variant is no longer resolvable in the active channel."
         productVariant: ProductVariant
         "NON-NULL always. The stored identifier survives the variant becoming unresolvable, which is what lets a buyer see and remove the stale line."
         productVariantId: ID!

@@ -1554,6 +1554,15 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expect(dataSource.hasMetadata(ReorderListLine), diagnostic).toBe(true);
         });
 
+        // WHY THIS ONE CHECKPOINT IS ENGINE-CONDITIONAL, AND WHERE THE FOUR-ENGINE CYCLE IS INSTEAD.
+        //
+        // This case drives the CHECKED-IN artefact's own `up()` and `down()` on the live connection, and an
+        // emitted migration is bound to the engine it was generated against ({@link committedMigrationApplies}
+        // carries the citations), so those two methods can only be called where the dialect matches. That is a
+        // property of the artefact rather than a gap in the checkpoint: `e2e/reorder-list-migration.e2e-spec.ts`
+        // owns the data-bearing up → down → up cycle and runs it on ALL FOUR engines, applying the checked-in
+        // artefact where the dialect matches and the migration this engine's own lifecycle emits otherwise. So
+        // what is conditional here is which FILE the cycle is spelled in, never whether the cycle is measured.
         it.skipIf(!committedMigrationApplies(resolveConfiguredEngine()))(
             'checkpoint 2: the checked-in migration applies and reverts on this engine, against a plugin-less baseline',
             async () => {
@@ -1989,6 +1998,34 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expect(stored.name).toBe(trimmedToBound);
             expect(await countLists(actingCustomerDbId, defaultChannelDbId)).toBe(1);
             expect(String((await readTheOnlyListRow()).name)).toBe(trimmedToBound);
+        });
+
+        it('createReorderList accepts an emoji name and stores every code point of it', async () => {
+            // ★ THE OTHER SIDE OF AC-2, AND IT IS A CASE THAT USED TO FAIL. AC-2 refuses four malformed
+            // names; the criterion does not license refusing anything else, and the display value is the
+            // submitted string trimmed and collapsed and NOTHING ELSE [AAP §0.1.2.5]. An earlier revision of
+            // the name module refused every `\p{Default_Ignorable_Code_Point}`, which includes the variation
+            // selectors, so an emoji written the way a phone keyboard writes it — with U+FE0F — was answered
+            // with a top-level `USER_INPUT_ERROR`, as was every zero-width-joiner sequence and any name
+            // carrying U+00AD SOFT HYPHEN.
+            //
+            // Driven end to end rather than only in the co-located unit specification, because what is at
+            // stake is the whole path: the mutation accepts it, the `varchar(191)` column stores it, and the
+            // read returns it code point for code point. `Array.from` is what compares by code point rather
+            // than by UTF-16 unit, which for astral emoji is the difference between a real assertion and one
+            // that would pass on a truncated surrogate pair.
+            const emojiName = 'Favourites \u2764\uFE0F \u{1F468}\u200D\u{1F469}\u200D\u{1F467} Co\u00ADop';
+
+            const created = expectCreated(await createReorderList(emojiName));
+
+            expect(created.name).toBe(emojiName);
+            expect(Array.from(created.name)).toEqual(Array.from(emojiName));
+            const row = await readTheOnlyListRow();
+            expect(String(row.name)).toBe(emojiName);
+            expect(Array.from(String(row.name))).toEqual(Array.from(emojiName));
+            // The canonical key is the same string lower-cased, so the selectors, the joiners and the soft
+            // hyphen all survive into it too — nothing about them is a comparison artefact.
+            expect(String(row.nameKey)).toBe(emojiName.toLowerCase());
         });
     });
 

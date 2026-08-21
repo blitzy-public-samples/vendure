@@ -45,6 +45,15 @@
  * covers under a two-segment path; and the in-process SQLite engine has neither. The harness's initializers
  * offer no non-public-schema server, which is why this suite builds its connections itself rather than asking
  * for one.
+ *
+ * ## An addition to the planned file set, declared here
+ *
+ * AAP section 0.5.1.8 enumerates six end-to-end suites and this is a seventh, so it is an addition rather than
+ * a planned artefact. It is admitted by the in-scope pattern `packages/reorder-plugin/e2e/*.e2e-spec.ts` (AAP
+ * section 0.6.1.2) and declared here under section 0.8.2's no-silent-deviation obligation. It is kept because
+ * the property it covers is invisible to every one of the six: on the harness's own unconfigured connection a
+ * bare fragment and a qualified one are the same statement, so a suite running there cannot tell a correct
+ * rendering from one that would read another schema's rows on a deployment that sets `DB_SCHEMA`.
  */
 import { CurrencyCode, LanguageCode } from '@vendure/common/lib/generated-types';
 import {

@@ -34,6 +34,12 @@ import {
  * ★ **WHAT IS ASSERTED IS ALWAYS "NO PART OF IT SURVIVED", NEVER "THE VALUE WAS REPLACED".** A rule that
  * replaces the shapes it was taught is a denylist wearing a redaction's clothes, and the four cases at the
  * top of the teardown group are each a real message that walked straight past exactly such a rule.
+ *
+ * ★ **AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE.** AAP §0.5.1.8 enumerates neither this file nor
+ * the module it covers, so both are additions rather than planned artefacts — admitted by the in-scope
+ * pattern `packages/reorder-plugin/e2e/fixtures/*.ts` (AAP §0.6.1.2) and declared here under §0.8.2's
+ * no-silent-deviation obligation. It is kept for the reason its subject is kept: an instrument that decides
+ * a security property, and whose negative cases are not committed, protects nothing against a later edit.
  */
 describe('the diagnostic redaction every e2e suite shares', () => {
     const TOKEN = ['s3cr3t', 'session', 'token', '4f2c81b9'].join('-');

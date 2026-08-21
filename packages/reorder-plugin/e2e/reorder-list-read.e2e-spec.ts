@@ -1021,8 +1021,10 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
      * **It is available on the generation engine alone**, because the shipped artefact is the migration
      * generator's PostgreSQL output and an emitted migration is bound to the engine it was generated against
      * ({@link committedMigrationApplies} carries the reasoning and the citations). Elsewhere the rebuild is
-     * skipped and the caller says what its assertion then rests on; the migration suite is where the shipped
-     * file is applied, and `withIsolatedMigrationState` is where another engine's own emission is.
+     * skipped and the caller says what its assertion then rests on, which is what the case below asserts
+     * rather than assumes. Where a migration-created schema IS exercised on every engine is
+     * `e2e/reorder-list-migration.e2e-spec.ts`: it applies the checked-in artefact where the dialect matches
+     * and this engine's own lifecycle emission otherwise, and runs its whole data-bearing cycle against that.
      *
      * @returns Whether the schema underneath is now the migration's own.
      */
