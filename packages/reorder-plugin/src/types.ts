@@ -5,8 +5,9 @@
  * yields the five declared defaults.
  *
  * `@since 3.8.0` on each member is a derivation rather than a quotation: the contribution guide requires a
- * new public API to name the next minor version, this checkout declares 3.7.0, and 3.8.0 appears nowhere in
- * the repository.
+ * new public API to name the next minor version, and this checkout declares 3.7.0 — in `lerna.json` and in
+ * every workspace manifest — so 3.8.0 is the next minor and is named here on that basis. No released
+ * version of this platform carries it, and nothing outside this package's own `@since` tags asserts it.
  *
  * There is no sixth key, and the absences are deliberate rather than pending. The list-name bound is not
  * configurable: it is the fixed constant `MAX_LIST_NAME_LENGTH` in `constants.ts`, equal to the `name`
@@ -139,7 +140,13 @@ export interface ReorderPluginOptions {
      * `ignoreQueryLimits` remains false on every query, so a caller asking for more than the platform limit
      * is refused by the platform rather than by plugin code.
      *
-     * Must be an integer, finite, and at least 1.
+     * Must be an integer, finite, at least 1, and **no greater than the running server's own
+     * `apiOptions.shopListQueryLimit`** (100 unless your configuration lowers it). That upper bound is not a
+     * style preference: the value is applied as the `take` of a Shop list query, and the platform refuses a
+     * larger page outright rather than clamping it, so a page size above the limit would make every read
+     * that omits `take` fail. It is therefore checked when the plugin is bootstrapped into a server, and a
+     * server whose limit is below this value fails to start with a named error rather than starting and then
+     * failing every such read.
      *
      * @default 25
      * @since 3.8.0
@@ -157,7 +164,9 @@ export interface ReorderPluginOptions {
      * than every line of the list. `lineCount` remains on the parent type for a client that needs only a
      * summary and no page of lines at all.
      *
-     * Must be an integer, finite, and at least 1.
+     * Must be an integer, finite, at least 1, and **no greater than the running server's own
+     * `apiOptions.shopListQueryLimit`**, for the reason given on `defaultReorderListsPageSize`: the same
+     * builder clamps the nested read, and the same refusal applies above the limit.
      *
      * @default 50
      * @since 3.8.0

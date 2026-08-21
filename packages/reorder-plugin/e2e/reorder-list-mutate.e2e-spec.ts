@@ -158,10 +158,19 @@ const QUANTITY_ABOVE_MAXIMUM_MESSAGE =
     `The resulting quantity for this reorder list line would exceed the maximum of ` +
     `${String(MAX_QUANTITY_PER_LINE)}`;
 
-/** The resolved English message for a name whose canonical form cannot be stored. */
+/**
+ * The resolved English message for a name whose canonical form cannot be stored.
+ *
+ * Restated here rather than imported from `i18n/en.json`, so that a change to the published wording has to
+ * be made deliberately in both places. It names the refused characters individually because the message
+ * does: a category ("control or zero-width") described a wider set than the code refuses, which told a
+ * buyer the wrong rule.
+ */
 const NAME_EMPTY_MESSAGE =
-    'The reorder list name must be between 1 and 191 characters once surrounding whitespace is removed, ' +
-    'and must not contain control or zero-width characters';
+    'The reorder list name must be between 1 and 191 characters once surrounding whitespace is removed ' +
+    'and internal whitespace is collapsed, must contain no control character (U+0000 to U+001F, U+007F ' +
+    'to U+009F), no zero-width space (U+200B) and no byte order mark (U+FEFF), and must still be within ' +
+    '191 characters once Unicode-normalised';
 
 const MONETARY_OR_STOCK_FIELD_NAME = /price|currenc|stock|money|amount|saleable|inventory|tax/i;
 

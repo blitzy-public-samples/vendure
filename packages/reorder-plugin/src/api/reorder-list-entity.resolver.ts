@@ -575,10 +575,14 @@ function selectedUnfilteredLinesPageOptions(
  * cached page instead of loading its own — so the nested read's two statements are issued once, here, rather
  * than once here and once there.
  *
- * **A failure to pre-resolve is not a failure of the request.** The read is wrapped, and a failure leaves the
- * field resolver to load the page as it always could, taking the fallback reconciliation with it. The
- * alternative — failing a read that would otherwise have succeeded, for the sake of a counter it only meant to
- * tidy — trades a working response for a maintenance task.
+ * **A failure to pre-resolve is retried once and then propagates**, and the ordering is why. A forgiven
+ * failure does not produce an error, it produces a WRONG ANSWER: the parent goes out unreconciled, the
+ * executor has already taken `lineCount` off it by the time the field resolver's fallback repairs the row,
+ * and the response reports the stale number as though it were current — the very ordering
+ * FEATURE-001-01 section 2.6.2.1 exists to forbid. So a transient failure is retried
+ * ({@link PRE_RESOLVE_READ_ATTEMPTS} attempts) and a failure that survives the retry fails the read. The one
+ * exception is a `UserInputError`: it is not retried and not raised from here, because it is a statement about
+ * the caller's own nested arguments and the nested field meets it on its own path, under its own field error.
  *
  * The platform's own resolvers use this shape: the Shop products resolver inspects its `info`, pre-starts the
  * query a field resolver will need and caches the result for it
@@ -667,10 +671,18 @@ export async function reconcileSingleReorderListRead(
         }
     }
     if (!page) {
-        // The service seeds an entry for every identifier it is given, so this is unreachable against its own
-        // contract. Returning leaves the stored counter reported as it stands, which is the same outcome as a
-        // request that selected no unfiltered window — there is no observed total to reconcile against.
-        return;
+        // ★ UNREACHABLE AGAINST THE SERVICE'S CONTRACT — WHICH IS WHY IT FAILS CLOSED RATHER THAN RETURNING.
+        // `getLinesForLists` seeds an entry for every identifier it is given, so a missing entry means that
+        // contract has been broken inside this plugin. Returning here would answer the request with the
+        // stored counter and no reconciliation, which is indistinguishable from the ordinary
+        // no-unfiltered-window path — so an internal defect would surface as a plausible NUMBER on a
+        // successful response, and a buyer would be told a `lineCount` this request had reason to doubt.
+        // Wrong data that looks right is the one outcome worth failing a read for, so the request fails with
+        // the plugin's own sanitised internal error and the defect reaches a log instead of a buyer.
+        throw reportReorderListInternalFailure(
+            'A line page pre-resolve resolved no partition for the list it was resolved for, which the ' +
+                'service contract makes unreachable',
+        );
     }
     // AND THE REPAIR PRECEDES THE CACHING, which is the other half of the same finding. Caching first left the
     // nested field resolver holding a page it would serve happily while the compare-and-set that was supposed
@@ -993,17 +1005,19 @@ export class ReorderListEntityResolver {
         const pages = await batch.loaded;
         const page = pages.get(parentId);
         if (!page) {
-            // Unreachable against the service's own contract, which seeds an entry for every identifier it is
-            // given — and reported rather than papered over, because the alternative is a page of lines that
-            // silently reads as empty. An empty page is returned rather than an error raised: the request has
-            // already produced the buyer's list, and failing it over a missing partition would lose more than
-            // it reports.
-            Logger.warn(
-                `Resolved no line page for reorder list ${String(list.id)} from a batch of ` +
-                    `${String(batch.registeredIds.size)} list(s)`,
-                loggerCtx,
+            // ★ UNREACHABLE AGAINST THE SERVICE'S CONTRACT, AND IT FAILS CLOSED. `getLinesForLists` seeds an
+            // entry for every identifier registered in the batch, so a missing partition means that contract
+            // has been broken inside this plugin. Returning `{ items: [], totalItems: 0 }` would publish
+            // "this list has no lines" — a statement about the buyer's own data that this request has no
+            // evidence for, and which a client cannot tell apart from a genuinely empty list. It would also
+            // suppress the reconciliation below, leaving a stored counter to be reported beside a fabricated
+            // empty page. An internal defect must not be converted into plausible incorrect data, so the
+            // field fails with the plugin's own sanitised internal error and the detail goes to the log.
+            throw reportReorderListInternalFailure(
+                `Resolved no line page for a reorder list from a batch of ` +
+                    `${String(batch.registeredIds.size)} list(s), which the service contract makes ` +
+                    'unreachable',
             );
-            return { items: [], totalItems: 0 };
         }
         // THE FALLBACK RECONCILIATION, and it is a fallback rather than the primary path. The single-list read
         // reconciles before it exposes the parent, which is the only ordering under which the response can

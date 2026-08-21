@@ -4725,6 +4725,43 @@ describe('ReorderListService', () => {
             expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
         });
 
+        it.each([
+            ['a negative counter', -1],
+            ['a fractional counter', 2.5],
+            ['a counter beyond the safe integer range', Number.MAX_SAFE_INTEGER + 2],
+        ])('fails the request where the row is still there but carries %s', async (_label, storedValue) => {
+            // ★ THE THIRD OUTCOME OF A LOST RACE, AND THE ONE THAT MUST NOT ANSWER WITH A NUMBER. The
+            // row exists within the owner scope, so there IS a stored value — it simply is not a count.
+            // Reporting the observed total here would publish a number that is not the stored column
+            // while the stored column exists, silently, which is precisely what the read-back exists to
+            // prevent. Nothing this plugin writes can produce such a value (every write is a guarded
+            // increment, a guarded decrement or this compare-and-set, and
+            // `CHK_reorder_list_line_count_non_negative` refuses a negative wherever TypeORM creates it),
+            // so it means something else has written to shared data — reachable on MySQL and MariaDB,
+            // where that constraint is discarded (conflict C-E).
+            const list = await readList();
+            harness.plan.listAffected = () => 0;
+            harness.plan.listFindOne = () =>
+                ({ id: LIST_ID, lineCount: storedValue }) as unknown as ReorderList;
+
+            const rejection = await captureRejection(() => service.reconcileLineCount(ctx, list, 4, 2));
+
+            expect(rejection).toBeInstanceOf(InternalServerError);
+            // The caller-visible message is the module's one generic sentence: it names no column, no
+            // value and no table.
+            expect((rejection as Error).message).toBe(UNCLASSIFIED_FAILURE_MESSAGE);
+            expect((rejection as Error).message).not.toContain(String(storedValue));
+            // The diagnostic that names what happened goes to the log, with a correlation id, and it
+            // carries no value either.
+            expect(loggedErrors).toHaveLength(1);
+            expect(loggedErrors[0].message).toContain('not a non-negative safe integer');
+            expect(loggedErrors[0].message).not.toContain(String(storedValue));
+            expect(loggedErrors[0].context).toBe(loggerCtx);
+            // The compare-and-set was attempted and the read-back happened; no second write followed.
+            expect(statementsOfKind(harness, 'ReorderList', 'update')).toHaveLength(1);
+            expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
+        });
+
         it('refuses to write an observed total that is not a non-negative integer', async () => {
             const list = await readList();
 

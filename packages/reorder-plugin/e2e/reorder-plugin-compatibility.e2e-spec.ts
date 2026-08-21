@@ -58,8 +58,10 @@
  */
 import {
     bootstrap,
+    ConfigService,
     getCompatibility,
     HEALTH_CHECK_ROUTE,
+    I18nService,
     InternalServerError,
     mergeConfig,
     PLUGIN_METADATA,
@@ -82,19 +84,19 @@ import {
  * tree and declares no `exports` map, so such a specifier does resolve for an installed consumer, but it
  * names an internal module carrying no compatibility guarantee. The root is the surface the package
  * documents and keeps. So this line is load-bearing twice over: it fails at resolution time if the root
- * barrel stops publishing one of the five symbols it names, and it fails at build time if
+ * barrel stops publishing one of the four symbols it names, and it fails at build time if
  * `tsconfig.build.json` stops emitting the module a symbol lives in. That file names ONE build root — the
  * barrel — and every module the published tree carries is reached from it through the import graph, the
- * migration included: `reorderPluginMigrations` names the class, so the module that declares it is compiled
- * whether or not any consumer imports it directly. A module no root reaches is not compiled, and a migration
- * absent from `lib` cannot be registered by a consumer, which is what the emission case below reads back.
+ * migration included: the barrel publishes `ReorderPlugin`, and the module declaring it imports the migration
+ * class to build its own `reorderPluginMigrations`, so the migration is compiled whether or not any consumer
+ * imports it. A module no root reaches is not compiled, and a migration absent from `lib` cannot be
+ * registered by a consumer, which is what the emission case below reads back.
  */
 import { preBootstrapConfig } from '@vendure/core/dist/bootstrap';
 import {
     ReorderList,
     ReorderListLine,
     ReorderPlugin,
-    reorderPluginMigrations,
     type ReorderPluginOptions,
 } from '@vendure/reorder-plugin';
 import { createTestEnvironment } from '@vendure/testing';
@@ -102,7 +104,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs-extra';
 import path from 'path';
 import { DataSource, DataSourceOptions, QueryRunner } from 'typeorm';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
@@ -110,13 +112,15 @@ import { AddReorderLists1786838400000 } from '../src/migrations/1786838400000-ad
 /**
  * **Deliberately NOT from the package root, and the specifier is the assertion.**
  *
- * The root barrel publishes the five symbols a deployment configures this plugin through — `ReorderPlugin`,
- * `ReorderPluginOptions`, both entities and `reorderPluginMigrations` — and nothing else, so
- * `ReorderPluginConfigurationError` is reached here through the module that declares it. The case below
- * therefore asserts two things at once: that the class behaves as its documentation says, and that it is
- * absent from the root, which is what the surface assertion beside it reads back.
+ * The root barrel publishes exactly the four symbols a deployment configures this plugin through —
+ * `ReorderPlugin`, `ReorderPluginOptions` and both entities — and nothing else, so both
+ * `ReorderPluginConfigurationError` and `reorderPluginMigrations` are reached here through the module that
+ * declares them. The case below therefore asserts two things at once: that each behaves as its documentation
+ * says, and that neither is on the root, which is what the surface assertion beside it reads back. A
+ * deployment does not need the migration constant either — it registers the emitted file by glob, which the
+ * emission case below reads back from a packed tarball.
  */
-import { ReorderPluginConfigurationError } from '../src/reorder.plugin';
+import { ReorderPluginConfigurationError, reorderPluginMigrations } from '../src/reorder.plugin';
 
 import { resolveConfiguredEngine } from './fixtures/concurrency-barrier';
 import { committedMigrationApplies } from './fixtures/migration-state';
@@ -166,7 +170,7 @@ const incompatibilityMessageFor = (pluginName: string) =>
 /** The error code `InternalServerError` carries in its GraphQL extensions [packages/core/src/common/error/errors.ts]. */
 const INTERNAL_SERVER_ERROR_CODE = 'INTERNAL_SERVER_ERROR';
 
-const DECLARED_OPTIONS: ReorderPluginOptions = {
+const DECLARED_OPTIONS: Required<ReorderPluginOptions> = {
     maxListsPerCustomer: 25,
     maxLinesPerList: 200,
     maxQuantityPerLine: 999,
@@ -277,6 +281,12 @@ async function firstProductVariantId(connection: DataSource): Promise<string> {
 const HARNESS_PORT = harnessConfig.apiOptions.port;
 const SATISFIED_RANGE_BOOTSTRAP_PORT = HARNESS_PORT + 100;
 const UNSATISFIABLE_RANGE_BOOTSTRAP_PORT = HARNESS_PORT + 200;
+
+/**
+ * The port the Shop-limit refusal names. Distinct from the two above only so that a failure to refuse cannot
+ * be masked by another test's listener; the path under test never reaches `app.listen()`.
+ */
+const SHOP_LIMIT_REFUSAL_BOOTSTRAP_PORT = HARNESS_PORT + 300;
 
 /**
  * How long a health probe waits before it gives up.
@@ -457,14 +467,16 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         expect(options).toEqual(DECLARED_OPTIONS);
     });
 
-    it('publishes the migration classes, and exactly the documented surface, from the package root', () => {
-        // ★ THE SURFACE ITSELF, READ BACK. The root barrel publishes what a deployment configures this
-        // plugin through and nothing more: the plugin class, its options type (erased at run time), both
-        // entity classes, and the migration classes the AAP's conflict C-D option A has a deployment
-        // register. Anything else reachable from here would be a compatibility promise nobody asked for —
-        // `ReorderPluginConfigurationError` is the concrete case, published from the root by an earlier
-        // revision and now reached only through the module that declares it, which is how the import at
-        // the head of this file spells it.
+    it('publishes exactly the documented surface from the package root, and nothing else', () => {
+        // ★ THE SURFACE ITSELF, READ BACK, AND IT IS AN EXACT SET RATHER THAN A SUBSET. The root barrel
+        // publishes what a deployment configures this plugin through and nothing more: the plugin class,
+        // its options type (erased at run time) and both entity classes — the four symbols AAP section
+        // 0.2.4.1 names. Anything else reachable from here would be a compatibility promise nobody asked
+        // for, and two concrete symbols were published from the root by earlier revisions and are not now:
+        // `ReorderPluginConfigurationError`, whose properties a caller branches on rather than the class,
+        // and `reorderPluginMigrations`, which a deployment never needs because it registers the emitted
+        // migration by glob. Both are reached here through the module that declares them, which is how the
+        // import at the head of this file spells them.
         //
         // `require` rather than the static import above, because the surface is the question: a named
         // import can only name what it expects, whereas the module object answers what the barrel actually
@@ -472,10 +484,11 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const rootModule = require('@vendure/reorder-plugin') as Record<string, unknown>;
         expect(Object.keys(rootModule).sort()).toEqual(
-            ['ReorderList', 'ReorderListLine', 'ReorderPlugin', 'reorderPluginMigrations'].sort(),
+            ['ReorderList', 'ReorderListLine', 'ReorderPlugin'].sort(),
         );
         expect(rootModule.ReorderPlugin).toBe(ReorderPlugin);
-        expect(rootModule.reorderPluginMigrations).toBe(reorderPluginMigrations);
+        expect(rootModule.reorderPluginMigrations).toBeUndefined();
+        expect(rootModule.ReorderPluginConfigurationError).toBeUndefined();
 
         expect(typeof ReorderPluginConfigurationError).toBe('function');
         expect(ReorderPluginConfigurationError.prototype instanceof Error).toBe(true);
@@ -510,10 +523,12 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         expect(registration.name).toBe('ReorderPlugin');
         expect(ReorderPlugin.init(DECLARED_OPTIONS)).not.toBe(registration);
 
-        // The migration classes are what a deployment registers in `dbConnectionOptions.migrations`, so
-        // the export is the registration contract and is read back as such: a non-empty array whose
-        // every member is a constructor carrying the timestamped name TypeORM orders migrations by.
+        // The migration constant is what this package's own suites load the class through, and it is frozen
+        // because an importable mutable array of migration classes is an importable way to change what a
+        // running process applies to a database. Read back as such: a non-empty frozen array whose every
+        // member is a constructor carrying the timestamped name TypeORM orders migrations by.
         expect(Array.isArray(reorderPluginMigrations)).toBe(true);
+        expect(Object.isFrozen(reorderPluginMigrations)).toBe(true);
         expect(reorderPluginMigrations.length).toBeGreaterThan(0);
         for (const migration of reorderPluginMigrations) {
             expect(typeof migration).toBe('function');
@@ -548,8 +563,10 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         expect(
             fs.existsSync(installedMigrationDir),
             `${installedMigrationDir} does not exist, so the migration is emitted nowhere a deployment can ` +
-                'register it: the build graph must reach it, which `tsconfig.build.json` does by naming it ' +
-                'as a second root rather than by publishing it from the barrel',
+                'register it. `tsconfig.build.json` names ONE root, the barrel, so the migration is ' +
+                'compiled because the import graph reaches it: the barrel exports `ReorderPlugin`, and the ' +
+                'module that declares it imports the migration class for its own `reorderPluginMigrations`. ' +
+                'Removing that import would silently stop publishing the migration.',
         ).toBe(true);
         const emitted = fs
             .readdirSync(installedMigrationDir)
@@ -732,6 +749,137 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         expect(await probeHealthEndpoint(UNSATISFIABLE_RANGE_BOOTSTRAP_PORT)).toBe(UNREACHABLE);
 
         expect(getCompatibility(ReorderPlugin)).toBe(DECLARED_COMPATIBILITY_RANGE);
+    });
+
+    /**
+     * The Shop list-query-limit refusal, in the two forms that together settle it.
+     *
+     * **Why the check exists at all.** Both page-size options are applied as the `take` of a
+     * `ListQueryBuilder` query when a caller supplies none, and `parseTakeSkipParams` throws
+     * `UserInputError('error.list-query-limit-exceeded')` on `take > apiOptions.shopListQueryLimit` for a
+     * Shop request, with `ignoreQueryLimits` deliberately false here. A page size above the limit therefore
+     * does not degrade to the limit — it makes every read that omits `take` fail, on a server that started
+     * healthily and reported nothing. The plugin refuses that configuration at bootstrap instead, which is
+     * what EPIC-001 section 7.10 requires of a bound it cannot serve.
+     *
+     * **The first case bootstraps a real server** and asserts that it is not created, which is the outcome a
+     * deployment experiences. **The second constructs the plugin over a configuration the PLATFORM resolved**
+     * — `preBootstrapConfig` plus the platform's own `ConfigService` — and names no limit at all, so the
+     * value compared against is the platform's own default rather than one this test chose. The unit
+     * specification covers the boundary values and the unreadable-limit guard over a doubled service; these
+     * two cover the parts a double cannot: a real refusal and the platform's own defaulting.
+     *
+     * **A NOTE FOR ANYONE EDITING THE PLUGIN AND THEN RUNNING THIS FILE.** `ReorderPlugin` arrives here
+     * through the package root, which resolves to the COMPILED `lib/` tree, so a change to `src/` is
+     * invisible to every case in this file until `npm run build` has run. A bootstrap-driven assertion about
+     * a brand-new refusal will "fail" against a stale build for a reason that has nothing to do with the
+     * refusal.
+     */
+    describe('the Shop list-query limit a page size is checked against', () => {
+        it('refuses to start a server whose limit is below a declared page size', async () => {
+            const limit = 10;
+            expect(
+                limit,
+                'the limit must be below both declared page sizes for this case to mean anything',
+            ).toBeLessThan(
+                Math.min(
+                    DECLARED_OPTIONS.defaultReorderListsPageSize,
+                    DECLARED_OPTIONS.defaultReorderListLinesPageSize,
+                ),
+            );
+
+            let app: BootstrappedApp | undefined;
+            let caught: unknown;
+            try {
+                const config = mergeConfig(directBootstrapConfigFor(SHOP_LIMIT_REFUSAL_BOOTSTRAP_PORT), {
+                    apiOptions: { shopListQueryLimit: limit },
+                    plugins: [ReorderPlugin.init(DECLARED_OPTIONS)],
+                });
+                // Read back off the configuration that is about to be bootstrapped, so a merge that failed
+                // to apply the limit cannot be reported as a passing negative test.
+                expect(config.apiOptions.shopListQueryLimit).toBe(limit);
+                try {
+                    app = await bootstrap(config);
+                } catch (e) {
+                    caught = e;
+                }
+            } finally {
+                // Same shape as the compatibility refusal above, for the same reasons: `bootstrap` mutates
+                // the global configuration singleton before this plugin's hook runs, and no shutdown hook
+                // undoes it because no application finished initialising.
+                try {
+                    await app?.close();
+                } finally {
+                    resetConfig();
+                }
+            }
+
+            expect(app, 'the server must not have been created').toBeUndefined();
+            expect((caught as Error | undefined)?.name).toBe('ReorderPluginConfigurationError');
+            expect((caught as { optionKey?: string } | undefined)?.optionKey).toBe(
+                'defaultReorderListsPageSize',
+            );
+            expect((caught as Error).message).toContain('defaultReorderListsPageSize');
+            expect((caught as Error).message).toContain(String(limit));
+            expect(await probeHealthEndpoint(SHOP_LIMIT_REFUSAL_BOOTSTRAP_PORT)).toBe(UNREACHABLE);
+        });
+
+        /** Builds a plugin instance over the configuration the platform resolves for `limit`. */
+        async function pluginOver(limit: number | undefined): Promise<{
+            plugin: ReorderPlugin;
+            resolvedLimit: number;
+            addTranslationFile: ReturnType<typeof vi.fn>;
+        }> {
+            resetConfig();
+            const config = mergeConfig(harnessConfig, {
+                apiOptions: limit === undefined ? {} : { shopListQueryLimit: limit },
+                plugins: [ReorderPlugin.init(DECLARED_OPTIONS)],
+            });
+            await preBootstrapConfig(config);
+            const configService = new ConfigService();
+            const addTranslationFile = vi.fn();
+            const plugin = new ReorderPlugin({ addTranslationFile } as unknown as I18nService, configService);
+            return { plugin, resolvedLimit: configService.apiOptions.shopListQueryLimit, addTranslationFile };
+        }
+
+        afterEach(() => {
+            vi.restoreAllMocks();
+            resetConfig();
+        });
+
+        it('refuses a page size above the resolved limit, naming the key and the limit', async () => {
+            const limit = 10;
+            const { plugin, resolvedLimit, addTranslationFile } = await pluginOver(limit);
+            // The limit is read back off the resolved configuration first, so a merge that failed to apply
+            // it cannot be reported as a passing refusal.
+            expect(resolvedLimit).toBe(limit);
+            expect(resolvedLimit).toBeLessThan(DECLARED_OPTIONS.defaultReorderListsPageSize);
+
+            let caught: unknown;
+            try {
+                plugin.onApplicationBootstrap();
+            } catch (e) {
+                caught = e;
+            }
+
+            expect((caught as Error | undefined)?.name).toBe('ReorderPluginConfigurationError');
+            expect((caught as { optionKey?: string }).optionKey).toBe('defaultReorderListsPageSize');
+            expect((caught as Error).message).toContain('defaultReorderListsPageSize');
+            expect((caught as Error).message).toContain(String(limit));
+            // Fail-closed: the catalogue registration sits behind both validations, so it did not run.
+            expect(addTranslationFile).not.toHaveBeenCalled();
+        });
+
+        it('accepts both page sizes under the platform default limit, which the platform supplies', async () => {
+            // The accepting direction, over a configuration that names no limit at all — so the value
+            // compared against is the platform's own default rather than one this test chose.
+            const { plugin, resolvedLimit, addTranslationFile } = await pluginOver(undefined);
+            expect(resolvedLimit).toBeGreaterThanOrEqual(DECLARED_OPTIONS.defaultReorderListsPageSize);
+            expect(resolvedLimit).toBeGreaterThanOrEqual(DECLARED_OPTIONS.defaultReorderListLinesPageSize);
+
+            expect(() => plugin.onApplicationBootstrap()).not.toThrow();
+            expect(addTranslationFile).toHaveBeenCalledTimes(1);
+        });
     });
 
     /**

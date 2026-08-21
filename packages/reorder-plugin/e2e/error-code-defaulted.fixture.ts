@@ -104,10 +104,11 @@
  * 6. NEITHER HALF IS EVER IMPORTED, SO NEITHER CAN BREAK THE BUILD OR ANY TEST RUN.
  *    Neither file is imported by `packages/reorder-plugin/index.ts`, nor by anything under
  *    `packages/reorder-plugin/src/`, nor by any specification — they have no importer at all, by design.
- *    The package build emits only what is reachable from its two declared roots — `tsconfig.build.json`
- *    names `./index.ts`, the barrel, and the one migration under `src/migrations/`, which the manifest's
- *    `files` entry publishes and a deployment may register by glob — and neither half of this pair is
- *    reachable from either, so `bun run build`, `bun run ci` and the unit suite never type-check them. The end-to-end runner does not collect them either: it matches
+ *    The package build emits only what is reachable from its ONE declared root — `tsconfig.build.json`
+ *    names `./index.ts`, the barrel, and nothing else; the migration under `src/migrations/` is emitted
+ *    because the import graph reaches it, the manifest's `files` entry publishes it, and a deployment
+ *    registers it by glob — and neither half of this pair is reachable from that root at all, so
+ *    `bun run build`, `bun run ci` and the unit suite never type-check them. The end-to-end runner does not collect them either: it matches
  *    `**\/*.e2e-spec.ts` only [e2e-common/vitest.config.mts:L7], and the `.fixture.ts` suffix is
  *    deliberately outside that pattern. Neither file may be renamed to `*.e2e-spec.ts`. Each half's exit
  *    status is asserted by the specification that names its project rather than by being reachable from

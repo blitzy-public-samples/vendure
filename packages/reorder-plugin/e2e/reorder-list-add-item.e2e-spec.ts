@@ -2459,7 +2459,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(refusal.errors[0].message).not.toBe('error.reorder-list-name-empty');
             expect(refusal.errors[0].message).toBe(
                 'The reorder list name must be between 1 and 191 characters once surrounding whitespace ' +
-                    'is removed, and must not contain control or zero-width characters',
+                    'is removed and internal whitespace is collapsed, must contain no control character ' +
+                    '(U+0000 to U+001F, U+007F to U+009F), no zero-width space (U+200B) and no byte order ' +
+                    'mark (U+FEFF), and must still be within 191 characters once Unicode-normalised',
             );
         });
     });

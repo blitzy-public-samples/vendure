@@ -128,8 +128,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { initialData } from '../../../e2e-common/e2e-initial-data';
 import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-config';
-import { ReorderList, ReorderListLine, ReorderPlugin, reorderPluginMigrations } from '../index';
+import { ReorderList, ReorderListLine, ReorderPlugin } from '../index';
 import { AddReorderLists1786838400000 } from '../src/migrations/1786838400000-add-reorder-lists';
+// Deliberately a deep import: the root barrel publishes exactly the four symbols a deployment
+// configures this plugin through (AAP section 0.2.4.1), and the migration constant is not one of them
+// — a deployment registers the emitted file by glob, which is what the dev-server assertions below
+// read back. This suite needs the class as a value, so it reaches the module that declares it.
+import { reorderPluginMigrations } from '../src/reorder.plugin';
 
 import {
     describeRowDifferences,
@@ -1620,10 +1625,12 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
         it('is emitted into the published package, at the path a consumer registers', async () => {
             // THE OTHER HALF OF THE GLOB CONTRACT, and the reason it is asserted at all: an installed package
-            // has no `src` tree, so a consumer's `migrations` entry has to name the COMPILED file. The migration
-            // is a named build root in `tsconfig.build.json` precisely so that it lands here, inside the one
-            // path the manifest's `files` entry publishes. The class itself is not a named export of the
-            // package root; it reaches a consumer through the root's `reorderPluginMigrations` array.
+            // has no `src` tree, so a consumer's `migrations` entry has to name the COMPILED file. It lands
+            // here without `tsconfig.build.json` naming it: that file names one root, the barrel, and the
+            // module the barrel reaches for `ReorderPlugin` imports the migration class to build its own
+            // `reorderPluginMigrations`, so the import graph carries it into `lib/` — inside the one path the
+            // manifest's `files` entry publishes. Neither the class nor that constant is on the package root,
+            // and a deployment needs neither: it registers this compiled file by glob.
             const built = (await fs.pathExists(BUILT_MIGRATION_GLOB_DIR))
                 ? (await fs.readdir(BUILT_MIGRATION_GLOB_DIR)).filter(entry => entry.endsWith('.js'))
                 : [];
@@ -2041,15 +2048,17 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
     // How the dev server registers this plugin's migration
     //
-    // The package ships its migration in two layouts — `src/migrations/*.ts` in a checkout and
-    // `lib/src/migrations/*.js` in the published artefact — and a built checkout carries BOTH. Registering a
-    // glob for each is not a harmless superset: TypeORM loads every pattern and then refuses the whole
-    // configuration, because both files declare the same class
-    // (`MigrationExecutor.checkForDuplicateMigrations`). Registering the CLASS instead is what makes one
-    // registration correct in both layouts, and it is what the shipped configuration does.
+    // By a glob at the plugin's own migrations directory, which is what AAP section 0.8.3.5 conflict C-D
+    // option A specifies: "append the plugin's migration glob to the existing `dbConnectionOptions.migrations`
+    // array". EXACTLY ONE pattern, and that is the load-bearing part. The package carries its migration in
+    // two layouts — `src/migrations/*.ts` in a checkout and `lib/src/migrations/*.js` in the published
+    // artefact — and a built checkout carries both, so a configuration naming a pattern for each would hand
+    // TypeORM two migrations of one name and be refused in full
+    // (`MigrationExecutor.checkForDuplicateMigrations`). This repository is a source checkout, so the one
+    // pattern names the source layout, in the same form as the pattern already beside it.
 
     describe('the registration the dev server carries', () => {
-        it('registers the migration class this package exports, not a per-layout glob', async () => {
+        it("appends exactly one glob at the plugin's own migrations directory", async () => {
             const devConfigSource = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
             const options = dbConnectionOptionsBlockOf(devConfigSource);
 
@@ -2057,24 +2066,45 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             // 0.4.1.1 permits exactly three changes to this file — an import line, the plugin registration,
             // and one appended clause on this array — so the assertion is over the whole array rather than
             // over the presence of the new member alone.
-            expect(
-                options,
-                "dev-config must append the plugin's own migration classes to the existing array",
-            ).toContain("migrations: [path.join(__dirname, 'migrations/*.ts'), ...reorderPluginMigrations],");
-
-            // And the symbol it appends is imported from the PACKAGE ROOT, which is the same specifier the
-            // plugin class itself arrives through. A deep path into this package's source tree would be a
-            // route the manifest resolves and the package makes no promise about.
-            expect(devConfigSource).toContain(
-                "import { ReorderPlugin, reorderPluginMigrations } from '@vendure/reorder-plugin';",
+            const migrationsArray = /migrations: \[([\s\S]*?)\n {8}\],/.exec(options);
+            expect(migrationsArray, 'dev-config must declare a migrations array').not.toBeNull();
+            // Each entry is matched as a whole `path.join(...)` call rather than by splitting on commas,
+            // because a comma inside the call would split one entry into two and read a correct array as a
+            // longer one.
+            const entries = [...(migrationsArray as RegExpExecArray)[1].matchAll(/path\.join\([^)]*\)/g)].map(
+                match => match[0],
             );
+            expect(entries).toEqual([
+                "path.join(__dirname, 'migrations/*.ts')",
+                "path.join(__dirname, '../reorder-plugin/src/migrations/*.ts')",
+            ]);
+            // Nothing but those two calls is in the array — an entry of another shape would be a third
+            // clause this file is not permitted to carry.
+            expect(
+                (migrationsArray as RegExpExecArray)[1].replace(/path\.join\([^)]*\),?/g, '').trim(),
+                'the migrations array must carry exactly the two path.join entries and nothing else',
+            ).toBe('');
+
+            // And it names ONE layout. Both layouts declare `AddReorderLists1786838400000`, so a pattern for
+            // each would hand TypeORM two migrations of one name and be refused in full — which is why the
+            // built layout must NOT also be named. Asserted over the array's own text rather than over the
+            // whole options block, because the comment above the array names the compiled layout in prose to
+            // tell a reader what an installed package registers instead.
+            expect(
+                (migrationsArray as RegExpExecArray)[1],
+                'naming the compiled layout as well would register the same migration twice',
+            ).not.toContain('lib/src/migrations');
+
+            // The plugin class still arrives from the package root, and the migration constant no longer
+            // does — the root publishes exactly four symbols and that constant is not one of them.
+            expect(devConfigSource).toContain("import { ReorderPlugin } from '@vendure/reorder-plugin';");
             expect(
                 devConfigSource,
-                'the registration must not be built from a path relative to the dev server',
-            ).not.toContain("'../reorder-plugin");
+                'the root barrel does not publish the migration constant, so nothing may import it here',
+            ).not.toContain('reorderPluginMigrations');
             expect(
                 devConfigSource,
-                'a class registration needs no filesystem probe, so no such probe may appear',
+                'a glob registration needs no filesystem probe, so no such probe may appear',
             ).not.toContain("import fs from 'fs'");
             expect(
                 devConfigSource,
@@ -2082,13 +2112,23 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             ).not.toContain('process.argv');
         });
 
-        it('registers a class per layout that resolves to exactly one migration file', async () => {
-            // WHY a class rather than two globs, stated as evidence rather than as a comment: both artefacts
-            // declare `AddReorderLists1786838400000`, so a configuration naming both hands TypeORM two
-            // migrations of one name and is rejected in full.
+        it('resolves that glob to exactly one migration file, in each layout', async () => {
+            // The registered pattern is relative to the dev server, so it is resolved the way Node resolves
+            // it there rather than restated: one file, and it is this package's one migration.
+            const registeredDir = path.resolve(
+                path.dirname(DEV_CONFIG_FILE_PATH),
+                '../reorder-plugin/src/migrations',
+            );
+            const sourceEntries = (await fs.readdir(registeredDir))
+                .filter(entry => entry.endsWith('.ts'))
+                .sort();
+            expect(sourceEntries).toEqual([MIGRATION_FILENAME]);
             expect(migrationSource, 'the source layout must declare the migration class').toContain(
                 `export class ${SHIPPED_MIGRATION_CLASS_NAME}`,
             );
+
+            // WHY only one layout may be registered, stated as evidence rather than as a comment: the
+            // compiled artefact declares the SAME class, so a configuration naming both is rejected in full.
             const builtFile = path.join(BUILT_MIGRATION_GLOB_DIR, MIGRATION_FILENAME.replace(/\.ts$/, '.js'));
             expect(
                 await fs.pathExists(builtFile),
@@ -2100,12 +2140,13 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     'not both be registered',
             ).toContain(SHIPPED_MIGRATION_CLASS_NAME);
 
-            // And what the package publishes for a deployment to register is that one class, so the
-            // duplicate-name rejection is unreachable by construction rather than by a layout choice.
+            // And the constant this package's own suites load the class through names that one class, frozen
+            // so that an importer cannot change what a running process would apply.
             expect(reorderPluginMigrations).toEqual([AddReorderLists1786838400000]);
             expect(reorderPluginMigrations.map(migration => migration.name)).toEqual([
                 SHIPPED_MIGRATION_CLASS_NAME,
             ]);
+            expect(Object.isFrozen(reorderPluginMigrations)).toBe(true);
         });
     });
 

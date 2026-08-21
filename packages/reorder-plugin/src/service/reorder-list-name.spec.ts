@@ -774,8 +774,9 @@ describe('reorder list name canonicalisation', () => {
             // far past the contract and cost real names: `Default_Ignorable_Code_Point` covers the variation
             // selectors, so EVERY emoji written with a presentation selector was refused — "Favourites ❤️",
             // "Notes ✏️" — and `\p{Cf}` adds U+00AD SOFT HYPHEN, so a hyphenated paste was refused as well.
-            // The registered message ("must not contain control or zero-width characters") did not describe
-            // any of those inputs either, so the refusal did not even name the rule it enforced.
+            // The registered message of the day ("must not contain control or zero-width characters") did not
+            // describe any of those inputs either, so the refusal did not even name the rule it enforced.
+            // The message now names the four refused characters individually, so the two halves agree.
             //
             // What the contract actually says is that a display name is the submitted value trimmed and
             // collapsed and NOTHING ELSE [AAP §0.1.2.5], that the characters it names are U+0007 and U+200B

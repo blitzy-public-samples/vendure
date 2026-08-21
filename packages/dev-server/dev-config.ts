@@ -20,7 +20,7 @@ import {
 import { DashboardPlugin } from '@vendure/dashboard/plugin';
 import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
 import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
-import { ReorderPlugin, reorderPluginMigrations } from '@vendure/reorder-plugin';
+import { ReorderPlugin } from '@vendure/reorder-plugin';
 import { TelemetryPlugin } from '@vendure/telemetry-plugin';
 import 'dotenv/config';
 import path from 'path';
@@ -99,11 +99,12 @@ export const devConfig: VendureConfig = {
         synchronize: false,
         logging: false,
         // FEATURE-001-01: the ONE clause this feature appends here. `ReorderPlugin` owns its migration inside
-        // its own package, so it is registered from there rather than copied into this directory, and it is
-        // registered by CLASS rather than by a path: TypeORM accepts a migration class wherever it accepts a
-        // glob, so one registration serves both layouts this repository runs in — the `src/` tree of a
-        // checkout and the compiled `lib/src/` of an installed package — and neither can be matched twice.
-        // Naming a glob for each layout would hand TypeORM two migrations of one name, which
+        // its own package, so it is registered from there rather than copied into this directory — a glob at
+        // the plugin's own `src/migrations/`, in the same form as the pattern beside it. This repository is a
+        // source checkout, which is why the pattern names `src/migrations/*.ts`; an installed package carries
+        // only the compiled layout and names `lib/src/migrations/*.js` instead, as the plugin's README
+        // records. Exactly one pattern is named, because two patterns matching the same migration under two
+        // layouts would hand TypeORM two migrations of one name, which
         // `MigrationExecutor.checkForDuplicateMigrations` rejects outright rather than degrading.
         //
         // `packages/dev-server/migration.ts`'s `run` and `revert` subcommands are what apply and reverse it,
@@ -115,7 +116,10 @@ export const devConfig: VendureConfig = {
         // reports its failure through `process.exitCode` rather than by throwing (`migrate.ts:L52-L59`) and the
         // boot then synchronizes as it always has. The migration-owned flow is exercised by the plugin's own
         // e2e suites instead, against a schema the migration itself created.
-        migrations: [path.join(__dirname, 'migrations/*.ts'), ...reorderPluginMigrations],
+        migrations: [
+            path.join(__dirname, 'migrations/*.ts'),
+            path.join(__dirname, '../reorder-plugin/src/migrations/*.ts'),
+        ],
         ...getDbConfig(),
     },
     paymentOptions: {

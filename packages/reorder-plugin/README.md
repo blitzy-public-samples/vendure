@@ -99,38 +99,38 @@ The plugin ships that migration. It is compiled into the published package at
 > emitted form rather than an omission: the platform's migration lifecycle is the only sanctioned way to
 > produce one of these files, and one run of it produces one dialect.
 
-On PostgreSQL, the supported way to register the shipped file is by value, from the package root:
+On PostgreSQL, register it the way you register any other migration in a Vendure project — by naming its
+file in `dbConnectionOptions.migrations`. Resolve this package's own directory through the module system
+rather than writing a relative path from your configuration file, so the pattern keeps working wherever
+that file lives:
 
 ```ts
 import type { VendureConfig } from '@vendure/core';
-import { reorderPluginMigrations } from '@vendure/reorder-plugin';
+import path from 'path';
+
+const reorderPluginRoot = path.dirname(require.resolve('@vendure/reorder-plugin/package.json'));
 
 export const config: VendureConfig = {
     dbConnectionOptions: {
         // ...
         migrations: [
             // ...your own migrations
-            ...reorderPluginMigrations,
+            path.join(reorderPluginRoot, 'lib/src/migrations/*.js'),
         ],
     },
 };
 ```
 
-Registering the class rather than a path is what makes one registration correct in both layouts this
-package runs in: TypeORM accepts a migration class wherever it accepts a glob, and a class is resolved
-by the module system, so no path arithmetic over `src/` versus `lib/src/` is needed. A deployment that
-prefers globs can name the emitted file instead — an installed package carries only the compiled
-layout, so one pattern is enough — but resolve it through the module system rather than writing a
-relative path from your own configuration file:
+**Name one layout, not both.** An installed package carries only the compiled tree, so the single pattern
+above is enough there; a source checkout of this repository carries `src/migrations/*.ts` instead, which is
+what `packages/dev-server` names. A configuration naming both would match two files declaring the same
+migration class, and TypeORM refuses the whole configuration in that case rather than de-duplicating
+(`MigrationExecutor.checkForDuplicateMigrations`).
 
-```ts
-import path from 'path';
-
-const reorderPluginRoot = path.dirname(require.resolve('@vendure/reorder-plugin/package.json'));
-
-// Equivalent to the above; prefer the class registration unless your tooling needs a path.
-const migrationGlob = path.join(reorderPluginRoot, 'lib/src/migrations/*.js');
-```
+The migration class is deliberately **not** exported from the package root. The root publishes exactly what
+you configure the plugin through — `ReorderPlugin`, `ReorderPluginOptions`, `ReorderList` and
+`ReorderListLine` — and a migration is registered by file, so nothing about the registration above needs a
+symbol from this package.
 
 Then apply it with the platform's own migration lifecycle — `runMigrations` to apply and
 `revertLastMigration` to reverse — as described in the
@@ -161,7 +161,10 @@ in one startup sequence in either order. Note also how such a failure is reporte
 synchronizes regardless.
 
 `packages/dev-server` in this repository is exactly such a synchronization-driven harness — it ships no
-core migrations of its own, and every engine branch of its own configuration turns `synchronize` on. It
+core migrations of its own, and **every branch of its connection configuration except one** turns
+`synchronize` on over the `false` its own `dbConnectionOptions` declares — MariaDB, MySQL, PostgreSQL and
+native SQLite all do. The exception is `sqljs`, which sets no `synchronize` at all, so on `DB=sqljs` the
+declared `false` stands. It
 registers this plugin's migration in the one place a registration belongs, `dbConnectionOptions.migrations`,
 and its start script calls `runMigrations` before `bootstrap`. **The visible consequence is worth stating
 rather than leaving to be met in a log**: on that harness's default MariaDB the boot-time `runMigrations`
@@ -205,9 +208,9 @@ rather than against PostgreSQL.
 ```ts
 import { generateMigration } from '@vendure/core';
 
-// `config` is your own VendureConfig with ReorderPlugin registered and this package's
-// `reorderPluginMigrations` NOT in `dbConnectionOptions.migrations` — the generator must not be
-// handed the migration it is being asked to decide the need for.
+// `config` is your own VendureConfig with ReorderPlugin registered and this package's shipped
+// migration NOT named in `dbConnectionOptions.migrations` — the generator must not be handed the
+// migration it is being asked to decide the need for.
 await generateMigration(config, { name: 'add-reorder-lists', outputDir: './src/migrations' });
 ```
 
@@ -292,12 +295,21 @@ this package ships the documented gap rather than the unsanctioned mechanism.
 | `maxListsPerCustomer`             | `number` — integer, finite, at least 1                                                | `25`    | `createReorderList`, under a pessimistic row lock on the owning customer                                     |
 | `maxLinesPerList`                 | `number` — integer, finite, at least 1                                                | `200`   | `addItemToReorderList` only — **not** `adjustReorderListLine`, which cannot breach a line-count bound        |
 | `maxQuantityPerLine`              | `number` — integer units, finite, at least 1, no greater than a signed 32-bit integer | `999`   | `addItemToReorderList` and `adjustReorderListLine`, applied to the **resulting** quantity, not the increment |
-| `defaultReorderListsPageSize`     | `number` — integer, finite, at least 1                                                | `25`    | The `take` applied to `activeCustomerReorderLists` when a caller supplies none                               |
-| `defaultReorderListLinesPageSize` | `number` — integer, finite, at least 1                                                | `50`    | The `take` applied to `ReorderList.lines` when a caller supplies none                                        |
+| `defaultReorderListsPageSize`     | `number` — integer, finite, at least 1, no greater than `shopListQueryLimit`          | `25`    | The `take` applied to `activeCustomerReorderLists` when a caller supplies none                               |
+| `defaultReorderListLinesPageSize` | `number` — integer, finite, at least 1, no greater than `shopListQueryLimit`          | `50`    | The `take` applied to `ReorderList.lines` when a caller supplies none                                        |
 
-Both page-size defaults sit below the platform's own `apiOptions.shopListQueryLimit`, which
-defaults to `100`. The plugin never bypasses that limit, so a caller asking for more rows than the
-Shop API permits is refused by the platform exactly as it would be on any other paginated query.
+Both page-size defaults sit below the platform's own `apiOptions.shopListQueryLimit`, which defaults to
+`100`. The plugin never bypasses that limit — `ignoreQueryLimits` stays false on every query — so a caller
+asking for more rows than the Shop API permits is refused by the platform exactly as it would be on any
+other paginated query.
+
+**If you lower `shopListQueryLimit` below either page size, the server will not start.** That is deliberate
+and it is checked when the plugin is bootstrapped: a page size is applied as the `take` of a Shop list query,
+and the platform refuses a `take` above the limit rather than clamping it, so a page size above the limit
+would leave every read that omits `take` failing with `USER_INPUT_ERROR` on a server that started and
+reported nothing wrong. The boot instead fails with `ReorderPluginConfigurationError` naming which of the two
+page sizes exceeds the limit and what the limit is. A page size exactly equal to the limit is accepted,
+because the platform's own test is strictly greater. The other three options are unaffected by this limit.
 
 There is deliberately no `maxListNameLength` option. The 191-character bound on a list name is a
 fixed constant, because it is a key-size constraint on a `varchar(191)` column that participates in
@@ -389,18 +401,29 @@ translation resource for the same keys.
 
 ## List names
 
-A list name is stored after whitespace canonicalisation only — surrounding whitespace removed and
-internal runs of whitespace collapsed to a single space. Nothing else is altered: the name is
-neither escaped, stripped nor entity-encoded at rest, so reading it back returns the string you
-submitted, byte for byte. Uniqueness is enforced per customer and channel by a database constraint
-over a canonicalised form of the name, which makes the comparison case-insensitive but
-accent-preserving, so `Café` and `Cafe` remain two distinct lists.
+A list name is stored after whitespace canonicalisation only — surrounding whitespace removed and internal
+runs of whitespace collapsed to a single space. **After that canonicalisation, nothing else is altered**: the
+name is neither escaped, stripped nor entity-encoded at rest, so reading it back returns exactly what
+canonicalisation produced, code point for code point. Submit `"  Weekly   order  "` and you get back
+`"Weekly order"` — the whitespace is the one thing that changes, and it changes before the row is written.
+Uniqueness is enforced per customer and channel by a database constraint over a canonicalised form of the
+name, which makes the comparison case-insensitive but accent-preserving, so `Café` and `Cafe` remain two
+distinct lists.
 
-A name is refused as malformed on exactly four grounds, and it is worth knowing the list is that short.
-Its canonical form must not be empty and must not exceed 191 characters, and the submitted text may
-carry none of: a C0 control character (`U+0000`–`U+001F`, less the tab, newline and carriage return that
-whitespace canonicalisation itself consumes), `U+007F`–`U+009F`, `U+200B` zero-width space, or `U+FEFF`.
-Everything else is stored. In particular an emoji sequence, a variation selector, a zero-width joiner or
+A name is refused as malformed on exactly four grounds, and it is worth knowing the list is that short:
+
+1. Its canonical form is empty.
+2. Its canonical form exceeds 191 characters.
+3. The canonical form carries any of: a C0 control character (`U+0000`–`U+001F`, less the tab, newline and
+   carriage return that whitespace canonicalisation itself consumes — so `U+000B` and `U+000C` **are**
+   refused), `U+007F`–`U+009F`, `U+200B` zero-width space, or `U+FEFF`.
+4. The canonical key derived from it — the same value lower-cased and Unicode-normalised, which is what the
+   uniqueness constraint compares — exceeds 191 characters even though the display value did not. NFC
+   composition can lengthen a string, so this is a real fourth ground rather than a restatement of the
+   second, and it is the one a caller is least likely to expect.
+
+All four arrive as a single top-level `errors` entry with `extensions.code` `USER_INPUT_ERROR` and no row
+written. Everything not in that list is stored. In particular an emoji sequence, a variation selector, a zero-width joiner or
 non-joiner, a soft hyphen, a bidirectional mark and a combining grapheme joiner are all accepted and
 round-trip code point for code point — a name is buyer-supplied text, and refusing characters that
 ordinary orthography and ordinary emoji are built from would reject names a buyer legitimately typed.

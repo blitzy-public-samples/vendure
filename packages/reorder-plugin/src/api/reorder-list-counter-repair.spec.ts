@@ -41,6 +41,7 @@
  */
 import {
     Channel,
+    InternalServerError,
     ProductVariantService,
     RequestContext,
     RequestContextCacheService,
@@ -182,6 +183,23 @@ function methodOf(target: NewableFunction, name: string): object {
         throw new Error(`${target.name} declares no member named ${name}`);
     }
     return descriptor.value as object;
+}
+
+/**
+ * The one caller-visible sentence this plugin's internal failures carry, restated rather than imported
+ * because it is a published string and a test that imported it could not notice it changing.
+ * (`reportReorderListInternalFailure` in `../service/reorder-list.service`.)
+ */
+const UNCLASSIFIED_FAILURE_MESSAGE = 'The reorder list request could not be completed';
+
+/** Runs `work` and returns whatever it rejected with, failing the test if it resolved instead. */
+async function captureRejection(work: () => Promise<unknown>): Promise<unknown> {
+    try {
+        await work();
+    } catch (e) {
+        return e;
+    }
+    throw new Error('expected the call to reject, but it resolved');
 }
 
 /** A fresh service double whose line loads answer with an unfiltered total unless the request narrows. */
@@ -407,6 +425,55 @@ describe('the single-list read reconciles the stored lineCount before the parent
         await expect(entity.lines(ctx, returned, linesArgs({ take: 500 }))).rejects.toBeInstanceOf(
             UserInputError,
         );
+    });
+
+    /*
+     * Both paths that load a nested page ask the service for a MAP keyed by list identifier, and the service
+     * contract is that every identifier it is handed comes back with an entry — an empty page where the list
+     * has no lines, never a missing key. The two cases below drive that contract being broken anyway.
+     *
+     * They exist because the obvious handling of "this cannot happen" is the dangerous one. A missing entry
+     * looks exactly like a list with no lines, so returning early or answering `{ items: [], totalItems: 0 }`
+     * converts an internal defect into a plausible statement about the buyer's own data: a `lineCount` that
+     * was never reconciled, or a page that reads as empty when the list is not. Neither is distinguishable
+     * from a correct response by any client, and neither leaves a trace once the request has gone out. So
+     * both branches fail the request with the module's one generic internal error and put the diagnostic in
+     * the log, where a defect belongs.
+     */
+    it('fails the read where the pre-resolve gets back no partition for its own list', async () => {
+        // The contract broken in the one way that matters: a resolved map that does not carry the identifier
+        // it was asked about. `Map` rather than undefined, so the failure is the MISSING ENTRY and not a
+        // missing result. The suite's own doubles are reused, so the only difference from the passing cases
+        // above is this one mock.
+        service.getLinesForLists.mockResolvedValue(new Map());
+        const ctx = ctxFor();
+        const info = infoFor(
+            `query Q($id: ID!) { activeCustomerReorderList(id: $id) { lineCount lines { totalItems } } }`,
+        );
+
+        const rejection = await captureRejection(() =>
+            shop.activeCustomerReorderList(ctx, { id: LIST_ID }, info),
+        );
+
+        expect(rejection).toBeInstanceOf(InternalServerError);
+        expect((rejection as Error).message).toBe(UNCLASSIFIED_FAILURE_MESSAGE);
+        // No repair was issued from a page that was never resolved, and the list identifier is not in the
+        // caller-visible message.
+        expect(service.reconcileLineCount).not.toHaveBeenCalled();
+        expect((rejection as Error).message).not.toContain(LIST_ID);
+    });
+
+    it('fails the lines field where the batch gets back no partition for its own list', async () => {
+        service.getLinesForLists.mockResolvedValue(new Map());
+        const ctx = ctxFor();
+
+        const rejection = await captureRejection(() => entity.lines(ctx, listRow(3), linesArgs({ take: 2 })));
+
+        // NOT `{ items: [], totalItems: 0 }`. An empty page here would tell a buyer their list is empty on
+        // the strength of a defect, and would suppress the fallback reconciliation as well.
+        expect(rejection).toBeInstanceOf(InternalServerError);
+        expect((rejection as Error).message).toBe(UNCLASSIFIED_FAILURE_MESSAGE);
+        expect(service.reconcileLineCount).not.toHaveBeenCalled();
     });
 });
 

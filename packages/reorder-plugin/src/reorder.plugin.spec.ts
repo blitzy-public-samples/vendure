@@ -75,6 +75,31 @@ const MUST_NOT_EXCEED_THE_32_BIT_CEILING =
 const MAX_SIGNED_32_BIT_INTEGER = 2147483647;
 
 /**
+ * The platform's own default Shop list-query limit, restated here because it is the value a server carries
+ * unless its configuration lowers it, and both page-size defaults have to sit at or below it.
+ *
+ * Not imported: it is a property of a resolved `VendureConfig` rather than an exported constant, and reading
+ * it out of one would need a bootstrapped server — which is precisely what these cases avoid. The number is
+ * pinned by the end-to-end suite instead, which reads it off a real server's own configuration.
+ * (`packages/core/src/config/default-config.ts` L89.)
+ */
+const DEFAULT_SHOP_LIST_QUERY_LIMIT = 100;
+
+/**
+ * The requirement clause carried when a page-size option exceeds the running server's Shop list-query limit.
+ * The clause names the limit AND the reason, because the reason is what makes the refusal correct rather than
+ * merely strict: the platform refuses a larger `take` outright instead of clamping it, so an unrefused value
+ * would leave every read that omits `take` failing at request time on a server that started cleanly.
+ */
+function mustNotExceedShopLimit(limit: number): string {
+    return (
+        `must not exceed apiOptions.shopListQueryLimit, which this server sets to ${String(limit)}, ` +
+        'because it is applied as the `take` of a Shop list query when a caller supplies none and the ' +
+        'platform refuses a larger page outright rather than clamping it'
+    );
+}
+
+/**
  * One row of the rejection matrix: a value the plugin must refuse, the requirement clause it must cite, and
  * the description it must render for the value.
  *
@@ -838,7 +863,10 @@ describe('the bootstrap hook', () => {
      * The engine is a parameter because it is the input the removed check-constraint warning branched on, so
      * a subject fixed to one engine could not show that no engine now produces a line.
      */
-    function bootstrapSubject(engine = 'postgres'): {
+    function bootstrapSubject(
+        engine = 'postgres',
+        shopListQueryLimit: unknown = DEFAULT_SHOP_LIST_QUERY_LIMIT,
+    ): {
         plugin: ReorderPlugin;
         addTranslationFile: ReturnType<typeof vi.fn>;
     } {
@@ -847,6 +875,11 @@ describe('the bootstrap hook', () => {
             { addTranslationFile } as unknown as I18nService,
             {
                 dbConnectionOptions: { type: engine },
+                // The hook reads this to check both page sizes against the limit that will actually clamp
+                // them, so the double carries it. `100` is the platform's own default
+                // (`packages/core/src/config/default-config.ts` L89), which is what a server carries unless
+                // its configuration lowers it.
+                apiOptions: { shopListQueryLimit },
             } as unknown as ConfigService,
         );
         return { plugin, addTranslationFile };
@@ -912,8 +945,8 @@ describe('the bootstrap hook', () => {
     });
 
     it('does not refuse to start, and still re-validates the options it will serve with', () => {
-        // The hook's one fail-closed act is the option re-validation, and it must remain the ONLY thing that
-        // can stop a boot here. Asserted alongside the catalogue registration so that "it does not throw" is
+        // The hook's fail-closed acts are the two validations, and they must remain the ONLY things that can
+        // stop a boot here. Asserted alongside the catalogue registration so that "it does not throw" is
         // not bought by the hook doing nothing.
         const { plugin, addTranslationFile } = bootstrapSubject('mariadb');
 
@@ -922,5 +955,84 @@ describe('the bootstrap hook', () => {
             addTranslationFile,
             'the catalogue registration must still have happened, so the hook was not short-circuited',
         ).toHaveBeenCalledTimes(1);
+    });
+
+    // ────────────────────────────────────────────────────────────────────────────────────────────────────
+    // The one bound `init()` cannot check: a page size against the server's own Shop list-query limit.
+    //
+    // WHY THIS IS A BOOT FAILURE AND NOT A CAVEAT. Both page-size options are applied as the `take` of a
+    // `ListQueryBuilder` query when a caller supplies none, and `parseTakeSkipParams` throws
+    // `UserInputError('error.list-query-limit-exceeded')` when `take` exceeds `apiOptions.shopListQueryLimit`
+    // for a Shop request — this plugin leaves `ignoreQueryLimits` false deliberately. So a page size above
+    // the limit does not degrade to the limit: it makes EVERY read that omits `take` fail, on a server that
+    // started healthily. The refusal therefore has to happen at bootstrap, where the configured limit is
+    // finally readable, and it has to name which key is at fault.
+    // ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+    it.each([
+        ['defaultReorderListsPageSize' as const, 24, 25],
+        ['defaultReorderListLinesPageSize' as const, 49, 50],
+    ])(
+        'refuses to start when the server limit is below %s, naming that key',
+        (key, limit, declaredDefault) => {
+            const { plugin, addTranslationFile } = bootstrapSubject('postgres', limit);
+
+            let caught: unknown;
+            try {
+                plugin.onApplicationBootstrap();
+            } catch (e) {
+                caught = e;
+            }
+
+            expect(caught, 'a page size above the server limit must stop the boot').toBeInstanceOf(
+                ReorderPluginConfigurationError,
+            );
+            expect((caught as ReorderPluginConfigurationError).optionKey).toBe(key);
+            expect((caught as Error).message).toContain(key);
+            expect((caught as Error).message).toContain(mustNotExceedShopLimit(limit));
+            // The declared default is what was refused, so the message names a value the operator can find
+            // in their own configuration rather than an abstraction.
+            expect((caught as Error).message).toContain(String(declaredDefault));
+            // And the hook failed CLOSED: the catalogue registration is behind the validations, so it did
+            // not run. A boot that got as far as registering translations would be a boot that continued.
+            expect(addTranslationFile).not.toHaveBeenCalled();
+        },
+    );
+
+    it('accepts a page size exactly equal to the server limit, because the platform test is strictly greater', () => {
+        // The boundary matters in the accepting direction too: `parseTakeSkipParams` refuses `take > limit`,
+        // so a page size OF the limit is served. Refusing it here would be stricter than the platform and
+        // would reject a configuration that works.
+        const { plugin, addTranslationFile } = bootstrapSubject('postgres', 50);
+
+        expect(() => plugin.onApplicationBootstrap()).not.toThrow();
+        expect(addTranslationFile).toHaveBeenCalledTimes(1);
+    });
+
+    it('leaves the three non-page-size options unbounded by the Shop limit', () => {
+        // `maxListsPerCustomer` (25), `maxLinesPerList` (200) and `maxQuantityPerLine` (999) are all above a
+        // limit of 10, and none of them is ever applied as a `take` — so a low limit must not refuse them.
+        // Without this case the check could be widened to every key and nothing would notice.
+        const { plugin } = bootstrapSubject('postgres', 50);
+
+        expect(() => plugin.onApplicationBootstrap()).not.toThrow();
+    });
+
+    it.each([
+        ['undefined', undefined],
+        ['a fractional value', 12.5],
+        ['zero', 0],
+        ['a negative number', -1],
+        ['a string', '100'],
+    ])('draws no conclusion from a Shop limit that is %s', (_label, limit) => {
+        // A limit this plugin cannot read is the platform's own configuration to answer for. Comparing
+        // against it would produce a refusal naming a plugin key for somebody else's value — and worse,
+        // `25 > undefined` is false while `25 > '10'` is true, so an unguarded comparison would be
+        // arbitrary rather than merely wrong. The platform clamps with whatever it holds; this hook
+        // declines to conclude anything.
+        const { plugin, addTranslationFile } = bootstrapSubject('postgres', limit);
+
+        expect(() => plugin.onApplicationBootstrap()).not.toThrow();
+        expect(addTranslationFile).toHaveBeenCalledTimes(1);
     });
 });

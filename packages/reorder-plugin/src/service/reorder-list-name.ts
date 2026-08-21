@@ -51,11 +51,15 @@ import { MAX_LIST_NAME_LENGTH } from '../constants';
  * rule is structurally true rather than merely observed.
  *
  * The plugin's translation bundle registers exactly four keys and this is the only one of them about a
- * name. Its registered English text states the whole name contract in one sentence — a length between one
- * and the maximum, measured on the canonical form, with no invisible or direction-changing character — and it
- * interpolates a `max` variable because the length half of that sentence carries the bound. That is why all
- * three rejections below share it: whichever clause a name broke, the sentence a buyer reads names the rule
- * they have to satisfy. The key's own spelling still says `empty`, which is narrower than what it now
+ * name. Its registered English text states the whole name contract in one sentence, and it states it
+ * SPECIFICALLY rather than in a category: a length between one and the maximum measured on the canonical
+ * form, no control character (U+0000–U+001F, U+007F–U+009F), no U+200B zero-width space, no U+FEFF byte
+ * order mark, and a normalised key still within the same bound. It interpolates `max` twice because two of
+ * those clauses carry the bound. Naming the characters rather than calling them "control or zero-width" is
+ * deliberate: the earlier wording described a wider set than the code refuses, so a buyer whose emoji name
+ * was accepted could not tell from the message that it would be, and one whose vertical tab was refused
+ * could not tell why. That is why all FOUR rejections below share this key: whichever clause a name broke,
+ * the sentence a buyer reads names the rule they have to satisfy. The key's own spelling still says `empty`, which is narrower than what it now
  * describes; it is kept exactly as registered because the key is the published identifier and renaming it
  * would break every caller matching on it, while the text behind it is free to state the contract in full.
  * Inventing a fifth key would surface to the caller as the raw key text, because nothing would register a
@@ -188,9 +192,11 @@ const BYTE_ORDER_MARK_CODE_POINT = 0xfeff;
  * great deal the contract never authorised. `Default_Ignorable_Code_Point` covers the variation selectors,
  * so **every emoji written with an explicit presentation selector was refused** — "Favourites ❤️" (U+2764
  * U+FE0F) and "Notes ✏️" among them — and `\p{Cf}` adds U+00AD SOFT HYPHEN, so a hyphenated paste was
- * refused too. Those are plausible, non-hostile list names, and the registered message ("must not contain
- * control or zero-width characters") did not describe them either, so the refusal a buyer saw did not match
- * the rule they had broken.
+ * refused too. Those are plausible, non-hostile list names, and the registered message of the day ("must not
+ * contain control or zero-width characters") did not describe them either, so the refusal a buyer saw did not
+ * match the rule they had broken. The message has since been rewritten to name the refused characters
+ * individually, which is what makes the two halves agree: what the code refuses and what the buyer is told
+ * are now the same four grounds.
  *
  * The characters that class also caught and this one does not — U+034F COMBINING GRAPHEME JOINER, the
  * bidirectional marks, embeddings, overrides and isolates, U+2060 WORD JOINER and the invisible mathematical
@@ -263,8 +269,9 @@ function countCodePoints(value: string): number {
 }
 
 /**
- * Returns the first control, format or default-ignorable character in the supplied value, or `undefined`
- * when it holds none.
+ * Returns the first character in the supplied value that this module refuses — a C0 control other than the
+ * three consumed as whitespace, DELETE or a C1 control, U+200B, or U+FEFF — or `undefined` when it holds
+ * none.
  *
  * **Why this runs after trim-and-collapse, which is the one subtlety in this module.** Three of the
  * characters this function would otherwise reject as C0 controls — tab U+0009, line feed U+000A and
@@ -340,7 +347,7 @@ function isDisallowedCodePoint(codePoint: number): boolean {
 /**
  * Refuses the submitted name.
  *
- * Every one of the three rejections funnels through here, and they all raise the identical error with the
+ * Every one of the four rejections funnels through here, and they all raise the identical error with the
  * identical variables. That is intentional on two counts. The registered message states the whole contract
  * in one sentence, so a buyer reading it learns the rule rather than which clause of it they broke. And
  * because the three are indistinguishable to the caller, the order in which they are evaluated has no
@@ -507,7 +514,8 @@ export function toNameKey(displayName: string): string {
  *    a constant equal to the width of the columns the values are stored in, and there is deliberately no
  *    option to configure it — a value above the column width would turn a rejection a buyer can act on into
  *    an opaque driver error, and a value below it would restrict what no engine restricts.
- * 3. **A control or zero-width character is refused.** Such characters are rejected rather than stripped, so
+ * 3. **A control character, a zero-width space or a byte order mark is refused.** These are rejected rather
+ *    than stripped, so
  *    that nothing reaches storage that the buyer did not knowingly submit and nothing is silently altered.
  *    The refused set is exactly four enumerated ranges: the C0 block U+0000 to U+001F in full apart from the
  *    three members the collapse step legitimately consumes — tab U+0009, line feed U+000A and carriage
@@ -518,7 +526,7 @@ export function toNameKey(displayName: string): string {
  *    stored verbatim, because a display name is trim-and-collapse and *nothing else* and the safety of the
  *    RENDERING is the storefront's. See {@link isDisallowedCodePoint} for the set and the note beside it for
  *    what an earlier revision refused here and why that over-reached, and {@link findDisallowedCharacter}
- *    for why this test of the *display* value necessarily runs last among the three above.
+ *    for why this test of the *display* value necessarily runs after the two above.
  * 4. **A derived `nameKey` longer than the same maximum is refused, even where the display value fitted.**
  *    Both stored values are bounded because both occupy a `varchar(191)` column, and normalisation is not
  *    guaranteed to shorten: NFC canonical composition can *lengthen* a string, so a display value at or
@@ -555,8 +563,10 @@ export function toNameKey(displayName: string): string {
  * canonicaliseReorderListName('Order\u000C');    // throws UserInputError — a C0 control, not whitespace
  * ```
  *
- * @throws A `UserInputError` carrying the code `USER_INPUT_ERROR` when the canonical name is empty, is
- * longer than the maximum, or contains a control, format or default-ignorable character.
+ * @throws A `UserInputError` carrying the code `USER_INPUT_ERROR` on any of the four grounds: the canonical
+ * name is empty; it is longer than the maximum; it carries a refused character (a C0 control other than the
+ * three consumed as whitespace, DELETE or a C1 control, U+200B, or U+FEFF); or the normalised `nameKey`
+ * derived from it is longer than the maximum.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage reorder list names
@@ -575,20 +585,21 @@ export function canonicaliseReorderListName(input: string): CanonicalReorderList
 
     const name = toDisplayName(input);
 
-    // Rejection one: the canonical form is empty. Written first because the requirements list it first;
-    // since all three rejections raise the identical error, the order carries no observable meaning.
+    // Rejection one of four: the canonical form is empty. Written first because the requirements list it
+    // first; since all four rejections raise the identical error, the order carries no observable meaning.
     if (name === '') {
         return rejectListName();
     }
 
-    // Rejection two: the canonical form is longer than the bound. Measured on the canonical form, after
+    // Rejection two of four: the canonical form is longer than the bound. Measured on the canonical form, after
     // trim and collapse, and measured in code points because that is the unit the `varchar` column counts.
     if (countCodePoints(name) > MAX_LIST_NAME_LENGTH) {
         return rejectListName();
     }
 
-    // Rejection three: the canonical form carries a control or zero-width character. Necessarily last, so
-    // that the whitespace the collapse step legitimately consumed is not misreported as a control
+    // Rejection three of four: the canonical form carries a refused character — a C0 control other than the
+    // three consumed as whitespace, DELETE or a C1 control, U+200B, or U+FEFF. Necessarily after the
+    // collapse, so that whitespace the collapse legitimately consumed is not misreported as a control
     // character; see findDisallowedCharacter for the full reasoning.
     if (findDisallowedCharacter(name) !== undefined) {
         return rejectListName();
@@ -596,7 +607,8 @@ export function canonicaliseReorderListName(input: string): CanonicalReorderList
 
     const nameKey = toNameKey(name);
 
-    // The key is bounded as well as the display value, and this is not redundant: NFC composition is not
+    // Rejection four of four: the DERIVED key is longer than the bound. It is a ground of its own rather
+    // than a restatement of rejection two, and it is not redundant: NFC composition is not
     // guaranteed to shorten a string, and there are code points whose canonical decomposition leaves the
     // normalised form longer than the input — U+0344 is one. Since `nameKey` is stored in a column of the
     // same declared width as `name`, a key that overflowed it would fail in the driver rather than here.

@@ -42,12 +42,14 @@ const ACCENT_SENSITIVE_NAME_KEY_COLLATIONS: ReadonlyMap<string, string> = new Ma
  * is.
  *
  * **It states what the RUNNING schema must have, and it is deliberately not what the migration reads.** The
- * migration that created this table froze its own copy of these values as literals at its own timestamp
- * (`NAME_KEY_COLLATIONS` in `src/migrations/`), precisely so that a later change here cannot alter what an
- * already-applied migration is recorded as having created — a change to this resolver belongs to a new
- * migration of its own. The two are held in step by comparison rather than by sharing: the migration's own
- * suite translates each entity's live metadata into a table description and requires it to equal the frozen
- * one, so a divergence fails a test instead of silently rewriting history.
+ * migration under `src/migrations/` carries literal SQL emitted by the platform's own generator against one
+ * engine, so whatever collation that engine required is already frozen into its `CREATE TABLE` text — the
+ * shipped PostgreSQL emission needs none, its default already being accent-sensitive, so the column is a
+ * bare `character varying(191)`. Nothing in that file calls this function or any other, which is the point:
+ * a later change here cannot alter what an already-applied migration is recorded as having created, and such
+ * a change belongs to a new migration of its own. The two are held in step by comparison rather than by
+ * sharing: the migration's own suite translates each entity's live metadata into a table description and
+ * requires it to equal the emitted one, so a divergence fails a test instead of silently rewriting history.
  *
  * It is exported so that a consumer configuring these entities, and any test asserting the shape of the
  * running table, reads the value from this one declaration rather than restating it.

@@ -56,6 +56,7 @@ import { OnApplicationBootstrap } from '@nestjs/common';
 import { ConfigService, I18nService, Logger, PluginCommonModule, Type, VendurePlugin } from '@vendure/core';
 import fs from 'fs';
 import path from 'path';
+import { MigrationInterface } from 'typeorm';
 
 import { shopApiExtensions } from './api/api-extensions';
 import { ReorderListEntityResolver } from './api/reorder-list-entity.resolver';
@@ -126,6 +127,22 @@ const VALIDATED_OPTION_KEYS: ReadonlyArray<keyof ResolvedReorderPluginOptions> =
 ];
 
 /**
+ * The two options that are applied as a `take`, and are therefore bounded by the running server's own Shop
+ * list-query limit as well as by the integer rules every option obeys.
+ *
+ * They are singled out because their upper bound is not a constant this file can check on its own: it is
+ * `apiOptions.shopListQueryLimit`, which belongs to the configuration the server is being started with. See
+ * {@link ReorderPlugin.validateAgainstShopListQueryLimit} for why an unchecked value is worse than a refused
+ * boot.
+ *
+ * @since 3.8.0
+ */
+const PAGE_SIZE_OPTION_KEYS: ReadonlyArray<keyof ResolvedReorderPluginOptions> = [
+    'defaultReorderListsPageSize',
+    'defaultReorderListLinesPageSize',
+];
+
+/**
  * The language this plugin ships a message catalogue for. One locale, deliberately: no other translation
  * exists in this package, and registering a key for a locale with no catalogue behind it would surface the
  * key itself to a buyer in that locale rather than a sentence.
@@ -185,10 +202,10 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
  * then have to be parsed. The message names the key as well, so a stack trace alone is enough to act on.
  *
  * **It is deliberately NOT one of the symbols the root barrel publishes.** `index.ts` publishes the surface a
- * deployment configures this plugin through — {@link ReorderPlugin}, `ReorderPluginOptions`, both entity
- * classes and {@link reorderPluginMigrations} — and nothing else, so the two properties a caller branches on
- * are `name` and `optionKey`, both of which this class sets and neither of which needs the class itself to be
- * in scope. That is what the example below uses.
+ * deployment configures this plugin through — {@link ReorderPlugin}, `ReorderPluginOptions` and both entity
+ * classes — and nothing else, so the two properties a caller branches on are `name` and `optionKey`, both of
+ * which this class sets and neither of which needs the class itself to be in scope. That is what the example
+ * below uses.
  *
  * **The message names the key and the KIND of value that arrived, and never the value's content.** The key
  * is what EPIC-001 section 7.10 requires the failure to identify, and it comes from a fixed set of five; the
@@ -537,22 +554,28 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  * to one — every foreign key points from this plugin's tables to core tables — so the migration is purely
  * additive and reverses cleanly.
  *
- * Register the classes this package publishes from its root as {@link reorderPluginMigrations}. Registering
- * by value rather than by path is correct in both the source and the built layout, because a class is
- * resolved by the module system:
+ * Register the migration this package ships the way every other migration in a Vendure project is
+ * registered — by naming its file in `dbConnectionOptions.migrations`. Resolve the package's own directory
+ * through the module system rather than writing a relative path from your configuration file, so that the
+ * glob keeps working wherever your configuration lives:
  *
  * ```ts
  * import type { VendureConfig } from '\@vendure/core';
- * import { reorderPluginMigrations } from '\@vendure/reorder-plugin';
+ * import path from 'path';
+ *
+ * const reorderPluginRoot = path.dirname(require.resolve('\@vendure/reorder-plugin/package.json'));
  *
  * const config: VendureConfig = {
  *   // ...
  *   dbConnectionOptions: {
  *     // ...your own entries stay where they are; add the plugin's beside them
- *     migrations: [...reorderPluginMigrations],
+ *     migrations: [path.join(reorderPluginRoot, 'lib/src/migrations/*.js')],
  *   },
  * };
  * ```
+ *
+ * An installed package carries only the compiled layout, so that one pattern is enough; a source checkout of
+ * this repository carries `src/migrations/*.ts` instead, which is what `packages/dev-server` names.
  *
  * Apply it with `runMigrations(config)`, exported by `\@vendure/core`. Rolling back is a separate,
  * deliberate operation rather than the next line of the same script: `revertLastMigration(config)` reverses
@@ -752,7 +775,10 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      * inclusion in the `plugins` array of your `VendureConfig`. Each call returns a distinct class, so two
      * differently configured servers in one process keep their own bounds.
      * @throws {@link ReorderPluginConfigurationError} if any resolved value is not a finite integer of at
-     * least 1, or if `maxQuantityPerLine` exceeds the largest signed 32-bit integer.
+     * least 1, or if `maxQuantityPerLine` exceeds the largest signed 32-bit integer. One further bound is
+     * checked later, at bootstrap rather than here, because it belongs to the server rather than to the
+     * option set: neither page size may exceed that server's `apiOptions.shopListQueryLimit`. See
+     * {@link ReorderPlugin.validateAgainstShopListQueryLimit}.
      *
      * @since 3.8.0
      */
@@ -778,13 +804,17 @@ export class ReorderPlugin implements OnApplicationBootstrap {
 
     /**
      * @description
-     * Re-asserts that the options in force are still usable, and registers this plugin's message catalogue,
-     * once the application has bootstrapped.
+     * Re-asserts that the options in force are still usable — including against this server's own Shop
+     * list-query limit — and registers this plugin's message catalogue, once the application has
+     * bootstrapped.
      *
-     * The two acts are ordered by what a failure in each means. The re-validation runs first and **fails
+     * The three acts are ordered by what a failure in each means. The two validations run first and **fail
      * closed**, because a bound this plugin cannot serve correctly must stop the server reaching a ready
-     * state. The catalogue registration cannot fail the boot — a missing catalogue degrades four messages to
-     * their keys, which is the lesser of the two outcomes and is why it is not allowed to be the greater.
+     * state; the integer rules are re-checked, and then the one bound `init()` could not check at all,
+     * because it belongs to the server rather than to the option set — see
+     * {@link ReorderPlugin.validateAgainstShopListQueryLimit}. The catalogue registration cannot fail the
+     * boot — a missing catalogue degrades four messages to their keys, which is the lesser of the two
+     * outcomes and is why it is not allowed to be the greater.
      *
      * Nothing else happens here. In particular this hook writes **no advisory line of its own**: the engine
      * limitation conflict C-E records is stated where a reader meets it — in the migration's own header, in
@@ -802,8 +832,61 @@ export class ReorderPlugin implements OnApplicationBootstrap {
         //
         // It reads THIS REGISTRATION's options rather than the static, so that in a process holding more
         // than one differently-configured registration each one checks the set it will actually serve with.
-        validateResolvedReorderPluginOptions(this.optionsInForce());
+        const options = validateResolvedReorderPluginOptions(this.optionsInForce());
+        // Then the one bound that cannot be checked by `init()`, because it is not a property of the option
+        // set at all — it is a property of the server this registration has just been bootstrapped into.
+        this.validateAgainstShopListQueryLimit(options);
         this.registerTranslations();
+    }
+
+    /**
+     * Refuses a page-size option that the running server's own Shop list-query limit would reject at request
+     * time.
+     *
+     * **Why this is a startup failure rather than a documented caveat.** Both page-size options are applied
+     * as the `take` of a `ListQueryBuilder` query when a caller supplies none, and that builder refuses a
+     * `take` above `apiOptions.shopListQueryLimit` for a Shop request — `parseTakeSkipParams` throws
+     * `UserInputError('error.list-query-limit-exceeded')` on `options.take > limit`, and this plugin leaves
+     * `ignoreQueryLimits` false on every query, deliberately. So a page size above that limit does not
+     * degrade to the limit: it makes **every** read that omits `take` fail, on a server that started
+     * healthily and reported nothing. That is the exact shape EPIC-001 section 7.10 requires an option to
+     * fail the boot for — a bound the plugin cannot serve correctly — and the failure names the key so an
+     * operator knows which of the two, and against which limit.
+     *
+     * **Why it is here and not in `init()`.** `init()` runs while a configuration is being assembled and has
+     * no access to the `apiOptions` of the server that will eventually serve with it; two servers in one
+     * process may even carry different limits. `ConfigService` resolves the configuration this registration
+     * was bootstrapped into, so the comparison is made against the limit that will actually clamp these
+     * reads. The integer rules stay in `init()`, where they can fail before a server is built at all.
+     *
+     * **Equal to the limit is accepted**, because the builder's own test is strictly greater — a page size of
+     * exactly the limit is served, and refusing it here would be stricter than the platform.
+     *
+     * @param options - The option set this registration serves with.
+     * @throws {@link ReorderPluginConfigurationError} naming the first page-size key that exceeds the limit.
+     */
+    private validateAgainstShopListQueryLimit(options: ResolvedReorderPluginOptions): void {
+        const shopListQueryLimit = this.configService.apiOptions.shopListQueryLimit;
+        // A limit that is not a usable positive integer is the platform's own configuration to answer for,
+        // not this plugin's, and comparing against it would produce a confusing refusal naming a plugin key
+        // for somebody else's value. The platform clamps with whatever it holds; this check simply declines
+        // to draw a conclusion from a value it cannot read.
+        if (!Number.isInteger(shopListQueryLimit) || shopListQueryLimit < MIN_OPTION_VALUE) {
+            return;
+        }
+        for (const key of PAGE_SIZE_OPTION_KEYS) {
+            const pageSize = options[key];
+            if (pageSize > shopListQueryLimit) {
+                throw new ReorderPluginConfigurationError(
+                    key,
+                    `must not exceed apiOptions.shopListQueryLimit, which this server sets to ` +
+                        `${String(shopListQueryLimit)}, because it is applied as the \`take\` of a Shop list ` +
+                        'query when a caller supplies none and the platform refuses a larger page outright ' +
+                        'rather than clamping it',
+                    pageSize,
+                );
+            }
+        }
     }
 
     /**
@@ -965,39 +1048,35 @@ function isReadableFile(candidatePath: string): boolean {
 }
 
 /**
- * @description
- * The migration classes that create this plugin's two tables, for `dbConnectionOptions.migrations`.
+ * The migration classes that create this plugin's two tables.
  *
- * Registering the classes rather than a path is what makes one registration correct in both layouts this
- * package runs in: TypeORM accepts a migration class wherever it accepts a glob, and a class is resolved by
- * the module system rather than by the filesystem, so a deployment needs no path arithmetic over `src/`
- * versus `lib/src/`. The compiled files remain available at `lib/src/migrations/` for a deployment that
- * prefers globs. The array is ordered, and TypeORM additionally orders migrations by the timestamp in each
- * class name, so spreading it beside another project's migrations cannot reorder either set.
+ * **It is deliberately NOT one of the symbols the root barrel publishes, and a deployment does not need it.**
+ * `index.ts` publishes exactly the surface a deployment configures this plugin through — {@link ReorderPlugin},
+ * `ReorderPluginOptions` and both entity classes — and a migration is registered the way every other
+ * migration in a Vendure project is registered, by naming its file in `dbConnectionOptions.migrations`:
  *
- * @example
  * ```ts
- * import type { VendureConfig } from '\@vendure/core';
- * import { reorderPluginMigrations } from '\@vendure/reorder-plugin';
- *
- * export const config: VendureConfig = {
- *   dbConnectionOptions: {
- *     // ...your own entries stay where they are; add the plugin's beside them
- *     migrations: [...reorderPluginMigrations],
- *   },
- *   // ...
- * };
+ * migrations: [path.join(reorderPluginRoot, 'lib/src/migrations/*.js')],
  * ```
  *
- * Register it before the first boot of a server that has `synchronize` enabled. `runMigrations` applies every
- * pending entry in `dbConnectionOptions.migrations`, and a schema builder that has already created the two
- * tables leaves this class with nothing to create, so applying it then fails on the existing tables rather
- * than adopting them. The class is the migration generator's PostgreSQL output and applies to a PostgreSQL
- * deployment; the migration's own header records the invocation that produces the equivalent file for another
- * engine. The package README sets that sequencing out step by step, and separates applying from rolling back.
+ * where `reorderPluginRoot` is resolved through the module system rather than by a relative path from your
+ * own configuration file. The package README gives the whole invocation. The compiled file is present at
+ * that location in every installed package: the barrel reaches `ReorderPlugin`, this module is where
+ * `ReorderPlugin` lives, and this constant is what puts the migration class into that module's import graph,
+ * so the build emits it without `tsconfig.build.json` naming a second root.
  *
- * @docsCategory core plugins/ReorderPlugin
- * @docsPage ReorderPlugin
+ * What this constant is for is the code inside this package that needs the class as a *value* rather than as
+ * a path — the migration end-to-end suite, which loads it, applies it and reverses it, and the package
+ * contract suite, which asserts there is exactly one of them. Both reach it by a deep import from
+ * `./src/reorder.plugin`, which is why publishing it from the root would buy nothing and would widen the
+ * root contract AAP section 0.2.4.1 fixes at four symbols.
+ *
+ * It is frozen, and readonly in the type system as well. An importable mutable array of migration classes is
+ * an importable way to change what a running process will apply to a database, and the freeze makes that a
+ * run-time failure rather than a silent one.
+ *
  * @since 3.8.0
  */
-export const reorderPluginMigrations = [AddReorderLists1786838400000];
+export const reorderPluginMigrations: ReadonlyArray<Type<MigrationInterface>> = Object.freeze([
+    AddReorderLists1786838400000,
+]);

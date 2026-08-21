@@ -523,8 +523,10 @@ export interface CreateReorderListInput {
     /**
      * @description
      * The buyer-supplied list name. Canonicalised — trimmed, internal whitespace runs collapsed — before it
-     * is stored, and refused as malformed input when its canonical form is empty, is longer than the fixed
-     * bound, or carries a control or zero-width character. It is never truncated and never silently altered.
+     * is stored, and refused as malformed input on four grounds: an empty canonical form; a canonical form
+     * longer than the fixed bound; a refused character (a C0 control other than the three consumed as
+     * whitespace, DELETE or a C1 control, U+200B, or U+FEFF); or a normalised `nameKey` longer than the same
+     * bound. It is never truncated and never silently altered.
      *
      * @since 3.8.0
      */
@@ -2275,10 +2277,14 @@ export class ReorderListService {
      * @returns The value the caller should report, which is the stored column in every case the column can be
      * established: the stored value when the two agreed or when the observed total was refused; the observed
      * total once this method has written it; and, where the compare-and-set lost its race, the column as it
-     * now stands, read back under the same ownership conjuncts — falling back to the observed total only when
-     * the row no longer exists within this scope and there is therefore no stored value to report.
+     * now stands, read back under the same ownership conjuncts. The observed total is reported on the lost
+     * race in exactly one case — the row no longer exists within this scope, so there is no stored value to
+     * report and the observed total is the only answer consistent with the page being returned.
      * @throws The generic internal failure when the row carries no owner provenance, or provenance that
-     * disagrees with the request — no statement is issued on that path.
+     * disagrees with the request — no statement is issued on that path. Also when the compare-and-set lost its
+     * race and the row is still there but its stored counter is not a non-negative safe integer: there is
+     * then a stored value and it is not a count, so no authoritative number exists to report and the observed
+     * total is deliberately not substituted for one.
      *
      * @since 3.8.0
      */
@@ -2346,7 +2352,12 @@ export class ReorderListService {
             // exactly one thing — that it does not know the counter — and answering with the total it counted
             // before the competing write would publish a number that is neither the stored column nor the
             // value the winner committed. So the column is read back, once, under the same three ownership
-            // conjuncts the update carried, and that is what the caller reports.
+            // conjuncts the update carried, and that is what the caller reports. Two outcomes follow from
+            // that read: the row is gone from this scope, in which case there is no stored value and the
+            // observed total is the only answer left; or the row is there, in which case its value is
+            // reported — and if that value is not a count at all, the request fails rather than substituting
+            // one, because a stored value that exists and is unusable is an invariant failure and not a
+            // missing number.
             Logger.debug(
                 `Skipped a lineCount repair on reorder list ${String(listId)} because the guarded row no ` +
                     `longer matched — its stored value changed concurrently, or the row is no longer within ` +
@@ -2374,7 +2385,25 @@ export class ReorderListService {
                 return observedTotal;
             }
             const currentStored = Number(current.lineCount);
-            return Number.isSafeInteger(currentStored) && currentStored >= 0 ? currentStored : observedTotal;
+            if (!Number.isSafeInteger(currentStored) || currentStored < 0) {
+                // ★ THE ROW IS THERE AND ITS COUNTER IS NOT A COUNT. Reporting `observedTotal` here would be
+                // the one thing this whole branch exists to avoid: answering with a number that is not the
+                // stored column while the stored column still exists, and doing it silently. The value is
+                // also not something this plugin can have produced — every write goes through a guarded
+                // increment, a guarded decrement or this compare-and-set, and
+                // `CHK_reorder_list_line_count_non_negative` refuses a negative on every engine that carries
+                // it. It is reachable on MySQL and MariaDB, where TypeORM 0.3.x discards that constraint
+                // (conflict C-E), after a direct write by something other than this plugin. So it is an
+                // invariant failure about shared data rather than a value to be worked around: the request
+                // fails with this module's own sanitised internal error, and the diagnostic reaches the log.
+                // A repair is deliberately NOT attempted from it — this method's guard is the value it read
+                // before the race, which is exactly the value that has been disproved.
+                throw reportReorderListInternalFailure(
+                    'A reorder list row within the owner scope carries a stored lineCount that is not a ' +
+                        'non-negative safe integer, so no authoritative value could be reported for it',
+                );
+            }
+            return currentStored;
         }
         return observedTotal;
     }
@@ -2566,7 +2595,7 @@ export class ReorderListService {
         // unauthenticated write surfaces the propagated FORBIDDEN error without opening one. It costs no
         // database read: it is the third conjunct of the predicate and reads the session alone.
         this.requireActiveUser(ctx);
-        // Canonicalisation and its three rejections live in one place, so no second code path can disagree
+        // Canonicalisation and its four rejections live in one place, so no second code path can disagree
         // about what a stored name is. This throws for a name that cannot be stored, again before any
         // statement, so a refused name never takes a lock.
         const { name, nameKey } = canonicaliseReorderListName(input.name);
@@ -4279,9 +4308,10 @@ export class ReorderListService {
      * **The one exception to that pass-through is an internal error this module did not author.** An
      * `INTERNAL_SERVER_ERROR` is the one code whose message is written for operators rather than for callers,
      * and a collaborator's internal message can name a table, a column, a configuration key or a strategy
-     * class. Only the two internal messages this module authors — see {@link OWN_INTERNAL_MESSAGES} — are
-     * forwarded; any other is reported as this module's own generic failure and logged like any unclassified
-     * one, so a platform internal is neither published to the caller nor copied into the log.
+     * class. Only the internal message this module authors — see {@link OWN_INTERNAL_MESSAGES}, which has
+     * exactly one member — is forwarded; any other is reported as this module's own generic failure and
+     * logged like any unclassified one, so a platform internal is neither published to the caller nor copied
+     * into the log.
      *
      * **What reaches the log, and what deliberately does not.** The log line carries three things this file
      * chose: the fixed operation code, a fixed classification of the failure's shape, and a fresh correlation
@@ -4328,7 +4358,7 @@ export class ReorderListService {
      * malformed, the session may not do this, the page size is above the configured limit — so its message is
      * written for whoever made the request and is forwarded. `INTERNAL_SERVER_ERROR` is the one code that
      * describes the server instead, and its message is therefore only safe to forward when this module wrote
-     * it. That is a narrow, enumerated test rather than a judgement: the two messages this module authors are
+     * it. That is a narrow, enumerated test rather than a judgement: the one message this module authors is
      * declared in {@link OWN_INTERNAL_MESSAGES}, and anything else — an internal error from a platform
      * collaborator this service calls into — is reported as this module's own generic failure.
      */

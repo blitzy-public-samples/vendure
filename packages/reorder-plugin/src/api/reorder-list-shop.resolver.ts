@@ -464,10 +464,12 @@ export class ReorderListShopResolver {
             markSingleReorderListRead(list);
             // Then the reconciliation, and BEFORE this method returns — see the note above on why the ordering
             // is the whole of the fix. It issues nothing where the document selected no `lines` field or
-            // narrowed the nested collection. A nested page it could not READ is forgiven and left to the field
-            // resolver, which would fail there if the failure were real; a counter repair that was attempted
-            // and FAILED propagates instead, already sanitised by the service, because the alternative is a
-            // response carrying a correct page beside a stale `lineCount` and no indication of it.
+            // narrowed the nested collection. Where it does run, it fails closed: a nested page it could not
+            // read is retried once and then propagates, and a counter repair that was attempted and FAILED
+            // propagates too, already sanitised by the service. Both for the same reason — forgiving either
+            // produces a response carrying a stale `lineCount` with no indication of it, which is a wrong
+            // answer rather than an error. The single exception is a `UserInputError` about the caller's own
+            // nested arguments, which is left for the nested field to raise on its own path.
             await reconcileSingleReorderListRead(
                 this.reorderListService,
                 ctx,
