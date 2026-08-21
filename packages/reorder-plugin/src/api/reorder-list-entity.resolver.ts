@@ -1,13 +1,5 @@
 /*
- * -------------------------------------------------------------------------------------------------------
  * The reorder-list field resolvers — provenance, and the one property that makes them correct.
- * -------------------------------------------------------------------------------------------------------
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing in this file is, or derives from, a user-specified rule. Every constraint stated below traces to
- * FEATURE-001-01 (sections 2.6, 2.6.2, 2.6.2.1 and 2.6.3), to STORY-001-01-04, to an EPIC-001 settled ruling
- * (R10, R15), or to a cited line of this repository, and is attributed as such wherever it is stated. The
- * absence of a rules document has not been treated as licence to lower the bar anywhere in this file.
  *
  * WHAT THIS FILE IS. Three field resolvers, and nothing else: `ReorderList.lines`, `ReorderList.viewerAccess`
  * and `ReorderListLine.productVariant`. They are the only published fields on the two plugin-owned types
@@ -51,33 +43,8 @@
  * a line: a saved list records INTENT rather than availability, so neither `deletedAt` nor `enabled` is
  * projected onto a payload here (surfacing availability is FEATURE-001-03's, resolving it FEATURE-001-04's).
  *
- * ONE CLASS, TWO PARENT TYPES, AND THE DECORATOR ORDER THAT MAKES THAT WORK. Three fields across two parent
- * types are bound here by a single exported class, because the plugin's source graph fixes the resolver count
- * at three — the Shop operations resolver, this entity resolver and the union `__resolveType` resolver — and a
- * fourth class would be a fourth registration. A class-level `@Resolver('ReorderList')` binds `lines` and
- * `viewerAccess`; the `productVariant` method rebinds itself to `ReorderListLine` with a METHOD-level
- * `@Resolver`, which the framework prefers over the class-level one.
- *
- * The mechanism, verified in the pinned `@nestjs/graphql` (`dist/utils/extract-metadata.util.js`): the parent
- * type is read from the method first and only then from the class
- * (`getMetadata(RESOLVER_TYPE, callback) || getMetadata(RESOLVER_TYPE, instance.constructor)`), the field name
- * is `getMetadata(RESOLVER_NAME, callback) || methodName`, and a method is dropped from the resolver map
- * altogether unless `RESOLVER_PROPERTY` is set, which only `@ResolveField` sets.
- *
- * THE HAZARD IS THE ORDER, AND IT FAILS SILENTLY. `@Resolver(name)` in its method form writes BOTH
- * `RESOLVER_TYPE` and `RESOLVER_NAME` to `name`; `@ResolveField(propertyName)` writes `RESOLVER_NAME` to
- * `propertyName`. They contend for the same key, decorators apply bottom-up, so the TOPMOST decorator writes
- * last and wins. `@ResolveField('productVariant')` therefore sits ABOVE `@Resolver('ReorderListLine')`. Reverse
- * the two and the map becomes `{ ReorderListLine: { ReorderListLine: fn } }` — a field named after the type and
- * no `productVariant` resolver at all, so the field falls through to the default resolver and returns the
- * relation this plugin's read never loads. Nothing about that fails at build time.
- *
- * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires new
- * public API to carry a `@since` tag naming what will be the next minor version, and its own literal example
- * names a different version. This checkout declares 3.7.0, so the next minor derives to 3.8.0 — computed
- * from that declared version plus the guide's rule, and never a quotation from the guide, which does not
- * state the value. The authoritative tickets record the same derivation.
- * -------------------------------------------------------------------------------------------------------
+ * The `@since 3.8.0` tags below are a derivation rather than a quotation: this checkout declares 3.7.0 and
+ * the contribution guide requires the next minor version, which the guide itself never states.
  */
 
 import { Inject } from '@nestjs/common';
@@ -112,8 +79,7 @@ import { ResolvedReorderPluginOptions } from '../types';
 /**
  * The exact list objects the single-list read returned on the request currently in flight.
  *
- * **It is module-private state keyed on OBJECT IDENTITY, and both halves of that are corrections to defects
- * rather than preferences.**
+ * **Object identity and module-private storage are both required, for the separate reasons below.**
  *
  * *Why identity rather than the row's identifier.* One request may legitimately carry both reads — a document
  * selecting `activeCustomerReorderList(id: 7)` beside `activeCustomerReorderLists` — and each read hydrates
@@ -285,7 +251,7 @@ const LINE_COUNT_REPAIRS = new WeakMap<ReorderList, Promise<number>>();
  * **The registration is synchronous and that is the whole mechanism.** `repair` is invoked and its promise is
  * stored in the same uninterrupted run of statements, so a second caller that arrives while the first is
  * suspended finds the promise already there and awaits it instead of starting another. Reversing those two
- * steps — or placing any `await` between the lookup and the store — reopens exactly the window this closes.
+ * steps — or placing any `await` between the lookup and the store — reopens exactly the window it closes.
  *
  * A rejected repair is deliberately left in place rather than evicted. Retrying it would issue the second
  * statement this gate exists to prevent, and every caller sharing one failure is the truthful outcome of one
@@ -312,10 +278,8 @@ export function repairLineCountOnce(list: ReorderList, repair: () => Promise<num
     return pending;
 }
 
-// ---------------------------------------------------------------------------------------------------
 // The single-list read's counter reconciliation, which has to happen BEFORE the parent object is handed
 // to GraphQL. This section is the whole of that mechanism, so it is documented as one.
-// ---------------------------------------------------------------------------------------------------
 
 /**
  * The name of the nested field this reconciliation reads its observed total from. It is the published field
@@ -494,25 +458,23 @@ function withoutAbsentMembers(value: unknown): unknown {
  * The window one `lines` selection asked for, normalised to the object the field resolver will compute for the
  * same selection.
  *
- * **The argument is read off the document rather than reconstructed, and it is coerced AGAINST THE SCHEMA.**
- * That second half is load-bearing and an earlier revision got it wrong. `valueFromASTUntyped` resolves
- * literals and variables through the request's own variable values, but for a member whose variable was NOT
- * supplied it keeps the key and gives it the value `undefined` — `keyValMap` sets every field it walks, and a
- * missing variable resolves to `undefined` rather than being skipped. Typed input coercion does the opposite:
- * it OMITS the field entirely (`valueFromAST` continues past a field whose variable is missing, applying the
- * field's default if it has one). So a window written `lines(options: { filter: { quantity: $unset } })` read
- * untyped, with `$unset` not supplied, is `{ filter: { quantity: undefined } }` — a filter with one key —
- * while the argument the field resolver receives is `{ filter: {} }`, a filter with none. Two consequences
- * followed, and both were silent: `narrowsTheLineCollection` counted the request as narrowing and suppressed
- * the counter reconciliation the request was entitled to, and the two spellings stringified to different
- * cache keys so the nested resolver reloaded the page that had already been resolved for it.
+ * **The argument is read off the document rather than reconstructed, and absent members are then stripped so
+ * that it matches what the executor coerces.** `valueFromASTUntyped` resolves literals and variables through
+ * the request's own variable values, but for a member whose variable was NOT supplied it keeps the key and
+ * gives it the value `undefined` — `keyValMap` sets every field it walks, and a missing variable resolves to
+ * `undefined` rather than being skipped. Typed input coercion does the opposite: it OMITS the field entirely
+ * (`valueFromAST` continues past a field whose variable is missing, applying the field's default if it has
+ * one). So a window written `lines(options: { filter: { quantity: $unset } })` read untyped, with `$unset` not
+ * supplied, is `{ filter: { quantity: undefined } }` — a filter with one key — while the argument the field
+ * resolver receives is `{ filter: {} }`, a filter with none. Left to disagree, that costs two things silently:
+ * `narrowsTheLineCollection` would count the request as narrowing and suppress the counter reconciliation the
+ * request is entitled to, and the two spellings would stringify to different cache keys, so the nested
+ * resolver would reload the page already resolved for it. {@link withoutAbsentMembers} closes the gap by
+ * recursively stripping absent members, which is exactly the omission the executor performs.
  *
- * The fix is {@link withoutAbsentMembers}: the untyped read, with absent members stripped recursively, which
- * is exactly the omission the executor performs.
- *
- * **Coercing through the declared input type was tried first and withdrawn, for a measured reason.** Reading
- * the generated argument's type off `info.schema` and calling `valueFromAST` requires `isObjectType` and the
- * type predicates inside `valueFromAST` to recognise objects the SERVER built. In this repository's end-to-end
+ * **Coercing through the declared input type is not available here, for a measured reason.** Reading the
+ * generated argument's type off `info.schema` and calling `valueFromAST` requires `isObjectType` and the type
+ * predicates inside `valueFromAST` to recognise objects the SERVER built. In this repository's end-to-end
  * environment they do not: two copies of `graphql` are resolvable at run time, and graphql-js raises
  * `Cannot use GraphQLObjectType "ReorderList" from another module or realm.` rather than returning false. The
  * two approaches are in any case equivalent for this argument, because the generated list-options input
@@ -786,8 +748,14 @@ async function repairStaleLineCount(
     }
     // Conjunct four: no repair for THIS OBJECT is already under way. The gate both answers that and starts the
     // repair when the answer is no, in one synchronous step — see {@link repairLineCountOnce}.
+    // THE PARENT OBJECT IS PASSED, NOT ITS IDENTIFIER, and that is a scoping decision rather than a
+    // convenience. The object is what carries the owner scope the row was actually read under, so handing it
+    // over is what lets the service build the repair's `WHERE` with the acting customer and the active channel
+    // on it, and refuse the write outright for a row whose provenance does not match this request. An
+    // identifier alone would leave the statement addressing whichever row bore that id — and ids are
+    // sequential under the default id strategy.
     const reconciled = await repairLineCountOnce(list, () =>
-        reorderListService.reconcileLineCount(ctx, list.id, storedLineCount, observedTotal),
+        reorderListService.reconcileLineCount(ctx, list, storedLineCount, observedTotal),
     );
     if (reconciled !== storedLineCount) {
         Logger.debug(
@@ -799,10 +767,8 @@ async function repairStaleLineCount(
     list.lineCount = reconciled;
 }
 
-// ---------------------------------------------------------------------------------------------------
 // The page batch. This is the mechanism that makes "once per page, never once per entry" true, so it
 // is documented at the length of a mechanism rather than of a helper.
-// ---------------------------------------------------------------------------------------------------
 
 /**
  * One page's worth of pending identifiers, together with the single promise that will deliver the loaded
@@ -942,42 +908,8 @@ function stableStringify(value: unknown): string {
  * @description
  * Resolves the three published fields of this plugin's two types that are not columns of their own rows: the
  * nested `ReorderList.lines` page, the per-requester `ReorderList.viewerAccess`, and the catalogue variant a
- * `ReorderListLine` references.
- *
- * **One class, two parent types.** `lines` and `viewerAccess` take their parent type from the class-level
- * `@Resolver('ReorderList')`; `productVariant` declares its own parent type on the method, because a
- * class-level `@Resolver` binds exactly one. The plugin registers exactly three resolver classes — one Shop,
- * one Entity, one Result — and this is the Entity one, so every field resolver this plugin owns is here. The
- * file header records the decorator order that makes the method-level binding work and the silent failure that
- * reversing it produces.
- *
- * **One class serves both parent types.** The class-level `@Resolver('ReorderList')` binds the first two
- * members; {@link ReorderListEntityResolver.productVariant} carries a method-level `@Resolver('ReorderListLine')`
- * that the framework prefers over the class-level one, and a `@ResolveField('productVariant')` above it that
- * must stay above it. The file header states the mechanism and the order hazard in full. This class is
- * therefore the single entity-resolver entry in the plugin's `shopApiExtensions.resolvers` array, which carries
- * exactly three classes: the Shop operations resolver, this one, and the union `__resolveType` resolver.
- *
- * **One class, two parent types, and the mechanism is the same one this plugin's union resolver already
- * relies on.** The class-level `@Resolver('ReorderList')` binds the two `ReorderList` fields, and
- * `productVariant` carries its own method-level `@Resolver('ReorderListLine')` beneath a named
- * `@ResolveField('productVariant')` — a method-level resolver type takes precedence over the class-level one
- * [@nestjs/graphql/dist/utils/extract-metadata.util.js], which is what lets a single registered class serve
- * more than one parent type. The decorator ORDER is load-bearing and is documented at the method itself.
- * Registering this one class therefore leaves nothing unresolved, and the plugin's
- * `shopApiExtensions.resolvers` array carries exactly three classes: the Shop operations, this file, and the
- * six `__resolveType` field resolvers.
- *
- * **`lineCount` is deliberately not among the resolved fields.** It is the stored column, it arrives with the
- * row the page query already selected, and it is the single authority for the published field, the generated
- * filter, the generated sort and the atomic line bound (FEATURE-001-01 section 2.6.2). A resolver for it —
- * counting rows per entry, issuing a grouped count beside the page, or taking the length of a loaded relation
- * — would return the same numbers while making a second source of truth, so there is no such member here and
- * the file header records why each of those three shapes is forbidden.
- *
- * **Every field costs one page rather than one entry.** `lines` and `productVariant` are each served by a
- * single batched load per page whose result is partitioned in process, and `viewerAccess` costs no statement
- * at all.
+ * `ReorderListLine` references. Each is served once per page rather than once per entry, and `viewerAccess`
+ * costs no statement at all.
  *
  * @docsCategory core plugins/ReorderPlugin
  * @docsPage ReorderListEntityResolver
@@ -1144,52 +1076,23 @@ export class ReorderListEntityResolver {
         return this.options.defaultReorderListLinesPageSize;
     }
 
-    /*
-     * ─────────────────────────────────────────────────────────────────────────────────────────────────────
-     * THE SECOND PARENT TYPE STARTS HERE. `ReorderListLine.productVariant` is the one published field of
-     * `ReorderListLine` that is not a column of `reorder_list_line`, and it is bound from THIS class rather
-     * than from a second one.
-     *
-     * HOW, AND WHY THE DECORATOR ORDER BELOW MUST NOT BE SWAPPED. `@Resolver(name)` in its method form writes
-     * BOTH the resolver-TYPE metadata and the resolver-NAME metadata
-     * [@nestjs/graphql/dist/decorators/resolvers.utils.js: addResolverMetadata], while
-     * `@ResolveField(propertyName)` writes the resolver-name metadata and the property-resolver flag
-     * [@nestjs/graphql/dist/decorators/resolve-field.decorator.js]. They write the same name key, and
-     * TypeScript applies decorators bottom-up, so the TOPMOST one writes last and wins:
-     *
-     *   @ResolveField('productVariant')   ← applied last  ⇒ name = 'productVariant'   ✔
-     *   @Resolver('ReorderListLine')      ← applied first ⇒ type = the parent type    ✔
-     *
-     * Reversed, the field would be named after the parent type and no `productVariant` resolver would exist:
-     * nothing fails to compile, the server still boots, and the first client to select the field silently
-     * receives whatever the default resolver finds on the row — which for an unloaded relation is null.
-     * Both decorators are required: the method-level `@Resolver` supplies the parent type, taking precedence
-     * over the class-level one [@nestjs/graphql/dist/utils/extract-metadata.util.js], and `@ResolveField`
-     * sets the property-resolver flag without which the explorer drops the method entirely, because the
-     * parent type is neither Query, Mutation nor Subscription
-     * [@nestjs/graphql/dist/services/resolvers-explorer.service.js]. This plugin's union resolver
-     * (`reorder-list-result.resolver.ts`) binds six parent types from one class the same way.
-     *
-     * THE COLUMN AND THE PUBLISHED FIELD ARE DELIBERATELY NOT THE SAME NULLABILITY, and the pair is what
-     * makes a stale line readable. `reorder_list_line.productVariantId` is `NOT NULL`, because a retained
-     * line always references a variant row that still exists; the published `productVariant` field is
-     * nullable, because a variant that is no longer resolvable in the active channel must not be exposed and
-     * must not null-bubble the whole line out of its page. `productVariantId` stays non-null on both sides,
-     * which is what lets a buyer see and remove the line (FEATURE-001-01 section 2.4).
-     * ─────────────────────────────────────────────────────────────────────────────────────────────────────
-     */
-
     /**
      * @description
      * Resolves the variant a `ReorderListLine` references, for every line on the page in one load, or `null`
      * where that variant is no longer resolvable in the active channel.
      *
-     * **This member belongs to a different parent type from the two above it, and its two decorators are what
-     * say so.** The method-level `@Resolver('ReorderListLine')` overrides the class-level `@Resolver('ReorderList')`
-     * for this method alone, and `@ResolveField('productVariant')` must stay ABOVE it: the two decorators write
-     * the same field-name metadata key, decorators apply bottom-up, and the topmost one wins. Reversed, the
-     * field is registered under the parent type's own name and `productVariant` silently has no resolver. The
-     * file header records the verified framework mechanism behind both statements.
+     * **This member belongs to a different parent type from the two above it, so `@ResolveField` must stay
+     * ABOVE `@Resolver` on it, and reversing them fails silently.** A class-level `@Resolver('ReorderList')`
+     * binds `lines` and `viewerAccess`; this method rebinds itself to `ReorderListLine` with a method-level
+     * `@Resolver`, which the framework prefers over the class-level one
+     * (`@nestjs/graphql/dist/utils/extract-metadata.util.js` reads `RESOLVER_TYPE` from the method first and
+     * only then from the class, and drops a method entirely unless `RESOLVER_PROPERTY` is set, which only
+     * `@ResolveField` sets). The order is the hazard: the method form of `@Resolver(name)` writes both
+     * `RESOLVER_TYPE` and `RESOLVER_NAME` to `name` while `@ResolveField(propertyName)` writes `RESOLVER_NAME`
+     * to `propertyName`, they contend for the same key, and decorators apply bottom-up so the topmost writes
+     * last. Reversed, the map becomes `{ ReorderListLine: { ReorderListLine: fn } }` — a field named after the
+     * type and no `productVariant` resolver at all, so the field falls through to the default resolver and
+     * returns the relation this plugin's read never loads. Nothing about that fails at build time.
      *
      * **The column and the published field are deliberately not the same nullability, and the pair is what
      * makes a stale line readable.** `reorder_list_line.productVariantId` is `NOT NULL`, because a retained line
@@ -1232,8 +1135,6 @@ export class ReorderListEntityResolver {
      *
      * @since 3.8.0
      */
-    // Order fixed. See the section note above: the top decorator writes the field name last and wins, and the
-    // method-level `@Resolver` is what binds this method to the OTHER parent type.
     @ResolveField('productVariant')
     @Resolver('ReorderListLine')
     async productVariant(

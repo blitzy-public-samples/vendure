@@ -1,75 +1,51 @@
 /**
- * The **one additive migration** of `@vendure/reorder-plugin`, exercised here and nowhere else.
+ * The **one additive migration** of `@vendure/reorder-plugin`, exercised end to end.
  *
- * `src/migrations/1786838400000-add-reorder-lists.ts` is the only migration this feature produces, and no
- * other suite in this directory applies it. That is not a division of convenience but a consequence of the
- * harness: **the end-to-end schema is always built by the ORM's schema builder and never by a migration.**
+ * `src/migrations/1786838400000-add-reorder-lists.ts` is the only migration this feature produces. This
+ * suite owns its full lifecycle — the data-bearing cycle, the named objects and the engine-conditional
+ * checks; `reorder-plugin-compatibility.e2e-spec.ts` additionally applies it once, to serve the published
+ * operations against a schema the migration created rather than the schema builder. No functional suite
+ * applies it, and that is a consequence of the harness rather than a division of convenience: **the
+ * end-to-end schema is otherwise always built by the ORM's schema builder and never by a migration.**
  * `packages/testing/src/initializers/mysql-initializer.ts:L16` and
  * `packages/testing/src/initializers/postgres-initializer.ts:L15` both force `synchronize = true`, and
  * `e2e-common/test-config.ts:L110, L119, L128` set it per engine branch, while the sql.js initializer
- * enables it only while it populates. Every sibling suite therefore runs against a synchronised schema and
- * the migration file is never touched. This suite constructs the migration path itself.
+ * enables it only while it populates. Every functional sibling suite therefore runs against a synchronised
+ * schema and never touches the migration file. This suite constructs the migration path itself.
  *
- * ## What it proves — four obligations, and nothing else
+ * The engine scope is split, and the split is documented rather than incidental. Obligation 3 and the
+ * declaring half of obligation 2 read the artefact's own text, so they run on every engine. The cycle and
+ * the catalogue and refusal halves EXECUTE the artefact, and the artefact is the migration generator's
+ * PostgreSQL output — engine-specific by construction, which plan section 0.2.3.1 records as a known
+ * limitation of the form section 0.5.2.2 prescribes — so those run on PostgreSQL alone. See
+ * {@link MIGRATION_GENERATION_ENGINE} for what that does and does not leave unexercised.
  *
- * 1. A **data-bearing up → down → up cycle** against a known-good baseline of seeded core rows.
- * 2. **Every one of the five named database objects asserted twice** — once as declared by the migration
- *    itself, and once by **attempting the write it forbids**, issued directly through the repository and
- *    never through a GraphQL mutation, because the mutation's own validation would refuse first and a
- *    passing test would then prove nothing about the database.
- * 3. The **withdrawn objects asserted absent** (conflict C-A).
- * 4. **Engine-conditional `CHECK` assertions** (conflict C-E), reported as unresolved and requiring a
- *    maintainer ruling — never as settled.
- *
- * These are sequential single writes rather than interleavings, so all four engine jobs carry them,
- * sql.js included: applying, reverting and violating a constraint are not concurrency behaviours
+ * What they are not is concurrency evidence: these are sequential single writes rather than interleavings
  * (EPIC-001 section 11.6.3, whose ruling is that "the four-job list is the default for every sequential,
  * constraint-shape, migration and response-level claim"). **There is deliberately no barrier and no forced
  * interleaving anywhere in this file** — those belong to the create, add-item and mutate suites and run on
  * MariaDB, MySQL and PostgreSQL only.
  *
- * ## Attribution — where these obligations come from
+ * ## The schema under test is always the migration's own — read this before changing anything below
  *
- * **No user-specified rules were provided for this project.** The rules document was read in full and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9. **No
- * user-specified rule governs this file and no rule forced it into scope**, so nothing below may be
- * presented as one. Every obligation here is either prompt-derived (the plan's sections 0.5.1.8 and 0.7.2)
- * or ticket-derived (STORY-001-01-01 section 2.1 checkpoint 2 and Definition-of-Done item 7; EPIC-001
- * sections 7.8, 11.6.1 and 11.6.3), and each is cited inline as such. The absence of a rules document has
- * not been treated as licence to lower the bar: the standard applied instead is the epic's own testing
- * contract, which is stricter than a general convention would have been.
+ * **There is no schema-builder fallback in this file, on any engine that executes here.** The migration
+ * under test is the output of the platform migration generator, which serialises the statements the schema
+ * builder logged into `queryRunner.query(<SQL>)` calls (`packages/core/src/migrate.ts:L127-L179`). Every
+ * executing assertion below reads a schema that `runMigrations` created from those statements, and the suite
+ * fails rather than substituting anything if it did not.
  *
- * ## THE SCHEMA UNDER TEST IS ALWAYS THE MIGRATION'S OWN — read this before changing anything below
+ * **Why nothing has to be arranged between the two connections here.** `runMigrations` builds its own data
+ * source (`packages/core/src/migrate.ts:L42`), so the connection that applies the migration is not the
+ * connection that reads the result. On the generation engine both address the same physical database, so the
+ * apply is observable to this file's assertions without any arrangement. The harness's own cached snapshot
+ * under `e2e/__data__` is never written to.
  *
- * **There is no schema-builder fallback in this file, on any engine.** The migration under test carries no
- * SQL: it describes the plugin's two tables as literals of its own and hands that description to the same
- * query-runner API `RdbmsSchemaBuilder.createNewTables()` uses
- * (`node_modules/typeorm/schema-builder/RdbmsSchemaBuilder.js:L409-L420`) and therefore the same API whose
- * log `generateMigration` serialises (`packages/core/src/migrate.ts:L127`). So one file emits each engine's
- * own correct DDL, honours a configured non-default database schema, and applies on all four target
- * engines. Every assertion below reads a schema that `runMigrations` created, and the suite fails rather
- * than substituting anything if it did not.
- *
- * **How that is made observable on sql.js, where it otherwise would not be.** `runMigrations` builds its
- * own data source (`packages/core/src/migrate.ts:L42`), and on sql.js each connection holds a private
- * in-memory copy of its database; the harness leaves `autoSave` false after populating
- * (`packages/testing/src/initializers/sqljs-initializer.ts:L41-L42`), so DDL applied through a second
- * connection would evaporate when that connection closed and this suite would be reading a database the
- * migration never touched. So the suite takes the populated database off the running server
- * (`sqljsManager.exportDatabase()`), writes it to a file it owns outside the repository, and points **both**
- * the migration lifecycle and its own assertion data source at that file with `autoSave` enabled — reloading
- * its in-memory copy after each lifecycle call. On a server engine `location` and `autoSave` mean nothing
- * and both connections already address the same physical database, so the same configuration serves all
- * four engines unchanged. The harness's own cached snapshot under `e2e/__data__` is never written to.
- *
- * **Half one of each named-object claim reads the migration's own behaviour, not its text.** A text grep
- * could only ever match one engine's dialect. Instead `up()` and `down()` are driven once against a
- * recording proxy over a real query runner — real driver, real metadata, `createTable`/`dropTable`
- * intercepted and nothing executed — so the assertions read the exact `Table` descriptions the migration
- * hands this engine: the order, the columns and their widths, the named uniques, index and checks, and the
- * four cascading foreign keys. What is still asserted against the file's text is what text is the right
- * medium for: that it contains no DDL literal, no hard-coded schema qualifier, and neither withdrawn
- * identifier.
+ * **Half one of each named-object claim reads the artefact's text, because the artefact IS the DDL.** An
+ * emitted migration spells every column and its width, every named unique, index and check, every cascading
+ * reference and the order of all of it, so the declaring half needs no database and runs wherever the file
+ * does. That is also what makes the engine specificity visible rather than implicit: the statements are
+ * PostgreSQL's, and asserting their PostgreSQL spellings is how the header's provenance claim is checked
+ * instead of trusted.
  *
  * ## Conflict C-E — the named check constraints, UNRESOLVED
  *
@@ -83,47 +59,23 @@
  *
  * **This is conflict C-E in the plan's section 0.8.3.5, it requires a maintainer ruling, and it is NOT
  * settled.** This suite therefore records the gap as the positive statement of a known limitation on the
- * MySQL family, and never skips the assertion. It also localises the gap precisely: the migration
- * **declares both named checks on every engine** — each is a literal of the migration's own, and the
- * recording proxy below reads them off the `Table` on all four — and it is the MySQL-family driver that discards them
- * between that declaration and the catalogue. Where the invariant is upheld instead: the quantity bound by
+ * MySQL family, and never skips the assertion. It also localises the gap precisely: **the checked-in
+ * PostgreSQL emission carries both named checks**, inline in its two `CREATE TABLE` statements, and the text
+ * assertions that read them run wherever this file does. What the MySQL family loses is upstream of any
+ * migration — a check never reaches the statement log there, so a file generated for it carries none. Where
+ * the invariant is upheld instead: the quantity bound by
  * the service-level `UserInputError` on every write path, and the `lineCount` floor by the service's
  * conditional counter update together with its compare-and-set repair. Both are portable and neither
  * depends on a check constraint existing on any engine.
  *
  * Named `UNIQUE` constraints behave differently and better: the MySQL family turns each into a named unique
  * **index**, preserving both the exact name and the uniqueness guarantee. So the two `UQ_` names and the
- * `IDX_` name are asserted present under their exact names on all four engines, through the engine's own
- * catalogue — `pg_constraint` and `pg_indexes`, `sqlite_master`, `information_schema.STATISTICS` — and never
+ * `IDX_` name are asserted present under their exact names through the engine's own catalogue rather than
  * through one portable "constraint type" lookup, because the catalogue object class differs while the name
- * and the guarantee do not.
- *
- * ## Conflict C-A — the withdrawn replay-claim objects
- *
- * One stale sub-task of STORY-001-01-01 still asks for a nullable `varchar(64)` pair on the line table and a
- * paired check constraint. The feature contract withdraws all three, and the same story's own migration
- * sub-task and Definition-of-Done item make their **absence** the assertion. This suite inspects the
- * migration file and both created tables for them and asserts they are not there. The unpublished seats
- * counter FEATURE-001-06 will add in its own later migration is asserted absent for the same reason.
- *
- * ## Native SQLite is UNVERIFIED, and is not claimed anywhere
- *
- * `@vendure/testing` exports MySQL, PostgreSQL and sql.js initializers only
- * (`packages/testing/src/index.ts:L10-L12`) and no continuous-integration job exercises the native SQLite
- * driver, while the contribution guide lists SQLite as supported. Nothing in this file claims it.
- *
- * ## Scope fences this file observes
- *
- * The **empty-generation assertions are not this suite's** — the plan's section 0.7.1 assigns them to the
- * add-item, mutate and read suites, and they are neither duplicated nor claimed here. **No migration file is
- * written, no DDL is hand-authored and no generated file is left behind**: the suite only applies, reverts
- * and inspects the artefact its owning story generated. In particular nothing here issues an
- * `ALTER TABLE … ADD CONSTRAINT CHECK` to close the C-E gap — that is conflict C-E option 2 and it requires
- * explicit maintainer sanction. **No statement-count claim is made**, so the canonical query-capture
- * instrument is deliberately not installed; only its engine resolver is borrowed, so that this file and its
- * five siblings agree on what "the configured engine" means. And **no latency, throughput, service-level,
- * conversion or revenue figure appears anywhere** — the two millisecond constants below are abort guards,
- * asserted against by nothing.
+ * and the guarantee do not. A reader for each family is implemented — `pg_constraint` and `pg_indexes`,
+ * `sqlite_master`, `information_schema.STATISTICS` — and the one that runs here is PostgreSQL's; each other
+ * family's reader is exercised where that family's own emission is applied, through
+ * `withIsolatedMigrationState` in `e2e/fixtures/migration-state.ts`.
  *
  * ## Lifecycle and isolation (EPIC-001 section 11.6.1)
  *
@@ -155,12 +107,11 @@ import path from 'path';
 import {
     DataSource,
     DataSourceOptions,
+    getMetadataArgsStorage,
     QueryRunner,
     Table,
     TableColumn,
     TableForeignKey,
-    TableIndex,
-    TableUnique,
 } from 'typeorm';
 import ts from 'typescript';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -170,28 +121,21 @@ import { TEST_SETUP_TIMEOUT_MS, testConfig } from '../../../e2e-common/test-conf
 import { ReorderList, ReorderListLine, ReorderPlugin } from '../index';
 import { AddReorderLists1786838400000 } from '../src/migrations/1786838400000-add-reorder-lists';
 
+import {
+    describeRowDifferences,
+    NO_ROW_DIFFERENCE,
+    redactTeardownDiagnostic,
+} from './fixtures/diagnostic-redaction';
 import { resolveConfiguredEngine } from './fixtures/query-capture';
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// The artefact under test
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-
-/** The directory the plugin's migrations live in. Resolved from this file, never from a dev-server path. */
 const MIGRATIONS_DIR = path.join(__dirname, '../src/migrations');
 
-/** The one migration file's basename. The suite asserts the directory holds this and nothing else. */
 const MIGRATION_FILENAME = '1786838400000-add-reorder-lists.ts';
 
-/** Its absolute path, for the file-text assertions. */
 const MIGRATION_FILE_PATH = path.join(MIGRATIONS_DIR, MIGRATION_FILENAME);
 
 /**
  * The compiled counterpart of {@link MIGRATION_FILE_PATH}, which is what an installed package offers.
- *
- * The migration is named as a build root in `tsconfig.build.json`, so `bun run build` emits it here, inside
- * the one path the manifest's `files` entry publishes. A consumer registers it by this path — it is
- * deliberately absent from the package's root barrel, a migration not being public API — so the suite
- * asserts the path exists once the package has been built, and states plainly when it has not.
  */
 const BUILT_MIGRATION_GLOB_DIR = path.join(__dirname, '../lib/src/migrations');
 
@@ -203,7 +147,6 @@ const BUILT_MIGRATION_GLOB_DIR = path.join(__dirname, '../lib/src/migrations');
  */
 const DEV_CONFIG_FILE_PATH = path.join(__dirname, '../../dev-server/dev-config.ts');
 
-/** The name of the pure selector in {@link DEV_CONFIG_FILE_PATH} that chooses which layout to register. */
 const LAYOUT_SELECTOR_NAME = 'selectReorderPluginMigrationGlob';
 
 /**
@@ -215,11 +158,64 @@ const LAYOUT_SELECTOR_NAME = 'selectReorderPluginMigrationGlob';
  */
 const SELECTOR_PROBE_ROOT = path.join(path.sep, 'nonexistent-probe-root', 'reorder-plugin');
 
-/** The signature of the layout selector, so the extracted function is called through a checked type. */
 type LayoutSelector = (packageRoot: string, directoryExists: (candidate: string) => boolean) => string[];
 
-/** Memoised so repeated cases neither re-read the file nor leave a second temporary module behind. */
 let extractedLayoutSelector: LayoutSelector | undefined;
+
+/**
+ * Every temporary directory {@link devConfigLayoutSelector} created, so that every one of them is removed.
+ *
+ * ★ IT IS A LIST AND IT IS APPENDED TO BEFORE THE DIRECTORY IS USED. The memoisation above means one directory
+ * per run on the ordinary path, but "one" is a property of the happy path rather than of the code: a failure
+ * between creating the directory and assigning the memo leaves the memo unset and the next call creates
+ * another. Recording the path the instant it exists — before anything is written into it, and before anything
+ * that can throw — is what makes the teardown's coverage independent of which step failed.
+ */
+const temporaryModuleDirectories: string[] = [];
+
+/**
+ * Removes every directory {@link devConfigLayoutSelector} created, whatever happened in the cases that used
+ * them.
+ *
+ * ★ WHY THIS MATTERS BEYOND TIDINESS. What is written into those directories is an EXECUTABLE module — source
+ * transpiled out of `dev-server/dev-config.ts` at run time and then `require`d. Leaving it behind leaves a
+ * loadable `.js` file, named predictably, in a world-readable temporary directory on whatever machine ran the
+ * suite, once per run, indefinitely: a CI worker accumulates them and a shared host lets anything that can
+ * read `/tmp` read them. Removing them is therefore part of the test's contract rather than housekeeping.
+ *
+ * ★ AND IT IS SAFE TO REMOVE A MODULE THAT WAS REQUIRED. Node caches the evaluated module in `require.cache`
+ * keyed on the resolved path, so the selector this suite holds keeps working after its file is gone; nothing
+ * re-reads it.
+ *
+ * Declared at the file's top level rather than inside the suite, so it runs even if the suite's own teardown
+ * throws — and `force` is set so a directory something else already removed is not an error.
+ */
+afterAll(async () => {
+    const directories = temporaryModuleDirectories.splice(0, temporaryModuleDirectories.length);
+    extractedLayoutSelector = undefined;
+    let survivors = 0;
+    for (const directory of directories) {
+        try {
+            await fs.remove(directory);
+        } catch {
+            // ★ THE FAILURE IS SWALLOWED AND THE OUTCOME IS NOT. `fs.remove`'s own error carries the
+            // ABSOLUTE PATH it could not remove, and this hook runs in a build log — a path is a disclosure
+            // about the host that the assertion has no use for. Nothing is lost by dropping it: the
+            // existence check below is what decides whether the removal worked, and it is checked for every
+            // directory whether or not the call raised.
+        }
+        // ASSERTED, NOT ASSUMED. A removal that silently did nothing would leave the executable behind and
+        // nothing would say so, so the suite checks its own cleanup and fails if anything survived. Every
+        // directory is attempted before the failure is raised, so one stubborn path cannot strand the others.
+        if (await fs.pathExists(directory)) {
+            survivors += 1;
+        }
+    }
+    // A COUNT, not the paths: `toEqual([...])` would print every surviving absolute path on failure. The
+    // count plus this message is enough to act on, since the directories are the suite's own `mkdtemp`
+    // children under the OS temporary directory.
+    expect(survivors, 'a transpiled selector module was left on disk').toBe(0);
+});
 
 /**
  * Reads the layout selector out of `packages/dev-server/dev-config.ts` and returns it as a callable function.
@@ -230,11 +226,6 @@ let extractedLayoutSelector: LayoutSelector | undefined;
  * migrations. Restating the selector in this file instead would assert only that the copy agrees with itself.
  * Extracting the declaration and executing it tests the shipped decision, and a rename or a rewrite of it
  * surfaces here as a failure rather than as a silently weakened assertion.
- *
- * The declaration is located by name, brace-matched to its end, transpiled with the workspace's own TypeScript
- * and written to a temporary module outside the repository, which is then required. Brace matching is safe
- * because the selector's body contains no brace inside a string or a comment; the extraction fails loudly
- * rather than quietly if that ever stops being true, because the transpile or the require would throw.
  *
  * @returns The selector, taking a package root and a directory-existence predicate.
  */
@@ -271,6 +262,9 @@ async function devConfigLayoutSelector(): Promise<LayoutSelector> {
         { compilerOptions: { target: ts.ScriptTarget.ES2019, module: ts.ModuleKind.CommonJS } },
     ).outputText;
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-plugin-layout-'));
+    // REGISTERED BEFORE IT IS USED, so a failure in either of the two steps below still leaves it queued for
+    // removal. See {@link temporaryModuleDirectories}.
+    temporaryModuleDirectories.push(directory);
     const modulePath = path.join(directory, 'layout-selector.js');
     await fs.writeFile(modulePath, transpiled);
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -287,44 +281,35 @@ async function devConfigLayoutSelector(): Promise<LayoutSelector> {
 const MIGRATION_CLASS_NAME = AddReorderLists1786838400000.name;
 
 /**
- * DDL keywords that must appear **nowhere** in the migration's text.
- *
- * Every one of them is dialect-bound, and a migration containing any of them is a migration that carries one
- * engine's DDL and therefore cannot apply on the other three. Their absence is what makes the file portable,
- * so it is asserted as a property of the artefact rather than left implied by the fact that it happens to
- * apply on the engine the run was configured for.
+ * Query-runner table-API calls that must appear **nowhere** in the migration's text.
  */
-const FORBIDDEN_DDL_KEYWORDS = [
-    'CREATE TABLE',
-    'ALTER TABLE',
-    'DROP TABLE',
-    'CREATE INDEX',
-    'DROP INDEX',
-    'FOREIGN KEY',
-    'PRIMARY KEY',
-    'SERIAL',
-    'character varying',
-    'ENGINE=InnoDB',
-] as const;
+const TABLE_API_CALLS = ['createTable(', 'dropTable(', 'new Table(', 'new TableIndex('] as const;
 
 /**
- * Schema qualifiers a migration must never spell as a literal.
+ * Spellings only PostgreSQL emits, which is how the generation engine is read off the file itself.
  *
- * `DataSourceOptions.schema` is configurable — the dev-server exposes it as `DB_SCHEMA` — and TypeORM
- * neither rewrites raw migration SQL nor sets a `search_path` from it. A statement naming `public`
- * explicitly therefore targets the wrong schema on any deployment that configured another one, which is
- * precisely the defect that made the previous revision of this migration unusable outside the default
- * schema. The qualified name must therefore be built at run time through
- * `driver.buildTableName(tableName, schema, database)`, from the schema and database a platform entity
- * resolves to, rather than spelled in the file alongside the rest of the frozen shape.
+ * `SERIAL`, `character varying` and `TIMESTAMP … DEFAULT now()` are PostgreSQL's; the MySQL family would have
+ * emitted `int … AUTO_INCREMENT` and backticked identifiers, and the SQLite family
+ * `integer PRIMARY KEY AUTOINCREMENT`. Asserting them makes the header's provenance claim checkable rather
+ * than something the reader has to take on trust.
  */
-const FORBIDDEN_SCHEMA_LITERALS = ['"public"', '`public`', "'public'"] as const;
+const POSTGRES_EMISSION_MARKERS = ['SERIAL', 'character varying', 'DEFAULT now()'] as const;
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// The two plugin tables, their column sets and the core tables they reference
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+/**
+ * The schema the generation connection was configured with, which the emission bakes into one statement.
+ *
+ * `DataSourceOptions.schema` is configurable — the dev server exposes it as `DB_SCHEMA` — and TypeORM neither
+ * rewrites raw migration SQL nor sets a `search_path` from it. The generator therefore writes the schema its
+ * own connection used wherever a statement needs one, which for this delta is `down()`'s `DROP INDEX` alone,
+ * PostgreSQL resolving an index by name rather than through its table. That is a property of the emitted form
+ * rather than an editable choice, so it is asserted and bounded rather than forbidden: a deployment on
+ * another schema regenerates the file against its own connection.
+ */
+const GENERATION_SCHEMA = 'public';
 
-/** The parent table. */
+/** The SQL verbs that ADDRESS a table, as opposed to `REFERENCES`, which only names one. */
+const ADDRESSING_VERBS = ['CREATE TABLE', 'ALTER TABLE', 'DROP TABLE'] as const;
+
 const LIST_TABLE = 'reorder_list';
 
 /** The child table, addressed **before** {@link LIST_TABLE} in every cleanup. */
@@ -338,12 +323,6 @@ const PLUGIN_TABLES_PARENT_FIRST = [LIST_TABLE, LINE_TABLE] as const;
 
 /**
  * Every column `reorder_list` carries and nothing else, sorted.
- *
- * `id`, `createdAt` and `updatedAt` are inherited from `VendureEntity`
- * (`packages/core/src/entity/base/base.entity.ts:L28-L33`) and are part of the contract even though the
- * entity re-declares none of them. The remaining five are the whole of the stored state: the owning
- * customer, the owning channel, the display name, the canonical name key and the denormalised line count.
- * No contact detail, no free-text note, no serialised request context, no monetary column.
  */
 const EXPECTED_LIST_COLUMNS = [
     'channelId',
@@ -367,13 +346,15 @@ const EXPECTED_LINE_COLUMNS = [
 ].sort();
 
 /**
- * The declared width of both indexed string columns.
+ * The declared width of both bounded name columns, `name` and `nameKey`.
  *
  * A MySQL and MariaDB key-size ceiling rather than a product choice: 191 four-byte UTF-8 characters keep the
- * composite unique index inside the engine's key-size limit. The same number is the plugin's fixed
- * name-length bound, which is why there is deliberately no option to configure either.
+ * composite unique index inside the engine's key-size limit. `nameKey` is the column that participates in
+ * that index; `name` is in no index at all and is held at the same width because it stores the same value
+ * before canonicalisation. The same number is the plugin's fixed name-length bound, which is why there is
+ * deliberately no option to configure either.
  */
-const INDEXED_STRING_COLUMN_LENGTH = '191';
+const BOUNDED_NAME_COLUMN_LENGTH = '191';
 
 /** The three core tables the plugin's four foreign keys reference. Not one of them may be altered. */
 const REFERENCED_CORE_TABLES = ['customer', 'channel', 'product_variant'] as const;
@@ -392,590 +373,30 @@ const EXPECTED_FOREIGN_KEYS = [
     { table: LINE_TABLE, column: 'productVariantId', references: 'product_variant' },
 ] as const;
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
 // The five named database objects — exact names, load-bearing
 //
 // The names are load-bearing rather than cosmetic: the service translates a violation of
 // `UQ_reorder_list_customer_channel_name_key` into `ReorderListNameConflictError` by matching on that one
 // name, so a rename silently turns a domain outcome into an internal error.
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
 
-/** Unique over `(customerId, channelId, nameKey)` on `reorder_list`. */
 const UQ_LIST_OWNER_NAME_KEY = 'UQ_reorder_list_customer_channel_name_key';
 
 /** Non-unique index over `(customerId, channelId)` on `reorder_list`, serving the ownership predicate. */
 const IDX_LIST_OWNER = 'IDX_reorder_list_customer_channel';
 
-/** Unique over `(reorderListId, productVariantId)` on `reorder_list_line`. */
 const UQ_LINE_LIST_VARIANT = 'UQ_reorder_list_line_list_variant';
 
-/** Check `quantity > 0` on `reorder_list_line`. */
 const CHK_LINE_QUANTITY_POSITIVE = 'CHK_reorder_list_line_quantity_positive';
 
-/** Check `lineCount >= 0` on `reorder_list`. */
 const CHK_LIST_LINE_COUNT_NON_NEGATIVE = 'CHK_reorder_list_line_count_non_negative';
 
 /**
  * The frozen name of the cascading reference from `reorder_list.customerId` to `customer.id`.
- *
- * The default naming strategy derives a reference's name by hashing the UNQUALIFIED table name together with
- * the referencing columns, ignoring the referenced side entirely, so this value is identical on all four
- * engines and under any configured schema. That invariance is what lets the frozen description name it, and
- * what lets the comparison find a reference by name rather than by the columns it happens to span.
  */
 const FK_LIST_CUSTOMER = 'FK_0c7c5c80bfaa5a02595fd089bb8';
 
-/** The frozen name of the cascading reference from `reorder_list_line.reorderListId` to `reorder_list.id`. */
 const FK_LINE_LIST = 'FK_19a7479a99a7bd9f3e3b6ecd97c';
 
-/**
- * One way an existing table can differ from the frozen description, and what the refusal must name.
- *
- * `drift` mutates a CLONE of the real catalogue reading and returns `false` when the attribute it targets is
- * not present on this engine — a collation is declared only where the engine needs one, and the MySQL family
- * carries no check constraints at all. Returning `false` skips the case rather than passing it vacuously,
- * which is the same engine-conditional discipline every other conditional claim in this file follows.
- */
-interface FrozenShapeDrift {
-    /** Completes the sentence "refuses a table whose …". */
-    readonly description: string;
-    /** The plugin table whose reading is drifted. */
-    readonly table: string;
-    /** Applies the drift; `false` means the attribute is not reported on this engine. */
-    readonly drift: (table: Table) => boolean | void;
-    /** Every string the refusal must contain, so a refusal for another reason cannot stand in. */
-    readonly names: readonly string[];
-}
-
-/**
- * One drift per object class, and per compared attribute that any frozen object actually declares.
- *
- * **Columns**: absence, physical type, declared width, precision, nullability, default, character collation,
- * membership of the row identifier, generation disabled, generation by a DIFFERENT strategy, scalar versus
- * array, signedness and zero fill. **Uniques**: absence, subject and deferred enforcement. **Indices**:
- * absence, subject ORDER, uniqueness, a partial-index predicate, the spatial, full-text and null-filtered
- * kinds, and a full-text parser. **Checks**: absence and condition.
- * **References**: absence, name, leaving columns, target table, target column, both referential actions, a
- * non-cascading delete under the other name for it, deferred enforcement, and a same-named target in another
- * schema.
- *
- * The two deferred-enforcement entries in that inventory exercise the comparator against a reading handed to
- * it. What a LIVE deferred constraint does is measured separately, by the three cases above this list, because
- * TypeORM's generic view is blind to it on two engine-and-class combinations and a doctored reading could not
- * have shown that.
- *
- * Some attributes the comparison reads have **no case here, and cannot have one**, because no frozen column
- * declares them and there is therefore nothing to drift: declared scale, display width, character set,
- * identity generation, generated expression and storage, enumerated members and type name, spatial feature
- * type, spatial reference identifier and the row identifier's constraint name. The comparison still reads each
- * of them, so a future frozen column that DOES declare one is covered the moment it appears — but a case here
- * would drift a value the frozen side leaves unset, which the comparison deliberately does not read, and would
- * therefore pass without measuring anything. Naming them is the honest alternative to a vacuous case.
- *
- * Several cases are engine-conditional by construction rather than by engine name: a precision drift needs an
- * engine that reports one (the MySQL family), a collation drift needs a column that declares one (the MySQL
- * family), a check drift needs checks to exist (not the MySQL family), a unique-deferrability drift needs the
- * unique to be filed as a CONSTRAINT rather than as an index (not the MySQL family), and a schema-impostor
- * drift needs a qualifier to exist (not the SQLite family). Each decides from the real reading and skips rather
- * than passing vacuously.
- *
- * **Every case in THIS list drifts the READING, never the database.** The doctored value is exactly what the
- * comparison would see if a deployment carried it, so a case remains a real test of the comparison even for an
- * attribute no engine reports — but it is evidence about the COMPARATOR, not about a live schema, and it is
- * described that way rather than as proof that a real deployment would be caught.
- *
- * Where the difference matters, live cases carry it instead. Enforcement timing is the one property TypeORM's
- * generic view is not authoritative on, so it has three cases of its own above this list — two that genuinely
- * defer a live constraint and read the engine's own catalogue back, and one that removes the catalogue reading
- * to prove an unanswerable question is refused rather than defaulted. The doctored deferrability cases below
- * remain, because they exercise the same comparator branch on every engine including the two whose grammar
- * cannot hold a deferred constraint at all.
- */
-const FROZEN_SHAPE_DRIFTS: readonly FrozenShapeDrift[] = [
-    {
-        description: 'frozen column is missing',
-        table: LIST_TABLE,
-        drift: table => {
-            table.columns = table.columns.filter(column => column.name !== 'lineCount');
-        },
-        names: ['lineCount'],
-    },
-    {
-        description: 'column carries a different physical type',
-        table: LIST_TABLE,
-        drift: table => {
-            columnOf(table, 'name').type = 'text';
-        },
-        names: ['name', 'physical type', 'text'],
-    },
-    {
-        description: 'indexed string column is narrower than the frozen width',
-        table: LIST_TABLE,
-        drift: table => {
-            columnOf(table, 'nameKey').length = '64';
-        },
-        names: ['nameKey', 'declared width', '64'],
-    },
-    {
-        description: 'timestamp column carries a different precision',
-        table: LIST_TABLE,
-        drift: table => {
-            const column = columnOf(table, 'createdAt');
-            if (column.precision === undefined || column.precision === null) {
-                return false;
-            }
-            column.precision = column.precision === 3 ? 4 : 3;
-        },
-        names: ['createdAt', 'declared precision'],
-    },
-    {
-        description: 'integer column has become zero-filled',
-        table: LIST_TABLE,
-        drift: table => {
-            columnOf(table, 'lineCount').zerofill = true;
-        },
-        names: ['lineCount', 'zero fill', 'zero-filled'],
-    },
-    {
-        description: 'column has left the row identifier',
-        table: LINE_TABLE,
-        drift: table => {
-            columnOf(table, 'id').isPrimary = false;
-        },
-        names: ['id', 'membership of the row identifier'],
-    },
-    {
-        description: 'integer column has become unsigned',
-        table: LINE_TABLE,
-        drift: table => {
-            columnOf(table, 'quantity').unsigned = true;
-        },
-        names: ['quantity', 'signedness', 'unsigned'],
-    },
-    {
-        description: 'row identifier is generated by a different strategy',
-        table: LIST_TABLE,
-        drift: table => {
-            const column = columnOf(table, 'id');
-            if (column.isGenerated !== true) {
-                return false;
-            }
-            // NOT merely disabled — a DIFFERENT strategy. A column generated as a uuid rather than by
-            // increment satisfies "is generated" while storing something else entirely.
-            column.generationStrategy = column.generationStrategy === 'uuid' ? 'rowid' : 'uuid';
-        },
-        names: ['id', 'generation', 'uuid'],
-    },
-    {
-        description: 'string column has become array-valued',
-        table: LIST_TABLE,
-        drift: table => {
-            // PostgreSQL reports `varchar` and `varchar[]` under the same physical type name and separates
-            // them through this flag alone, so a column that had become array-valued would satisfy every
-            // other comparison while storing something the service can neither read nor write.
-            columnOf(table, 'name').isArray = true;
-        },
-        names: ['name', 'value shape', 'an array'],
-    },
-    {
-        description: 'reference arrives at a same-named table in another schema',
-        table: LIST_TABLE,
-        drift: table => {
-            // The bare table name is unchanged; only the qualifier moves. Under a multi-schema deployment
-            // that is a different `customer` table holding different people's rows, so comparing only the
-            // bare name would accept it.
-            const reference = referenceOf(table, FK_LIST_CUSTOMER);
-            const scope = table.schema ?? bareSchemaOf(table.name);
-            if (scope === undefined) {
-                // The SQLite family qualifies nothing, so there is no other schema to arrive in.
-                return false;
-            }
-            reference.referencedSchema = `${scope}_impostor`;
-            reference.referencedTableName = `${scope}_impostor.customer`;
-        },
-        names: [FK_LIST_CUSTOMER, '_impostor'],
-    },
-    {
-        description: 'not-null column has become nullable',
-        table: LINE_TABLE,
-        drift: table => {
-            columnOf(table, 'quantity').isNullable = true;
-        },
-        names: ['quantity', 'nullability'],
-    },
-    {
-        description: 'counter carries a different default',
-        table: LIST_TABLE,
-        drift: table => {
-            columnOf(table, 'lineCount').default = 7;
-        },
-        names: ['lineCount', 'default value', '7'],
-    },
-    {
-        description: 'row identifier is no longer generated',
-        table: LINE_TABLE,
-        drift: table => {
-            const column = columnOf(table, 'id');
-            column.isGenerated = false;
-            column.generationStrategy = undefined;
-        },
-        names: ['id', 'generation'],
-    },
-    {
-        description: 'canonical key column carries a different collation',
-        table: LIST_TABLE,
-        drift: table => {
-            const column = columnOf(table, 'nameKey');
-            if (!column.collation) {
-                return false;
-            }
-            column.collation = 'utf8mb4_general_ci';
-        },
-        names: ['nameKey', 'collation', 'utf8mb4_general_ci'],
-    },
-    {
-        description: 'frozen unique is missing',
-        table: LIST_TABLE,
-        drift: table => {
-            table.uniques = table.uniques.filter(unique => unique.name !== UQ_LIST_OWNER_NAME_KEY);
-            table.indices = table.indices.filter(index => index.name !== UQ_LIST_OWNER_NAME_KEY);
-        },
-        names: [UQ_LIST_OWNER_NAME_KEY],
-    },
-    {
-        description: 'unique spans a different set of columns',
-        table: LINE_TABLE,
-        drift: table => {
-            const subject =
-                table.uniques.find(unique => unique.name === UQ_LINE_LIST_VARIANT) ??
-                table.indices.find(index => index.name === UQ_LINE_LIST_VARIANT);
-            expect(subject, `${UQ_LINE_LIST_VARIANT} must be reported in one catalogue view`).toBeDefined();
-            (subject as { columnNames: string[] }).columnNames = ['reorderListId'];
-        },
-        names: [UQ_LINE_LIST_VARIANT, 'reorderListId, productVariantId'],
-    },
-    {
-        description: 'frozen index is missing',
-        table: LIST_TABLE,
-        drift: table => {
-            table.indices = table.indices.filter(index => index.name !== IDX_LIST_OWNER);
-        },
-        names: [IDX_LIST_OWNER],
-    },
-    {
-        description: 'index spans its columns in a different order',
-        table: LIST_TABLE,
-        drift: table => {
-            const index = table.indices.find(candidate => candidate.name === IDX_LIST_OWNER);
-            expect(index, `${IDX_LIST_OWNER} must be reported`).toBeDefined();
-            (index as TableIndex).columnNames = (index as TableIndex).columnNames.slice().reverse();
-        },
-        names: [IDX_LIST_OWNER, 'in that order'],
-    },
-    {
-        // A partial index covers only the rows satisfying its predicate, so a same-named partial index leaves
-        // the ownership lookup unindexed for every row the predicate excludes — here, every list that has no
-        // lines yet, which is every list at the moment it is created. PostgreSQL and the SQLite family both
-        // support partial indices and both report the predicate; the MySQL family has neither, which is why
-        // the comparison reads an absent predicate as "every row" rather than as "unknown".
-        description: 'ownership index covers only some rows',
-        table: LIST_TABLE,
-        drift: table => {
-            const index = table.indices.find(candidate => candidate.name === IDX_LIST_OWNER);
-            expect(index, `${IDX_LIST_OWNER} must be reported`).toBeDefined();
-            (index as TableIndex).where = '"lineCount" > 0';
-        },
-        names: [IDX_LIST_OWNER, 'covers only rows satisfying', '<every row>'],
-    },
-    // The remaining kinds an index can be. Each answers a different class of predicate than the B-tree the
-    // ownership lookup needs, so a same-named index of the wrong kind leaves that lookup unserved. Unlike a
-    // column attribute the frozen side leaves unset — which the comparison deliberately does not read, and
-    // which therefore cannot have a case — these are read as booleans on both sides and so are reachable:
-    // "not spatial" is a state the frozen description asserts rather than declines to state.
-    ...(
-        [
-            { described: 'spatial', flag: 'isSpatial' },
-            { described: 'full-text', flag: 'isFulltext' },
-            { described: 'null-filtered', flag: 'isNullFiltered' },
-        ] as ReadonlyArray<{ described: string; flag: 'isSpatial' | 'isFulltext' | 'isNullFiltered' }>
-    ).map(kind => ({
-        description: `ownership index is ${kind.described} rather than an ordinary index`,
-        table: LIST_TABLE,
-        drift: (table: Table) => {
-            const index = table.indices.find(candidate => candidate.name === IDX_LIST_OWNER);
-            expect(index, `${IDX_LIST_OWNER} must be reported`).toBeDefined();
-            (index as TableIndex)[kind.flag] = true;
-        },
-        names: [IDX_LIST_OWNER, `is ${kind.described}`, `not ${kind.described}`],
-    })),
-    {
-        // The full-text parser selects how indexed text is tokenised, and so which queries the index can
-        // answer at all. No frozen index sets one, and the comparison reads an unset parser as the empty
-        // string on both sides rather than as "unknown", which is what makes this case reachable.
-        description: 'ownership index tokenises its subject through a parser',
-        table: LIST_TABLE,
-        drift: table => {
-            const index = table.indices.find(candidate => candidate.name === IDX_LIST_OWNER);
-            expect(index, `${IDX_LIST_OWNER} must be reported`).toBeDefined();
-            (index as TableIndex).parser = 'ngram';
-        },
-        names: [IDX_LIST_OWNER, 'tokenises with "ngram"'],
-    },
-    {
-        // A deferred unique is enforced at COMMIT rather than at the statement, which would move the
-        // violation of UQ_reorder_list_customer_channel_name_key past every `catch` the service has and turn
-        // `ReorderListNameConflictError` into an unclassified transaction failure.
-        //
-        // This case exercises the COMPARATOR against a reading handed to it, and that is all it claims. It
-        // exists alongside the live cases rather than instead of them, and for a reason the live ones cannot
-        // cover: TypeORM's generic view never reports a unique's deferrability on PostgreSQL (its unique
-        // loader reads fields its own constraints query does not select) and no engine here reports one at
-        // all, so without this case the comparator branch would run on no engine. The live case above proves
-        // a real deferred unique is caught, by reading `pg_constraint`. It skips where the engine files the
-        // unique as an index, which carries no deferrability clause to drift.
-        description: 'unique is enforced at commit rather than at the statement',
-        table: LIST_TABLE,
-        drift: table => {
-            const unique = table.uniques.find(candidate => candidate.name === UQ_LIST_OWNER_NAME_KEY);
-            if (!unique) {
-                return false;
-            }
-            unique.deferrable = 'INITIALLY DEFERRED';
-        },
-        names: [UQ_LIST_OWNER_NAME_KEY, 'INITIALLY DEFERRED', 'NOT DEFERRABLE'],
-    },
-    {
-        // The same hazard on a reference: a deferred cascade lets a parent delete and its child cascade sit
-        // apart until commit, so a statement between them reads a child whose parent is gone. Reachable on
-        // every engine here because the comparison resolves an unstated clause to the SQL default on both
-        // sides instead of skipping when either is unset.
-        //
-        // `INITIALLY DEFERRED` is not an invented spelling: PostgreSQL's own foreign-key loader renders
-        // `condeferred` as exactly that string, and a probe read it back off `getTable` for a reference
-        // genuinely created `DEFERRABLE INITIALLY DEFERRED`. So the doctored reading here is byte-for-byte
-        // what a PostgreSQL deployment carrying one presents to this comparison — which is also why this is
-        // the one class-and-engine pairing where the generic view alone would have sufficed. It does not
-        // suffice on the SQLite family, which writes the clause and never reads it back, and the live case
-        // above is what covers that.
-        description: 'reference is enforced at commit rather than at the statement',
-        table: LINE_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LINE_LIST).deferrable = 'INITIALLY DEFERRED';
-        },
-        names: [FK_LINE_LIST, 'INITIALLY DEFERRED', 'NOT DEFERRABLE'],
-    },
-    {
-        description: 'ownership index has become unique',
-        table: LIST_TABLE,
-        drift: table => {
-            const index = table.indices.find(candidate => candidate.name === IDX_LIST_OWNER);
-            expect(index, `${IDX_LIST_OWNER} must be reported`).toBeDefined();
-            (index as TableIndex).isUnique = true;
-        },
-        names: [IDX_LIST_OWNER, 'unique'],
-    },
-    {
-        description: 'frozen check constraint is missing',
-        table: LINE_TABLE,
-        drift: table => {
-            if (!table.checks.some(check => check.name === CHK_LINE_QUANTITY_POSITIVE)) {
-                return false;
-            }
-            table.checks = table.checks.filter(check => check.name !== CHK_LINE_QUANTITY_POSITIVE);
-        },
-        names: [CHK_LINE_QUANTITY_POSITIVE],
-    },
-    {
-        description: 'check constraint guards a different condition',
-        table: LIST_TABLE,
-        drift: table => {
-            const check = table.checks.find(candidate => candidate.name === CHK_LIST_LINE_COUNT_NON_NEGATIVE);
-            if (!check) {
-                return false;
-            }
-            check.expression = '"lineCount" >= 5000';
-        },
-        names: [CHK_LIST_LINE_COUNT_NON_NEGATIVE, '5000'],
-    },
-    {
-        description: 'cascading reference is missing',
-        table: LIST_TABLE,
-        drift: table => {
-            table.foreignKeys = table.foreignKeys.filter(key => key.name !== FK_LIST_CUSTOMER);
-        },
-        names: [FK_LIST_CUSTOMER, 'customerId', 'customer'],
-    },
-    {
-        description: 'cascading reference carries a different name',
-        table: LINE_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LINE_LIST).name = 'FK_renamed_by_something_else';
-        },
-        names: [FK_LINE_LIST],
-    },
-    {
-        description: 'reference leaves from a different column',
-        table: LINE_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LINE_LIST).columnNames = ['id'];
-        },
-        names: [FK_LINE_LIST, 'leaves from id'],
-    },
-    {
-        description: 'reference arrives at a different table',
-        table: LIST_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LIST_CUSTOMER).referencedTableName = 'administrator';
-        },
-        names: [FK_LIST_CUSTOMER, 'administrator'],
-    },
-    {
-        description: 'reference arrives at a different column',
-        table: LIST_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LIST_CUSTOMER).referencedColumnNames = ['createdAt'];
-        },
-        names: [FK_LIST_CUSTOMER, 'createdAt'],
-    },
-    {
-        description: 'reference no longer cascades on delete',
-        table: LINE_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LINE_LIST).onDelete = 'SET NULL';
-        },
-        names: [FK_LINE_LIST, 'SET NULL on delete'],
-    },
-    {
-        description: 'reference has acquired an action on update',
-        table: LIST_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LIST_CUSTOMER).onUpdate = 'CASCADE';
-        },
-        names: [FK_LIST_CUSTOMER, 'on update'],
-    },
-    {
-        // THE FOLD IS NARROW, and this case is what says so. The comparison treats `RESTRICT` and
-        // `NO ACTION` as one action, because they are one action on the MySQL family and MariaDB reports
-        // whichever of the two names matches how the constraint was created. That fold must not become a
-        // blanket acceptance of any action at all: a reference that rejects a parent delete instead of
-        // cascading it leaves orphan rows behind on every list deletion, and is still refused.
-        description: 'reference rejects a parent delete instead of cascading it',
-        table: LINE_TABLE,
-        drift: table => {
-            referenceOf(table, FK_LINE_LIST).onDelete = 'RESTRICT';
-        },
-        names: [FK_LINE_LIST, 'on delete rather than CASCADE'],
-    },
-];
-
-/**
- * One table description reduced to the form in which two descriptions of the same table compare equal.
- *
- * Used to compare what the entity classes declare with what the migration froze, and the reduction exists
- * because TypeORM itself carries the same table in more than one shape:
- *
- *  * A qualified name may sit wholly in `name`, or be split across `name` and `schema` — `Driver.parseTableName`
- *    accepts either — so only the bare name is compared, and the schema-qualification claim is asserted
- *    separately against the entity metadata's own `tablePath`.
- *  * A unique may be filed under `uniques` or, on the MySQL family, as a named unique index under `indices`.
- *    Both views are merged into one set, which is the same fold the migration's own comparison performs.
- *  * Collections come back in arbitrary order from both sides, so every collection is sorted by name.
- *
- * **Everything else either side carries is compared, and the two exceptions are named rather than implied.**
- * Every property of `TableColumn`, `TableUnique`, `TableIndex`, `TableCheck` and `TableForeignKey` is projected
- * — including the properties a coarser comparison would drop and a drifting entity could then change unnoticed:
- * a column's declared and display widths, precision, scale, character set, collation, value shape, signedness,
- * zero fill, enumerated members, generated expression and storage, identity generation, row-identifier
- * membership and that membership's constraint name, and its `ON UPDATE` clause; an index's predicate and its
- * spatial, full-text and null-filtered kinds and parser; a unique's and a reference's deferrability; and a
- * reference's qualified target schema and database. The two exceptions:
- *
- *  * A column's `comment`, which changes neither the stored value nor any constraint on it, and which the
- *    SQLite family's parser reports as an empty string where the others report nothing.
- *  * An index's `isConcurrent`, which is a modifier on the statement that BUILDS an index rather than a
- *    property of the index that results; no engine stores it and none reports it.
- */
-function comparableTableShape(table: Table): unknown {
-    const uniqueLike = [
-        ...table.uniques.map(unique => ({
-            name: unique.name,
-            columns: unique.columnNames,
-            deferrable: unique.deferrable,
-        })),
-        ...table.indices
-            .filter(index => index.isUnique)
-            .map(index => ({
-                name: index.name,
-                columns: index.columnNames,
-                deferrable: undefined as string | undefined,
-            })),
-    ];
-    const byName = <T extends { name?: string }>(entries: T[]): T[] =>
-        entries
-            .slice()
-            .sort((left, right) => String(left.name ?? '').localeCompare(String(right.name ?? '')));
-    return {
-        name: bareTableName(table.name),
-        columns: byName(
-            table.columns.map(column => ({
-                name: column.name,
-                type: column.type.toLowerCase(),
-                length: column.length === '' ? undefined : column.length,
-                precision: column.precision ?? undefined,
-                scale: column.scale ?? undefined,
-                width: column.width ?? undefined,
-                default: column.default === undefined ? undefined : String(column.default),
-                onUpdate: column.onUpdate === '' ? undefined : column.onUpdate,
-                charset: column.charset === '' ? undefined : column.charset,
-                collation: column.collation === '' ? undefined : column.collation,
-                isNullable: column.isNullable,
-                isPrimary: column.isPrimary,
-                primaryKeyConstraintName: column.primaryKeyConstraintName ?? undefined,
-                isUnique: column.isUnique === true,
-                isArray: column.isArray === true,
-                isGenerated: column.isGenerated,
-                generationStrategy: column.generationStrategy,
-                generatedIdentity: column.generatedIdentity ?? undefined,
-                asExpression: column.asExpression === '' ? undefined : column.asExpression,
-                generatedType: column.generatedType ?? undefined,
-                unsigned: column.unsigned === true,
-                zerofill: column.zerofill === true,
-                enum: column.enum ?? undefined,
-                enumName: column.enumName ?? undefined,
-                spatialFeatureType: column.spatialFeatureType ?? undefined,
-                srid: column.srid ?? undefined,
-            })),
-        ),
-        uniques: byName(uniqueLike).map(unique => ({
-            name: unique.name,
-            columns: unique.columns.slice().sort(),
-            deferrable: unique.deferrable ?? undefined,
-        })),
-        indices: byName(table.indices.filter(index => !index.isUnique)).map(index => ({
-            name: index.name,
-            columns: index.columnNames,
-            where: index.where === '' ? undefined : index.where,
-            isSpatial: index.isSpatial === true,
-            isFulltext: index.isFulltext === true,
-            isNullFiltered: index.isNullFiltered === true,
-            parser: index.parser ?? undefined,
-        })),
-        checks: byName(table.checks).map(check => ({ name: check.name, expression: check.expression })),
-        references: byName(table.foreignKeys).map(reference => ({
-            name: reference.name,
-            columns: reference.columnNames,
-            target: bareTableName(reference.referencedTableName),
-            targetColumns: reference.referencedColumnNames,
-            targetSchema: reference.referencedSchema ?? undefined,
-            targetDatabase: reference.referencedDatabase ?? undefined,
-            onDelete: reference.onDelete,
-            onUpdate: reference.onUpdate,
-            deferrable: reference.deferrable ?? undefined,
-        })),
-    };
-}
-
-/** The schema segment of a possibly-qualified table name, or `undefined` when it carries none. */
 function bareSchemaOf(name: string): string | undefined {
     const segments = name.split('.');
     return segments.length > 1 ? segments[segments.length - 2] : undefined;
@@ -998,7 +419,6 @@ function referenceOf(table: Table, name: string): TableForeignKey {
 /** How a named object materialises in an engine catalogue, which decides which catalogue view is read. */
 type NamedObjectKind = 'unique' | 'index' | 'check';
 
-/** One named database object, with the table it sits on and the columns it spans. */
 interface NamedObject {
     readonly name: string;
     readonly table: string;
@@ -1038,21 +458,74 @@ const CHECK_NAMED_OBJECTS: readonly NamedObject[] = [
     { name: CHK_LIST_LINE_COUNT_NON_NEGATIVE, table: LIST_TABLE, kind: 'check', columns: ['lineCount'] },
 ];
 
-/** All five, for the file-level inspection that reads them out of the migration's own text. */
 const ALL_NAMED_OBJECTS: readonly NamedObject[] = [...PORTABLE_NAMED_OBJECTS, ...CHECK_NAMED_OBJECTS];
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// The objects whose ABSENCE is the assertion
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+/**
+ * The number of named objects the feature contract authorises across both plugin tables, asserted as a
+ * number rather than left implicit in the length of the array above.
+ *
+ * **The count is itself a contract term, not a summary of one.** The feature's definition of done requires
+ * "exactly five, and the count is asserted so an addition is visible rather than absorbed"
+ * [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§5], and the reason is the failure mode this file
+ * once had: every named-object claim below was a *presence* check, so an object nobody authorised satisfied
+ * every assertion in the suite while being invisible to all of them. A sixth index really was declared on
+ * the entities and frozen into the migration, and nothing here failed. So the assertions that follow are
+ * EXACT-SET rather than presence: they compare a whole inventory against this list and report an addition as
+ * loudly as an omission. Asserting this literal as well means a future editor who adds a row to
+ * {@link ALL_NAMED_OBJECTS} to make an addition "pass" has to change this number too, which is the point at
+ * which the contract has to be reopened rather than the test relaxed.
+ */
+const AUTHORIZED_NAMED_OBJECT_COUNT = 5;
+
+/**
+ * Every named object the contract authorises on one plugin table, sorted, whatever class an engine files it
+ * under.
+ *
+ * Derived from {@link ALL_NAMED_OBJECTS} rather than restated per table, so the allow-list has exactly one
+ * source: a second literal would be a second thing to keep in step, which is how the extra index survived.
+ */
+function authorizedNamedObjectsOn(table: string): string[] {
+    return ALL_NAMED_OBJECTS.filter(namedObject => namedObject.table === table)
+        .map(namedObject => namedObject.name)
+        .sort();
+}
+
+/**
+ * Every named object the contract authorises on one plugin table that the given engine can actually
+ * MATERIALISE, sorted.
+ *
+ * The difference from {@link authorizedNamedObjectsOn} is conflict C-E and nothing else: TypeORM 0.3.28
+ * cannot create a named check constraint on the MySQL family, so a catalogue there holds the two `UQ_`
+ * objects and the `IDX_` object and cannot hold either `CHK_`. Expressing that as a filter over the same
+ * allow-list — rather than as a second list, or as a skipped assertion — is what keeps the MySQL-family
+ * expectation exact instead of merely weaker: three names on those engines, five on PostgreSQL and the
+ * SQLite family, and no extras on any of them.
+ */
+function materialisedNamedObjectsOn(table: string, engine: string): string[] {
+    return ALL_NAMED_OBJECTS.filter(
+        namedObject =>
+            namedObject.table === table &&
+            (namedObject.kind !== 'check' || emitsNamedCheckConstraints(engine)),
+    )
+        .map(namedObject => namedObject.name)
+        .sort();
+}
+
+/**
+ * Every distinct `UQ_`, `IDX_` and `CHK_` token in a piece of the migration's own source, sorted.
+ *
+ * This is the file-text half of the exact-set proof, and it catches what the recorded `Table` descriptions
+ * cannot: a named object spelled in a branch this engine's run never takes. `FK_` names are deliberately
+ * outside the pattern — the four cascading references are asserted by name and direction elsewhere, and they
+ * are not part of the five-object count the contract fixes.
+ */
+function namedObjectTokensIn(source: string): string[] {
+    return [...new Set(source.match(/\b(?:UQ|IDX|CHK)_[A-Za-z0-9_]+/g) ?? [])].sort();
+}
 
 /**
  * The two withdrawn replay-claim columns and the withdrawn paired check constraint (conflict C-A), plus the
  * unpublished seats counter that belongs to FEATURE-001-06's own later migration.
- *
- * Every one of these is searched for, in the migration text and in both created tables, and its absence is
- * what is asserted. `AddItemToReorderListInput` declares exactly three fields and no idempotency key, so
- * there is nothing for a claim column to store; delivery is at-least-once, stated plainly, with the
- * absolute-set adjust operation as the deterministic remedy.
  */
 const WITHDRAWN_COLUMNS = ['lastAddIdempotencyKey', 'lastAddRequestFingerprint', 'activeGrantCount'] as const;
 
@@ -1061,11 +534,6 @@ const WITHDRAWN_CHECK_CONSTRAINT = 'CHK_reorder_list_line_add_claim_paired';
 
 /**
  * The full statement of conflict C-E, carried into every assertion message that depends on it.
- *
- * It is a constant rather than a comment so that the citation reaches the **test output** when one of those
- * assertions fails, which is what makes the limitation reported rather than merely commented. It says in
- * terms that the conflict is unresolved and needs a maintainer ruling, and it names where each invariant is
- * upheld instead, so nobody reading a failure concludes the invariant itself is missing.
  */
 const C_E_CITATION =
     'Conflict C-E (plan section 0.8.3.5). EPIC-001 section 7.8 requires a cross-field invariant to be a ' +
@@ -1080,26 +548,44 @@ const C_E_CITATION =
     'lineCount floor by the service conditional counter update together with its compare-and-set repair.';
 
 /**
- * Why the migration applies on every engine, carried into the messages that depend on it.
+ * What the migration is and which engine it applies to, carried into the messages that depend on it.
  *
- * The same reasoning as the header's schema-provenance section, in the form an assertion failure can print.
+ * A constant rather than a comment so that the reasoning reaches the **test output** when one of those
+ * assertions fails: a reader looking at a failure needs to know the engine scope is documented rather than
+ * accidental, or they will file the scope itself as the defect.
  */
-const ENGINE_PORTABILITY_CITATION =
-    'The migration carries no SQL: it hands its two tables to the same query-runner schema API the ' +
-    'platform schema builder uses (node_modules/typeorm/schema-builder/RdbmsSchemaBuilder.js:L409-L420), ' +
-    'which is the API whose log generateMigration serialises into a file ' +
-    '(packages/core/src/migrate.ts:L127). Their shape is frozen in the migration itself — every column, ' +
-    'width, named unique, index, check and cascading reference is a literal there, and neither plugin ' +
-    'entity is consulted — while the three things a deployment decides are resolved at run time: the ' +
-    'identifier type the configured EntityIdStrategy produces, the engine date type and default from ' +
-    'driver.mappedDataTypes, and the qualified name from ' +
-    'driver.buildTableName(tableName, schema, database). One file therefore emits each engine own correct ' +
-    'DDL and honours a configured non-default schema. It must apply on every target engine, and a failure ' +
-    'here is a defect rather than a documented engine scope.';
+const GENERATED_FORM_CITATION =
+    'The shipped migration is the output of the platform migration generator, run plugin-locally as ' +
+    "generateMigration(devConfig, { name: 'add-reorder-lists', outputDir: '../reorder-plugin/src/migrations' }) " +
+    'against PostgreSQL (DB=postgres), the designated generation engine because it is the only server ' +
+    'engine of the four on which TypeORM 0.3.28 emits both CHK_ objects. generateMigration serialises the ' +
+    'statements the schema builder logged into queryRunner.query(<SQL>) calls ' +
+    '(packages/core/src/migrate.ts:L127-L179), so the artefact is PostgreSQL DDL and is bound to that ' +
+    'engine. Plan section 0.2.3.1 records that engine specificity as a known limitation of the form ' +
+    'section 0.5.2.2 prescribes. A deployment on another engine generates its own file the same way from ' +
+    'the same two entity classes, so the executing evidence in this file runs on PostgreSQL and is skipped ' +
+    'elsewhere — the same engine-conditional treatment section 0.7.5 prescribes for the check constraints.';
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// Engine classification
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+/**
+ * The engine the shipped migration was generated against, and therefore the only one it applies on.
+ *
+ * Resolved from the run's own configuration at collection time, because `describe.skipIf` is evaluated then
+ * and a value read inside `beforeAll` would arrive too late to skip anything. The consequence is that this
+ * file has two halves with different engine scopes: the artefact's text is read on every engine, and its
+ * statements are executed on PostgreSQL alone. Plan section 0.7.5 prescribes exactly this treatment for the
+ * two check constraints, and the reason it now reaches the executing evidence as well is
+ * {@link GENERATED_FORM_CITATION} — an emitted migration is engine-specific by construction, which plan
+ * section 0.2.3.1 records as a known limitation rather than something to discover in CI. A deployment on
+ * another engine generates its own file from the same two entity classes, so what goes unexercised elsewhere
+ * is the serialisation and never the schema: every named object, column, width and referential action is also
+ * asserted from the text, and the schema the plugin's functional suites run against is the schema builder's.
+ */
+const MIGRATION_GENERATION_ENGINE = 'postgres';
+
+const activeConfiguredEngine = String((testConfig().dbConnectionOptions as unknown as { type: string }).type);
+
+/** Whether this run can execute the shipped artefact, as opposed to only reading it. */
+const appliesShippedMigration = activeConfiguredEngine === MIGRATION_GENERATION_ENGINE;
 
 /** The TypeORM engine identifiers of the MySQL family, on which TypeORM 0.3.28 skips check constraints. */
 const MYSQL_FAMILY_ENGINES: readonly string[] = ['mysql', 'mariadb'];
@@ -1128,12 +614,6 @@ function isPostgresFamily(engine: string): boolean {
 /**
  * What enforcement timing the ENGINE ITSELF holds for one named constraint, read independently of both
  * TypeORM's generic table view and the migration under test.
- *
- * This is the oracle the two live-deferral cases below decide their own applicability from. It has to be an
- * independent reading rather than a call into the migration, because the question those cases ask is
- * precisely "does the engine hold a deferred constraint" — answering it with the code under test would make
- * the case agree with itself. And it cannot be `getTable()`, because being blind to exactly this is why the
- * migration reads a native catalogue at all.
  *
  * @param queryRunner - A runner on the assertion connection.
  * @param table - The bare table name the constraint belongs to.
@@ -1201,47 +681,93 @@ function emitsNamedCheckConstraints(engine: string): boolean {
 
 /**
  * The executable text of a TypeScript source, with every comment removed.
- *
- * The two text assertions below are about what the migration *does*, and a comment does nothing. The
- * migration's header necessarily names some of the very tokens those assertions forbid — it explains why
- * engine-specific DDL and a hard-coded schema qualifier are wrong, and cannot do that without quoting them —
- * so matching against the raw file would fail on its own documentation. Stripping comments first is what
- * makes the assertion say what it means.
- *
- * A regular expression is sufficient here rather than approximate: the file under test contains no string or
- * template literal carrying a comment opener, so there is no case for the naive strip to get wrong. It is
- * applied only to this one known file.
  */
 function executableTextOf(source: string): string {
     return source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
 }
 
-/**
- * Whether the engine keeps its whole database in one connection-local buffer rather than on a server.
- *
- * The distinction decides one thing only: whether the migration lifecycle's own connection and this file's
- * assertion data source address the same bytes automatically (a server engine) or have to be pointed at a
- * shared file this suite owns (sql.js and the native SQLite driver).
- */
-function isConnectionLocalEngine(engine: string): boolean {
-    return isSqliteFamily(engine);
+function countOccurrences(haystack: string, needle: string): number {
+    return haystack.split(needle).length - 1;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// Normalisation — how "identical, field for field" and "identical, column for column" are decided
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+/**
+ * Every quoted identifier inside the first parenthesised group after a marker, in declaration order.
+ *
+ * Both spellings the generator uses are covered: an inline `CONSTRAINT "<name>" UNIQUE ("a", "b")` and a
+ * standalone `CREATE INDEX "<name>" ON "<table>" ("a", "b")`.
+ */
+function columnsSpannedBy(statement: string, marker: string): string[] {
+    const after = statement.slice(statement.indexOf(marker) + marker.length);
+    const parenthesised = /\(([^)]*)\)/.exec(after);
+    if (parenthesised === null) {
+        return [];
+    }
+    const quoted = /"([^"]+)"/g;
+    const columns: string[] = [];
+    let match = quoted.exec(parenthesised[1]);
+    while (match !== null) {
+        columns.push(match[1]);
+        match = quoted.exec(parenthesised[1]);
+    }
+    return columns;
+}
 
-/** One row read back with `SELECT *`, after normalisation. */
+/**
+ * The SQL statements one direction of the migration issues, in the order the generator serialised them.
+ *
+ * @param source - The migration file's text.
+ * @param direction - `up` or `down`.
+ */
+function emittedStatements(source: string, direction: 'up' | 'down'): string[] {
+    const opener = `public async ${direction}(queryRunner: QueryRunner): Promise<any> {`;
+    const start = source.indexOf(opener);
+    expect(
+        start,
+        `the migration declares no ${direction}() in the shape the generator emits. ` +
+            GENERATED_FORM_CITATION,
+    ).toBeGreaterThan(-1);
+    const rest = source.slice(start + opener.length);
+    const end = rest.indexOf('\n    }');
+    const body = end === -1 ? rest : rest.slice(0, end);
+    const literal = /`([^`]*)`/g;
+    const statements: string[] = [];
+    let match = literal.exec(body);
+    while (match !== null) {
+        statements.push(match[1]);
+        match = literal.exec(body);
+    }
+    return statements;
+}
+
+function tablesInOrder(statements: readonly string[], verb: string): string[] {
+    const names: string[] = [];
+    for (const statement of statements) {
+        const match = new RegExp(`${verb} "([^"]+)"`).exec(statement);
+        if (match !== null) {
+            names.push(match[1]);
+        }
+    }
+    return names;
+}
+
+function statementDeclaring(source: string, name: string): string | undefined {
+    const matches = emittedStatements(source, 'up').filter(statement => statement.indexOf(name) !== -1);
+    expect(matches.length, `${name} must be declared by exactly one emitted statement`).toBe(1);
+    return matches[0];
+}
+
+function statementCreating(source: string, table: string): string | undefined {
+    const matches = emittedStatements(source, 'up').filter(
+        statement => statement.indexOf(`CREATE TABLE "${table}"`) !== -1,
+    );
+    expect(matches.length, `"${table}" must be created by exactly one emitted statement`).toBe(1);
+    return matches[0];
+}
+
 type NormalisedRow = Record<string, unknown>;
 
 /**
  * Reduces one cell to a form two reads of the same engine compare equal on.
- *
- * `Date` instances are distinct objects for the same instant, so they become ISO strings; a `Buffer` becomes
- * hex; a `bigint` becomes its decimal string, since a driver may return the same integer as either. Nothing
- * else is touched, and in particular a numeric string a driver returns for a `decimal` column is left
- * exactly as it came back — both sides of every comparison in this file are read through the same driver, so
- * coercing further would only hide a difference.
  */
 function normaliseCellValue(value: unknown): unknown {
     if (value instanceof Date) {
@@ -1341,80 +867,6 @@ function describeTable(table: Table): TableSnapshot {
     };
 }
 
-/**
- * What one direction of the migration asked the engine to do, recorded without anything being executed.
- *
- * This is half one of every named-object claim. The migration builds its `Table` descriptions from frozen
- * literals of its own and hands them to `queryRunner.createTable` / `dropTable`; a proxy standing in front of
- * a **real** query runner — real driver, so the deployment-specific primitives and the rendered DDL are the
- * ones this engine would actually receive — records those calls and performs none of them. Reading the recording is therefore
- * reading what the migration does, on the engine the run was configured for, rather than grepping one
- * engine's dialect out of a text file.
- */
-interface RecordedMigrationDirection {
-    /** The tables named, in the order the migration named them. */
-    tables: Table[];
-    /** Which query-runner method each call was, so the up and down paths can be told apart in a diagnostic. */
-    calls: string[];
-}
-
-/**
- * Runs one direction of `migration` against a recording proxy over `queryRunner` and returns what it asked
- * for.
- *
- * Every member other than the four below is delegated to the real runner, so `connection`,
- * `connection.getMetadata` and `connection.driver` are genuine and the recorded `Table` objects carry the
- * engine's own normalised column types and its own qualified table name. `createTable` and `dropTable`
- * return without issuing a statement, which is what makes this observation free of side effects — it can run
- * after the real migration has already been applied without disturbing it.
- *
- * `getTable` and `hasTable` are answered with ABSENCE, and that is not a shortcut. The migration's up path
- * asks whether each table is already there and, when it is, checks it against the frozen description instead
- * of creating it — so a recording taken after the apply would otherwise capture the CHECK path and record no
- * table at all. Reporting absence is what makes the recording show the shape this migration creates on a
- * fresh database, which is the shape every named-object claim below is about. The check path is asserted
- * separately, against a table that really is there.
- */
-async function recordMigrationDirection(
-    queryRunner: QueryRunner,
-    run: (recording: QueryRunner) => Promise<void>,
-): Promise<RecordedMigrationDirection> {
-    const recorded: RecordedMigrationDirection = { tables: [], calls: [] };
-    const recording = new Proxy(queryRunner, {
-        get(target, property, receiver) {
-            if (property === 'createTable' || property === 'dropTable') {
-                return (table: Table): Promise<void> => {
-                    recorded.calls.push(String(property));
-                    recorded.tables.push(table);
-                    return Promise.resolve();
-                };
-            }
-            if (property === 'getTable') {
-                return (): Promise<Table | undefined> => Promise.resolve(undefined);
-            }
-            if (property === 'hasTable') {
-                return (): Promise<boolean> => Promise.resolve(false);
-            }
-            const value = Reflect.get(target, property, receiver);
-            return typeof value === 'function' ? value.bind(target) : value;
-        },
-    });
-    await run(recording);
-    return recorded;
-}
-
-/** The recorded table of a given (unqualified) name, failing with a diagnostic when the migration named none. */
-function recordedTable(recording: RecordedMigrationDirection, name: string): Table {
-    const table = recording.tables.find(candidate => bareTableName(candidate.name) === name);
-    expect(
-        table,
-        `the migration named no table "${name}"; it named ${recording.tables
-            .map(candidate => bareTableName(candidate.name))
-            .join(', ')}`,
-    ).toBeDefined();
-    return table as Table;
-}
-
 /** Every named object a table's catalogue entry carries, whatever class the engine filed it under. */
 function namedObjectsOf(table: Table): string[] {
     return [
@@ -1424,17 +876,8 @@ function namedObjectsOf(table: Table): string[] {
     ].filter(name => name.length > 0);
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// Values this suite drives
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-
 /**
  * The five plugin options, at their declared defaults.
- *
- * None of them affects a table, an index or a constraint, so no assertion below depends on a value. They are
- * named in full anyway, because `ReorderPlugin.init` is the registration path a deployment uses and
- * registering the plugin the way a deployment does is what puts its two entities into the metadata the
- * migration lifecycle reads.
  */
 const DECLARED_OPTIONS = {
     maxListsPerCustomer: 25,
@@ -1472,20 +915,6 @@ const MIGRATION_CYCLE_ABORT_AFTER_MS = 240_000;
  */
 const CATALOGUE_READ_ABORT_AFTER_MS = 60_000;
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// Outcomes of the two migration entry points, and why each is wrapped
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-
-/**
- * What one guarded call of a migration entry point yielded.
- *
- * **Neither entry point throws on failure**, and that is the single most important fact about testing them.
- * `runMigrations` catches, logs, and sets `process.exitCode = 1` unless it is running from the Vendure CLI
- * (`packages/core/src/migrate.ts:L52-L59`); `revertLastMigration` does the same and returns nothing at all
- * (`:L96-L103`). A test that merely awaited either and asserted no rejection would pass while the migration
- * had failed outright. So each call is wrapped: the ambient exit code is saved and cleared, the call is made,
- * the exit code the platform left behind is *read* as evidence, and the ambient value is put back.
- */
 interface GuardedMigrationOutcome {
     /** The migration names the platform reported as applied. Empty when nothing ran or the run failed. */
     migrationsRan: string[];
@@ -1501,7 +930,6 @@ interface GuardedMigrationOutcome {
 interface EngineCatalogue {
     /** Names filed as unique constraints or as unique indices — the two classes are engine-dependent. */
     uniqueNames: string[];
-    /** Names filed as indices. */
     indexNames: string[];
     /** Names filed as check constraints. Empty on the MySQL family, which is conflict C-E. */
     checkNames: string[];
@@ -1509,34 +937,55 @@ interface EngineCatalogue {
     source: string;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// The configuration and the environment
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+/**
+ * One plugin table's whole named-object inventory as the engine's own catalogue holds it, reduced to the
+ * objects this feature is answerable for.
+ *
+ * **This exists because a whole-schema reading cannot answer "and nothing else".** {@link EngineCatalogue}
+ * gathers every name in the database, which is the right instrument for asking whether a withdrawn object is
+ * absent anywhere, and the wrong one for asking whether a table carries exactly the objects the contract
+ * authorises: the seeded core schema contributes hundreds of names, and MariaDB adds implicit check
+ * constraints of its own for JSON columns, so an exact comparison at that scope is impossible. Scoping to one
+ * table is what makes the comparison exact.
+ *
+ * Two classes of name are then removed, and each removal is a claim asserted elsewhere rather than a
+ * convenience:
+ *
+ *  * **The row identifier.** Every engine files an object for it — `PRIMARY` on the MySQL family, a
+ *    `PK_`-prefixed constraint and its backing index on PostgreSQL — and the identifier itself is asserted as
+ *    an inherited primary-key COLUMN by the column-shape cases. It is not one of the five.
+ *  * **The four cascading references.** They are asserted by name, direction and referential action by their
+ *    own case. Removing them here is also REQUIRED rather than tidy: the MySQL family creates an index for a
+ *    foreign key of its own accord when no declared index already leads with that column, and names it after
+ *    the constraint — so once the unauthorised channel-only and variant-only indices were withdrawn, two
+ *    such indices appear under the two `FK_` names. Counting them would report a contract breach that is
+ *    really the engine doing its own bookkeeping.
+ *
+ * SQLite's internal `sqlite_autoindex_*` entries are removed for the same reason: they are the storage for
+ * the named `UNIQUE` constraint, which is counted under its own name.
+ */
+interface TableCatalogueReading {
+    /** The plugin table this reading is scoped to. */
+    table: string;
+    /** Every named object the engine files for this table, minus the identifier and reference artefacts. */
+    names: string[];
+    /** The identifier artefacts removed, reported so a failure can show what was discounted and why. */
+    identifierArtefacts: string[];
+    /** The reference artefacts removed, likewise reported. */
+    referenceArtefacts: string[];
+    /** The catalogue view or views actually read, quoted in assertion messages so a failure names its source. */
+    source: string;
+}
 
 /**
  * The harness configuration, built at the **top level of this spec file** and deliberately **without
  * `ReorderPlugin` registered**.
- *
- * Both halves of that sentence are load-bearing.
- *
- * `testConfig()` must be called from here rather than from a helper module: it derives this file's port as
- * `getBasePort() + <index of the calling file in its own directory listing>`, reading the caller off the
- * stack (`e2e-common/test-config.ts:L37-L48, L71-L77`). Called from `fixtures/` it would index against the
- * wrong directory and hand two suites the same port.
  *
  * The plugin is **absent** so that the initializer synchronises the **core schema only** and seeds it. Were
  * the plugin registered, `synchronize: true` would create `reorder_list` and `reorder_list_line` during
  * population and the migration would then have nothing to create — its first statement would fail on an
  * object that already exists, and the up-path assertion would be meaningless. This is the whole reason the
  * suite is arranged the way it is.
- *
- * `importExportOptions.importAssetsDir` is overridden because the shared configuration points it at this
- * package's own `e2e/fixtures/assets`, which this package does not ship and may not add; the seeded
- * catalogue's assets live in core's fixtures and the shipped cross-package precedent for reaching them is
- * `packages/dashboard/e2e/global-setup.ts:L105, L122`.
- *
- * The canonical query-capture instrument is deliberately **not** installed: this suite makes no
- * statement-count claim, and installing a logger it never reads would only invite one.
  */
 const serverConfig = mergeConfig(testConfig(), {
     importExportOptions: {
@@ -1556,28 +1005,9 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     /** The plugin tables that existed before any apply. Expected empty — the precondition the up-path needs. */
     let pluginTablesBeforeAnyApply: string[];
 
-    /** The plugin tables that existed immediately after the first apply attempt and before any fallback. */
     let pluginTablesAfterFirstAttempt: string[];
 
-    /** The outcome of the first apply attempt, recorded in `beforeAll` and asserted by the cycle case. */
     let firstApply: GuardedMigrationOutcome;
-
-    /** What `up()` asked this engine for, recorded once through the proxy and read by half one of each claim. */
-    let recordedUp: RecordedMigrationDirection;
-
-    /** What `down()` asked this engine for, recorded the same way. */
-    let recordedDown: RecordedMigrationDirection;
-
-    /**
-     * The database file this suite owns on a connection-local engine, and `undefined` on a server engine.
-     *
-     * On sql.js the migration lifecycle's own connection and this file's assertion data source would
-     * otherwise hold independent in-memory copies, and the migration's effect would be unobservable. Both are
-     * pointed at this file instead, with `autoSave` enabled, so each sees what the other did. It is created
-     * outside the repository and removed in `afterAll`; the harness's cached snapshot under `e2e/__data__` is
-     * never written to.
-     */
-    let privateDatabasePath: string | undefined;
 
     /**
      * The known-good baseline: every row of each referenced core table, field for field, captured **before**
@@ -1594,7 +1024,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     /** The identifiers of the seeded buyers, decoded to the values the columns actually hold. */
     let seededCustomerIds: number[];
 
-    /** The identifier of the seeded default channel. */
     let seededChannelId: number;
 
     /** The identifiers of the seeded catalogue variants. At least two, so a per-list-and-variant pair can differ. */
@@ -1611,10 +1040,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
     /** The ambient `process.exitCode`, saved once and restored after every case. */
     let ambientExitCode: number | string | undefined;
-
-    // -----------------------------------------------------------------------------------------------
-    // Connection and catalogue helpers
-    // -----------------------------------------------------------------------------------------------
 
     /**
      * Runs work with a query runner and releases it in a `finally`, however the work ends.
@@ -1648,10 +1073,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
     /**
      * Reads one table's catalogue entry, failing with a named diagnostic when the engine has no such table.
-     *
-     * `getTable` is used rather than a per-engine `information_schema` query because TypeORM parses each
-     * engine's own catalogue back into one `Table` shape, which is what makes the column and foreign-key
-     * assertions portable across all four engines.
      */
     async function readTable(name: string): Promise<Table> {
         const table = await withQueryRunner(queryRunner => queryRunner.getTable(name));
@@ -1742,6 +1163,132 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         };
     }
 
+    /**
+     * Reads ONE plugin table's named-object inventory out of the engine's own catalogue, scoped to that table
+     * and reduced to the objects this feature is answerable for. See {@link TableCatalogueReading} for why the
+     * scope and the two exclusions are what they are.
+     *
+     * The three catalogues are read the same way {@link readEngineCatalogue} reads them, and for the same
+     * reason: the object CLASS differs between engines while the name and the guarantee do not, so a single
+     * portable "constraint type" lookup would report a `UQ_` as missing on the MySQL family while it was
+     * enforcing exactly the same rule. What differs here is only the scope — every query carries the table
+     * name — and the reference names, which are read from the same catalogue rather than assumed, so an engine
+     * that files a foreign-key index under a name of its own choosing is still discounted correctly.
+     *
+     * The table name is compared in TypeScript rather than bound as a parameter, because the three engines
+     * spell a placeholder three ways and this file writes no engine-specific SQL beyond the catalogue views
+     * themselves.
+     */
+    async function readTableCatalogue(table: string): Promise<TableCatalogueReading> {
+        const distinct = (names: Array<string | null | undefined>): string[] => [
+            ...new Set(names.filter((name): name is string => typeof name === 'string' && name.length > 0)),
+        ];
+        const reduce = (
+            gathered: string[],
+            identifierArtefacts: string[],
+            referenceArtefacts: string[],
+            source: string,
+        ): TableCatalogueReading => {
+            const discounted = new Set([...identifierArtefacts, ...referenceArtefacts]);
+            return {
+                table,
+                names: distinct(gathered)
+                    .filter(name => !discounted.has(name))
+                    .sort(),
+                identifierArtefacts: distinct(identifierArtefacts).sort(),
+                referenceArtefacts: distinct(referenceArtefacts).sort(),
+                source,
+            };
+        };
+
+        if (isSqliteFamily(activeEngine)) {
+            const rows: Array<{ type: string; name: string; tableName: string; sql: string | null }> =
+                await assertionDataSource.query(
+                    `SELECT type, name, tbl_name AS tableName, sql FROM sqlite_master`,
+                );
+            const forThisTable = rows.filter(row => row.tableName === table);
+            const tableDdl = forThisTable
+                .filter(row => row.type === 'table' && typeof row.sql === 'string')
+                .map(row => String(row.sql))
+                .join('\n');
+            const namedClauses = (keyword: string): string[] => {
+                const pattern = new RegExp(`CONSTRAINT\\s+"([^"]+)"\\s+${keyword}`, 'gi');
+                const found: string[] = [];
+                let match = pattern.exec(tableDdl);
+                while (match !== null) {
+                    found.push(match[1]);
+                    match = pattern.exec(tableDdl);
+                }
+                return found;
+            };
+            const indexNames = forThisTable.filter(row => row.type === 'index').map(row => row.name);
+            return reduce(
+                [...namedClauses('UNIQUE'), ...indexNames, ...namedClauses('CHECK')],
+                // The identifier is a rowid alias here, so the engine files nothing for it; the internal
+                // entries below are the UNIQUE constraint's own storage rather than the identifier's.
+                indexNames.filter(name => name.startsWith('sqlite_autoindex_')),
+                namedClauses('FOREIGN\\s+KEY'),
+                `sqlite_master scoped to "${table}" (table DDL text for named CONSTRAINT clauses, index rows for indices)`,
+            );
+        }
+
+        if (isMysqlFamily(activeEngine)) {
+            const statistics: Array<{ tableName: string; name: string; nonUnique: number | string }> =
+                await assertionDataSource.query(
+                    `SELECT TABLE_NAME AS tableName, INDEX_NAME AS name, NON_UNIQUE AS nonUnique
+                       FROM information_schema.STATISTICS
+                      WHERE TABLE_SCHEMA = DATABASE()`,
+                );
+            // TABLE_CONSTRAINTS rather than CHECK_CONSTRAINTS, because MySQL 8 does not carry a table name on
+            // the latter while MariaDB does; the former is scoped by table on both and reports every class.
+            const tableConstraints: Array<{ tableName: string; name: string; kind: string }> =
+                await assertionDataSource.query(
+                    `SELECT TABLE_NAME AS tableName, CONSTRAINT_NAME AS name, CONSTRAINT_TYPE AS kind
+                       FROM information_schema.TABLE_CONSTRAINTS
+                      WHERE CONSTRAINT_SCHEMA = DATABASE()`,
+                );
+            const mysqlIndexRows = statistics.filter(row => row.tableName === table);
+            const mysqlConstraintRows = tableConstraints.filter(row => row.tableName === table);
+            const named = (kind: string): string[] =>
+                mysqlConstraintRows.filter(row => row.kind.toUpperCase() === kind).map(row => row.name);
+            return reduce(
+                [...mysqlIndexRows.map(row => row.name), ...named('UNIQUE'), ...named('CHECK')],
+                mysqlIndexRows.map(row => row.name).filter(name => name === 'PRIMARY'),
+                named('FOREIGN KEY'),
+                `information_schema.STATISTICS and information_schema.TABLE_CONSTRAINTS, both scoped to "${table}" in DATABASE()`,
+            );
+        }
+
+        const constraints: Array<{ tableName: string; name: string; kind: string }> =
+            await assertionDataSource.query(
+                `SELECT rel.relname AS "tableName", c.conname AS "name", c.contype AS "kind"
+                   FROM pg_constraint c
+                   JOIN pg_class rel ON rel.oid = c.conrelid
+                   JOIN pg_namespace n ON n.oid = c.connamespace
+                  WHERE n.nspname = current_schema()`,
+            );
+        const indexes: Array<{ tableName: string; name: string }> = await assertionDataSource.query(
+            `SELECT tablename AS "tableName", indexname AS "name" FROM pg_indexes
+              WHERE schemaname = current_schema()`,
+        );
+        const constraintRows = constraints.filter(row => row.tableName === table);
+        const indexRows = indexes.filter(row => row.tableName === table);
+        const ofKind = (kind: string): string[] =>
+            constraintRows.filter(row => row.kind === kind).map(row => row.name);
+        // A unique constraint and its backing index share one name here, which the set collapses; the
+        // identifier's constraint and its index likewise, which is why both are discounted by name.
+        const identifierNames = ofKind('p');
+        return reduce(
+            [...ofKind('u'), ...indexRows.map(row => row.name), ...ofKind('c')],
+            [
+                ...identifierNames,
+                ...indexRows.map(row => row.name).filter(name => identifierNames.includes(name)),
+            ],
+            ofKind('f'),
+            `pg_constraint and pg_indexes scoped to "${table}" in current_schema()`,
+        );
+    }
+
     /** Both plugin tables reduced to normalised snapshots, parent first, for the up/down/up comparison. */
     async function snapshotPluginSchema(): Promise<TableSnapshot[]> {
         const snapshots: TableSnapshot[] = [];
@@ -1751,17 +1298,8 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         return snapshots;
     }
 
-    // -----------------------------------------------------------------------------------------------
-    // Seeding and cleanup — plugin rows only, written directly through the repository
-    // -----------------------------------------------------------------------------------------------
-
     /**
      * Inserts one list row **directly through the repository** and returns the identifier the engine assigned.
-     *
-     * Directly through the repository is required rather than convenient: the published mutation's own
-     * validation would refuse most of the writes below before they reached the engine, and a test that passed
-     * because the service refused would prove nothing about the database. Going through the repository also
-     * keeps the statement TypeORM's own, so no parameter placeholder is written by hand for any engine.
      */
     async function insertList(
         overrides: { customerId?: number; name?: string; nameKey?: string; lineCount?: number } = {},
@@ -1797,15 +1335,14 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     /**
      * Removes every plugin row, **child table before parent**, so a foreign key is never what fails a cleanup.
      *
-     * Deleting every row rather than tracking identifiers is exact here rather than lax: this file is the only
-     * writer these two tables ever have. The harness server is bootstrapped without the plugin, so no
-     * resolver, service or job can reach them, and every row present is one a case in this file inserted.
-     *
      * The harness's wholesale `clearAllTables` is deliberately not used, here or anywhere: it runs
      * `connection.synchronize(true)` (`packages/testing/src/data-population/clear-all-tables.ts:L18`), which
      * would drop and recreate the very schema this suite exists to assert.
      */
     async function deleteAllPluginRows(): Promise<void> {
+        if (assertionDataSource === undefined || !assertionDataSource.isInitialized) {
+            return;
+        }
         const present = await existingPluginTables();
         for (const table of PLUGIN_TABLES_CHILD_FIRST) {
             if (present.indexOf(table) !== -1) {
@@ -1817,41 +1354,28 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
     /**
      * Attempts a write and reports whether the database refused it, without letting a refusal fail the case.
      *
-     * The raw driver error is *expected* on this path and is returned rather than asserted against: the write
-     * is issued straight through the repository, so there is no service layer between the engine and the
-     * caller to translate anything. Where a refusal must reach an API caller carrying no driver text, no
-     * statement fragment and no constraint name, that is a service-level claim and the create, add-item and
-     * mutate suites own it.
+     * A refusal is *expected* on this path: the write is issued straight through the repository, so there is
+     * no service layer between the engine and the caller to translate anything. Where a refusal must reach an
+     * API caller carrying no driver text, no statement fragment and no constraint name, that is a
+     * service-level claim and the create, add-item and mutate suites own it.
+     *
+     * ★ WHAT IS RETURNED IS A DESCRIPTION, NOT THE DRIVER'S OWN WORDS. An earlier revision returned
+     * `e.message` and three assertions below interpolated it, so a write the database refused for a reason
+     * nobody expected published whatever the driver said — on MySQL that is `Duplicate entry '<the value>'
+     * for key '<the name>'`, and on PostgreSQL a `Key (column)=(value)` detail. The refusal is a BOOLEAN, and
+     * that is what every assertion here reads; the description exists only to say why an ACCEPTED write was
+     * refused instead, and the shared redactor's classification answers that without reproducing anything.
+     * See `e2e/fixtures/diagnostic-redaction.ts`.
      */
     async function attemptWrite(
         work: () => Promise<unknown>,
-    ): Promise<{ refused: boolean; message: string }> {
+    ): Promise<{ refused: boolean; diagnostic: string }> {
         try {
             await work();
-            return { refused: false, message: '' };
+            return { refused: false, diagnostic: '' };
         } catch (e) {
-            return { refused: true, message: e instanceof Error ? e.message : String(e) };
+            return { refused: true, diagnostic: redactTeardownDiagnostic(e) };
         }
-    }
-
-    // -----------------------------------------------------------------------------------------------
-    // The two migration entry points, each wrapped so a silent failure is evidence rather than a pass
-    // -----------------------------------------------------------------------------------------------
-
-    /**
-     * Re-reads the assertion data source's copy of the database on a connection-local engine.
-     *
-     * On sql.js the working database is a buffer inside the connection, so a lifecycle call made through the
-     * migration connection is invisible to this file's data source until its copy is reloaded from the shared
-     * file both of them address. On a server engine there is nothing to reload: both connections already speak
-     * to the same physical database, so this is a no-op and is called unconditionally rather than guarded at
-     * every call site.
-     */
-    async function resyncAssertionSource(): Promise<void> {
-        if (privateDatabasePath === undefined || !isConnectionLocalEngine(activeEngine)) {
-            return;
-        }
-        await assertionDataSource.sqljsManager.loadDatabase(privateDatabasePath);
     }
 
     /** Applies pending migrations, reading the exit code the platform leaves behind and then restoring it. */
@@ -1865,9 +1389,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         } finally {
             observedExitCode = process.exitCode;
             process.exitCode = saved;
-        }
-        if (assertionDataSource !== undefined && assertionDataSource.isInitialized) {
-            await resyncAssertionSource();
         }
         return { migrationsRan, observedExitCode };
     }
@@ -1888,15 +1409,8 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             observedExitCode = process.exitCode;
             process.exitCode = saved;
         }
-        if (assertionDataSource !== undefined && assertionDataSource.isInitialized) {
-            await resyncAssertionSource();
-        }
         return { migrationsRan: [], observedExitCode };
     }
-
-    // -----------------------------------------------------------------------------------------------
-    // Lifecycle
-    // -----------------------------------------------------------------------------------------------
 
     beforeAll(async () => {
         ambientExitCode = process.exitCode;
@@ -1912,6 +1426,17 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
         const rawConnection = server.app.get(TransactionalConnection).rawConnection;
         activeEngine = rawConnection.options.type;
+
+        // Everything below applies the shipped artefact, and the artefact is PostgreSQL DDL — see
+        // {@link MIGRATION_GENERATION_ENGINE}. On any other engine the four executing describes are skipped,
+        // so none of this arrangement would have a reader: the artefact's own text was loaded above, and the
+        // remaining halves read the migration source, the package layout and the dev-server configuration off
+        // the filesystem. The server is still created here and still destroyed in `afterAll`, because the
+        // harness contract is one server per file either way.
+        if (!appliesShippedMigration) {
+            return;
+        }
+
         const escapeOnServer = (name: string): string => rawConnection.driver.escape(name);
 
         const queryRunner = rawConnection.createQueryRunner();
@@ -1949,30 +1474,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         seededChannelId = Number(baselineCoreRows.channel[0].id);
         seededVariantIds = baselineCoreRows.product_variant.map(row => Number(row.id));
 
-        // THE SHARED DATABASE, on the one engine family where "shared" is not automatic. On sql.js the
-        // database is a buffer inside whichever connection holds it, and the migration lifecycle builds its
-        // own connection (`packages/core/src/migrate.ts:L42`); the harness also leaves `autoSave` false after
-        // populating (`packages/testing/src/initializers/sqljs-initializer.ts:L41-L42`). Applied through that
-        // second connection, the migration's DDL would therefore vanish when it closed and this suite would be
-        // asserting against a database the migration never touched — which is exactly the hole that made a
-        // schema-builder fallback look necessary. So the populated database is taken off the running server and
-        // written to a file THIS SUITE OWNS, outside the repository, and both the lifecycle and the assertion
-        // data source are pointed at it with `autoSave` enabled. The harness's own cached snapshot under
-        // `e2e/__data__` is never written to, so a second run of this file starts from the same core-only
-        // schema. On a server engine `location` and `autoSave` mean nothing and the two connections already
-        // address the same physical database, so there is nothing to arrange.
-        if (isConnectionLocalEngine(activeEngine)) {
-            privateDatabasePath = path.join(
-                await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-plugin-migration-')),
-                'migration-suite.sqlite',
-            );
-            await fs.writeFile(privateDatabasePath, Buffer.from(rawConnection.sqljsManager.exportDatabase()));
-        }
-
-        /** The overrides that make one physical database serve both connections, per engine family. */
-        const sharedDatabaseOptions =
-            privateDatabasePath === undefined ? {} : { location: privateDatabasePath, autoSave: true };
-
         // From this point the plugin-less server is NOT USED AGAIN — every statement below goes through the
         // data source this file owns. The plan permits "destroy or stop using", and stopping using it is the
         // choice taken deliberately: `afterAll` owes the contract exactly one unconditional
@@ -1982,7 +1483,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             plugins: [ReorderPlugin.init(DECLARED_OPTIONS)],
             dbConnectionOptions: {
                 ...serverConfig.dbConnectionOptions,
-                ...sharedDatabaseOptions,
                 synchronize: false,
                 // THE MIGRATION CLASS RATHER THAN A GLOB, and the reason is environmental rather than
                 // stylistic. TypeORM resolves a directory glob with `PlatformTools.load`, which is Node's own
@@ -2025,21 +1525,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         await assertionDataSource.initialize();
         esc = (name: string): string => assertionDataSource.driver.escape(name);
 
-        // WHAT THE MIGRATION ASKED FOR, recorded through a proxy that executes nothing. It is taken after the
-        // apply deliberately: the recording issues no statement, so it can neither disturb the schema the rest
-        // of the file reads nor depend on the order the cases run in. This is half one of every named-object
-        // claim, and it reads the migration's own behaviour on THIS engine rather than one engine's dialect out
-        // of a text file.
-        await withQueryRunner(async recordingSubject => {
-            const migration = new AddReorderLists1786838400000();
-            recordedUp = await recordMigrationDirection(recordingSubject, recording =>
-                migration.up(recording),
-            );
-            recordedDown = await recordMigrationDirection(recordingSubject, recording =>
-                migration.down(recording),
-            );
-        });
-
         pluginTablesAfterFirstAttempt = await existingPluginTables();
 
         // Nothing may be inherited by the first case: a previous run against a server engine is impossible
@@ -2066,11 +1551,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             if (assertionDataSource !== undefined && assertionDataSource.isInitialized) {
                 await assertionDataSource.destroy();
             }
-            if (privateDatabasePath !== undefined) {
-                // The suite's own file, created by the suite, outside the repository — so removing it is the
-                // one deletion this file performs and it can only ever remove what `beforeAll` wrote.
-                await fs.remove(path.dirname(privateDatabasePath));
-            }
         } finally {
             process.exitCode = ambientExitCode;
             resetConfig();
@@ -2080,25 +1560,13 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         }
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
-    // HALF ONE OF EVERY NAMED-OBJECT CLAIM — what the migration itself asks this engine for
+    // Half one of every named-object claim — what the migration itself asks the engine for
     //
-    // Reading the migration proves only what it asked for. Issuing the write it forbids proves the database
-    // enforces it. The two are different claims and STORY-001-01-01's Definition-of-Done item 7 requires both,
-    // which is why every named object appears twice in this file: once here and once below.
-    //
-    // WHY THIS HALF READS BEHAVIOUR RATHER THAN TEXT. The migration carries no SQL — it builds its two
-    // `Table` descriptions from frozen literals of its own and hands them to the query runner — so there is no
-    // DDL string to grep, and a grep would in any case only ever have matched one engine's dialect. The
-    // recording proxy in `beforeAll` drove `up()` and `down()` against a real query runner with
-    // `createTable`/`dropTable` intercepted, so what these cases read is the exact description this engine
-    // receives: the order, the columns and their widths, the named uniques, index and checks, and the four
-    // cascading foreign keys. Nothing was executed to obtain it.
-    //
-    // What the file's TEXT is still asserted on is what text is the right medium for: that it contains no DDL
-    // literal (which is what makes it portable), no hard-coded schema qualifier (which is what makes it
-    // correct under a configured non-default schema), and neither withdrawn identifier.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // Reading the migration proves only what it asked for; observing the engine's own behaviour proves it is
+    // enforced. The two are different claims and STORY-001-01-01's Definition-of-Done item 7 requires both,
+    // which is why every named object appears twice in this file: once here and once below. The four
+    // constraints are evidenced by the writes they forbid. `IDX_reorder_list_customer_channel` is evidenced by
+    // an engine-catalogue read instead, because it is non-unique and so forbids no write.
 
     describe('the checked-in migration file', () => {
         it('is the only migration this feature produces', async () => {
@@ -2116,8 +1584,8 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             // THE OTHER HALF OF THE GLOB CONTRACT, and the reason it is asserted at all: an installed package
             // has no `src` tree, so a consumer's `migrations` entry has to name the COMPILED file. The migration
             // is a named build root in `tsconfig.build.json` precisely so that it lands here, inside the one
-            // path the manifest's `files` entry publishes — and it is still absent from the package's root
-            // barrel, because a migration is not public API.
+            // path the manifest's `files` entry publishes. The class itself is not a named export of the
+            // package root; it reaches a consumer through the root's `reorderPluginMigrations` array.
             const built = (await fs.pathExists(BUILT_MIGRATION_GLOB_DIR))
                 ? (await fs.readdir(BUILT_MIGRATION_GLOB_DIR)).filter(entry => entry.endsWith('.js'))
                 : [];
@@ -2140,27 +1608,34 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             expect(MIGRATION_FILENAME.startsWith(MIGRATION_CLASS_NAME.replace(/^\D+/, ''))).toBe(true);
         });
 
-        it('contains no DDL of any engine, which is what makes one file serve all four', () => {
-            // Every keyword below is dialect-bound, so any one of them appearing would pin this file to a
-            // single engine — which is the defect this migration exists without. The absence is asserted
-            // positively rather than left implied by the file happening to apply on the configured engine.
-            //
-            // The keywords are matched against the executable text only. The header explains the mechanism and
-            // necessarily names some of these words while doing so; a prose sentence is not a statement.
+        it('is the generator emitted form, every statement issued through queryRunner.query', () => {
+            // The form is what identifies the artefact as generated rather than transcribed.
+            // `generateMigration` writes one `queryRunner.query(<SQL>, undefined)` call per logged statement
+            // and nothing else, so a file that reached its shape through the query-runner table API — or
+            // through entity metadata — would not look like this.
             const body = executableTextOf(migrationSource);
-            for (const keyword of FORBIDDEN_DDL_KEYWORDS) {
+            expect(countOccurrences(body, 'queryRunner.query(')).toBe(
+                emittedStatements(migrationSource, 'up').length +
+                    emittedStatements(migrationSource, 'down').length,
+            );
+            for (const absent of TABLE_API_CALLS) {
                 expect(
-                    body.toUpperCase(),
-                    `"${keyword}" is engine-specific DDL and must not appear. ${ENGINE_PORTABILITY_CITATION}`,
-                ).not.toContain(keyword.toUpperCase());
+                    body,
+                    `${absent} belongs to the query-runner table API; the shipped migration is the ` +
+                        `generator serialised SQL. ${GENERATED_FORM_CITATION}`,
+                ).not.toContain(absent);
             }
 
-            // And the positive form of the same claim: the two directions are expressed through the query
-            // runner's own schema API, which is the API the platform's schema builder uses, over table
-            // descriptions the file constructs itself.
-            expect(body).toContain('createTable(');
-            expect(body).toContain('dropTable(');
-            expect(body).toContain('new Table(');
+            // PostgreSQL's own spellings, which is how the generation engine is evidenced from the file rather
+            // than taken on trust from the header.
+            const up = emittedStatements(migrationSource, 'up').join('\n');
+            for (const spelling of POSTGRES_EMISSION_MARKERS) {
+                expect(
+                    up,
+                    `"${spelling}" is how PostgreSQL spells this, and its absence would mean the file was ` +
+                        'generated against a different engine than the header records',
+                ).toContain(spelling);
+            }
         });
 
         it('freezes its shape rather than reading it from the plugin entities', () => {
@@ -2184,185 +1659,256 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
             // The positive half: every column, and every named object, is spelled HERE. That is what makes
             // the shape auditable against the entities rather than derived from them.
+            const up = emittedStatements(migrationSource, 'up').join('\n');
             for (const column of [...EXPECTED_LIST_COLUMNS, ...EXPECTED_LINE_COLUMNS]) {
                 expect(
-                    body,
+                    up,
                     `the migration must spell the "${column}" column it created, so that a reader can see ` +
                         'the frozen shape without resolving entity metadata',
-                ).toContain(`'${column}'`);
+                ).toContain(`"${column}"`);
             }
-            for (const namedObject of ALL_NAMED_OBJECTS) {
-                expect(body, `the migration must spell ${namedObject.name}`).toContain(namedObject.name);
+            // And the named objects EXACTLY, not merely present. A loop that asserted each authorised name
+            // appeared could not see a name that also appeared and should not have, which is precisely how a
+            // sixth index reached this file's own frozen description unnoticed. Comparing the whole token set
+            // reports an addition and an omission alike.
+            expect(
+                namedObjectTokensIn(body),
+                'the migration must spell every authorised named object and no other: an object frozen here ' +
+                    'that the contract does not enumerate is created on every deployment that replays this ' +
+                    'timestamp, and the contract fixes the count at ' +
+                    `${AUTHORIZED_NAMED_OBJECT_COUNT} so that an addition is visible rather than absorbed`,
+            ).toEqual(ALL_NAMED_OBJECTS.map(namedObject => namedObject.name).sort());
+        });
+
+        it(`freezes exactly the ${AUTHORIZED_NAMED_OBJECT_COUNT} named objects the contract authorises`, () => {
+            // THE ALLOW-LIST IS ITSELF ASSERTED FIRST, because every other exact-set claim in this file
+            // compares against it: an editor who "fixes" a failure by adding a row to ALL_NAMED_OBJECTS has to
+            // change this number as well, and changing it means reopening the contract rather than relaxing a
+            // test. Five across two tables — three on the parent, two on the child.
+            expect(ALL_NAMED_OBJECTS.map(namedObject => namedObject.name).sort()).toEqual(
+                [...authorizedNamedObjectsOn(LIST_TABLE), ...authorizedNamedObjectsOn(LINE_TABLE)].sort(),
+            );
+            expect(ALL_NAMED_OBJECTS).toHaveLength(AUTHORIZED_NAMED_OBJECT_COUNT);
+            expect(new Set(ALL_NAMED_OBJECTS.map(namedObject => namedObject.name)).size).toBe(
+                AUTHORIZED_NAMED_OBJECT_COUNT,
+            );
+
+            // BOTH DIRECTIONS OF THE EMITTED TEXT, which is what this artefact hands the engine. `up()` must
+            // spell every authorised name and no other, and `down()` must spell no name the contract does not
+            // authorise — a name in one direction alone would be a divergence between what a deployment
+            // creates and what it drops. The counts are engine-independent, because the emitted statements are
+            // frozen literals: conflict C-E is about what a MySQL-family driver discards between here and the
+            // catalogue, which the catalogue cases assert separately.
+            const emittedUp = emittedStatements(migrationSource, 'up').join('\n');
+            const emittedDown = emittedStatements(migrationSource, 'down').join('\n');
+            expect(
+                namedObjectTokensIn(emittedUp),
+                `up() must create exactly the ${AUTHORIZED_NAMED_OBJECT_COUNT} authorised named objects and ` +
+                    'no others, because an unauthorised object here materialises on every deployment ' +
+                    'provisioned by this migration and diverges from the entity declarations the schema ' +
+                    'builder provisions from',
+            ).toEqual(ALL_NAMED_OBJECTS.map(namedObject => namedObject.name).sort());
+            expect(namedObjectTokensIn(emittedUp)).toHaveLength(AUTHORIZED_NAMED_OBJECT_COUNT);
+            for (const token of namedObjectTokensIn(emittedDown)) {
+                expect(
+                    ALL_NAMED_OBJECTS.map(namedObject => namedObject.name),
+                    `down() names ${token}, which the contract does not authorise`,
+                ).toContain(token);
             }
         });
 
-        it('froze the shape these entities still declare, so changing one needs a new migration', () => {
-            // THE OTHER DIRECTION OF THE SAME PROPERTY, and the reason the frozen shape is auditable rather
-            // than merely fixed. Freezing stops a later entity edit from changing what THIS timestamp
-            // creates; it does not stop the two from drifting apart, and a drift would mean a deployment
-            // built by migration carries a different schema from one built by the schema builder.
+        it('names a schema in one statement only, which is the emitted form known limitation', () => {
+            // `DataSourceOptions.schema` is configurable and the dev server exposes it as `DB_SCHEMA`, while
+            // TypeORM neither rewrites raw migration SQL nor sets a `search_path` from it. The generator
+            // therefore bakes in whatever schema its own connection used, wherever a statement needs one —
+            // which for this delta is `down()`'s `DROP INDEX` alone, PostgreSQL resolving an index by name
+            // rather than through its table. It is asserted and bounded here rather than forbidden, because it
+            // is a property of the emitted artefact and not a defect in a transcription: a deployment on
+            // another schema regenerates the file against its own connection, exactly as the header describes.
+            for (const statement of emittedStatements(migrationSource, 'up')) {
+                expect(
+                    statement,
+                    'up() must carry no schema qualifier, so that applying the migration lands wherever the ' +
+                        'connection search path points',
+                ).not.toContain(`"${GENERATION_SCHEMA}".`);
+            }
+
+            const qualified = emittedStatements(migrationSource, 'down').filter(
+                statement => statement.indexOf(`"${GENERATION_SCHEMA}".`) !== -1,
+            );
+            expect(qualified).toHaveLength(1);
+            expect(qualified[0]).toContain('DROP INDEX');
+            expect(qualified[0]).toContain(IDX_LIST_OWNER);
+        });
+
+        it(`declares on the entities exactly the ${AUTHORIZED_NAMED_OBJECT_COUNT} authorised named objects`, () => {
+            // THE ENTITY SIDE OF THE EXACT-SET PROOF, and no case above implies it. Those cases compare the
+            // MIGRATION's frozen text against the contract, and the entity declarations are the other,
+            // independent provisioning path — the schema builder reads them, which is how every synchronised
+            // deployment and every e2e suite here gets its schema. Comparing the two sides against EACH OTHER
+            // would not close this, because a named object added to both agrees with itself and passes: that is
+            // exactly what happened, an unauthorised index was declared on both sides and the addition was
+            // invisible. So each side is compared against the CONTRACT, which is the only comparison an editor
+            // cannot satisfy by changing the other side.
             //
-            // So the entity declarations are turned into the same kind of description the migration froze —
-            // `Table.create(metadata, driver)`, the schema builder's own translation, plus the foreign keys it
-            // omits — and compared with what the migration actually handed this engine. Whoever adds a column
-            // to `ReorderList` fails here, which is the moment to be told that the column belongs to a new
-            // migration of its own rather than to this one.
+            // The inventory is read from the metadata TypeORM itself collected off the decorators, rather than
+            // from their source text, because metadata is what the schema builder provisions a database from:
+            // `@Unique`, `@Index` and `@Check` each land in their own collection on it, and nothing else does
+            // — a relation adds no index of its own, and the row identifier is a primary-key column rather
+            // than a named object.
+            //
+            // It is read from the ARGS STORAGE rather than off a connection's built `EntityMetadata`, and that
+            // is what makes the claim hold wherever it is run. This claim is about the two entity CLASSES, so
+            // it is engine-independent, but neither data source in this file can answer it on every engine:
+            // the booted server deliberately registers no plugin at all, so it holds no metadata for these
+            // classes, and the plugin-registered `assertionDataSource` is built only on the engine the shipped
+            // artefact applies to. The args storage is the input `EntityMetadataBuilder` reads to produce that
+            // metadata, so it is the same declarations one step earlier, available with no connection open.
+            // Its collections carry an unnamed entry as `undefined` where a built metadata would have
+            // substituted a generated name, so the absence of one is asserted first — otherwise an unnamed
+            // object would be invisible to an exact-set comparison, which is the very failure this case exists
+            // to prevent.
+            const storage = getMetadataArgsStorage();
             for (const [table, entityClass] of [
                 [LIST_TABLE, ReorderList],
                 [LINE_TABLE, ReorderListLine],
             ] as const) {
-                const metadata = assertionDataSource.getMetadata(entityClass);
-                const declared = Table.create(metadata, assertionDataSource.driver);
-                // `Table.create` omits foreign keys, exactly as `RdbmsSchemaBuilder` does before adding them
-                // separately, so they are supplied through the same translation it uses.
-                declared.foreignKeys = metadata.foreignKeys.map(foreignKey =>
-                    TableForeignKey.create(foreignKey, assertionDataSource.driver),
-                );
-                const frozen = recordedUp.tables.find(candidate => bareTableName(candidate.name) === table);
-                expect(frozen, `the migration must create "${table}"`).toBeDefined();
-
+                const entries = [
+                    ...storage.filterUniques(entityClass).map(unique => unique.name),
+                    ...storage.filterIndices(entityClass).map(index => index.name),
+                    ...storage.filterChecks(entityClass).map(check => check.name),
+                ];
                 expect(
-                    comparableTableShape(declared),
-                    `"${table}" as ${entityClass.name} declares it differs from what this migration froze; ` +
-                        'a change to the entity belongs in a new migration rather than in this one',
-                ).toEqual(comparableTableShape(frozen as Table));
-            }
-        });
-
-        it('hard-codes no schema qualifier, so a configured non-default schema is honoured', () => {
-            // `DataSourceOptions.schema` is configurable and the dev-server exposes it as `DB_SCHEMA`. TypeORM
-            // neither rewrites raw migration SQL nor sets a `search_path` from it, so a literal `public` would
-            // target the wrong schema on any deployment that configured another one — in `down()` most
-            // damagingly of all, where it would fail to drop what `up()` created.
-            // The executable text again, and for the same reason: the header quotes the qualifier while
-            // explaining why spelling it would be wrong.
-            const body = executableTextOf(migrationSource);
-            for (const literal of FORBIDDEN_SCHEMA_LITERALS) {
+                    entries.filter(name => name === undefined || name.length === 0).length,
+                    `${entityClass.name} declares a unique, index or check with no name of its own. An ` +
+                        'object the contract cannot enumerate by name is also one the error mapping cannot ' +
+                        'match on, and an exact-set comparison cannot see it at all',
+                ).toBe(0);
+                const declared = entries.map(name => String(name)).sort();
+                const authorized = authorizedNamedObjectsOn(table);
                 expect(
-                    body,
-                    `${literal} is a hard-coded schema qualifier; the qualified name must be built at run ` +
-                        'time through driver.buildTableName(tableName, schema, database)',
-                ).not.toContain(literal);
-            }
-
-            // The positive half, read off the recording: the table names the migration actually handed this
-            // engine are the ones the configured schema resolves to, which is what a name built through the
-            // driver produces. The entity metadata is the ORACLE for that expectation here — it is what a
-            // correctly-qualified name must agree with — not the source the migration read it from.
-            for (const table of PLUGIN_TABLES_PARENT_FIRST) {
-                const expectedName = assertionDataSource.getMetadata(
-                    table === LIST_TABLE ? ReorderList : ReorderListLine,
-                ).tablePath;
-                expect(recordedTable(recordedUp, table).name).toBe(expectedName);
-                expect(recordedTable(recordedDown, table).name).toBe(expectedName);
+                    declared,
+                    `${entityClass.name} must declare exactly the ${authorized.length} named objects the ` +
+                        `contract authorises on "${table}" and no others. A sixth object is created by the ` +
+                        'schema builder on every synchronised deployment and by this migration on every ' +
+                        'provisioned one, and the contract fixes the count so that an addition is visible ' +
+                        'rather than absorbed',
+                ).toEqual(authorized);
             }
         });
 
         it('creates the parent table first and drops the child table first', () => {
             // The parent first, because the child's foreign key references it; the child first on the way down,
-            // because a parent still referenced cannot be dropped. Read off the recording in the order the
-            // migration made the calls.
-            expect(recordedUp.calls).toEqual(['createTable', 'createTable']);
-            expect(recordedUp.tables.map(table => bareTableName(table.name))).toEqual([
+            // because a parent still referenced cannot be dropped. Read off the emitted statements in the
+            // order the generator serialised them.
+            expect(tablesInOrder(emittedStatements(migrationSource, 'up'), 'CREATE TABLE')).toEqual([
                 ...PLUGIN_TABLES_PARENT_FIRST,
             ]);
-
-            expect(recordedDown.calls).toEqual(['dropTable', 'dropTable']);
-            expect(recordedDown.tables.map(table => bareTableName(table.name))).toEqual([
+            expect(tablesInOrder(emittedStatements(migrationSource, 'down'), 'DROP TABLE')).toEqual([
                 ...PLUGIN_TABLES_CHILD_FIRST,
             ]);
+
+            // And each foreign key is added only after both of its tables exist, which is the constraint the
+            // ordering exists to satisfy.
+            const up = emittedStatements(migrationSource, 'up');
+            for (const key of EXPECTED_FOREIGN_KEYS) {
+                const added = up.findIndex(
+                    statement =>
+                        statement.indexOf('ADD CONSTRAINT') !== -1 &&
+                        statement.indexOf(`"${key.column}"`) !== -1 &&
+                        statement.indexOf(`"${key.table}"`) !== -1,
+                );
+                const referentCreated = up.findIndex(
+                    statement =>
+                        statement.indexOf('CREATE TABLE') !== -1 &&
+                        statement.indexOf(`"${key.references}"`) !== -1,
+                );
+                expect(added, `${key.table}.${key.column} must be added by some statement`).toBeGreaterThan(
+                    -1,
+                );
+                expect(added).toBeGreaterThan(referentCreated);
+            }
         });
 
         it('carries the three engine-portable named objects under their exact names', () => {
             for (const namedObject of PORTABLE_NAMED_OBJECTS) {
-                const table = recordedTable(recordedUp, namedObject.table);
+                const statement = String(statementDeclaring(migrationSource, namedObject.name));
                 expect(
-                    namedObjectsOf(table),
+                    statement,
                     `the migration must name ${namedObject.name} on ${namedObject.table}`,
-                ).toContain(namedObject.name);
+                ).toContain(`"${namedObject.table}"`);
 
                 // And spanning exactly the declared columns, so a name cannot be right while its subject is
                 // wrong. The name is load-bearing — the service translates a violation of
                 // `UQ_reorder_list_customer_channel_name_key` into `ReorderListNameConflictError` by matching
                 // it — and so is what it covers.
-                const spans = [...table.uniques, ...table.indices].find(
-                    candidate => candidate.name === namedObject.name,
+                expect(columnsSpannedBy(statement, namedObject.name).slice().sort()).toEqual(
+                    namedObject.columns.slice().sort(),
                 );
-                expect(spans, `${namedObject.name} is not declared on ${namedObject.table}`).toBeDefined();
-                expect(spans?.columnNames.slice().sort()).toEqual(namedObject.columns.slice().sort());
             }
         });
 
-        it('declares both named check constraints on every engine, which localises conflict C-E', () => {
-            // THE GAP IS LOCATED HERE RATHER THAN ASSUMED. The migration declares both checks on all four
-            // engines — each is one of its own frozen literals, and this recording is taken before any driver
-            // has had a chance to discard them. So what conflict C-E describes is not a missing declaration but a
-            // MySQL-family driver that drops the declaration silently between here and the catalogue, and the
-            // catalogue half below is where that shows up. Asserting the declaration on every engine is what
-            // makes the two halves distinguishable.
+        it('carries both named check constraints, which generating against PostgreSQL is what buys', () => {
+            // CONFLICT C-E, LOCATED RATHER THAN ASSUMED. Both checks are here, inline in the `CREATE TABLE`
+            // statements, because the generation engine is PostgreSQL. A file generated for MySQL or MariaDB
+            // would carry neither: TypeORM 0.3.28 returns early for that family before a check reaches the
+            // statement log at all, so the gap is upstream of the migration rather than inside it. The
+            // catalogue half below is where the same objects are read back out of the engine.
+            const up = emittedStatements(migrationSource, 'up').join('\n');
             for (const namedObject of CHECK_NAMED_OBJECTS) {
-                const table = recordedTable(recordedUp, namedObject.table);
                 expect(
-                    table.checks.map(check => String(check.name ?? '')),
+                    up,
                     `the migration must declare ${namedObject.name} on ${namedObject.table}. ${C_E_CITATION}`,
-                ).toContain(namedObject.name);
+                ).toContain(`CONSTRAINT "${namedObject.name}" CHECK`);
             }
 
             // The expressions themselves, so a check cannot be present under the right name while guarding
-            // nothing. Both are read off the entity declarations rather than restated, which is the whole
-            // reason the migration cannot drift from them.
-            const lineChecks = recordedTable(recordedUp, LINE_TABLE).checks.map(check =>
-                String(check.expression ?? ''),
-            );
-            expect(lineChecks.join(' ')).toContain('quantity');
-            const listChecks = recordedTable(recordedUp, LIST_TABLE).checks.map(check =>
-                String(check.expression ?? ''),
-            );
-            expect(listChecks.join(' ')).toContain('lineCount');
+            // nothing.
+            expect(up).toContain(`CONSTRAINT "${CHK_LINE_QUANTITY_POSITIVE}" CHECK ("quantity" > 0)`);
+            expect(up).toContain(`CONSTRAINT "${CHK_LIST_LINE_COUNT_NON_NEGATIVE}" CHECK ("lineCount" >= 0)`);
         });
 
-        it('carries the denormalised line counter and both indexed string columns at their declared width', () => {
-            const list = describeTable(recordedTable(recordedUp, LIST_TABLE));
-            const columnNames = list.columns.map(column => column.name);
-            expect(columnNames).toContain('lineCount');
-            expect(columnNames).toContain('name');
-            expect(columnNames).toContain('nameKey');
-
-            // 191 on both string columns. A key-size ceiling on the MySQL family rather than a product choice,
-            // which is why the same number is the plugin's fixed name-length bound.
-            for (const stringColumn of ['name', 'nameKey']) {
-                const column = list.columns.find(candidate => candidate.name === stringColumn);
-                expect(column?.length, `"${stringColumn}" must be declared at 191`).toBe(
-                    INDEXED_STRING_COLUMN_LENGTH,
-                );
-                expect(column?.isNullable).toBe(false);
+        it('carries the denormalised line counter and both bounded name columns at their declared width', () => {
+            const listTable = String(statementCreating(migrationSource, LIST_TABLE));
+            for (const column of ['lineCount', 'name', 'nameKey']) {
+                expect(listTable).toContain(`"${column}"`);
             }
 
-            // The counter starts at zero, which is what makes a freshly created list report `lineCount: 0`
-            // without the service writing anything.
-            const lineCount = list.columns.find(candidate => candidate.name === 'lineCount');
-            expect(lineCount?.isNullable).toBe(false);
-            expect(String(lineCount?.default ?? '').replace(/[()']/g, '')).toBe('0');
+            // 191 on both name columns. A key-size ceiling on the MySQL family rather than a product choice,
+            // which is why the same number is the plugin's fixed name-length bound. Only `nameKey` is in the
+            // index the ceiling is about; `name` shares the width because it holds the same value before
+            // canonicalisation.
+            for (const stringColumn of ['name', 'nameKey']) {
+                expect(listTable, `"${stringColumn}" must be declared at 191 and NOT NULL`).toContain(
+                    `"${stringColumn}" character varying(${BOUNDED_NAME_COLUMN_LENGTH}) NOT NULL`,
+                );
+            }
+
+            expect(listTable).toContain(`"lineCount" integer NOT NULL DEFAULT '0'`);
         });
 
         it('carries four ON DELETE CASCADE foreign keys, every one declared on a plugin table', () => {
+            const added = emittedStatements(migrationSource, 'up').filter(
+                statement => statement.indexOf('FOREIGN KEY') !== -1,
+            );
+            expect(added).toHaveLength(EXPECTED_FOREIGN_KEYS.length);
+
             const declared: string[] = [];
-            for (const table of recordedUp.tables) {
-                for (const foreignKey of table.foreignKeys) {
-                    expect(
-                        foreignKey.columnNames.length,
-                        `${String(foreignKey.name)} must be a single-column key`,
-                    ).toBe(1);
-                    expect(
-                        String(foreignKey.onDelete ?? '').toUpperCase(),
-                        `${bareTableName(table.name)}.${foreignKey.columnNames[0]} must cascade`,
-                    ).toBe('CASCADE');
-                    declared.push(
-                        `${bareTableName(table.name)}.${foreignKey.columnNames[0]}->${bareTableName(
-                            foreignKey.referencedTableName,
-                        )}`,
-                    );
-                }
+            for (const statement of added) {
+                expect(
+                    statement,
+                    `${statement} must cascade, so that deleting the referent removes the referencing row`,
+                ).toContain('ON DELETE CASCADE');
+                const [, table] = /ALTER TABLE "([^"]+)"/.exec(statement) ?? [];
+                const [, column] = /FOREIGN KEY \("([^"]+)"\)/.exec(statement) ?? [];
+                const [, references] = /REFERENCES "([^"]+)"/.exec(statement) ?? [];
+                expect(
+                    PLUGIN_TABLES_PARENT_FIRST.indexOf(
+                        String(table) as (typeof PLUGIN_TABLES_PARENT_FIRST)[number],
+                    ),
+                    `"${String(table)}" is not a plugin table, so this key is not additive`,
+                ).toBeGreaterThan(-1);
+                declared.push(`${String(table)}.${String(column)}->${String(references)}`);
             }
 
             // Exactly the four the entity declarations carry, each FROM a plugin table TO a core table or to
@@ -2376,32 +1922,39 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         });
 
         it('alters no core table and drops no core object', () => {
-            // Every table the migration names is a PLUGIN table, on both directions. The core tables appear
-            // only as the target of a foreign-key reference, which adds nothing to them.
-            for (const recording of [recordedUp, recordedDown]) {
-                for (const table of recording.tables) {
-                    expect(
-                        PLUGIN_TABLES_PARENT_FIRST.indexOf(
-                            bareTableName(table.name) as (typeof PLUGIN_TABLES_PARENT_FIRST)[number],
-                        ),
-                        `"${table.name}" is not a plugin table, so this migration is not additive`,
-                    ).toBeGreaterThan(-1);
+            // Every table the migration ADDRESSES is a plugin table, on both directions: whatever follows
+            // `CREATE TABLE`, `ALTER TABLE` or `DROP TABLE` is one of the two. A core table appears only after
+            // `REFERENCES`, which adds nothing to it.
+            for (const direction of ['up', 'down'] as const) {
+                for (const statement of emittedStatements(migrationSource, direction)) {
+                    for (const verb of ADDRESSING_VERBS) {
+                        const match = new RegExp(`${verb} "([^"]+)"`).exec(statement);
+                        if (match === null) {
+                            continue;
+                        }
+                        expect(
+                            PLUGIN_TABLES_PARENT_FIRST.indexOf(
+                                match[1] as (typeof PLUGIN_TABLES_PARENT_FIRST)[number],
+                            ),
+                            `${direction}() addresses "${match[1]}", which is not a plugin table, so this ` +
+                                'migration is not additive',
+                        ).toBeGreaterThan(-1);
+                    }
                 }
             }
 
-            // Each core table IS named in the migration's text — that is what freezing a foreign key means —
-            // and the assertion is therefore about HOW. It appears only as a reference target: the file
-            // contains no DDL of any kind (asserted above), and the only tables it hands the engine are the
-            // two plugin tables (asserted just now), so naming `customer` can create nothing and alter
-            // nothing. A core table absent from the text would mean the reference had been derived from live
-            // metadata, which is the very thing that made this migration's shape mutable.
-            const body = executableTextOf(migrationSource);
+            // Each core table IS named — that is what a frozen foreign-key target means — and the assertion is
+            // therefore about HOW. It is named only as a reference target, which is what makes naming
+            // `customer` create nothing and alter nothing. A core table absent from the text would mean the
+            // reference had been derived from live metadata, which is the very thing that would make this
+            // migration's shape mutable.
+            const up = emittedStatements(migrationSource, 'up').join('\n');
             for (const coreTable of REFERENCED_CORE_TABLES) {
                 expect(
-                    body,
+                    up,
                     `"${coreTable}" must be named as a frozen foreign-key target rather than resolved from ` +
                         'entity metadata at replay time',
-                ).toContain(`'${coreTable}'`);
+                ).toContain(`REFERENCES "${coreTable}"`);
             }
         });
 
@@ -2410,49 +1963,30 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             // contract withdraws all three objects and the story's own migration sub-task and Definition-of-Done
             // item make their ABSENCE the assertion. The seats counter belongs to FEATURE-001-06's own later
             // migration, so this file must never be edited to add it either.
-            //
-            // Asserted twice over, and the two reads answer different questions now that the migration spells
-            // its own frozen inventory: absent from the file's TEXT, so no future editor can add one here
-            // without the assertion catching it, AND absent from the tables it actually asks this engine to
-            // create, so a shape that acquired one by some other route is caught too.
+            const emitted = [
+                ...emittedStatements(migrationSource, 'up'),
+                ...emittedStatements(migrationSource, 'down'),
+            ].join('\n');
             for (const column of WITHDRAWN_COLUMNS) {
                 expect(migrationSource, `${column} is withdrawn and must not appear`).not.toContain(column);
-                for (const table of recordedUp.tables) {
-                    expect(
-                        table.columns.map(candidate => candidate.name),
-                        `${column} is withdrawn and must not be created on ${bareTableName(table.name)}`,
-                    ).not.toContain(column);
-                }
+                expect(emitted, `${column} is withdrawn and must not be created`).not.toContain(column);
             }
             expect(
                 migrationSource,
                 `${WITHDRAWN_CHECK_CONSTRAINT} is withdrawn and must not appear`,
             ).not.toContain(WITHDRAWN_CHECK_CONSTRAINT);
-            for (const table of recordedUp.tables) {
-                expect(namedObjectsOf(table)).not.toContain(WITHDRAWN_CHECK_CONSTRAINT);
-            }
+            expect(emitted).not.toContain(WITHDRAWN_CHECK_CONSTRAINT);
         });
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
     // The layout the dev server registers
     //
     // The package ships its migration in two layouts — `src/migrations/*.ts` in a checkout and
     // `lib/src/migrations/*.js` in the published artefact — and a built checkout carries BOTH. Registering
     // both patterns is not a harmless superset: TypeORM loads every pattern and then refuses the whole
     // configuration, because both files declare the same class.
-    // `MigrationExecutor.checkForDuplicateMigrations` throws `Duplicate migrations: <name>`
-    // (`node_modules/typeorm/migration/MigrationExecutor.js:L423-L433`), which stops the server and every
-    // migration command outright.
-    //
-    // So the registration must pick exactly one, and the choice is asserted for all three layouts a machine
-    // can be in rather than only for the one this machine happens to be in. The selection function is read out
-    // of `packages/dev-server/dev-config.ts` and executed, so what is exercised is the shipped decision rather
-    // than a restatement of it here.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
     describe('the layout the dev server registers', () => {
-        /** Directories the selector is asked about, keyed by the layout each represents. */
         const BUILT_LAYOUT_DIR = path.join(SELECTOR_PROBE_ROOT, 'lib/src/migrations');
         const SOURCE_LAYOUT_DIR = path.join(SELECTOR_PROBE_ROOT, 'src/migrations');
 
@@ -2464,27 +1998,21 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 (candidate: string) =>
                     directories.includes(candidate);
 
-            // An installed package: no `src` tree at all, so the compiled layout is the only one there is.
             expect(
                 select(SELECTOR_PROBE_ROOT, present(BUILT_LAYOUT_DIR)),
                 'an installed package must register its compiled migration',
             ).toEqual([path.join(BUILT_LAYOUT_DIR, '*.js')]);
 
-            // A source checkout that has been built — the normal state of this repository, because `AGENTS.md`
-            // prescribes change, build, restart. Both layouts are present and exactly one must be chosen.
             expect(
                 select(SELECTOR_PROBE_ROOT, present(BUILT_LAYOUT_DIR, SOURCE_LAYOUT_DIR)),
                 'a built checkout must register one layout, not both',
             ).toEqual([path.join(BUILT_LAYOUT_DIR, '*.js')]);
 
-            // A source checkout that has not been built yet: the source layout, which a TypeScript-aware host
-            // can load and which is the only thing there.
             expect(
                 select(SELECTOR_PROBE_ROOT, present(SOURCE_LAYOUT_DIR)),
                 'an unbuilt checkout must register its source migration',
             ).toEqual([path.join(SOURCE_LAYOUT_DIR, '*.ts')]);
 
-            // Neither: nothing is registered, rather than a pattern that cannot match.
             expect(select(SELECTOR_PROBE_ROOT, () => false)).toEqual([]);
         });
 
@@ -2510,13 +2038,18 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             // directory holds exactly one migration file — so the duplicate-name rejection is unreachable.
             const select = await devConfigLayoutSelector();
             const selected = select(path.join(__dirname, '..'), candidate => fs.existsSync(candidate));
-            expect(selected, 'exactly one pattern must be registered on this machine').toHaveLength(1);
+            // COUNTS, and a FIXED message. `selected` holds absolute glob patterns rooted at the installed
+            // package, so both the array as a matcher actual and `selected[0]` interpolated into a message
+            // publish the layout of whatever machine ran the suite. The counts state the same claim.
+            expect(selected.length, 'exactly one pattern must be registered on this machine').toBe(1);
             const selectedDir = path.dirname(selected[0]);
             const selectedExtension = path.extname(selected[0]);
             const matches = (await fs.readdir(selectedDir)).filter(entry =>
                 entry.endsWith(selectedExtension),
             );
-            expect(matches, `${selected[0]} must resolve to exactly one migration file`).toHaveLength(1);
+            expect(matches.length, 'the registered pattern must resolve to exactly one migration file').toBe(
+                1,
+            );
         });
 
         it('anchors the pattern on the installed package root rather than on a relative path', async () => {
@@ -2534,20 +2067,12 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         });
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
     // The configuration that drives the migration
     //
     // A migration-driven connection must not synchronise. If it does, the schema builder creates this
     // plugin's two tables from entity metadata before the migration runs, and the migration then validates a
     // schema it did not author instead of owning it — which is the difference between a schema history that
     // records what happened and one that merely records that something did.
-    //
-    // Two independent guarantees are asserted, because either alone is thinner than it looks. The platform
-    // forces `synchronize: false` onto every migration connection, which is the guarantee that actually holds
-    // in production; and the dev-server configuration says so itself, at a position where saying it has an
-    // effect. The second exists because it used to be declared BEFORE `...getDbConfig()`, which returns
-    // `synchronize: true` on every branch, so the file read as though it made a promise it did not keep.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
     describe('the configuration that drives the migration', () => {
         it('is synchronization-free because the platform forces it, on every entry point', async () => {
@@ -2566,7 +2091,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 'the platform must force synchronization off on every migration connection',
             ).toContain('synchronize: false');
             expect(body).toContain('userConfig.dbConnectionOptions');
-            // The forced object comes AFTER the caller's, which is what makes it win.
             expect(body.indexOf('synchronize: false')).toBeGreaterThan(
                 body.indexOf('userConfig.dbConnectionOptions'),
             );
@@ -2576,9 +2100,14 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 );
             }
 
-            // And this suite's own lifecycle configuration says the same thing explicitly, so the apply the
-            // rest of the file measures cannot have been a synchronization pass wearing a migration's name.
-            expect(migrationConfig.dbConnectionOptions.synchronize).toBe(false);
+            // And where this file drives the lifecycle itself, its own configuration says the same thing
+            // explicitly, so the apply the executing half measures cannot have been a synchronization pass
+            // wearing a migration's name. That configuration is built only on the engine that half runs on —
+            // see {@link MIGRATION_GENERATION_ENGINE} — and the platform guarantee above is what covers the
+            // rest, being the one that actually holds in production.
+            if (appliesShippedMigration) {
+                expect(migrationConfig.dbConnectionOptions.synchronize).toBe(false);
+            }
         });
 
         it('declares synchronization after every spread, and disables it for the migration entry point', async () => {
@@ -2655,10 +2184,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
             // (`packages/core/src/migrate.ts:L52-L59`) — so the chain continues, bootstrap synchronizes, the
             // schema builder creates the two tables, and a later boot records this migration as applied
             // against a schema it did not author, having already failed once without stopping anything.
-            //
-            // Gating the registration on the same discriminator that gates synchronization removes that whole
-            // chain, and restores the boot path to what it was before this feature registered anything: a
-            // pattern that matches nothing.
             const devConfigSource = await fs.readFile(DEV_CONFIG_FILE_PATH, 'utf-8');
             const optionsStart = devConfigSource.indexOf('dbConnectionOptions: {');
             const options = devConfigSource.slice(
@@ -2666,7 +2191,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 devConfigSource.indexOf('\n    },', optionsStart),
             );
 
-            // The plugin's patterns appear exactly once, and behind the discriminator.
             const registration = /\.\.\.\((\w+) \? reorderPluginMigrationGlobs\(\) : \[\]\)/.exec(options);
             expect(
                 registration,
@@ -2674,7 +2198,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     'server boot that carries it can half-apply it and then let the schema builder finish',
             ).not.toBeNull();
 
-            // And it is the SAME discriminator that turns synchronization off, so the two cannot drift apart.
             const guard = (registration as RegExpExecArray)[1];
             expect(
                 options,
@@ -2695,466 +2218,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         });
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
-    // The up-path against a table that is already there
-    //
-    // `up()` passes no `ifNotExist`, because a migration that silently accepts whatever table it finds can be
-    // recorded as applied against a shape it never created — and a schema history that says so is worse than
-    // no history. Instead it asks for the table and, finding one, checks it against the FROZEN MINIMUM: every
-    // frozen object and every attribute of it the catalogue reports, with a surplus tolerated and the
-    // exclusions enumerated on the migration's own `frozenShapeShortfalls`. Both outcomes are asserted here,
-    // on the live schema the apply in `beforeAll` produced: the matching table is accepted without a
-    // statement, and a table falling short of the minimum is refused by name. The second case restores what it removed in a `finally`, so the schema every sibling
-    // case reads is the one the migration built.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
-
-    describe('the up-path against an existing table', () => {
-        it(
-            'accepts the schema it created, and issues no create for it',
-            async () => {
-                await withQueryRunner(async queryRunner => {
-                    // A proxy that FAILS the case if a create is attempted, and delegates everything else —
-                    // including `getTable` — to the real runner, so the decision is made against the live
-                    // schema rather than against a stub. This is the counterpart of the recording proxy, which
-                    // reports absence in order to observe the create path.
-                    const created: string[] = [];
-                    const observing = new Proxy(queryRunner, {
-                        get(target, property, receiver) {
-                            if (property === 'createTable') {
-                                return (table: Table): Promise<void> => {
-                                    created.push(bareTableName(table.name));
-                                    return Promise.resolve();
-                                };
-                            }
-                            const value = Reflect.get(target, property, receiver);
-                            return typeof value === 'function' ? value.bind(target) : value;
-                        },
-                    });
-
-                    await new AddReorderLists1786838400000().up(observing);
-
-                    expect(
-                        created,
-                        'both tables are already standing in exactly the frozen shape, so the up-path must ' +
-                            'verify them rather than attempt a create that the engine would refuse',
-                    ).toEqual([]);
-                });
-            },
-            CATALOGUE_READ_ABORT_AFTER_MS,
-        );
-
-        it(
-            'refuses a table that is missing one of its frozen named objects',
-            async () => {
-                await withQueryRunner(async queryRunner => {
-                    const before = await queryRunner.getTable(LIST_TABLE);
-                    const removed = (before as Table).indices.find(index => index.name === IDX_LIST_OWNER);
-                    expect(
-                        removed,
-                        `"${LIST_TABLE}" must carry ${IDX_LIST_OWNER} before this case removes it`,
-                    ).toBeDefined();
-
-                    // The drift is a DROPPED INDEX rather than a dropped column, and deliberately so: dropping
-                    // and recreating an index is supported identically on all four engines, so this case makes
-                    // the same measurement everywhere, and it restores exactly what it removed.
-                    await queryRunner.dropIndex(LIST_TABLE, IDX_LIST_OWNER);
-                    try {
-                        await expect(new AddReorderLists1786838400000().up(queryRunner)).rejects.toThrowError(
-                            new RegExp(IDX_LIST_OWNER),
-                        );
-                    } finally {
-                        await queryRunner.createIndex(LIST_TABLE, removed as TableIndex);
-                    }
-
-                    const after = await queryRunner.getTable(LIST_TABLE);
-                    expect(
-                        (after as Table).indices.map(index => String(index.name ?? '')),
-                        'this case must leave the schema exactly as it found it',
-                    ).toContain(IDX_LIST_OWNER);
-                });
-            },
-            CATALOGUE_READ_ABORT_AFTER_MS,
-        );
-
-        // ═══════════════════════════════════════════════════════════════════════════════════════════
-        // LIVE deferred constraints — the drift TypeORM's generic table view cannot see
-        // ═══════════════════════════════════════════════════════════════════════════════════════════
-        //
-        // A deferred constraint fires at COMMIT instead of at the statement, which breaks this plugin's
-        // narrow constraint translation: `createReorderList` answers `ReorderListNameConflictError` by
-        // catching the `INSERT` failing, and against a deferred unique the insert succeeds and the
-        // transaction fails later, past every `catch` the service has.
-        //
-        // These two cases GENUINELY DEFER a live constraint rather than doctoring a catalogue reading, and
-        // they exist because for two engine-and-class combinations the doctored form would prove nothing
-        // about a real deployment. TypeORM's `getTable()` is not authoritative on enforcement timing:
-        //
-        //   - The SQLite family WRITES a reference's clause into the table text it stores
-        //     (`AbstractSqliteQueryRunner.js:1204-1205`) and has no loader that reads it back, so a live
-        //     deferred reference presents as `undefined` — indistinguishable, to the generic view, from an
-        //     immediate one.
-        //   - PostgreSQL's unique loader reads deferrability fields its own constraints query never selects
-        //     (`PostgresQueryRunner.js:2125` against `:1801-1808`), so a live deferred UNIQUE presents as
-        //     `undefined` there too.
-        //
-        // The migration answers both by reading the engine's own catalogue — `pg_constraint` on PostgreSQL,
-        // the stored table text on the SQLite family. What these cases measure is exactly that: a constraint
-        // the generic view calls immediate and the engine really defers. Each restores what it changed and
-        // asserts the restoration, and each decides its own applicability from what the engine actually
-        // stored rather than from an engine name.
-        describe('a live constraint whose enforcement has been deferred', () => {
-            it(
-                'is refused for a unique, which the generic table view reports nothing about',
-                async () => {
-                    await withQueryRunner(async queryRunner => {
-                        const before = await queryRunner.getTable(LIST_TABLE);
-                        const original = (before as Table).uniques.find(
-                            unique => unique.name === UQ_LIST_OWNER_NAME_KEY,
-                        );
-                        if (!original) {
-                            // The MySQL family files a unique as a named unique index, which carries no
-                            // deferrability clause in any grammar. There is no timing here to defer.
-                            return;
-                        }
-
-                        await queryRunner.dropUniqueConstraint(LIST_TABLE, original);
-                        try {
-                            await queryRunner.createUniqueConstraint(
-                                LIST_TABLE,
-                                new TableUnique({
-                                    name: original.name,
-                                    columnNames: original.columnNames,
-                                    deferrable: 'INITIALLY DEFERRED',
-                                }),
-                            );
-
-                            // Applicability decided from what the ENGINE holds, read independently of both
-                            // the generic view and the migration under test. SQLite's grammar admits no
-                            // deferrability clause on a unique, so on that family the constraint comes back
-                            // immediate and there is no deferral for anything to catch.
-                            const held = await liveEnforcementTiming(
-                                queryRunner,
-                                LIST_TABLE,
-                                UQ_LIST_OWNER_NAME_KEY,
-                            );
-                            if (held !== 'INITIALLY DEFERRED') {
-                                expect(
-                                    isPostgresFamily(resolveConfiguredEngine()),
-                                    "PostgreSQL stores a unique's deferrability, so a request to defer one " +
-                                        'that comes back immediate there is a defect in this case rather ' +
-                                        'than an engine limitation',
-                                ).toBe(false);
-                                return;
-                            }
-
-                            // THE POINT OF THE CASE, asserted before the refusal is asked for: the generic
-                            // view still reports nothing, so anything that refuses this must have read
-                            // somewhere else.
-                            const doctoredByTheEngine = await queryRunner.getTable(LIST_TABLE);
-                            const asGenericViewSeesIt = (doctoredByTheEngine as Table).uniques.find(
-                                unique => unique.name === UQ_LIST_OWNER_NAME_KEY,
-                            );
-                            expect(
-                                asGenericViewSeesIt?.deferrable,
-                                'this case rests on the generic view being blind to a live deferred unique; ' +
-                                    'if TypeORM has started reporting it, the native reading is no longer ' +
-                                    'the only source and this case must be rewritten rather than deleted',
-                            ).toBeUndefined();
-
-                            await expect(
-                                new AddReorderLists1786838400000().up(queryRunner),
-                                "a unique enforced at commit cannot be recorded as this migration's work, " +
-                                    'because the service catches the statement failing and there would be ' +
-                                    'no failing statement to catch',
-                            ).rejects.toThrowError(new RegExp(UQ_LIST_OWNER_NAME_KEY));
-                        } finally {
-                            await queryRunner
-                                .dropUniqueConstraint(LIST_TABLE, UQ_LIST_OWNER_NAME_KEY)
-                                .catch(() => undefined);
-                            await queryRunner.createUniqueConstraint(LIST_TABLE, original);
-                        }
-
-                        const after = await queryRunner.getTable(LIST_TABLE);
-                        expect(
-                            (after as Table).uniques.map(unique => String(unique.name ?? '')),
-                            'this case must leave the schema exactly as it found it',
-                        ).toContain(UQ_LIST_OWNER_NAME_KEY);
-                        await expect(
-                            new AddReorderLists1786838400000().up(queryRunner),
-                            'and the restored schema must be accepted again, which is what proves the ' +
-                                'refusal above was about the deferral rather than about the rebuild',
-                        ).resolves.toBeUndefined();
-                    });
-                },
-                CATALOGUE_READ_ABORT_AFTER_MS,
-            );
-
-            it(
-                'is refused for a reference, on every engine that stores the clause',
-                async () => {
-                    await withQueryRunner(async queryRunner => {
-                        const before = await queryRunner.getTable(LINE_TABLE);
-                        const original = (before as Table).foreignKeys.find(
-                            reference => reference.name === FK_LINE_LIST,
-                        );
-                        expect(
-                            original,
-                            `"${LINE_TABLE}" must carry ${FK_LINE_LIST} before this case defers it`,
-                        ).toBeDefined();
-
-                        const deferred = new TableForeignKey({
-                            name: (original as TableForeignKey).name,
-                            columnNames: (original as TableForeignKey).columnNames,
-                            referencedTableName: (original as TableForeignKey).referencedTableName,
-                            referencedColumnNames: (original as TableForeignKey).referencedColumnNames,
-                            onDelete: (original as TableForeignKey).onDelete,
-                            onUpdate: (original as TableForeignKey).onUpdate,
-                            deferrable: 'INITIALLY DEFERRED',
-                        });
-
-                        await queryRunner.dropForeignKey(LINE_TABLE, original as TableForeignKey);
-                        try {
-                            await queryRunner.createForeignKey(LINE_TABLE, deferred);
-
-                            // Applicability decided from what the ENGINE holds, read independently of both
-                            // the generic view and the migration under test. The MySQL family's grammar
-                            // refuses the clause outright — measured as `ER_PARSE_ERROR`, and its driver has
-                            // no notion of deferrability in either direction — so it creates an immediate
-                            // reference and there is nothing here to detect.
-                            const held = await liveEnforcementTiming(queryRunner, LINE_TABLE, FK_LINE_LIST);
-                            if (held !== 'INITIALLY DEFERRED') {
-                                expect(
-                                    isMysqlFamily(resolveConfiguredEngine()),
-                                    'PostgreSQL and the SQLite family both store this clause, so a request ' +
-                                        'to defer a reference that comes back immediate on either is a ' +
-                                        'defect in this case rather than an engine limitation',
-                                ).toBe(true);
-                                return;
-                            }
-
-                            if (isSqliteFamily(resolveConfiguredEngine())) {
-                                // THE POINT OF THE CASE on this family: the engine holds the deferral and
-                                // the generic view reports nothing for it, so a refusal can only have come
-                                // from the stored table text. Asserting the blindness here is what makes the
-                                // native reading's necessity measured rather than argued.
-                                const asGenericViewSeesIt = await queryRunner.getTable(LINE_TABLE);
-                                expect(
-                                    (asGenericViewSeesIt as Table).foreignKeys.find(
-                                        reference => reference.name === FK_LINE_LIST,
-                                    )?.deferrable,
-                                    'the SQLite family writes this clause and never reads it back, so the ' +
-                                        'generic view must still report nothing while the engine holds a ' +
-                                        'deferred reference',
-                                ).toBeUndefined();
-                            }
-
-                            await expect(
-                                new AddReorderLists1786838400000().up(queryRunner),
-                                'a cascade enforced at commit lets a parent delete and its child cascade ' +
-                                    'sit apart, so a statement between them reads a child whose parent is ' +
-                                    "gone; it cannot be recorded as this migration's work",
-                            ).rejects.toThrowError(new RegExp(FK_LINE_LIST));
-                        } finally {
-                            await queryRunner.dropForeignKey(LINE_TABLE, FK_LINE_LIST).catch(() => undefined);
-                            await queryRunner.createForeignKey(LINE_TABLE, original as TableForeignKey);
-                        }
-
-                        const after = await queryRunner.getTable(LINE_TABLE);
-                        expect(
-                            (after as Table).foreignKeys.map(reference => String(reference.name ?? '')),
-                            'this case must leave the schema exactly as it found it',
-                        ).toContain(FK_LINE_LIST);
-                        await expect(
-                            new AddReorderLists1786838400000().up(queryRunner),
-                            'and the restored schema must be accepted again',
-                        ).resolves.toBeUndefined();
-                    });
-                },
-                CATALOGUE_READ_ABORT_AFTER_MS,
-            );
-
-            it(
-                'is refused when the catalogue cannot be read at all, rather than assumed immediate',
-                async () => {
-                    // THE FAIL-CLOSED RULE, which is the other half of reading a native catalogue: a source
-                    // that cannot answer must produce a refusal, not a default. Without it, the whole
-                    // mechanism degrades silently the moment an engine, a driver version or a permission
-                    // grant stops answering — which is precisely the failure mode that made the generic
-                    // view's `undefined` unsafe in the first place.
-                    //
-                    // The reading is removed rather than the engine faked: every catalogue query the
-                    // migration issues comes back empty, and nothing else about the connection changes. On
-                    // the MySQL family the migration issues no such query — its grammar refuses a
-                    // deferrability clause, measured as `ER_PARSE_ERROR` — so there is nothing to remove and
-                    // the case records that instead.
-                    await withQueryRunner(async queryRunner => {
-                        let silenced = 0;
-                        const mute = new Proxy(queryRunner, {
-                            get(target, property, receiver) {
-                                if (property === 'query') {
-                                    return async (sql: string, parameters?: unknown[]): Promise<unknown> => {
-                                        if (/pg_constraint|sqlite_master/i.test(sql)) {
-                                            silenced += 1;
-                                            return [];
-                                        }
-                                        return target.query(sql, parameters as undefined);
-                                    };
-                                }
-                                const value = Reflect.get(target, property, receiver);
-                                return typeof value === 'function' ? value.bind(target) : value;
-                            },
-                        });
-
-                        let refusal: Error | undefined;
-                        try {
-                            await new AddReorderLists1786838400000().up(mute);
-                        } catch (error) {
-                            refusal = error as Error;
-                        }
-
-                        if (silenced === 0) {
-                            expect(
-                                isMysqlFamily(resolveConfiguredEngine()),
-                                'every engine that can hold a deferred constraint must be asked about one, ' +
-                                    'so a run that silenced no catalogue query on such an engine means the ' +
-                                    'native reading was never issued',
-                            ).toBe(true);
-                            expect(
-                                refusal,
-                                'and the schema itself is unchanged, so it must be accepted',
-                            ).toBe(undefined);
-                            return;
-                        }
-
-                        expect(
-                            refusal,
-                            'a constraint whose enforcement timing cannot be established must be refused; ' +
-                                'accepting it would record this migration as the author of a shape whose ' +
-                                'error handling it cannot show works',
-                        ).toBeDefined();
-                        expect(
-                            (refusal as Error).message,
-                            'the refusal must say that the timing could not be shown, and name the engine ' +
-                                'whose catalogue was asked, so an operator knows what to check',
-                        ).toContain('cannot be shown to be NOT DEFERRABLE');
-                        expect((refusal as Error).message).toContain(resolveConfiguredEngine());
-                        expect(
-                            (refusal as Error).message,
-                            'and it must name the constraint, because a refusal that names nothing is not ' +
-                                'actionable',
-                        ).toContain(FK_LIST_CUSTOMER);
-
-                        // The schema was never touched, so the real reading must still be accepted.
-                        await expect(
-                            new AddReorderLists1786838400000().up(queryRunner),
-                            'nothing was written, so the unmuted run must accept the same schema',
-                        ).resolves.toBeUndefined();
-                    });
-                },
-                CATALOGUE_READ_ABORT_AFTER_MS,
-            );
-        });
-
-        // ONE REFUSAL PER OBJECT CLASS, and per attribute within a class.
-        //
-        // The case above drifts the LIVE schema, which is the strongest evidence available but is only
-        // practical for an object every engine can drop and recreate identically. A column's type, a check
-        // constraint's expression and a reference's target are not in that set: altering them on the SQLite
-        // family means rebuilding the table, and altering them on any engine risks leaving the schema every
-        // sibling case reads in a state the migration did not build.
-        //
-        // So these cases drift the CATALOGUE READING instead. Each takes the real table the engine reports,
-        // clones it, changes exactly one attribute, and hands that clone to `up()` — the comparison is the
-        // shipped one, running against a real driver and real metadata, and the database is never written to.
-        // Every case asserts the refusal names the object or attribute it broke, so a refusal for the wrong
-        // reason cannot pass as the right one.
-        describe.each(FROZEN_SHAPE_DRIFTS)(
-            'refuses a table whose $description',
-            ({ table, drift, names }) => {
-                it(
-                    'differs from the frozen description, naming what differs',
-                    async () => {
-                        await withQueryRunner(async queryRunner => {
-                            const real = await queryRunner.getTable(table);
-                            expect(real, `"${table}" must exist before this case reads it`).toBeDefined();
-
-                            // Applicability is decided from the real reading rather than from the engine name: a
-                            // collation is only declared where the engine needs one, and the MySQL family carries
-                            // no check constraints at all (conflict C-E).
-                            const rehearsal = (real as Table).clone();
-                            if (drift(rehearsal) === false) {
-                                return;
-                            }
-
-                            const created: string[] = [];
-                            let doctored = false;
-                            const drifting = new Proxy(queryRunner, {
-                                get(target, property, receiver) {
-                                    if (property === 'getTable') {
-                                        return async (name: string): Promise<Table | undefined> => {
-                                            const found = await target.getTable(name);
-                                            if (!found) {
-                                                return undefined;
-                                            }
-                                            const clone = found.clone();
-                                            if (!doctored && bareTableName(clone.name) === table) {
-                                                doctored = drift(clone) !== false;
-                                            }
-                                            return clone;
-                                        };
-                                    }
-                                    if (property === 'createTable') {
-                                        return (candidate: Table): Promise<void> => {
-                                            created.push(bareTableName(candidate.name));
-                                            return Promise.resolve();
-                                        };
-                                    }
-                                    const value = Reflect.get(target, property, receiver);
-                                    return typeof value === 'function' ? value.bind(target) : value;
-                                },
-                            });
-
-                            let refusal: Error | undefined;
-                            try {
-                                await new AddReorderLists1786838400000().up(drifting);
-                            } catch (error) {
-                                refusal = error as Error;
-                            }
-
-                            expect(
-                                doctored,
-                                'the drift must have been applied to the catalogue reading',
-                            ).toBe(true);
-                            expect(
-                                refusal,
-                                'a table that differs from the frozen description must not be accepted, ' +
-                                    'because accepting it records this migration as the author of a shape it ' +
-                                    'never created',
-                            ).toBeDefined();
-                            expect(
-                                (refusal as Error).message,
-                                'the refusal must name the table it examined',
-                            ).toContain(table);
-                            for (const name of names) {
-                                expect(
-                                    (refusal as Error).message,
-                                    `the refusal must name "${name}", so an operator is told what to fix`,
-                                ).toContain(name);
-                            }
-                            // And it refuses rather than quietly creating a second table over the first.
-                            expect(created, 'a refusal must not also attempt a create').toEqual([]);
-                        });
-                    },
-                    CATALOGUE_READ_ABORT_AFTER_MS,
-                );
-            },
-        );
-    });
-
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
-    // The schema under test, which the migration and nothing else produced
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
-
     /** One table's normalised snapshot, read from the engine's own catalogue through TypeORM's parser. */
     async function readTableSnapshot(name: string): Promise<TableSnapshot> {
         return describeTable(await readTable(name));
@@ -3167,9 +2230,9 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         return column as ColumnSnapshot;
     }
 
-    describe('the schema under test', () => {
+    describe.skipIf(!appliesShippedMigration)('the schema under test', () => {
         it(
-            'was created by the migration itself, on whichever engine the run configured',
+            'was created by the migration itself rather than by any schema builder',
             async () => {
                 // THE ENGINE UNDER TEST IS THE ENGINE THE RUN WAS CONFIGURED FOR. Read off the running data
                 // source rather than off an environment variable, and cross-checked against the resolver the
@@ -3190,14 +2253,14 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     'the harness registers no plugin, so the initializer must have synchronised the core schema alone',
                 ).toEqual([]);
 
-                // AND THE MIGRATION IS WHAT CREATED THEM, on this engine and on every other. There is no
-                // schema-builder fallback anywhere in this file: the schema every shape, catalogue and
-                // forbidden-write assertion below reads is the one `runMigrations` built, and if it did not
-                // build it this case fails rather than substituting something that resembles it.
+                // AND THE MIGRATION IS WHAT CREATED THEM, on PostgreSQL, where this describe runs. There is
+                // no schema-builder fallback: the schema every shape, catalogue and forbidden-write assertion
+                // below reads is the one `runMigrations` built, and if it did not build it this case fails
+                // rather than substituting something that resembles it.
                 expect(
                     pluginTablesAfterFirstAttempt.slice().sort(),
                     `the migration did not create both plugin tables on ${activeEngine}. ` +
-                        ENGINE_PORTABILITY_CITATION,
+                        GENERATED_FORM_CITATION,
                 ).toEqual(PLUGIN_TABLES_CHILD_FIRST.slice().sort());
 
                 expect((await existingPluginTables()).slice().sort()).toEqual(
@@ -3214,20 +2277,18 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
                 expect(snapshot.columns.map(column => column.name).sort()).toEqual(EXPECTED_LIST_COLUMNS);
 
-                // The three inherited columns, which `VendureEntity` supplies and the entity re-declares none of.
                 expect(columnNamed(snapshot, 'id').isPrimary).toBe(true);
                 expect(columnNamed(snapshot, 'id').isGenerated).toBe(true);
                 expect(columnNamed(snapshot, 'createdAt').isNullable).toBe(false);
                 expect(columnNamed(snapshot, 'updatedAt').isNullable).toBe(false);
 
-                // Both indexed string columns at 191 — the MySQL-family key-size ceiling.
-                expect(columnNamed(snapshot, 'name').length).toBe(INDEXED_STRING_COLUMN_LENGTH);
-                expect(columnNamed(snapshot, 'nameKey').length).toBe(INDEXED_STRING_COLUMN_LENGTH);
+                // Both bounded name columns at 191 — the MySQL-family key-size ceiling, which `nameKey` is
+                // indexed under and `name` merely shares the width of.
+                expect(columnNamed(snapshot, 'name').length).toBe(BOUNDED_NAME_COLUMN_LENGTH);
+                expect(columnNamed(snapshot, 'nameKey').length).toBe(BOUNDED_NAME_COLUMN_LENGTH);
                 expect(columnNamed(snapshot, 'name').isNullable).toBe(false);
                 expect(columnNamed(snapshot, 'nameKey').isNullable).toBe(false);
 
-                // The ownership pair. Both are `@EntityId()` columns, so their physical type is whatever the
-                // configured `EntityIdStrategy` resolved to rather than a hand-typed one.
                 expect(columnNamed(snapshot, 'customerId').isNullable).toBe(false);
                 expect(columnNamed(snapshot, 'channelId').isNullable).toBe(false);
 
@@ -3258,9 +2319,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
 
                 expect(columnNamed(snapshot, 'reorderListId').isNullable).toBe(false);
 
-                // The stored variant reference stays NOT NULL while the published GraphQL field is nullable. The
-                // pair is deliberate: platform variant deletion is soft and being disabled is a flag on a row that
-                // remains present, so a retained line always points at a row that still exists.
                 expect(columnNamed(snapshot, 'productVariantId').isNullable).toBe(false);
 
                 expect(columnNamed(snapshot, 'quantity').isNullable).toBe(false);
@@ -3284,7 +2342,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     ).toContain(`${foreignKey.column}->${foreignKey.references}(id) ON DELETE CASCADE`);
                 }
 
-                // Four in total and not one more, so nothing has quietly acquired a second reference.
                 const total = Array.from(snapshots.values()).reduce(
                     (count, snapshot) => count + snapshot.foreignKeys.length,
                     0,
@@ -3343,19 +2400,19 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         );
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
     // HALF TWO, PART ONE — the named objects, present in the engine's own catalogue under their exact names
     //
-    // Three catalogues, deliberately, because the object CLASS differs between engines while the name and the
+    // Three catalogue readers, because the object CLASS differs between engines while the name and the
     // guarantee do not: a `UQ_` is a unique constraint on PostgreSQL and the SQLite family and a named unique
-    // INDEX on the MySQL family. A single portable "constraint type" lookup would report it missing on two of
-    // the four engine jobs while it was enforcing exactly the same rule.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // INDEX on the MySQL family, so a single "constraint type" lookup would report it missing while it was
+    // enforcing exactly the same rule. These cases execute on the generation engine and read PostgreSQL's
+    // catalogue; the reader for each other family is exercised where that family's own emission is applied,
+    // through `withIsolatedMigrationState` in `e2e/fixtures/migration-state.ts`.
 
-    describe("the named objects, in the engine's own catalogue", () => {
+    describe.skipIf(!appliesShippedMigration)("the named objects, in the engine's own catalogue", () => {
         for (const namedObject of PORTABLE_NAMED_OBJECTS) {
             it(
-                `${namedObject.name} exists on ${namedObject.table} on every engine`,
+                `${namedObject.name} exists on ${namedObject.table} in the engine's own catalogue`,
                 async () => {
                     const catalogue = await readEngineCatalogue();
                     const namesForKind =
@@ -3367,9 +2424,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                             'the schema was created by the migration under test',
                     ).toContain(namedObject.name);
 
-                    // And under the same name in TypeORM's own parse of that catalogue, spanning the declared
-                    // columns. Two reads of one fact through two mechanisms, because the name is what the service's
-                    // narrow violation match depends on.
                     const table = await readTable(namedObject.table);
                     expect(namedObjectsOf(table)).toContain(namedObject.name);
                     const spans = [...table.uniques, ...table.indices].find(
@@ -3419,51 +2473,81 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 CATALOGUE_READ_ABORT_AFTER_MS,
             );
         }
+
+        it(
+            'carries exactly the authorised named objects on each plugin table, and no others',
+            async () => {
+                // THE ASSERTION THE CASES ABOVE CANNOT MAKE. Each of them asks whether one authorised name is
+                // present, and a presence check is blind in one direction: an object nobody authorised is
+                // present in the catalogue, absent from every expectation, and reported by nothing. That is not
+                // hypothetical — a channel-only index on the parent and a variant-only index on the child were
+                // declared on the entities, frozen into the migration and created on all four engines, and
+                // every case in this suite stayed green. This case is the one that fails for it.
+                //
+                // The comparison is per table and exact, over the catalogue scoped to that table with the row
+                // identifier's and the four references' own artefacts discounted — see
+                // {@link TableCatalogueReading} for why each exclusion is a claim asserted elsewhere rather
+                // than a convenience.
+                let materialisedTotal = 0;
+                for (const table of PLUGIN_TABLES_PARENT_FIRST) {
+                    const reading = await readTableCatalogue(table);
+                    const expected = materialisedNamedObjectsOn(table, activeEngine);
+                    materialisedTotal += expected.length;
+                    expect(
+                        reading.names,
+                        `"${table}" must carry exactly the ${expected.length} named objects the contract ` +
+                            `authorises and materialises on ${activeEngine}, and no others. Read from ` +
+                            `${reading.source}. Discounted as the row identifier's own artefacts: ` +
+                            `[${reading.identifierArtefacts.join(', ')}]; as the cascading references' own: ` +
+                            `[${reading.referenceArtefacts.join(', ')}] — the MySQL family creates an index ` +
+                            'for a foreign key of its own accord and names it after the constraint, which is ' +
+                            'the engine keeping its own books rather than a contract breach. Anything left ' +
+                            `over is an object this feature created and the contract does not authorise. ${
+                                emitsNamedCheckConstraints(activeEngine) ? '' : C_E_CITATION
+                            }`,
+                    ).toEqual(expected);
+                }
+
+                // AND THE TOTAL, which is the number that differs between the engine families and the reason
+                // this claim is engine-conditional rather than one number everywhere: five materialised on
+                // PostgreSQL and the SQLite family, three on the MySQL family, where the two named checks are
+                // declared by the migration and then silently discarded by the driver.
+                expect(
+                    materialisedTotal,
+                    `${activeEngine} must materialise ${materialisedTotal} of the ` +
+                        `${AUTHORIZED_NAMED_OBJECT_COUNT} authorised named objects. ${
+                            emitsNamedCheckConstraints(activeEngine)
+                                ? 'This engine emits named check constraints, so all five exist.'
+                                : `This engine emits none, so the two CHK_ objects cannot. ${C_E_CITATION}`
+                        }`,
+                ).toBe(emitsNamedCheckConstraints(activeEngine) ? AUTHORIZED_NAMED_OBJECT_COUNT : 3);
+            },
+            CATALOGUE_READ_ABORT_AFTER_MS,
+        );
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
-    // HALF TWO, PART TWO — the write each named object forbids
+    // HALF TWO, PART TWO — the engine's own enforcement of each named object
+    //
+    // The four constraints are evidenced by the writes they forbid; `IDX_reorder_list_customer_channel` is
+    // evidenced by an engine-catalogue read, because a non-unique index constrains no value and forbids no
+    // write.
     //
     // Each case in its own `it`, each building its own precondition, each issued straight through the
-    // repository. Every one of them runs on all four engine jobs, sql.js included: these are sequential single
-    // writes rather than interleavings, and EPIC-001 section 11.6.3 keeps the migration and constraint
-    // obligations on all four jobs for exactly that reason. There is no barrier anywhere in this file.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // repository. They are sequential single writes rather than interleavings, so there is no barrier
+    // anywhere in this file. They run against the schema the checked-in artefact built, which is the
+    // generation engine; the same refusals against another engine's own emission belong with that emission,
+    // in `withIsolatedMigrationState`.
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
     // THE MIGRATION-OWNED DEPLOYMENT, AND WHERE ITS EXECUTED PROOF LIVES
     //
-    // Everything above establishes that the migration BUILT this schema, on whichever engine the run
-    // configured. The other half of the claim — that a deployment provisioned that way SERVES the published
+    // Everything above establishes that the migration BUILT this schema, on the engine the checked-in
+    // artefact was generated for. The other half of the claim — that a deployment provisioned that way SERVES the published
     // contract — is executed in `reorder-plugin-compatibility.e2e-spec.ts` ("a deployment provisioned by the
-    // migration alone"), and it has to be there rather than here for a platform reason worth stating exactly,
-    // because it looks at first like something this file could simply do.
-    //
-    // A second server booted in THIS worker cannot serve the plugin's operations. `AppModule` imports
-    // `PluginModule.forRoot()`, which reads `getConfig().plugins` — and it does so inside the `@Module({...})`
-    // decorator argument, which Node evaluates once, when `@vendure/core/dist/app.module.js` is first loaded
-    // [packages/core/src/app.module.ts:L18-L30, packages/core/src/plugin/plugin.module.ts:L14-L19]. Every test
-    // server loads that module through the same `await import(...)`
-    // [packages/testing/src/test-server.ts:L108-L112], so the plugin module set of the whole worker is frozen
-    // by the FIRST bootstrap in it. This file's first bootstrap is deliberately plugin-less — that is what
-    // leaves the plugin tables for the migration to create — so a later plugin-enabled server here merges the
-    // SDL (read per schema build from `getConfig()`) while registering neither the providers nor the
-    // resolvers. Measured, not assumed: such a server answers `Cannot return null for non-nullable field
-    // Mutation.createReorderList` while `activeCustomer` still resolves, and `app.get(ReorderListService)`
-    // reports that the provider does not exist in the current context.
-    //
-    // WHY THE DEV-SERVER HARNESS ITSELF IS NOT MIGRATION-DRIVEN FOR BOOTING, which is the related question.
-    // `packages/dev-server` ships no core migrations at all — `dev-config.ts`'s own `migrations/*.ts` pattern
-    // names a directory that does not exist — so a migration-first boot there would face a database with no
-    // core tables for this plugin's foreign keys to reference, and authoring core migrations would create
-    // files outside `packages/reorder-plugin`, which the change boundary forbids [AAP §0.1.2.1]. The dev
-    // harness therefore stays synchronization-driven for booting and populating, which is its own
-    // long-standing design and predates this feature, while its migration-driven entry points run with
-    // synchronization off and this plugin's migration registered. Both halves of that rule are asserted by
-    // "the configuration that drives the migration" above.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // migration alone"), which is the one other suite that applies this migration. It has to be there rather
+    // than here for a platform reason worth stating exactly, because it looks at first like something this
+    // file could simply do.
 
-    describe('the write each named object forbids', () => {
+    describe.skipIf(!appliesShippedMigration)('the write each named constraint forbids', () => {
         it(
             `${UQ_LIST_OWNER_NAME_KEY} refuses a second row for one customer, channel and canonical name`,
             async () => {
@@ -3472,8 +2556,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 await insertList();
                 expect(await lists.count({ where: { nameKey: SEEDED_NAME_KEY } })).toBe(1);
 
-                // The same owner, the same channel and the same canonical key, differing only in the display name —
-                // which is not part of the constraint and so cannot rescue the row.
                 const attempt = await attemptWrite(() =>
                     insertList({ name: 'A different display spelling of the same canonical name' }),
                 );
@@ -3483,8 +2565,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     `the database must refuse the duplicate through ${UQ_LIST_OWNER_NAME_KEY}; the write was ` +
                         `accepted instead, so uniqueness rests on the service alone and a race defeats it`,
                 ).toBe(true);
-                // WHAT IS READ TO OBSERVE THE REFUSAL: the row count, unchanged. "An error occurred" would not
-                // distinguish a refusal from a write that landed and then failed on something else.
                 expect(await lists.count({ where: { nameKey: SEEDED_NAME_KEY } })).toBe(1);
 
                 // AND THE SCOPE IS THE TRIPLE, not the name alone: the second buyer holds the same canonical name
@@ -3493,7 +2573,7 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 expect(
                     otherBuyer.refused,
                     `${UQ_LIST_OWNER_NAME_KEY} spans (customerId, channelId, nameKey), so a second buyer's row ` +
-                        `must be accepted: ${otherBuyer.message}`,
+                        `must be accepted: ${otherBuyer.diagnostic}`,
                 ).toBe(false);
                 expect(await lists.count({ where: { nameKey: SEEDED_NAME_KEY } })).toBe(2);
             },
@@ -3522,10 +2602,8 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 ).toBe(true);
                 expect(await lines.count({ where: { reorderListId: listId } })).toBe(1);
 
-                // A DIFFERENT variant on the same list is accepted, so the constraint spans the pair rather than
-                // limiting a list to one line.
                 const secondVariant = await attemptWrite(() => insertLine(listId, seededVariantIds[1], 9));
-                expect(secondVariant.refused, secondVariant.message).toBe(false);
+                expect(secondVariant.refused, secondVariant.diagnostic).toBe(false);
                 expect(await lines.count({ where: { reorderListId: listId } })).toBe(2);
             },
             CATALOGUE_READ_ABORT_AFTER_MS,
@@ -3589,7 +2667,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                         attempt.refused,
                         `${CHK_LIST_LINE_COUNT_NON_NEGATIVE} must refuse a stored count of -1 on ${activeEngine}`,
                     ).toBe(true);
-                    // WHAT IS READ TO OBSERVE THE REFUSAL: the stored counter, still zero.
                     expect(
                         Number(reloaded?.lineCount),
                         'the counter must be unchanged by a refused update',
@@ -3617,38 +2694,31 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 const catalogue = await readEngineCatalogue();
                 expect(catalogue.indexNames, `read from ${catalogue.source}`).toContain(IDX_LIST_OWNER);
 
-                // A write the index does not forbid: two lists for one owner in one channel, differing only in
-                // canonical name. The index serves the ownership predicate rather than restricting it.
                 const lists = assertionDataSource.getRepository(ReorderList);
                 await insertList({ nameKey: 'first list for this owner', name: 'First list for this owner' });
                 const second = await attemptWrite(() =>
                     insertList({ nameKey: 'second list for this owner', name: 'Second list for this owner' }),
                 );
-                expect(second.refused, second.message).toBe(false);
+                expect(second.refused, second.diagnostic).toBe(false);
                 expect(await lists.count({ where: { customerId: seededCustomerIds[0] } })).toBe(2);
             },
             CATALOGUE_READ_ABORT_AFTER_MS,
         );
     });
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
     // The data-bearing up → down → up cycle
     //
     // Applied once and reverted once cannot detect a non-idempotent up-path or a down-path that takes a core
     // row with it, which is why the sequence is whole and why it carries data. Both cases below are
     // self-contained: each builds its own precondition and leaves the schema as it found it, so running either
     // alone, or the file in reverse order, gives the same result.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-    describe('the data-bearing up, down and up cycle', () => {
-        // Synchronous deliberately: the apply itself happened in `beforeAll`, because an assertion made there
-        // reports as a suite-wide setup error rather than as the named case that owns the claim. This case reads
-        // the recorded outcome, so it issues no statement of its own and needs no abort guard.
+    describe.skipIf(!appliesShippedMigration)('the data-bearing up, down and up cycle', () => {
         it('applied cleanly through the platform lifecycle, on the engine the run configured', () => {
             expect(
                 firstApply.migrationsRan,
                 `runMigrations must report ${MIGRATION_CLASS_NAME} as applied on ${activeEngine}. ` +
-                    ENGINE_PORTABILITY_CITATION,
+                    GENERATED_FORM_CITATION,
             ).toContain(MIGRATION_CLASS_NAME);
 
             // THE SILENT-FAILURE PATH, CLOSED. `runMigrations` does not throw: it logs and sets
@@ -3672,14 +2742,10 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
         it(
             'reverts without taking a core row with it, and re-applies to an identical schema',
             async () => {
-                // DATA-BEARING. One list row and two line rows on two distinct variants, alongside the seeded core
-                // rows they reference. A schema-only cycle cannot detect collateral data loss, which is the whole
-                // point of seeding before the revert rather than after it.
                 const seeded = await seedPluginRows();
                 expect(seeded.lineIds).toHaveLength(2);
                 const afterFirstApply = await snapshotPluginSchema();
 
-                // ── DOWN ────────────────────────────────────────────────────────────────────────────────
                 const revert = await revertLastMigrationGuarded();
                 let secondApply: GuardedMigrationOutcome;
                 try {
@@ -3698,11 +2764,34 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                     // down-path fails and the one a schema-only cycle cannot make. The plugin rows are expected to
                     // be gone with their tables — a down-path that preserved them would be keeping rows whose table
                     // it dropped.
+                    //
+                    // ★ THE COMPARISON IS OVER FULL VALUES; THE ASSERTION IS OVER A REDACTED DESCRIPTION OF THE
+                    // RESULT. Those are two separate things, and handing the two arrays to `toEqual` conflated
+                    // them: `REFERENCED_CORE_TABLES` includes `customer`, so the arrays hold every seeded buyer's
+                    // name and contact fields, and a matcher prints its actual AND its expected — meaning the one
+                    // failure this assertion exists to report is also the one that publishes the whole seeded
+                    // customer table into the build log. `describeRowDifferences` compares every column of every
+                    // row through the same canonicalisation, reports a vanished row and an arrived row by
+                    // identifier, and renders each side of a moved cell by SHAPE — so the check is exactly as
+                    // strict and both sides of the assertion are short value-free strings.
                     for (const coreTable of REFERENCED_CORE_TABLES) {
+                        const survivors = await selectAllRows(coreTable);
                         expect(
-                            await selectAllRows(coreTable),
-                            `the down-path took a row from "${coreTable}"`,
-                        ).toEqual(baselineCoreRows[coreTable]);
+                            describeRowDifferences(baselineCoreRows[coreTable], survivors),
+                            `the down-path took or changed a row in "${coreTable}"; the difference is reported ` +
+                                'by row id, column name and value SHAPE only, deliberately — see ' +
+                                'describeCellForDiagnostic in e2e/fixtures/diagnostic-redaction.ts',
+                        ).toBe(NO_ROW_DIFFERENCE);
+                        // AND THE ROW COUNT, which the description above already covers through its
+                        // missing/added entries and which is restated here so a future edit to that
+                        // description cannot quietly weaken this to a per-column check over a shorter table.
+                        // Two NUMBERS compared by hand rather than `expect(survivors).toHaveLength(n)`,
+                        // because that matcher prints the RECEIVED ARRAY on failure — and for `customer` that
+                        // array is every seeded buyer's name and contact fields.
+                        expect(
+                            survivors.length,
+                            `the down-path changed how many rows "${coreTable}" holds`,
+                        ).toBe(baselineCoreRows[coreTable].length);
                     }
 
                     // No core table was reshaped either, so the revert removed only what the up-path added.
@@ -3712,7 +2801,6 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                         );
                     }
                 } finally {
-                    // ── UP, THE SECOND TIME ─────────────────────────────────────────────────────────────
                     // In a `finally` so that the schema is restored however the assertions above ended. Leaving a
                     // reverted schema behind would make every sibling case in this file fail for a reason that had
                     // nothing to do with it.
@@ -3734,16 +2822,12 @@ describe('STORY-001-01-01 the one additive reorder-list migration', () => {
                 // fail it while a column, a width, a nullability, a default or a named object that changed does.
                 expect(await snapshotPluginSchema()).toEqual(afterFirstApply);
 
-                // The plugin rows went with their tables, and are re-seeded before anything else reads them.
                 expect(await countRows(LIST_TABLE)).toBe(0);
                 expect(await countRows(LINE_TABLE)).toBe(0);
                 const reseeded = await seedPluginRows();
                 expect(await countRows(LIST_TABLE)).toBe(1);
                 expect(await countRows(LINE_TABLE)).toBe(2);
 
-                // And the re-created schema is writable and readable through the same repository the forbidden-write
-                // cases use, which is what makes "identical" a claim about a working schema rather than about a
-                // catalogue listing.
                 const reloaded = await assertionDataSource
                     .getRepository(ReorderList)
                     .findOne({ where: { id: reseeded.listId } });

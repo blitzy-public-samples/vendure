@@ -24,98 +24,39 @@ import gql from 'graphql-tag';
 /* eslint-disable max-len */
 /**
  * @description
- * The Shop API extensions published by the ReorderPlugin: two read queries — a paginated collection
- * of lists, and a single list addressed by id whose nested `lines` field is paginated — six
- * mutations, the plugin-owned object types, enums, error results, inputs and result unions that
- * make up feature FEATURE-001-01 "Named Reorder Lists with Line Quantities".
+ * The Shop API extensions published by the ReorderPlugin, and the plugin's **published contract**: every
+ * other file in the plugin implements what the document below declares.
  *
- * This constant is the plugin's **published contract** and every other file in the plugin
- * implements what it declares. The document is transcribed from the feature contract's own SDL
- * block [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:L153-L315], which is the single
- * authority for this surface and outranks any story ticket that disagrees with it. Everything is
- * additive: no existing Shop API type, field, argument, return type or nullability is declared,
- * altered or shadowed, no custom permission is registered, and no Admin API extension is
- * published here — the Admin API and every dashboard surface belong to FEATURE-001-08.
+ * It is transcribed from the feature contract's own SDL block
+ * [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:L153-L315], which is the single authority for this
+ * surface and outranks any story ticket that disagrees with it. Everything is additive: no existing Shop API
+ * type, field, argument, return type or nullability is declared, altered or shadowed, no custom permission is
+ * registered, and no Admin API extension is published here — the Admin API and every dashboard surface belong
+ * to FEATURE-001-08. What the document declares, what it deliberately omits, and why, is stated inside it
+ * beside the declarations concerned.
  *
- * **Two omissions in the document below are as load-bearing as anything present in it, and both
- * are invisible in a diff.** They are required by the epic's ruling R10 and they are the
- * difference between a server that boots and one that does not:
+ * Two rules bind a CLIENT of this contract, and neither is visible in the SDL:
  *
- * 1. **No `options` argument is declared on any field** — neither on the root collection query nor
- *    on the nested `lines` field. The platform's list-options generator supplies it, because it
- *    walks every object type's fields rather than only the root query's and appends the argument to
- *    any field returning a `PaginatedList` implementor that does not already declare one
- *    [packages/core/src/api/config/generate-list-options.ts:L41-L48] and
- *    [packages/core/src/api/config/generate-list-options.ts:L87-L99]. Declaring both list types
- *    `implements PaginatedList` is what qualifies them
- *    [packages/core/src/api/config/generate-list-options.ts:L114-L117].
- * 2. **Neither of the two per-row options inputs the generator derives from the two list types is
- *    declared, and neither is named either.** A plugin's document is merged into the schema before
- *    any generator runs [packages/core/src/api/config/get-final-vendure-schema.ts:L99-L100], so a
- *    document that names one of those inputs without declaring it names a type that does not yet
- *    exist, the merge fails on the unknown type, and the server never starts. Ruling R10 permits
- *    two routes — declare nothing and let the generator add the argument, or declare the input bare
- *    and name it as the argument so the generator merges its own fields into that declaration
- *    [packages/core/src/api/config/generate-list-options.ts:L83]. This document needs no extra
- *    filter key, so it takes the first route and declares neither input.
- *
- * Note on the comments inside the document: the feature contract's own commentary spells those two
- * generated input type names out in prose. Here they are described rather than spelled, so that the
- * invariant "this document names no generated options input" is mechanically checkable over this
- * file rather than merely asserted. Nothing is lost by it — GraphQL discards `#` comments as lexical
- * trivia, so they form no part of the published contract, and the original wording remains available
- * at [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:L159], L161 and L238-L243.
- *
- * Two further shapes are deliberate and must not be "corrected". `viewerAccess` is object-typed
- * because a per-requester value must never become a generated sort or filter key — the generator
- * places every scalar and enum field of a row type into those inputs
- * [packages/core/src/api/config/generate-list-options.ts:L119-L135] and skips object-typed fields.
- * And `lineCount` is a real stored column on `reorder_list` for the same reason: it is offered as a
- * generated sort and filter key, so there must be a column behind it.
- *
- * Five properties of this contract are worth stating for a consumer, because each is a decision a
- * storefront will feel rather than an implementation detail:
- *
- * - **`includeShared` is accepted at both values and, for now, both return the same page.** No grant
- *   row can exist until FEATURE-001-06 creates the table, so the set the non-default value asks for
- *   is empty by construction rather than withheld. The argument is published from the outset so that
- *   feature adds behaviour rather than redefining an already-shipped operation, and it is never
- *   refused.
- * - **The single-list read resolves to `null` rather than to an error result for every inaccessible
- *   case** — absent, another customer's, another channel's, not shared, or unauthenticated. Under the
- *   default id strategy identifiers are sequential and therefore guessable, so one indistinguishable
- *   `null` is what keeps the read non-enumerable. `ReorderListNotFoundError` plays that normalising
- *   role only where a *mutation* must report a reason.
- * - **Neither payload carries a price, a currency or a stock field.** A saved line is a reference,
- *   valued when it is read rather than when it is written; price and availability delta surfacing
- *   belongs to FEATURE-001-03.
- * - **`deleteReorderList` requires one field alias to be selected in full, and the requirement is a
- *   validation rule rather than a style preference.** Its success member is the platform's own
- *   `DeletionResponse`, whose `message` is a nullable `String`
- *   [packages/core/src/api/schema/common/common-types.graphql:L64-L67], while every error result
- *   below declares `message: String!`. A document that selects `message` on **both** members of
- *   `DeleteReorderListResult` under one response key is therefore INVALID: GraphQL's
- *   overlapping-fields rule compares response shapes without unwrapping nullability, and inline
- *   fragments on mutually exclusive types relax only the name-and-arguments half of that check, so
- *   a Non-Null `String!` paired with a nullable `String` conflicts outright
- *   [node_modules/graphql/validation/rules/OverlappingFieldsCanBeMergedRule.js:doTypesConflict].
- *   The request is then refused at validation time with `GRAPHQL_VALIDATION_FAILED` before any
- *   resolver runs. Alias one of the two — the plugin's own shared documents alias the success
- *   branch, `... on DeletionResponse { result deletionMessage: message }`
- *   [packages/reorder-plugin/e2e/graphql/reorder-definitions.ts] — and select `message` unaliased
- *   on the error branch so one error shape serves every operation that returns it. Neither
- *   nullability may be "corrected" instead: `DeletionResponse` is a published platform type reused
- *   verbatim here by ruling, and `ErrorResult` fixes `message: String!` on every implementor.
+ * - **`deleteReorderList` requires one of its two `message` selections to be aliased.** Its success member is
+ *   the platform's own `DeletionResponse`, whose `message` is a nullable `String`
+ *   [packages/core/src/api/schema/common/common-types.graphql:L64-L67], while every error result below
+ *   declares `message: String!`. Selecting `message` unaliased on BOTH members under one response key is
+ *   invalid: GraphQL's overlapping-fields rule compares response shapes without unwrapping nullability, and
+ *   inline fragments on mutually exclusive types relax only the name-and-arguments half of that check
+ *   [node_modules/graphql/validation/rules/OverlappingFieldsCanBeMergedRule.js:doTypesConflict], so the
+ *   request is refused with `GRAPHQL_VALIDATION_FAILED` before any resolver runs. Alias one branch — the
+ *   plugin's own shared documents alias the success one
+ *   [packages/reorder-plugin/e2e/graphql/reorder-definitions.ts]. Neither nullability may be "corrected"
+ *   instead: `DeletionResponse` is a published platform type reused verbatim by ruling, and `ErrorResult`
+ *   fixes `message: String!` on every implementor.
  * - **Keep a `default` branch when switching on `ErrorCode`.** That enum is generated from every type
- *   implementing `ErrorResult` [packages/core/src/api/config/generate-error-code-enum.ts:L11-L19], so
- *   the four members these error results add are a widening that later features widen further. An
- *   exhaustive switch with no default branch stops compiling as soon as it does.
+ *   implementing `ErrorResult` [packages/core/src/api/config/generate-error-code-enum.ts:L11-L19], so the four
+ *   members these error results add are a widening that later features widen further.
  *
  * The `@since` value below is a **derivation, not a quotation**: it applies the contribution guide's
  * next-minor rule [CONTRIBUTING.md:§New features] to this checkout's declared version 3.7.0
- * [packages/core/package.json:L2-L3]. The guide's own example names a different version and the guide never
- * states `3.8.0`, so the value must never be presented as quoted from it; the authoritative tickets, where
- * the same derived value appears, present it the same way.
+ * [packages/core/package.json:L2-L3]. The guide never states `3.8.0`, so the value must not be presented as
+ * quoted from it.
  *
  * @since 3.8.0
  */
@@ -189,7 +130,7 @@ export const shopApiExtensions = gql`
         id: ID!
         createdAt: DateTime!
         updatedAt: DateTime!
-        "NULLABLE, and that is a contract rather than an oversight: a line whose variant has been soft-deleted or disabled since it was saved is RETAINED, and a non-null field would have to expose a withdrawn catalogue object or null-bubble the whole line out of the page. Null means the variant is no longer resolvable in the active channel."
+        "NULLABLE, and that is a contract rather than an oversight. Null means exactly one thing: the variant is no longer RESOLVABLE in the active channel — it has been soft-deleted, it belongs to another channel, or the stored identifier answers to nothing. The line itself is RETAINED in every one of those cases, because a non-null field would have to expose a withdrawn catalogue object or null-bubble the whole line out of its page. A variant that is merely DISABLED is NOT one of those cases and resolves normally, carrying enabled: false for a client to read: a saved list records intent rather than availability, so this payload reports the variant as the catalogue has it and adds no availability field of its own."
         productVariant: ProductVariant
         "NON-NULL always. The stored identifier survives the variant becoming unresolvable, which is what lets a buyer see and remove the stale line."
         productVariantId: ID!

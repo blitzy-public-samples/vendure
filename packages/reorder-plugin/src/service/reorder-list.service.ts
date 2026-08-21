@@ -1,18 +1,9 @@
 /*
- * -------------------------------------------------------------------------------------------------------
  * The reorder list service — provenance, and the one property that makes it correct.
- * -------------------------------------------------------------------------------------------------------
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing in this file is, or derives from, a user-specified rule. Every constraint stated below traces to
- * FEATURE-001-01 (sections 2.5 to 2.12), to one of STORY-001-01-01 through STORY-001-01-04, to an EPIC-001
- * settled ruling (R1, R2, R3, R8, R13, R14, R17, R19, R22), or to a cited line of this repository, and is
- * attributed as such wherever it is stated. The absence of a rules document has not been treated as licence
- * to lower the bar anywhere in this file.
  *
  * WHAT THIS FILE IS. It holds *every* read and write for `reorder_list` and `reorder_list_line`, which is a
  * deliberate structural choice rather than an accident of layering: the ownership rule below then has
- * exactly one implementation to review, and a second code path cannot disagree with it.
+ * exactly one implementation, so no second code path can disagree with it.
  *
  * THE ONE PROPERTY THAT MAKES IT CORRECT. `@Allow(Permission.Owner)` on the resolvers is NOT the access
  * control — the ownership-and-channel predicate in this file is. `Permission.Owner` is declared
@@ -65,7 +56,6 @@
  * names a different version. This checkout declares 3.7.0, so the next minor derives to 3.8.0 — computed
  * from that declared version plus the guide's rule, and never a quotation from the guide, which does not
  * state the value. The authoritative tickets record the same derivation.
- * -------------------------------------------------------------------------------------------------------
  */
 
 import { Inject, Injectable } from '@nestjs/common';
@@ -202,8 +192,7 @@ const ID_VARIABLE = 'id';
  * in-process WebAssembly engine the test harness ships serves a single connection, so two transactions there
  * cannot interleave and a count-and-insert inside one transaction is sufficient on its own. Asking that
  * driver for a lock raises rather than degrades, so the branch is required and is not a micro-optimisation.
- */
-/*
+ *
  * Exported so the unit spec's lock-order replay reads the SAME list rather than a copy of it: the model has
  * to agree with the implementation about which engines have an order to impose, and a second literal would
  * be one more place to keep in step. It is not part of the package's published surface, this module being
@@ -1066,6 +1055,17 @@ export type RemoveReorderListLineResult =
 interface ReorderListOwnerScope {
     customerId: ID;
     channelId: ID;
+    /**
+     * The authenticated user the other two were resolved under.
+     *
+     * It is carried but **never** used as a query predicate — no plugin table holds a user id, and the row
+     * scope is the customer and the channel. What it exists for is provenance: it says *whose session*
+     * established this scope, so a scope recorded against a returned row can be checked against the session
+     * asking about that row later. Without it, "an active user exists" is all a later check could establish,
+     * and two different buyers in one channel are indistinguishable to it. See
+     * {@link ReorderListService.ownerScopeForRecordedRow}.
+     */
+    activeUserId: ID;
 }
 
 /**
@@ -1165,7 +1165,6 @@ export class ReorderListService {
     ) {}
 
     /*
-     * ─────────────────────────────────────────────────────────────────────────────────────────────────────
      * THE FIVE BOUNDS BELOW READ THE INJECTED OPTIONS DIRECTLY, AND NONE OF THEM RESTATES A DEFAULT.
      *
      * The provider supplies {@link ResolvedReorderPluginOptions}: every key present, validated in
@@ -1174,7 +1173,6 @@ export class ReorderListService {
      * plugin already declares — unreachable through `ReorderPlugin.init()`, and therefore untested and free
      * to drift away from the value the server is actually running on. The named accessors remain, because
      * each one records WHERE its bound bites, which is the fact a reader of a call site needs.
-     * ─────────────────────────────────────────────────────────────────────────────────────────────────────
      */
 
     /**
@@ -1245,9 +1243,7 @@ export class ReorderListService {
             : 'pessimistic_read';
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // The ownership-and-channel predicate. This is the access control for all eight operations.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * Resolves the customer-and-channel scope every operation is evaluated against, and refuses a request
@@ -1323,7 +1319,12 @@ export class ReorderListService {
             // problem, and carrying no identifier so nothing about the session is echoed to the caller.
             throw withoutStackFrames(new InternalServerError(NO_CUSTOMER_FOR_USER_MESSAGE));
         }
-        return this.rememberOwnerScope(ctx, { customerId: customer.id, channelId: ctx.channelId });
+        return this.rememberOwnerScope(ctx, {
+            customerId: customer.id,
+            channelId: ctx.channelId,
+            // `requireActiveUser` above has already refused an absent session, so this is non-null here.
+            activeUserId: ctx.activeUserId as ID,
+        });
     }
 
     /**
@@ -1394,19 +1395,19 @@ export class ReorderListService {
      * user is addressed through the `customer` table's own foreign-key column rather than through the `user`
      * relation, so the statement reads one table. That matters because the lock this method takes is the
      * unqualified form: `FOR UPDATE` with no `OF` clause locks a row of **every** table the statement reads, so
-     * an earlier revision that wrote `.innerJoin('customer.user', 'user')` and filtered on `user.id` locked the
-     * `User` row as well as the `Customer` row — a row this feature never writes, shared with authentication
-     * and with every other feature that touches a session, held for the whole of a list creation. The bound
-     * requires a lock on the owning customer and nothing more, and one table in the statement is the portable
-     * way to say so: `FOR UPDATE OF customer` would express it on PostgreSQL and is not accepted by the MySQL
-     * family in the same form, whereas a single-table statement needs no dialect-specific clause and TypeORM's
-     * own `pessimistic_write` emits exactly it on all three locking engines.
+     * joining `customer.user` and filtering on `user.id` would lock the `User` row as well as the `Customer`
+     * row — a row this feature never writes, shared with authentication and with every other feature that
+     * touches a session, held for the whole of a list creation. The bound requires a lock on the owning
+     * customer and nothing more, and one table in the statement is the portable way to say so:
+     * `FOR UPDATE OF customer` would express it on PostgreSQL and is not accepted by the MySQL family in the
+     * same form, whereas a single-table statement needs no dialect-specific clause and TypeORM's own
+     * `pessimistic_write` emits exactly it on all three locking engines.
      *
-     * Removing the join also removes the reason the join had to be written by hand. A find-options relation
-     * condition (`where: { user: { id } }`) is realised as a LEFT join, and PostgreSQL refuses `FOR UPDATE` on
-     * the nullable side of an outer join — so the *relation* could not be filtered on at all under a lock
-     * without spelling the join explicitly. The foreign-key column sidesteps both: no join to write, no
-     * nullable side to refuse. The column name is read from the relation's own metadata rather than spelled as
+     * Addressing the column also removes the reason a join would have to be written by hand. A find-options
+     * relation condition (`where: { user: { id } }`) is realised as a LEFT join, and PostgreSQL refuses
+     * `FOR UPDATE` on the nullable side of an outer join — so the *relation* cannot be filtered on at all
+     * under a lock without spelling the join explicitly. The foreign-key column sidesteps both: no join to
+     * write, no nullable side to refuse. The column name is read from the relation's own metadata rather than spelled as
      * a literal, because it is a join column the entity declares no property for, so a literal here would be
      * the one identifier in this file that could drift from the schema unnoticed.
      *
@@ -1450,7 +1451,12 @@ export class ReorderListService {
         if (!customer) {
             throw withoutStackFrames(new InternalServerError(NO_CUSTOMER_FOR_USER_MESSAGE));
         }
-        return { customerId: customer.id, channelId: ctx.channelId };
+        return {
+            customerId: customer.id,
+            channelId: ctx.channelId,
+            // `requireActiveUser` above has already refused an absent session, so this is non-null here.
+            activeUserId: ctx.activeUserId as ID,
+        };
     }
 
     /**
@@ -1566,12 +1572,11 @@ export class ReorderListService {
      * removed under it, the insert path is what the call needs — but the transaction holds a lock on a line row
      * by then, and taking the parent while a child is held is the one ordering this rule forbids. So the attempt
      * ends, every lock it took is released with it, and the bounded retry reaches the insert branch holding
-     * nothing. An earlier revision instead took ONE exclusive lock ahead of both branches, which cannot cycle
-     * either but serialises every add to a list — including adds of unrelated variants — and closes the very
-     * windows the atomic increment and the conditional claim exist to defend. A revision after that took this
-     * shared lock on the accumulation branch and a locking read on retries, which reintroduced the inversion by
-     * another route: a savepoint retry keeps both, so the retry asked for the parent exclusively while holding a
-     * shared lock on it and a lock on a child row.
+     * nothing. Two alternatives are ruled out rather than untried. ONE exclusive lock ahead of both branches
+     * cannot cycle either, but it serialises every add to a list — including adds of unrelated variants — and
+     * closes the very windows the atomic increment and the conditional claim exist to defend. Retrying under a
+     * locking read reintroduces the inversion by another route: a savepoint retry keeps both locks, so the
+     * retry would ask for the parent exclusively while holding a shared lock on it and a lock on a child row.
      *
      * The predicate, the single-statement shape and the SQLite-family skip are all exactly as
      * {@link ReorderListService.findOwnedListForUpdate} describes them.
@@ -1637,9 +1642,64 @@ export class ReorderListService {
         return list;
     }
 
-    // ---------------------------------------------------------------------------------------------------
+    /**
+     * Reads back the scope a row was resolved under and answers it only where it still describes THIS request,
+     * refusing outright where it does not.
+     *
+     * **It is the inverse of {@link ReorderListService.recordOwnerScope}, and it is the single implementation of
+     * that check.** Two members need it — `getViewerAccess`, which must *describe* a row's provenance, and
+     * `reconcileLineCount`, which must *scope a write* by it — and both are reachable from the api layer with a
+     * row the caller supplies. A second copy of the derivation would be a second thing to keep correct, and the
+     * two disagreeing is exactly the shape in which one of them stops checking.
+     *
+     * **Six conjuncts, each ruling out a different way a row can arrive here unvouched for.** The scope must
+     * have been recorded at all; the request must carry an authenticated session; the recorded customer and
+     * channel must still match the row's own columns, so provenance cannot be attached to a row it does not
+     * describe; the recorded channel must be the request's active channel; and **the recorded session must be
+     * this request's session**.
+     *
+     * ★ THE LAST CONJUNCT IS THE ONE THAT IS EASY TO LEAVE OUT, AND IT IS WHAT MAKES THE CHECK ABOUT *WHO IS
+     * ASKING*. Without it the strongest statement available is "some user is authenticated and the row was read
+     * in this channel" — which two different buyers in one channel both satisfy. A row read for buyer A, held
+     * beyond its request by a cache or by an integration and then passed to a member here during buyer B's
+     * authenticated request in the same channel, would pass every other conjunct: the row's columns agree with
+     * the recorded scope because they describe A, and the channel agrees because both are in it. The write
+     * would then be correctly scoped **to A** and issued **on B's call**. Comparing the recorded session to
+     * the asking one closes that, and it is the only conjunct that can: the row itself carries no evidence of
+     * who read it.
+     *
+     * It issues **no statement**: the answer is one map lookup and six comparisons over values that are already
+     * in memory — the recorded scope, the row's own columns and the request context.
+     *
+     * @param ctx - The request the recorded scope must still describe.
+     * @param list - The row whose provenance is being read back, and the key it was recorded against.
+     * @param member - The member asking, named in the server-side diagnostic so a refusal says which path
+     * received the unvouched-for row. It reaches the log only; the caller still sees the generic message.
+     * @throws The generic internal failure — never a caller-shaped error — because reaching the refusal means a
+     * row bypassed the ownership predicate, which no caller-reachable path produces.
+     */
+    private ownerScopeForRecordedRow(
+        ctx: RequestContext,
+        list: ReorderList,
+        member: 'viewerAccess' | 'reconcileLineCount',
+    ): ReorderListOwnerScope {
+        const scope = RESOLVED_OWNER_SCOPES.get(list);
+        const derivedFromThisRequest =
+            scope !== undefined &&
+            ctx.activeUserId != null &&
+            sameId(scope.activeUserId, ctx.activeUserId) &&
+            sameId(scope.customerId, list.customerId) &&
+            sameId(scope.channelId, list.channelId) &&
+            sameId(scope.channelId, ctx.channelId);
+        if (!derivedFromThisRequest || scope === undefined) {
+            throw reportReorderListInternalFailure(
+                `A reorder list reached ${member} without owner provenance matching the request`,
+            );
+        }
+        return scope;
+    }
+
     // Reads. A failed guard answers with an empty page or null, never with an error.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * @description
@@ -1797,9 +1857,7 @@ export class ReorderListService {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Support members for the entity field resolvers. Each is resolved once per page, never once per entry.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * @description
@@ -2162,6 +2220,26 @@ export class ReorderListService {
      * finds the guard value already changed and affects no row. A `lineCount` that a competing writer moved in
      * the meantime is therefore left alone rather than clobbered with a total observed before that write.
      *
+     * **The statement carries the ownership predicate, exactly as every other statement this service issues
+     * against a plugin table does.** Its `WHERE` names four things: the row, the stale counter it expects to
+     * find, the acting customer and the active channel. The last two are not redundant with the read that
+     * produced the row. This member is `public` because the api layer calls it, so the caller's provenance is
+     * an argument rather than an invariant of this file, and a predicate naming the identifier alone would
+     * write to whichever row bore that identifier — identifiers are sequential under the default id strategy,
+     * so "whichever row" is a neighbouring buyer's list. Keeping the pair on the statement means the write is
+     * scoped by the database rather than by the caller having been careful, which is the same rule
+     * [FEATURE-001-01:§2.6.1.1] applies to all eight operations.
+     *
+     * **And the scope is taken from the row's recorded provenance, never from the request alone.** The row
+     * arrives carrying the scope it was actually read under ({@link RESOLVED_OWNER_SCOPES}), and that
+     * recording — not `ctx` — is what the predicate is built from, after being checked against the row's own
+     * `customerId` and `channelId` and against the request's active channel and session. A row with no
+     * provenance, or with provenance that disagrees, is refused: nothing is written, no statement is issued,
+     * and the generic internal failure is raised. That is the same fail-closed derivation
+     * {@link ReorderListService.getViewerAccess} performs, for the same reason — reaching it means a list
+     * arrived here without passing the predicate, which is a defect in this service rather than anything a
+     * caller did, and answering it by writing anyway is the one response that cannot be justified.
+     *
      * **What keeps the written value non-negative, and why it is not the check constraint.**
      * `CHK_reorder_list_line_count_non_negative` is real defence in depth on PostgreSQL and the SQLite family
      * and is simply *absent* on MySQL and MariaDB, because TypeORM skips check constraints silently for that
@@ -2174,22 +2252,36 @@ export class ReorderListService {
      * instead, so a defective caller cannot put in the column a value that only two of the four engines would
      * have rejected.
      *
-     * @param ctx - The request context.
-     * @param listId - The list whose counter is being reconciled.
+     * @param ctx - The request context whose active channel and authenticated session the row's recorded
+     * scope is checked against, so provenance from one request cannot scope another's write.
+     * @param list - The list whose counter is being reconciled. The **row object** rather than its identifier,
+     * because the object is what carries the scope the row was read under, and that scope is what the
+     * statement's ownership conjuncts are built from.
      * @param storedLineCount - The counter value that arrived with the row, and the guard the update compares.
      * @param observedTotal - The line total this request actually observed. A value that is not a non-negative
      * safe integer is a defect in the caller, and is refused rather than written.
      * @returns The value the caller should report: the observed total when the two disagreed, and the stored
      * value when they agreed or when the observed total was refused.
+     * @throws The generic internal failure when the row carries no owner provenance, or provenance that
+     * disagrees with the request — no statement is issued on that path.
      *
      * @since 3.8.0
      */
     async reconcileLineCount(
         ctx: RequestContext,
-        listId: ID,
+        list: ReorderList,
         storedLineCount: number,
         observedTotal: number,
     ): Promise<number> {
+        // THE SCOPE THE WRITE WILL BE MADE UNDER, derived from the row's own recorded provenance and refused
+        // rather than assumed. See this member's JSDoc, and `getViewerAccess` for the same derivation.
+        //
+        // It is derived FIRST, before the two values are even compared, so that "this member does not act on a
+        // row it cannot vouch for" holds without qualification rather than only on the branch that happens to
+        // write. It costs no statement — a map lookup and comparisons over already-loaded values — so the
+        // zero-statement property of the agreeing path is untouched.
+        const scope = this.ownerScopeForRecordedRow(ctx, list, 'reconcileLineCount');
+        const listId = list.id;
         if (storedLineCount === observedTotal) {
             // The overwhelmingly common path: zero statements.
             return storedLineCount;
@@ -2219,16 +2311,25 @@ export class ReorderListService {
                 .set({ lineCount: observedTotal })
                 .where('id = :id', { id: listId })
                 .andWhere('lineCount = :storedLineCount', { storedLineCount })
+                // THE OWNERSHIP CONJUNCTS, ON THE STATEMENT THAT WRITES. Bound under names of their own so a
+                // reader — and the assertion that checks this shape — follows the predicate to the value rather
+                // than finding the value in the parameter bag and inferring the predicate.
+                .andWhere('customerId = :ownerCustomerId', { ownerCustomerId: scope.customerId })
+                .andWhere('channelId = :ownerChannelId', { ownerChannelId: scope.channelId })
                 .execute();
         } catch (err: unknown) {
             return this.rethrowSanitisedFailure(err, 'reconcileLineCount');
         }
         if (!result.affected) {
-            // A competing writer moved the counter between the read and this statement. The observed total is
-            // still the truthful answer for what this request saw, and the writer's own value now stands in
-            // the row, so nothing is retried and nothing is overwritten.
+            // The guarded row did not match. Either a competing writer moved the counter between the read and
+            // this statement, or the row is no longer reachable under this owner scope at all — a list deleted
+            // in the same window matches neither guard. Both are answered the same way and neither is retried:
+            // the observed total is still the truthful answer for what this request saw, and whatever now
+            // stands in the row was put there by something with a better claim than a repair.
             Logger.debug(
-                `Skipped a lineCount repair on reorder list ${String(listId)} because the stored value changed concurrently`,
+                `Skipped a lineCount repair on reorder list ${String(listId)} because the guarded row no ` +
+                    `longer matched — its stored value changed concurrently, or the row is no longer within ` +
+                    `the owner scope it was read under`,
                 loggerCtx,
             );
         }
@@ -2249,9 +2350,9 @@ export class ReorderListService {
      * `customerId` and `channelId`, and the request's own active channel and session.
      *
      * **It still issues no statement, which is the point of deriving it this way.** The comparison reads a map
-     * entry and four already-loaded values; nothing is queried. A per-entry access check that issued a statement
-     * would make the request's statement count grow with the page size while every published bound stayed
-     * satisfied, which is the shape this whole family of members exists to avoid.
+     * entry and a handful of already-loaded values; nothing is queried. A per-entry access check that issued a
+     * statement would make the request's statement count grow with the page size while every published bound
+     * stayed satisfied, which is the shape this whole family of members exists to avoid.
      *
      * **A row it cannot vouch for is refused rather than described.** The published enum offers `OWNED` and
      * `SHARED`, and neither is an honest answer for a row whose provenance is missing or disagrees with the
@@ -2271,24 +2372,13 @@ export class ReorderListService {
      * @since 3.8.0
      */
     getViewerAccess(ctx: RequestContext, list: ReorderList): ReorderListViewerAccess {
-        const scope = RESOLVED_OWNER_SCOPES.get(list);
-        const derivedFromThisRequest =
-            scope !== undefined &&
-            ctx.activeUserId != null &&
-            sameId(scope.customerId, list.customerId) &&
-            sameId(scope.channelId, list.channelId) &&
-            sameId(scope.channelId, ctx.channelId);
-        if (!derivedFromThisRequest) {
-            throw reportReorderListInternalFailure(
-                'A reorder list reached viewerAccess without owner provenance matching the request',
-            );
-        }
+        // The derivation itself lives in one place, because the counter repair needs the identical check to
+        // scope its write. See {@link ReorderListService.ownerScopeForRecordedRow}.
+        this.ownerScopeForRecordedRow(ctx, list, 'viewerAccess');
         return { access: 'OWNED', grantedCapabilities: [] };
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Deterministic ordering. The identifier tie-break is APPENDED to a caller's sort, never substituted.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * Builds the ordering the collection read hands to the builder as its `orderBy` extension, which is the
@@ -2345,8 +2435,9 @@ export class ReorderListService {
      * Reduces a caller's sort parameter to the keys that actually order something, as a NEW object, and
      * answers `undefined` where nothing is left.
      *
-     * **Both halves of this are corrections to a real defect rather than tidying, and both come from the same
-     * property of the generated input: every position in it is nullable.**
+     * **Both halves below follow from one property of the generated input: every position in it is nullable.
+     * A null direction must therefore be removed both to keep the `ORDER BY` valid and to keep an appended
+     * identifier tie-break in final position.**
      *
      * The first half is validity. A direction of `null` is not "no direction" to the platform's sort parser —
      * it copies every entry it is given straight into the ORM's order map, so a `null` direction becomes a
@@ -2376,9 +2467,7 @@ export class ReorderListService {
         return ordering.length ? (Object.fromEntries(ordering) as ListQueryOptions<T>['sort']) : undefined;
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Writes over the list itself. A failed guard propagates, so an unauthenticated write is FORBIDDEN.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * @description
@@ -2720,10 +2809,6 @@ export class ReorderListService {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------
-    // Writes over a list's lines.
-    // ---------------------------------------------------------------------------------------------------
-
     /**
      * @description
      * Adds a variant to a list at an integer quantity, or accumulates onto the line that variant already has.
@@ -2823,10 +2908,9 @@ export class ReorderListService {
     /**
      * One attempt at {@link ReorderListService.addItemToReorderList}, inside one transaction.
      *
-     * The three mandated steps are unchanged and in their fixed order — resolve the existing line, validate
-     * the RESULTING quantity, and only then consult the line bound — and each of the three concurrent states
-     * the straight-line version could not distinguish is now resolved explicitly rather than collapsed into
-     * whichever outcome happened to be nearest.
+     * The three mandated steps run in their fixed order — resolve the existing line, validate the RESULTING
+     * quantity, and only then consult the line bound — and each of the three concurrent states the capacity
+     * claim can report is resolved explicitly rather than collapsed into whichever outcome is nearest.
      *
      * **The lock order is satisfied per branch, and which lock each branch takes follows from what it writes.**
      * FEATURE-001-01 §5's lock-ordering item fixes one rule for the whole plugin — a transaction touching both
@@ -2849,13 +2933,13 @@ export class ReorderListService {
      * The branch is decided by a NON-LOCKING read of the line, which joins no wait-for graph and so cannot
      * invert anything by preceding a lock. It is correct on every engine because each attempt runs in its own
      * fresh transaction and therefore its own snapshot — see the retry loop in
-     * {@link ReorderListService.addItemToReorderList} for why that is the resolver's doing and what it replaced.
+     * {@link ReorderListService.addItemToReorderList} for why the resolver, and not this method, owns that.
      * The variant is resolved before either branch takes or writes anything on the parent, which is the same
      * ticket item's other sentence: "no transaction holds the parent row across a call it does not control".
      *
      * **The one crossing between the branches goes through a fresh transaction, not through a fall-through.**
      * Where the increment matches nothing because a concurrent request removed the line, the insert path is what
-     * this call now needs — but by then this attempt holds a lock on a LINE row (the increment's own, and the
+     * this call needs — but by then this attempt holds a lock on a LINE row (the increment's own, and the
      * current read that established the state), and the insert path's capacity claim would take the parent while
      * that is held. That is the one ordering the rule forbids, so the attempt is abandoned instead and the
      * bounded retry reaches the insert branch in a transaction holding nothing.
@@ -2910,16 +2994,17 @@ export class ReorderListService {
         // A PLAIN READ IS ALSO ENOUGH ON EVERY ENGINE, and that is a consequence of the transaction boundary
         // rather than of this statement. Each attempt runs in a transaction of its own, so its snapshot is taken
         // here and reflects everything committed before it; there is no earlier attempt whose view this one could
-        // inherit. An earlier revision took a LOCKING read on retries precisely because there was — the retry ran
-        // as a savepoint inside the resolver's transaction and kept its original REPEATABLE READ snapshot — and
-        // that lock was itself the defect: it put a lock on a LINE row ahead of the insert branch's parent
-        // statement, inverting the one ordering the plugin fixes.
+        // inherit. A LOCKING read here would be needed only if a retry ran as a savepoint inside the resolver's
+        // transaction, keeping its original REPEATABLE READ snapshot — and it would then be the defect, putting
+        // a lock on a LINE row ahead of the insert branch's parent statement and inverting the one ordering the
+        // plugin fixes.
         //
-        // An even earlier revision took ONE exclusive parent lock here for both branches. It ordered the locks
-        // correctly and cost far too much for it: every add to a list serialised behind every other, including
-        // adds of unrelated variants and accumulations onto an existing line, and the serialisation hid the
-        // very defects the atomic statements below exist to prevent — a read-compute-save increment and a
-        // count-then-insert capacity check both pass a race whose contention window a preceding lock has closed.
+        // ONE exclusive parent lock here for both branches is the other rejected shape. It orders the locks
+        // correctly and costs far too much for it: every add to a list would serialise behind every other,
+        // including adds of unrelated variants and accumulations onto an existing line, and the serialisation
+        // would hide the very defects the atomic statements below exist to prevent — a read-compute-save
+        // increment and a count-then-insert capacity check both pass a race whose contention window a preceding
+        // lock has closed.
         const existingLine = await this.findLineForVariant(ctx, list.id, input.productVariantId, false);
 
         // Step two: validate, and BOTH checks are needed rather than one being a superset of the other.
@@ -2929,11 +3014,32 @@ export class ReorderListService {
         // line would hold and not to what was asked for: an add of six onto a line already holding six is
         // refused at a maximum of ten even though the increment alone is legal.
         this.validateQuantity(input.quantity);
+
+        // THE STORED BASE IS CLASSIFIED BEFORE ANY TOTAL IS COMPUTED FROM IT, and the order is the whole
+        // point. The resulting-quantity check below is arithmetic over `existingLine.quantity`, so a base the
+        // column may not hold poisons its verdict: a stored `-5` plus a perfectly legal increment of `2` is
+        // `-3`, which that check refuses as a malformed request and reports to the buyer as
+        // `UserInputError`. The buyer did not write that row and can do nothing about it, and the report
+        // names the one party that is not at fault while the actual data defect goes unlogged — visible to
+        // nobody, because a user input error is the least investigated outcome this service produces.
+        // Classifying here catches EVERY non-positive base, where the statement-level floor further down
+        // only catches the ones whose sum happens to come out positive.
+        //
+        // This does not make that floor or its `'line-invalid'` classification redundant. This is a read, so
+        // the row can still be corrupted between here and the statement; the floor is what refuses to write
+        // in that window, and its classifier is what reports it. Two guards, one race apart.
+        if (existingLine && existingLine.quantity <= 0) {
+            throw reportReorderListInternalFailure(
+                `Declined to accumulate onto reorder list line ${String(existingLine.id)} because its ` +
+                    'stored quantity is not positive',
+            );
+        }
+
         this.validateQuantity((existingLine?.quantity ?? 0) + input.quantity);
 
         if (existingLine) {
             // THE PARENT FIRST, IN SHARE MODE, BECAUSE THIS BRANCH DOES TOUCH THE PARENT ROW — inside its own
-            // child statement, which is exactly why an earlier revision missed it.
+            // child statement, which is what makes the dependency easy to miss.
             //
             // The increment below carries its ownership predicate as a correlated `EXISTS` over `reorder_list`,
             // because a line row stores neither a customer nor a channel and the affected-row count has to be
@@ -2943,9 +3049,9 @@ export class ReorderListService {
             // then parent, whatever its author intended, and `removeReorderListLine` and `deleteReorderList`
             // take the same two rows parent then child. That is an inversion, and an inversion is what a
             // deadlock is: the engine resolves it by killing one of the two, which a buyer sees as an operation
-            // that failed for no reason they can act on. An earlier revision reasoned that this branch "writes
-            // only the child, so the ordering rule does not reach it" — true of what it WRITES and false of
-            // what it LOCKS, and the rule is about locks.
+            // that failed for no reason they can act on. Reasoning that this branch "writes only the child, so
+            // the ordering rule does not reach it" is true of what it WRITES and false of what it LOCKS, and the
+            // rule is about locks.
             //
             // SHARED rather than exclusive, because this transaction writes no column of `reorder_list`: an
             // accumulation changes one line's quantity and leaves `lineCount` untouched. Two concurrent
@@ -2993,11 +3099,26 @@ export class ReorderListService {
                     }),
                 );
             }
+            if (accumulation === 'line-invalid') {
+                // The addressed line is present and owned, but its stored quantity is not positive — a state
+                // `CHK_reorder_list_line_quantity_positive` would make unrepresentable, and which TypeORM does
+                // not create on MySQL or MariaDB (conflict C-E). Something outside this service put it there,
+                // so there is nothing the caller could have sent differently and nothing to normalise into a
+                // domain outcome: `UserInputError` would blame the request for data it did not write, and
+                // not-found would deny a row that is demonstrably present. It is reported as what it is, an
+                // internal data defect, which is also the only answer that leaves the row untouched — the
+                // increment already declined to compound it, and this path adds no repair of its own because
+                // guessing the intended quantity is not something this service can do correctly.
+                throw reportReorderListInternalFailure(
+                    `Declined to accumulate onto reorder list line ${String(existingLine.id)} because its ` +
+                        'stored quantity is not positive',
+                );
+            }
             if (accumulation === 'list-gone') {
-                // The addressed line is still there and within the maximum, so the only conjunct left to have
-                // refused the increment is the ownership one: the list was deleted or moved out of the
-                // caller's scope between this attempt resolving it and the increment. Normalised to the same
-                // not-found every inaccessible case produces.
+                // The addressed line is still there, within the maximum and above the floor, so the only
+                // conjunct left to have refused the increment is the ownership one: the list was deleted or
+                // moved out of the caller's scope between this attempt resolving it and the increment.
+                // Normalised to the same not-found every inaccessible case produces.
                 return new ReorderListNotFoundError();
             }
             if (accumulation === 'line-replaced') {
@@ -3014,7 +3135,7 @@ export class ReorderListService {
             // not "the list is gone" — it is that this variant is no longer on the list, which is precisely the
             // state the insert path below exists for.
             //
-            // This attempt does NOT fall through to it, and that is a correction rather than a preference. By
+            // This attempt does NOT fall through to it, and the ordering rule is why. By
             // now it holds a lock on a LINE row — the increment examined one, and the current read that
             // established this state holds either the replacement's row or the gap the removed row left — while
             // the insert path's capacity claim would take the PARENT. A transaction holding a child and then
@@ -3047,6 +3168,19 @@ export class ReorderListService {
                 // A concurrent add created the line for this very variant. The contract's answer is an
                 // accumulation onto it, so this attempt is abandoned and retried with the row visible.
                 throw new ConcurrentLineInsertDetected();
+            case 'counter-invalid':
+                // The list is present and owned, holds no line for this variant, and its stored counter is
+                // negative — a state `CHK_reorder_list_line_count_non_negative` would make unrepresentable,
+                // and which TypeORM does not create on MySQL or MariaDB (conflict C-E). The claim declined to
+                // build on it, and this attempt declines to guess past it: the insert below is not reached, so
+                // no line is created against a capacity that was never established. It is reported as an
+                // internal data defect rather than as `ReorderListLimitError`, because a limit error would
+                // state a maximum this list has not been shown to have reached and would hide the defect
+                // behind an outcome an operator would read as ordinary.
+                throw reportReorderListInternalFailure(
+                    `Declined to claim line capacity on reorder list ${String(list.id)} because its stored ` +
+                        'line count is negative',
+                );
             case 'full':
                 return new ReorderListLimitError(this.maxLinesPerList);
         }
@@ -3275,9 +3409,7 @@ export class ReorderListService {
         }
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Write-side conventions, shared by all six mutations so that none of them can quietly differ.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * Resolves one list under the full predicate by a **current** read, for the zero-affected path of a write.
@@ -3757,8 +3889,10 @@ export class ReorderListService {
      * a *different* row now holds this variant, which is a concurrent insert to reconcile onto rather than a
      * state to report; `'line-gone'` when no row holds this variant at all, so the caller should take the
      * insert path; `'above-maximum'` when the addressed line is still there and its current quantity plus this
-     * increment would breach the configured maximum; `'list-gone'` when the addressed line is there and within
-     * the maximum, which leaves the ownership conjunct as the only thing the statement can have failed on.
+     * increment would breach the configured maximum; `'line-invalid'` when the addressed line is still there
+     * but its stored quantity already violates the column's positive invariant, so this statement declined to
+     * compound it; `'list-gone'` when the addressed line is there, within the maximum and above the floor,
+     * which leaves the ownership conjunct as the only thing the statement can have failed on.
      */
     private async accumulateLineQuantity(
         ctx: RequestContext,
@@ -3767,7 +3901,9 @@ export class ReorderListService {
         productVariantId: ID,
         delta: number,
         scope: ReorderListOwnerScope,
-    ): Promise<'accumulated' | 'line-replaced' | 'line-gone' | 'above-maximum' | 'list-gone'> {
+    ): Promise<
+        'accumulated' | 'line-replaced' | 'line-gone' | 'above-maximum' | 'line-invalid' | 'list-gone'
+    > {
         const quantityColumn = this.escapeColumn('quantity');
         const result = await this.connection
             .getRepository(ctx, ReorderListLine)
@@ -3777,6 +3913,18 @@ export class ReorderListService {
             .where('id = :lineId', { lineId })
             .andWhere('reorderListId = :listId', { listId })
             .andWhere(`${quantityColumn} <= :maxBeforeIncrement`)
+            // THE STORED QUANTITY'S OWN FLOOR, for the same reason the ceiling beside it is here. This
+            // statement adds to a number it does not read first, so a stored quantity that already violates
+            // the column's positive invariant would be carried forward by the arithmetic rather than caught by
+            // it: zero plus a legal increment stores a total the request never asked for, and a negative base
+            // stores another negative. `CHK_reorder_list_line_quantity_positive` is what makes such a row
+            // unrepresentable, and TypeORM does not create it on MySQL or MariaDB (conflict C-E), so on those
+            // engines this predicate is the only thing standing between a corrupt row and a corrupt total
+            // compounded on top of it. Refusing is classified below as `'line-invalid'` and is reported as an
+            // internal failure, because a row the column may not hold is a defect in this service's data
+            // rather than anything the request did — and compounding it would make this service the author of
+            // the next invalid value.
+            .andWhere(`${quantityColumn} > 0`)
             .andWhere(this.ownedListExistsClause())
             .setParameters({
                 delta,
@@ -3811,9 +3959,17 @@ export class ReorderListService {
         if (String(current.id) !== String(lineId)) {
             return 'line-replaced';
         }
-        // The addressed row is there, so exactly one of the two remaining conjuncts refused it, and the
-        // arithmetic says which: a stored quantity that this increment would carry past the maximum is the
-        // guard, and anything else leaves only the ownership conjunct.
+        // The addressed row is there, so exactly one of the three remaining conjuncts refused it, and the
+        // stored quantity says which. The floor is tested FIRST, and the order is load-bearing rather than
+        // stylistic: a non-positive stored quantity does not breach the ceiling either — a negative base plus
+        // a legal increment stays well under the maximum — so asking the ceiling's question first would answer
+        // `'list-gone'` and blame the ownership conjunct for a row that is present and owned, sending a data
+        // defect back to the buyer as a missing list.
+        if (current.quantity <= 0) {
+            return 'line-invalid';
+        }
+        // The floor held, so a stored quantity that this increment would carry past the maximum is the guard,
+        // and anything else leaves only the ownership conjunct.
         return current.quantity + delta > this.maxQuantityPerLine ? 'above-maximum' : 'list-gone';
     }
 
@@ -3871,7 +4027,7 @@ export class ReorderListService {
      * Because a single statement decides, no interleaving can admit an extra line, which is exactly the
      * assertion a count-then-insert check fails.
      *
-     * **Zero affected rows is where a boolean return was wrong, and the three states it conflated are not
+     * **Zero affected rows is where a boolean return is inadequate, and the three states it conflates are not
      * interchangeable.** The list may be genuinely full; it may have been deleted (or moved out of the
      * caller's scope) since this transaction resolved it; or a concurrent add may have inserted a line for the
      * very variant this call is adding, in which case the contract's answer is an accumulation onto that row
@@ -3881,14 +4037,15 @@ export class ReorderListService {
      *
      * It is issued as the **first write of the insert path**, so a refusal leaves nothing to undo.
      *
-     * @returns `'claimed'`, `'list-gone'`, `'duplicate-line'` or `'full'`.
+     * @returns `'claimed'`, `'list-gone'`, `'duplicate-line'`, `'counter-invalid'` when the list is present and
+     * holds no line for this variant but its stored counter is negative, or `'full'`.
      */
     private async claimLineCapacity(
         ctx: RequestContext,
         listId: ID,
         productVariantId: ID,
         scope: ReorderListOwnerScope,
-    ): Promise<'claimed' | 'list-gone' | 'duplicate-line' | 'full'> {
+    ): Promise<'claimed' | 'list-gone' | 'duplicate-line' | 'counter-invalid' | 'full'> {
         const lineCount = this.escapeColumn('lineCount');
         const result = await this.connection
             .getRepository(ctx, ReorderList)
@@ -3899,6 +4056,17 @@ export class ReorderListService {
             .andWhere('customerId = :customerId', { customerId: scope.customerId })
             .andWhere('channelId = :channelId', { channelId: scope.channelId })
             .andWhere('lineCount < :maxLinesPerList', { maxLinesPerList: this.maxLinesPerList })
+            // THE COUNTER'S OWN FLOOR, as a predicate rather than an assumption. The bound above compares a
+            // stored number, so it is exactly as trustworthy as that number: a counter that has drifted below
+            // zero satisfies `< maxLinesPerList` however many lines the list really holds, and the claim would
+            // then hand out the capacity the bound exists to withhold — once for every unit of drift, silently.
+            // `CHK_reorder_list_line_count_non_negative` is what makes a negative counter unrepresentable, and
+            // TypeORM does not create it on MySQL or MariaDB (conflict C-E), so on those engines this predicate
+            // is the only place the floor can be asserted. It costs nothing when the counter is sound and fails
+            // closed when it is not: the refusal is classified below and reaches the caller as the ordinary
+            // limit outcome, never as a quietly widened bound. The decrement carries this guard's mirror; see
+            // `releaseLineCapacity`.
+            .andWhere('lineCount >= 0')
             .execute();
         if (result.affected === 1) {
             return 'claimed';
@@ -3918,6 +4086,16 @@ export class ReorderListService {
         const duplicate = await this.findLineForVariant(ctx, listId, productVariantId, true);
         if (duplicate) {
             return 'duplicate-line';
+        }
+        // Only now is the counter believed, and the first thing asked of it is whether it is a number this
+        // column may hold. A negative counter is the one state that reaches here having satisfied every
+        // conjunct except the floor, and it is NOT the same answer as `'full'`: a list whose counter has
+        // drifted below zero is almost certainly not at its maximum, so reporting a limit would tell the buyer
+        // their list is full when it is not, and would bury the defect behind a plausible domain outcome that
+        // no operator would ever investigate. It is separated out so it can be reported as the data defect it
+        // is, for the same reasons set out on the `'line-invalid'` branch of the accumulate path.
+        if (list.lineCount < 0) {
+            return 'counter-invalid';
         }
         return 'full';
     }
@@ -3995,9 +4173,7 @@ export class ReorderListService {
         return list ?? new ReorderListNotFoundError();
     }
 
-    // ---------------------------------------------------------------------------------------------------
     // Database-failure translation: narrow where it is a buyer outcome, sanitised everywhere else.
-    // ---------------------------------------------------------------------------------------------------
 
     /**
      * Translates a name-uniqueness violation into its buyer-visible result, and re-raises everything else.

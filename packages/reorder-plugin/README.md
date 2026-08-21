@@ -8,6 +8,60 @@ Adds named reorder lists carrying a per-line quantity to the Vendure Shop API, s
 npm install @vendure/reorder-plugin
 ```
 
+### Platform version, and what the compatibility range does and does not say
+
+The plugin declares `compatibility: '>=3.3.0'`. That is a statement about **what it is built
+against** — which Vendure versions it will boot on — and the platform enforces it by refusing to
+start a server below the floor. It is **not** a statement that every version at or above the floor
+carries current security fixes, and no value in that field could make it one, because the check only
+looks downwards.
+
+Choose the platform version by Vendure's own release and advisory notes, not by this range. This
+package is developed against Vendure **3.7.0**, and Vendure's **3.7.2** patch release fixes four
+reported vulnerabilities affecting 3.7.0 — one critical, one high and two medium — alongside
+channel-scoping fixes on entity update and delete paths. **Run 3.7.2 or later.** None of those
+defects is in this plugin and none of them is reachable through its eight operations, but they are
+reachable through the platform's own pre-existing routes in the same server, so the version you
+deploy on is what decides your exposure to them.
+
+The floor is deliberately left at the 3.3 line rather than narrowed to exclude the affected
+releases: narrowing it would refuse to boot on the whole 3.3–3.7.1 range, which is a support-policy
+decision for the maintainers rather than a change this package should make on its own.
+
+**The plugin also says this at run time, not only here.** During bootstrap it writes one `warn` line
+under the `ReorderPlugin` log context unless the platform it is running on is a release known to carry
+the fixes. It reads the platform's own `VENDURE_VERSION`, so it reports the server it is in rather than
+whatever a manifest says. A document is read once, by whoever installs the package; a deployment that
+inherits an old platform months later has nothing telling it so, and the compatibility range cannot,
+because that mechanism only refuses versions below its floor.
+
+It says only what the version establishes, which is three different things and not one:
+
+| Running version                            | What the line says                                                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| Below 3.7.2 — e.g. `3.7.0`                 | The release is affected by the four advisories, named individually.                                                 |
+| A pre-release of 3.7.2 — e.g. `3.7.2-rc.1` | Semantic versioning orders it **before** 3.7.2, so it is **not established** that the build carries all four fixes. |
+| Not a valid version — e.g. `03.8.0`        | The posture **could not be determined** and must be checked by hand.                                                |
+| 3.7.2 or later, including `3.8.0-alpha.2`  | Nothing. A pre-release of a later release still orders above 3.7.2, so it carries the fixes and produces no line.   |
+
+The middle two matter because the alternatives are both dishonest: calling an unreadable version
+affected asserts a vulnerability from ignorance, and calling it fixed asserts safety from the same
+ignorance. Build metadata is ignored, as semantic versioning requires — `3.7.2+build.5` is `3.7.2`,
+and `3.7.2+0.build.01` is too, since build identifiers may carry leading zeros.
+
+The version is checked against the **full Semantic Versioning 2.0.0 grammar** before any comparison,
+because precedence is only defined between two valid versions. That is not pedantry: `03.8.0` is not a
+version, but a permissive `major.minor.patch` shape reads it as major 3 — _later_ than the floor — and
+so goes quiet. The same is true of `3.8.0-..` and `3.8.0+.`, which carry empty identifiers the
+specification forbids, and of `3.7.2-01`, whose numeric pre-release identifier may not carry a leading
+zero even though a build identifier may. Every one of those becomes "could not be determined", which
+speaks, rather than "fixed", which does not.
+
+The line is a **warning and never a refusal**: a plugin that declined to start over its host's patch
+level would convert a documented risk into a certain outage and would take an availability decision
+belonging to the deployment. It also states in terms that the defects are the platform's and are
+neither introduced nor fixable by this plugin, so it cannot send an investigation to the wrong place.
+
 ## Usage
 
 Add the plugin to the `plugins` array of your `VendureConfig`:
@@ -211,13 +265,73 @@ Those four are the whole of the exclusion list: every other property TypeORM rep
 unique, index, check or reference is compared.
 
 One documented limitation, on the MySQL family only: TypeORM 0.3.x cannot create `CHECK`
-constraints there and discards them silently, so the two named check constraints on these tables
-exist on PostgreSQL and the SQLite family and not on MySQL or MariaDB. The invariants they express
-are enforced by the plugin's service layer on every engine regardless — a non-positive or
-over-maximum quantity is refused before any write, and the stored line count is maintained by a
-conditional counter update — so no behaviour depends on the constraints being present. The two named
-unique constraints and the named index do exist on all four engines (the MySQL family stores each
-unique constraint as a named unique index, keeping both the name and the guarantee).
+constraints there and discards them silently, so the two named check constraints on these tables are
+created on PostgreSQL and the SQLite family and **not** on MySQL or MariaDB. Nothing stops you
+provisioning them yourself on those two engines — the plugin's own existing-table check tolerates
+objects it did not create — but this plugin will not create them and does not look to see whether you
+have. The two named unique constraints and the named index do exist on all four engines (the MySQL
+family stores each unique constraint as a named unique index, keeping both the name and the
+guarantee).
+
+**What still holds on every engine, and what does not.** Both invariants the missing constraints
+express are enforced twice over by the plugin, and neither enforcement depends on a check
+constraint existing:
+
+- `quantity` — every request that could set it validates the **resulting** value first and refuses a
+  non-integer, a non-positive value or one above `maxQuantityPerLine` with a top-level
+  `USER_INPUT_ERROR` before any write. One of the three writes additionally carries the bound **in the
+  statement's own `WHERE`**: the accumulating add is predicated on
+  `quantity <= maxQuantityPerLine - increment`, so the database itself declines the write when the
+  resulting value would breach it. The other two — the insert of a new line, and the absolute set of
+  `adjustReorderListLine` — carry ownership and identity conjuncts only, so on those two paths the
+  in-process guard is what refuses a bad value and the check constraint is what would have stood
+  behind it.
+- `lineCount` — it is written only by three guarded statements: an increment predicated on
+  `lineCount < maxLinesPerList`, a decrement predicated on `lineCount > 0`, and a compare-and-set
+  repair predicated on the row and its stale counter. The floor is therefore in the decrement's own
+  predicate, evaluated by the database, on all four engines; on the repair path it is an in-process
+  guard, which refuses any total that is not a non-negative safe integer before the statement is
+  built.
+
+What is genuinely lost on MySQL and MariaDB is therefore two things. First, the last line of defence
+against a write that does not go through this plugin at all — direct SQL against these two tables,
+another application sharing the schema, or a future code path that bypasses the service. Second, on
+the three paths whose statements carry no value predicate (the line insert, the absolute quantity
+set, and the counter repair), the database-side backstop behind the in-process guard. On PostgreSQL
+and the SQLite family both are present; on MySQL and MariaDB such a write is accepted, and a
+non-positive `quantity` or a negative `lineCount` can be persisted. If you share this schema with
+anything that writes to `reorder_list` or `reorder_list_line` directly, treat those two invariants as
+that writer's responsibility on those engines. This gap is tracked as conflict **C-E** and is
+**unresolved**: closing it needs a maintainer ruling, because the only mechanism available on those
+engines is engine-specific DDL added to the migration by hand, which the project's own migration
+policy forbids. See the plugin's migration end-to-end suite, which states the conflict in full and
+asserts the gap positively rather than skipping over it.
+
+**The plugin says this at run time too, on the engines where it applies.** Booting on MySQL or MariaDB
+writes one `warn` line under the `ReorderPlugin` log context, naming both constraints exactly and
+attributing the shortfall to the object-relational mapper rather than the engine, which supports them.
+It states the consequence in the terms that matter — everything the plugin serves is still guarded, and
+what is missing is the backstop against a write that does not come through the plugin. The reason it
+exists is that the person who later points a reporting job or a repair script at these tables is
+usually not the person who read this file, and the schema does not tell them.
+
+It reads the configured engine type, issues no statement of any kind, and never refuses to start. That
+also bounds what it is entitled to claim: engine type establishes what the mapper does, not what is in
+your catalogue, so the line says the constraints are absent **unless something outside this plugin
+provisioned them** and says outright that it did not look. If you provisioned them yourself they are in
+force and the line does not apply to you.
+
+That mechanism was built and measured against MySQL 8.0.43 and MariaDB 11.5.2 before being withdrawn,
+and the migration's own header records what a ruling on it would have to weigh, so the decision can be
+taken on facts rather than re-measured. In short: the frozen conditions cannot be reused verbatim,
+because both engines accept an ANSI-quoted `CHECK` and then read the quoted column as a _string
+literal_, producing a correctly named constraint that refuses every valid row; a check can be present
+and inert on MySQL, which records `NOT ENFORCED` while still reporting the original condition, in a
+column MariaDB does not have at all; and covering the `synchronize` provisioning path as well as the
+migration means the plugin issues `ALTER TABLE` while starting up, so a deployment whose database user
+lacks `ALTER` either fails to boot or continues silently without the constraint. **A plugin should not
+make that availability decision about someone else's deployment on its own authority**, which is why
+this package ships the documented gap rather than the unsanctioned mechanism.
 
 ## Options
 

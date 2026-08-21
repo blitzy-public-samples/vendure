@@ -1,14 +1,5 @@
 /*
- * -------------------------------------------------------------------------------------------------------
  * The ReorderPlugin class — provenance, the two deliberate departures, and the one quiet failure mode.
- * -------------------------------------------------------------------------------------------------------
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing in this file is, or derives from, a user-specified rule, and no rule forces anything into it.
- * Every constraint stated below traces to EPIC-001 (rulings R1, R2, R3, R8, R10, R15, R19, R22, and
- * sections 7.9.2, 7.10, 11.2 and 11.5), to FEATURE-001-01, to STORY-001-01-01, or to a cited line of this
- * repository, and is attributed as such wherever it is stated. The absence of a rules document has not been
- * treated as licence to lower the bar anywhere in this file.
  *
  * WHAT THIS FILE IS. It is the plugin's single registration point and its only initialisation surface: the
  * two entities, the service, the resolved-options provider and the three Shop resolver classes — the
@@ -40,27 +31,6 @@
  *    is imported as an ordinary named type and the side-effect import would be dead weight that a reader
  *    would have to prove harmless.
  *
- * TWO DIVERGENCES THIS FILE CREATES, BOTH REPORTED RATHER THAN ABSORBED. Neither is silent, because the
- * standing obligation on this work is that no deviation is silent.
- *
- * A. REQUIRED BECAME DEFAULTED. EPIC-001 section 7.10 marks `maxListsPerCustomer`, `maxLinesPerList` and
- *    `maxQuantityPerLine` "Required, no value in this set", and STORY-001-01-01 asks initialisation to fail
- *    when one is absent. This run's supplied decisions instead give 25, 200 and 999 as declared defaults to
- *    be used without substitution, so an omitted key now resolves to a default rather than failing. The
- *    values are used exactly as supplied and none is invented; the change of kind is reported in the pull
- *    request body alongside the two-key ledger divergence that `types.ts` records as conflict C-C. An
- *    EXPLICIT `undefined` or `null` is still refused — see `validateResolvedReorderPluginOptions`.
- * B. THE COMPATIBILITY RANGE IS THE EPIC'S FLOOR, NOT THE SIBLINGS' CARET. `'>=3.3.0'` is declared below,
- *    in the floor form the platform's own floor-declaring plugin uses
- *    (`packages/telemetry-plugin/src/telemetry.plugin.ts` L121), rather than the `'^3.0.0'` that five
- *    shipped plugins declare. EPIC-001 section 7.9.2 states the 3.3 floor and says the range "states that
- *    floor rather than copying `^3.0.0` unexamined", and the epic outranks a feature or story on a
- *    cross-file ruling. Stated honestly: the floor's basis in section 7.9.2 is the scheduler and its
- *    `configure` surface, and THIS FEATURE USES NEITHER — it registers no `ScheduledTask` under ruling R19
- *    and declares no `configure` method. The range is therefore declared because the epic outranks the
- *    feature on this ruling, not because any line of this package needs a mechanism introduced in 3.3. That
- *    reasoning is reported in the pull request body rather than implied by the literal.
- *
  * THE QUIETEST FAILURE MODE IN THIS FILE IS THE I18N PATH, AND IT IS HANDLED EXPLICITLY.
  * `I18nService.addTranslationFile` wraps its `readFileSync` and `JSON.parse` in a `try` whose `catch` does
  * nothing but log (`packages/core/src/i18n/i18n.service.ts`). A wrong path therefore throws nothing, fails
@@ -80,11 +50,18 @@
  * the authoritative tickets, where the same derived value appears, present it the same way. Section 11.5
  * forbids a hand-written reference page, so the JSDoc in this file is the documentation deliverable for the
  * plugin class.
- * -------------------------------------------------------------------------------------------------------
  */
 
 import { OnApplicationBootstrap } from '@nestjs/common';
-import { I18nService, Logger, PluginCommonModule, Type, VendurePlugin } from '@vendure/core';
+import {
+    ConfigService,
+    I18nService,
+    Logger,
+    PluginCommonModule,
+    Type,
+    VENDURE_VERSION,
+    VendurePlugin,
+} from '@vendure/core';
 import fs from 'fs';
 import path from 'path';
 
@@ -95,6 +72,7 @@ import { ReorderListShopResolver } from './api/reorder-list-shop.resolver';
 import { loggerCtx, REORDER_PLUGIN_OPTIONS } from './constants';
 import { ReorderListLine } from './entities/reorder-list-line.entity';
 import { ReorderList } from './entities/reorder-list.entity';
+import { AddReorderLists1786838400000 } from './migrations/1786838400000-add-reorder-lists';
 import { ReorderListService } from './service/reorder-list.service';
 import { ReorderPluginOptions, ResolvedReorderPluginOptions } from './types';
 
@@ -204,6 +182,149 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
     path.join('..', 'i18n', `${I18N_LANGUAGE_KEY}.json`),
     path.join('..', '..', 'i18n', `${I18N_LANGUAGE_KEY}.json`),
 ];
+
+/**
+ * The engines on which TypeORM 0.3.x discards a named `CHECK` constraint instead of creating it.
+ *
+ * A fact about the object-relational mapper rather than about any deployment: `RdbmsSchemaBuilder.createNewChecks()`
+ * returns early for this family (L694-L698), `dropOldChecks()` carries the identical guard (L333-L337), all four
+ * check-constraint methods on `MysqlQueryRunner` throw (L1153-L1172), and `MysqlQueryRunner.createTableSql` never
+ * reads `table.checks`. The engines themselves support `CHECK` — MySQL from 8.0.16 and MariaDB from 10.2.1 — so the
+ * shortfall travels with the mapper version, not with the server. The same list is declared in the migration for
+ * the same reason.
+ */
+const CHECK_LESS_ENGINES: readonly string[] = ['mysql', 'mariadb'];
+
+/**
+ * The two named check constraints both entities declare and this family does not receive.
+ *
+ * Named exactly, because the name is what an operator greps for in a catalogue and what a later migration would
+ * have to create.
+ */
+const DECLARED_CHECK_CONSTRAINTS: readonly string[] = [
+    'CHK_reorder_list_line_quantity_positive on reorder_list_line ("quantity" > 0)',
+    'CHK_reorder_list_line_count_non_negative on reorder_list ("lineCount" >= 0)',
+];
+
+/**
+ * The earliest platform release carrying the fixes for the advisories named in {@link PLATFORM_ADVISORIES}.
+ *
+ * Kept as the release triple rather than a range string so the comparison below needs no dependency, and
+ * declared here rather than inside the check so that a later bump is one edit in one place.
+ */
+const PLATFORM_SECURITY_FLOOR: readonly [number, number, number] = [3, 7, 2];
+
+/**
+ * The published advisories against platform releases earlier than {@link PLATFORM_SECURITY_FLOOR}.
+ *
+ * Identifiers only, with each one's severity, because an identifier is what an operator can look up and a
+ * paraphrase of the vulnerability would age badly and could mislead. All four were fixed in the same patch
+ * release, which is why one floor covers them.
+ */
+const PLATFORM_ADVISORIES: readonly string[] = [
+    'GHSA-v85r-wfgv-jcqc (critical)',
+    'GHSA-hc75-2v4j-x372 (high)',
+    'GHSA-fp4j-ff6j-9793 (moderate)',
+    'GHSA-rgjm-ff27-p2hf (moderate)',
+];
+
+/**
+ * The complete Semantic Versioning 2.0.0 grammar, as one anchored expression.
+ *
+ * **Transcribed from the specification, not invented here.** This is the expression semver.org publishes in its
+ * own FAQ as the official suggested regular expression for a valid version, with its two capture groups kept
+ * (pre-release, then build metadata) and its named groups reduced to positional ones. It is quoted rather than
+ * approximated because the grammar has three requirements a permissive `\d+\.\d+\.\d+` shape silently drops,
+ * and each of them lets a *syntactically invalid* version be read as a later release than it is:
+ *
+ * - **A core identifier may not carry a leading zero** (clause 2: `0 | [1-9]\d*`). Without this, `03.8.0` reads
+ *   as major 3 and is treated as carrying the fixes.
+ * - **Every dot-separated identifier must be non-empty** (clauses 9 and 10). Without this, `3.8.0-..` and
+ *   `3.8.0+.` both parse.
+ * - **A NUMERIC pre-release identifier may not carry a leading zero either**, while a build identifier may —
+ *   which is why the two halves of this expression are deliberately different: `(?:0|[1-9]\d*|\d*[a-zA-Z-]
+ *   [0-9a-zA-Z-]*)` for pre-release against `[0-9a-zA-Z-]+` for build.
+ *
+ * A version this expression rejects is not "probably fine": it is a string whose ordering against any other
+ * version is undefined, so {@link assessPlatformSecurityPosture} reports it as unassessable rather than
+ * guessing. That is the whole reason the grammar is validated before any comparison happens.
+ */
+const SEMVER_2_0_0 = new RegExp(
+    // <version core>: three numeric identifiers, none of which may carry a leading zero.
+    '^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)' +
+        // Optional <pre-release>: dot-separated identifiers, each either a leading-zero-free numeric
+        // identifier or an alphanumeric one carrying at least one non-digit. None may be empty.
+        '(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)' +
+        '(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?' +
+        // Optional <build>: dot-separated identifiers which MAY carry leading zeros, and none of which may
+        // be empty. This is the one place the two halves of the grammar deliberately differ.
+        '(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$',
+);
+
+/**
+ * What can be said about a platform version's relation to {@link PLATFORM_SECURITY_FLOOR}.
+ *
+ * Three outcomes rather than a boolean, because a boolean cannot distinguish "this release precedes the fixes"
+ * from "this build precedes the fixed release but may contain them" from "this string cannot be read at all",
+ * and a security signal that collapses those into one claim is either wrong or silent about something it
+ * should say.
+ */
+export type PlatformSecurityPosture = 'affected' | 'unproven-prerelease' | 'unassessable' | 'fixed';
+
+/**
+ * Decides what may honestly be said about a platform version's patch posture.
+ *
+ * **The version is validated against the full Semantic Versioning 2.0.0 grammar before anything is compared.**
+ * Precedence is defined only between two *valid* versions, so a string the grammar rejects has no position
+ * relative to the floor and gets `'unassessable'`. That ordering matters in one direction in particular: a
+ * malformed string that merely looks later than the floor would otherwise suppress the warning outright. See
+ * {@link SEMVER_2_0_0} for the three requirements a permissive shape drops and what each one lets through.
+ *
+ * Deliberately not delegated to `semver`. This package declares no runtime dependency of its own — the whole
+ * of AAP section 0.3.1 rests on that — so the grammar is transcribed from the specification and the comparison
+ * is a dozen lines, rather than the package's dependency posture changing to answer this one question.
+ *
+ * **Semantic-version precedence is honoured, including for pre-releases.** Semver clause 9 puts a pre-release
+ * below its own release, so `3.7.2-rc.1` PRECEDES `3.7.2` and is not proven to carry the fixes; it is reported
+ * `'unproven-prerelease'` rather than `'fixed'`. A pre-release of a LATER release is a different case:
+ * `3.8.0-alpha.2` still orders above `3.7.2`, so it does carry them and is reported `'fixed'`. Build metadata
+ * is ignored, which is also what clause 10 requires — `3.7.2+build.5` is `3.7.2`.
+ *
+ * **An unreadable version is reported as such rather than as either answer.** Calling it affected would assert
+ * a vulnerability from ignorance; calling it fixed would assert the opposite from the same ignorance. Neither
+ * belongs in a startup log, so the third outcome exists to say plainly that the posture could not be
+ * determined and must be checked by hand.
+ *
+ * Exported for `src/reorder.plugin.spec.ts` and deliberately absent from the package's root barrel, so it is
+ * package-internal rather than a published API. The decision it makes is a table, and a table is worth driving
+ * directly instead of inferring from log output.
+ *
+ * @param version - The value of `VENDURE_VERSION`, or any string in its shape.
+ * @returns Which of the four things can honestly be said about it.
+ */
+export function assessPlatformSecurityPosture(version: string): PlatformSecurityPosture {
+    // GRAMMAR FIRST, PRECEDENCE SECOND, AND IN THAT ORDER FOR A REASON. Precedence is only defined between two
+    // VALID versions, so comparing a malformed string is comparing something whose position is undefined — and
+    // every way of getting that wrong errs towards silence, because a malformed string that merely looks later
+    // than the floor would suppress the warning entirely. Surrounding whitespace is removed before validating,
+    // since the value arrives from a published manifest and a stray space is not a grammar violation.
+    const parts = SEMVER_2_0_0.exec(version.trim());
+    if (parts === null) {
+        return 'unassessable';
+    }
+    const release = [Number(parts[1]), Number(parts[2]), Number(parts[3])] as const;
+    const isPrerelease = parts[4] !== undefined;
+    for (let position = 0; position < PLATFORM_SECURITY_FLOOR.length; position++) {
+        if (release[position] !== PLATFORM_SECURITY_FLOOR[position]) {
+            // A pre-release of a release BELOW the floor is affected twice over, so the release comparison
+            // alone settles it in both directions here.
+            return release[position] < PLATFORM_SECURITY_FLOOR[position] ? 'affected' : 'fixed';
+        }
+    }
+    // Exactly the floor's release triple. Without a pre-release suffix this IS the first fixed release; with
+    // one it precedes it, and nothing establishes that the build already carried every fix.
+    return isPrerelease ? 'unproven-prerelease' : 'fixed';
+}
 
 /**
  * @description
@@ -321,8 +442,8 @@ function countCodePoints(value: string): number {
  * ★ **The rejected value is untrusted input, and this message is written to a log.** An option arrives from
  * whatever the deployment's configuration produced — an environment variable, a JSON file, a secret manager
  * lookup, a mis-wired expression — so a rejected *string* may be a credential, a connection URL or a token
- * that happened to be assigned to the wrong key. Interpolating it verbatim, as this function previously did,
- * writes it into the startup log and into the error's message, where it outlives the request and is read by
+ * that happened to be assigned to the wrong key. Interpolating it verbatim would write it into the startup
+ * log and into the error's message, where it outlives the request and is read by
  * people and tools that were never entitled to it (CWE-532). The same string can also carry newlines,
  * carriage returns and terminal escape sequences, which forge or corrupt surrounding log lines (CWE-117), and
  * it can be arbitrarily long, which turns one refusal into an unbounded startup log entry. A `Symbol`'s
@@ -566,16 +687,9 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  * to one — every foreign key points from this plugin's tables to core tables — so the migration is purely
  * additive and reverses cleanly.
  *
- * **One registration serves every supported engine, because the bundled migration carries no SQL.** It
- * describes the two tables to TypeORM's `QueryRunner` table API and lets the configured driver render the
- * statements, taking the identifier type from `connection.driver.normalizeType()` over the configured
- * `EntityIdStrategy` and the table path from `connection.driver.buildTableName()`, so a configured non-default
- * schema is honoured in both directions. You do not need to generate a migration of your own for these two
- * tables on any engine.
- *
- * Register the classes this package publishes from its root as `reorderPluginMigrations`. Registering by
- * value rather than by path is correct in both the source and the built layout, because a class is resolved
- * by the module system:
+ * Register the classes this package publishes from its root as {@link reorderPluginMigrations}. Registering
+ * by value rather than by path is correct in both the source and the built layout, because a class is
+ * resolved by the module system:
  *
  * ```ts
  * import type { VendureConfig } from '\@vendure/core';
@@ -595,19 +709,45 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  * whichever migration was applied most recently, so it removes these two tables only while this one is the
  * last applied.
  *
- * Register it before the first boot of a server whose `dbConnectionOptions.synchronize` is `true`. That
- * server's schema builder creates the two tables itself, after which this migration compares what it finds
- * against its own frozen minimum and records itself as applied rather than authoring anything — a supported
- * outcome, but one where the schema builder and not the migration is what created the tables. The package's
- * README sets that sequencing out step by step, separates applying from rolling back, and records the
- * sql.js seed-cache reset a test harness needs after a schema change.
+ * Register it before the first boot of a server whose `dbConnectionOptions.synchronize` is `true`. Boot such
+ * a server first and its schema builder creates the two tables from the entity metadata, after which the
+ * migration has nothing left to create and applying it fails on the tables already existing. The package's
+ * README sets that sequencing out step by step, separates applying from rolling back, and records the sql.js
+ * seed-cache reset a test harness needs after a schema change.
  *
- * One engine-scoped shortfall is declared rather than hidden: TypeORM 0.3.x cannot create a `CHECK`
- * constraint on the MySQL family and discards it silently, so the two named check constraints exist on
- * PostgreSQL and the SQLite family and not on MySQL or MariaDB. No behaviour depends on them — the quantity
- * invariant is refused by this plugin's service layer before any write on every engine, and the stored line
- * count is maintained by a conditional counter update — and both named unique constraints and the named
- * indices do exist on all four engines.
+ * **The shipped migration is PostgreSQL DDL, and that is a property of how it is produced rather than a
+ * choice.** It is the output of Vendure's own migration generator, which serialises the statements one
+ * configured engine emits, so the artefact is bound to that engine. Deploying on PostgreSQL applies the
+ * shipped file as it stands. Deploying on MySQL, MariaDB or SQLite means generating the equivalent file for
+ * that engine from these same two entity classes, by the invocation the migration's own header records; the
+ * entities, the tables and the column names are the same either way. A server with `synchronize` enabled
+ * needs no migration at all, which is the path the test harnesses take.
+ *
+ * **What a generated file actually creates differs by engine, and the difference is declared rather than
+ * hidden.** The two entity classes declare five named database objects. A file generated for PostgreSQL or
+ * the SQLite family creates all five. A file generated for MySQL or MariaDB creates **three** — the two
+ * named unique constraints, as named unique indices, and the named index — and neither named check
+ * constraint, because TypeORM 0.3.x cannot create a `CHECK` on that family and discards the declaration
+ * silently.
+ *
+ * No behaviour of this plugin depends on the two missing constraints, and the reason differs by write path
+ * rather than being uniform, so it is stated per path:
+ *
+ * - **Every** path that can set `quantity` or `lineCount` validates the RESULTING value in process before it
+ *   writes, refusing a non-integer, a non-positive quantity or one above `maxQuantityPerLine` with a top-level
+ *   `USER_INPUT_ERROR`, and refusing a counter total that is not a non-negative integer outright.
+ * - **Three** of them additionally carry the bound as a value predicate in their OWN statement, so the
+ *   database evaluates it on all four engines: `quantity <= maxQuantityPerLine - increment` on the
+ *   accumulating add, `lineCount < maxLinesPerList` on the capacity claim, `lineCount > 0` on the release.
+ * - **Three do not**, and their statements carry ownership and identity conjuncts only: the line insert, the
+ *   absolute quantity set of `adjustReorderListLine`, and the counter compare-and-set repair. On PostgreSQL
+ *   and the SQLite family the check constraint is what would have refused a bad value from those; on MySQL and
+ *   MariaDB the in-process guard is the only thing that does.
+ *
+ * What is therefore genuinely lost on MySQL and MariaDB is the last line of defence against a write that does
+ * not go through this service at all — direct SQL, another application sharing the schema, or a future code
+ * path that bypasses the guards — and, for those three paths, the database-side backstop behind the in-process
+ * guard. The package README states the consequence in full, and the gap is the unresolved conflict C-E.
  *
  * ## Localisation
  *
@@ -675,6 +815,22 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
     // `'^3.0.0'` five shipped plugins declare — follows EPIC-001 section 7.9.2 and matches
     // `packages/telemetry-plugin/src/telemetry.plugin.ts` L121. Kept as a plain string literal so that a
     // test can read it from the plugin metadata and substitute an unsatisfiable one.
+    //
+    // ‼ IT IS A COMPATIBILITY STATEMENT AND NOT A SECURITY ENDORSEMENT, and the difference is worth stating
+    // here because the two are easy to read as one. What this range asserts is which platform versions this
+    // plugin's own code is built against and will boot on. It asserts nothing about whether a given version
+    // in that range carries current security fixes, and it cannot: the mechanism only refuses versions BELOW
+    // the floor, so no value here protects a deployment from running an outdated platform. Vendure's own
+    // 3.7.2 patch release fixes four reported vulnerabilities (one critical, one high, two medium) affecting
+    // 3.7.0, which is the version of this workspace — so a deployment should be on a release carrying those
+    // fixes regardless of what this string says, and the package README says so in terms.
+    //
+    // Raising the floor to exclude the affected line would be a SUPPORT-POLICY change rather than a fix: it
+    // would refuse to boot on every 3.3 to 3.7.1 release, and the floor is fixed at the 3.3 line by
+    // EPIC-001 section 7.9.2 (AAP section 0.8.4). Narrowing it therefore needs a maintainer decision, and
+    // upgrading the workspace itself is outside this package's change boundary (AAP sections 0.1.2.1, 0.3.1
+    // and 0.6.2.3 hold `packages/core` byte-identical and forbid any dependency or lock change). Both are
+    // recorded rather than acted on unilaterally, which is what keeps the posture disclosed instead of quiet.
     compatibility: '>=3.3.0',
 })
 export class ReorderPlugin implements OnApplicationBootstrap {
@@ -713,11 +869,15 @@ export class ReorderPlugin implements OnApplicationBootstrap {
     }
 
     /** @internal */
-    constructor(private i18nService: I18nService) {}
+    constructor(
+        private i18nService: I18nService,
+        private configService: ConfigService,
+    ) {}
 
     /**
      * @description
-     * Initialises the plugin with the given options and returns the plugin class for the `plugins` array.
+     * Initialises the plugin with the given options and returns a `ReorderPlugin` registration class bound
+     * to this resolved option set, for the `plugins` array.
      *
      * Each supplied key overrides its declared default and each omitted key takes it, so a partial call is
      * valid and `init({})` yields the documented defaults. The merged result is then validated in full
@@ -738,7 +898,9 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      *
      * @param options - Any subset of {@link ReorderPluginOptions}; every omitted key takes its declared
      * default.
-     * @returns The `ReorderPlugin` class, for inclusion in the `plugins` array of your `VendureConfig`.
+     * @returns A `ReorderPlugin` registration class bound to exactly this resolved option set, for
+     * inclusion in the `plugins` array of your `VendureConfig`. Each call returns a distinct class, so two
+     * differently configured servers in one process keep their own bounds.
      * @throws {@link ReorderPluginConfigurationError} if any resolved value is not a finite integer of at
      * least 1, or if `maxQuantityPerLine` exceeds the largest signed 32-bit integer.
      *
@@ -766,22 +928,163 @@ export class ReorderPlugin implements OnApplicationBootstrap {
 
     /**
      * @description
-     * Registers this plugin's message catalogue once the application has bootstrapped, and re-asserts that
-     * the options in force are still usable.
+     * Registers this plugin's message catalogue once the application has bootstrapped, re-asserts that the
+     * options in force are still usable, and reports two things the deployment cannot see for itself: whether
+     * this engine received the plugin's named check constraints, and the host platform's patch posture.
+     *
+     * The three acts are ordered by what a failure in each means. The re-validation runs first and **fails
+     * closed**, because a bound this plugin cannot serve correctly must stop the server reaching a ready
+     * state. The catalogue registration cannot fail the boot — a missing catalogue degrades four messages to
+     * their keys. Neither warning can either, by deliberate choice: see
+     * {@link ReorderPlugin.warnIfCheckConstraintsAreUnavailable} and
+     * {@link ReorderPlugin.warnIfPlatformSecurityPostureIsNotEstablished} for why a plugin must not refuse to start over
+     * a shortfall in the schema it is given or in its host's patch level.
      *
      * @since 3.8.0
      */
     onApplicationBootstrap(): void {
         // Cheap defence in depth: five integer comparisons proving that the values this server is about to
-        // serve requests with are the values initialisation approved. The accessor and the freeze make a
-        // write from outside this module impossible, so this is no longer the guard against one — it is the
-        // guard against a server that was registered with a `ReorderPlugin` whose `init()` never ran the
-        // validator, and a failure here still prevents the server from reaching a ready state.
+        // serve requests with are the values initialisation approved. The accessor and the freeze already
+        // make a write from outside this module impossible, so what this guards is a server registered with
+        // a `ReorderPlugin` whose `init()` never ran the validator; a failure here prevents that server from
+        // reaching a ready state.
         //
         // It reads THIS REGISTRATION's options rather than the static, so that in a process holding more
         // than one differently-configured registration each one checks the set it will actually serve with.
         validateResolvedReorderPluginOptions(this.optionsInForce());
         this.registerTranslations();
+        this.warnIfCheckConstraintsAreUnavailable();
+        this.warnIfPlatformSecurityPostureIsNotEstablished();
+    }
+
+    /**
+     * Writes one warning to the startup log when the configured engine is one TypeORM cannot create this
+     * plugin's two named check constraints on.
+     *
+     * **What it is telling the operator, and why a document could not.** Both entities declare both checks on
+     * every engine, and on PostgreSQL and the SQLite family both exist and refuse a violating write. On MySQL
+     * and MariaDB TypeORM discards them silently — see {@link CHECK_LESS_ENGINES} for the exact source
+     * locations — so the two invariants have no database-side backstop there. Nothing this plugin serves is
+     * affected: every write path validates the resulting quantity in process before writing, the accumulating
+     * add additionally carries the bound in its own statement's `WHERE`, and the counter floor lives in the
+     * decrement's own predicate on all four engines. What is genuinely absent is the last line of defence
+     * against a write that does not come through this plugin at all — direct SQL, another application sharing
+     * the schema, a data-repair script, or a future code path below the service. Such a write can persist a
+     * non-positive `quantity` or a negative `lineCount` on these two engines, and everything that reads
+     * afterwards consumes it.
+     *
+     * That is exactly the audience a README cannot reach. A document is read once, by whoever installs the
+     * package; the operator who later points a reporting job or a migration script at these tables is a
+     * different person, often at a different time, and the schema they are writing to does not tell them. A
+     * boot-time line in the deployment's own log does.
+     *
+     * **It reads configuration and issues no statement of any kind**, and its wording is bounded accordingly.
+     * What `dbConnectionOptions.type` establishes is what the MAPPER does on this engine family, which is
+     * decided by the mapper's version; it does not establish what is in the deployment's catalogue. An operator
+     * may have provisioned both constraints by hand, and the migration's existing-table check deliberately
+     * tolerates surplus objects, so a categorical "they are absent" would sometimes be false and would send a
+     * correctly hardened deployment chasing a non-problem. The line therefore says they are absent *unless
+     * something outside this plugin provisioned them*, and says outright that this plugin does not look.
+     *
+     * Reading the catalogue instead would be more precise and is deliberately not done here: it needs
+     * engine-specific `information_schema` SQL on a boot path, and the wording above conveys the actionable
+     * part without it. In particular this method issues **no DDL**: closing the gap rather than reporting it
+     * would need engine-specific `ALTER TABLE`, which is conflict C-E option two and requires an explicit
+     * maintainer ruling that has not been recorded. It reports the gap and does not attempt to close it.
+     *
+     * Like {@link ReorderPlugin.warnIfPlatformSecurityPostureIsNotEstablished} it warns and never refuses, for the same
+     * reason: the plugin serves correctly on these engines, and declining to start would take an availability
+     * decision belonging to the deployment over a shortfall the deployment may well have accepted.
+     */
+    private warnIfCheckConstraintsAreUnavailable(): void {
+        if (!CHECK_LESS_ENGINES.includes(this.configService.dbConnectionOptions.type)) {
+            return;
+        }
+        Logger.warn(
+            `The ReorderPlugin declares two named check constraints that TypeORM does not create on ` +
+                `${this.configService.dbConnectionOptions.type}, so unless something outside this plugin has ` +
+                `provisioned them, this database does not have them: ` +
+                `${DECLARED_CHECK_CONSTRAINTS.join('; ')}. The engine supports them; the object-relational ` +
+                'mapper discards them for this family. This plugin does not read the catalogue to check, and ' +
+                'issues no DDL either way — if you provisioned them yourself, they are in force and this ' +
+                'line does not apply to you. Every operation this plugin serves still refuses a non-positive ' +
+                'quantity and cannot drive the line counter below zero, so nothing it does is affected. What ' +
+                'these constraints would add is the database-side backstop against a write that does not ' +
+                'come through this plugin — direct SQL, another application sharing this schema, or a ' +
+                'data-repair script — which without them can persist a non-positive quantity or a negative ' +
+                'line count. If anything other than this plugin writes to reorder_list or reorder_list_line, ' +
+                "either provision both constraints or treat those two invariants as that writer's " +
+                'responsibility. Tracked as conflict C-E; closing it inside this package needs a maintainer ' +
+                'ruling, because the only mechanism available here is engine-specific DDL that the ' +
+                "project's migration policy forbids.",
+            loggerCtx,
+        );
+    }
+
+    /**
+     * Writes one warning to the startup log unless the platform hosting this plugin is a release known to
+     * carry the fixes named in {@link PLATFORM_ADVISORIES}.
+     *
+     * **What this is for, and what it is not.** It does not fix anything and cannot: the vulnerabilities are
+     * in the platform, and this package holds no part of it — AAP sections 0.1.2.1, 0.3.1 and 0.6.2.3 hold
+     * `packages/core` byte-identical and forbid any dependency or lock change, so upgrading the host is
+     * outside this package's change boundary by construction. What it does is convert a passive disclosure
+     * into an active one. The README and the `compatibility` comment already state the posture, but a
+     * document is read once, by whoever installs the package, and possibly by nobody; a deployment that
+     * inherits an old platform months later has nothing telling it so. The declared `compatibility` range
+     * cannot serve either — it only refuses versions BELOW its floor, so no value in it warns about running
+     * an outdated one, and raising it to exclude the affected line would be a support-policy change fixed at
+     * the 3.3 line by EPIC-001 section 7.9.2 (AAP section 0.8.4) rather than a fix. A boot-time line is the
+     * one place left where the fact reaches the person who can act on it.
+     *
+     * **It warns and never refuses.** A plugin declining to start because its host is behind on patches would
+     * take an availability decision belonging to the deployment, and would do it from inside an unrelated
+     * feature — turning a known, documented risk into a certain outage. So this sits after
+     * {@link ReorderPlugin.registerTranslations} rather than beside the option validation that deliberately
+     * does fail closed: a bad option means this plugin cannot serve correctly, whereas an old host means the
+     * platform around it needs attention.
+     *
+     * **It says only what the version establishes.** {@link assessPlatformSecurityPosture} distinguishes three
+     * reasons to speak from the one reason to stay quiet, and each gets its own sentence, because a signal that
+     * asserts more than it knows is one an operator is right to stop believing:
+     *
+     * - `'affected'` — the release orders below the floor, so the advisories apply to it. Stated as fact.
+     * - `'unproven-prerelease'` — a pre-release of the floor itself, which semver orders BELOW the floor. It may
+     *   already carry every fix; nothing here establishes that it does, so it is reported as unproven rather
+     *   than as either affected or fixed.
+     * - `'unassessable'` — the version string could not be read. Reported as exactly that. Calling it affected
+     *   would assert a vulnerability from ignorance and calling it fixed would assert safety from the same
+     *   ignorance; saying the posture is undetermined is the only honest option, and it still prompts a check.
+     * - `'fixed'` — nothing is written.
+     *
+     * It reads `VENDURE_VERSION`, the platform's own published constant, so it reports the version actually
+     * running rather than a version this package's manifest happens to name.
+     */
+    private warnIfPlatformSecurityPostureIsNotEstablished(): void {
+        const posture = assessPlatformSecurityPosture(VENDURE_VERSION);
+        if (posture === 'fixed') {
+            return;
+        }
+        const floor = PLATFORM_SECURITY_FLOOR.join('.');
+        const advisories = `${PLATFORM_ADVISORIES.join(', ')}`;
+        const finding =
+            posture === 'affected'
+                ? `This server is running Vendure ${VENDURE_VERSION}. Releases earlier than ${floor} are ` +
+                  `affected by published advisories fixed in ${floor}: ${advisories}.`
+                : posture === 'unproven-prerelease'
+                  ? `This server is running Vendure ${VENDURE_VERSION}, which semantic-version ordering places ` +
+                    `BEFORE the ${floor} release that fixes ${advisories}. It is not established that this ` +
+                    'pre-release carries all of those fixes.'
+                  : `This server reports its Vendure version as "${VENDURE_VERSION}", which this plugin could ` +
+                    `not read as a version number, so it could not determine whether the platform carries the ` +
+                    `fixes released in ${floor}: ${advisories}. Treat the posture as unverified and check by hand.`;
+        Logger.warn(
+            `${finding} They are platform vulnerabilities and are not introduced or fixable by the ` +
+                `ReorderPlugin, which continues to serve normally; run a platform release of ${floor} or ` +
+                "later. The plugin's own operations remain scoped to the authenticated customer and active " +
+                'channel on every read and write.',
+            loggerCtx,
+        );
     }
 
     /**
@@ -854,18 +1157,18 @@ export class ReorderPlugin implements OnApplicationBootstrap {
 /**
  * A registration that carries one resolved option set of its own, rather than reading the module's.
  *
- * **The defect this closes.** `init()` used to return the `ReorderPlugin` class itself, and the options
- * provider read a module-level variable through {@link ReorderPlugin.options}. Since the class is the
- * registration, two configurations built in one process shared one slot: `A.init({ maxListsPerCustomer: 10 })`
- * followed by `B.init({ maxListsPerCustomer: 20 })` left A's provider resolving 20, because the provider's
- * factory ran when A bootstrapped — after B's `init()` had already overwritten the variable. Nothing failed
- * and nothing logged; A simply enforced a bound its own configuration never asked for. It is reachable
- * wherever one process holds more than one server: a multi-tenant host, and any test file that builds two
- * configurations before booting either.
+ * **Why a distinct class per call.** The class a deployment registers *is* the registration, so returning
+ * `ReorderPlugin` itself from every `init()` would give every configuration in a process one shared slot to
+ * resolve its options from: `A.init({ maxListsPerCustomer: 10 })` followed by
+ * `B.init({ maxListsPerCustomer: 20 })` would leave A's provider resolving 20, because a provider factory
+ * reading module state runs when A bootstraps — after B's `init()` has already written the variable. Nothing
+ * would fail and nothing would log; A would simply enforce a bound its own configuration never asked for.
+ * That is reachable wherever one process holds more than one server: a multi-tenant host, and any test file
+ * that builds two configurations before booting either.
  *
- * **How it is closed.** Each `init()` returns a distinct subclass of `ReorderPlugin` whose options provider
- * is a `useValue` capturing the set that call resolved. The value is fixed at registration time, so no later
- * `init()` can reach it — there is no shared slot left to overwrite.
+ * So each `init()` returns a distinct subclass of `ReorderPlugin` whose options provider is a `useValue`
+ * capturing the set that call resolved. The value is fixed at registration time and no later `init()` can
+ * reach it — there is no shared slot to overwrite.
  *
  * **What the subclass declares, and what it deliberately inherits.** It declares only the two module-scoped
  * keys, `imports` and `providers`. It has to declare `imports` as well as `providers` even though the value is
@@ -888,15 +1191,14 @@ export class ReorderPlugin implements OnApplicationBootstrap {
  * **The bare class is bound to the DEFAULTS, not to the latest initialisation, and that is the other half of
  * the same property.** Registering `ReorderPlugin` itself instead of calling `init()` is a request for the
  * documented defaults, so the base class's provider is `useValue: DEFAULT_REORDER_PLUGIN_OPTIONS` and its
- * `optionsInForce()` returns the same object. Had either read {@link ReorderPlugin.options} instead, isolating
- * the scoped registrations would have left the hole open at the one registration that never asked for anything:
- * a process where one server called `init({ maxLinesPerList: 33 })` would have given a second, bare server
- * that same 33 in place of the documented 200, silently and in an order-dependent way.
+ * `optionsInForce()` returns the same object. Were either to read {@link ReorderPlugin.options} instead,
+ * isolating the scoped registrations would leave the hole open at the one registration that never asked for
+ * anything: a process where one server called `init({ maxLinesPerList: 33 })` would give a second, bare
+ * server that same 33 in place of the documented 200, silently and in an order-dependent way.
  *
- * **What the static still means.** {@link ReorderPlugin.options} reports the most recently resolved set, which
- * is what keeps the shape EPIC-001 section 7.10 and the AAP prescribe — a readable static behind a validated
- * `init()`. It is a report and nothing serves from it, which is why the mutable variable behind it can no
- * longer move any server's bounds.
+ * **What the static means.** {@link ReorderPlugin.options} reports the most recently resolved set, which is
+ * the shape EPIC-001 section 7.10 and the AAP prescribe — a readable static behind a validated `init()`. It
+ * is a report and nothing serves from it, so the mutable variable behind it cannot move any server's bounds.
  *
  * @param resolved - The frozen, validated set this registration will serve with for the life of the process.
  * @returns A `ReorderPlugin` registration bound to exactly that set.
@@ -942,3 +1244,41 @@ function isReadableFile(candidatePath: string): boolean {
         return false;
     }
 }
+
+/**
+ * @description
+ * The migration classes that create this plugin's two tables, for `dbConnectionOptions.migrations`.
+ *
+ * Registering the classes rather than a path is what makes one registration correct in both layouts this
+ * package runs in: TypeORM accepts a migration class wherever it accepts a glob, and a class is resolved by
+ * the module system rather than by the filesystem, so a deployment needs no path arithmetic over `src/`
+ * versus `lib/src/`. The compiled files remain available at `lib/src/migrations/` for a deployment that
+ * prefers globs. The array is ordered, and TypeORM additionally orders migrations by the timestamp in each
+ * class name, so spreading it beside another project's migrations cannot reorder either set.
+ *
+ * @example
+ * ```ts
+ * import type { VendureConfig } from '\@vendure/core';
+ * import { reorderPluginMigrations } from '\@vendure/reorder-plugin';
+ *
+ * export const config: VendureConfig = {
+ *   dbConnectionOptions: {
+ *     // ...your own entries stay where they are; add the plugin's beside them
+ *     migrations: [...reorderPluginMigrations],
+ *   },
+ *   // ...
+ * };
+ * ```
+ *
+ * Register it before the first boot of a server that has `synchronize` enabled. `runMigrations` applies every
+ * pending entry in `dbConnectionOptions.migrations`, and a schema builder that has already created the two
+ * tables leaves this class with nothing to create, so applying it then fails on the existing tables rather
+ * than adopting them. The class is the migration generator's PostgreSQL output and applies to a PostgreSQL
+ * deployment; the migration's own header records the invocation that produces the equivalent file for another
+ * engine. The package README sets that sequencing out step by step, and separates applying from rolling back.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @docsPage ReorderPlugin
+ * @since 3.8.0
+ */
+export const reorderPluginMigrations = [AddReorderLists1786838400000];

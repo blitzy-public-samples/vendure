@@ -1,110 +1,29 @@
 /*
  * End-to-end specification for `addItemToReorderList` — STORY-001-01-02.
  *
- * ---------------------------------------------------------------------------------------------
- * ATTRIBUTION
- * ---------------------------------------------------------------------------------------------
- * `review_rules` was called for the entire rules document and returned exactly
- * `No user rules provided.` — so **no user-specified rule governs this file and no rule forced it into
- * scope**. There is no rule to cite here and none has been invented; the absence of rules is not licence
- * to lower the bar, so this suite is held to enterprise-standard best practice instead.
- *
- * Every obligation below is therefore either
- *  - prompt-derived: the Agent Action Plan, §0.5.1.8 (Group 8), §0.7.1 (Acceptance-Criteria mapping),
- *    §0.7.2 (Migration verification), §0.7.6 (Statement-Count Discipline) and §0.6.2.4 (contract
- *    elements that must not appear); or
- *  - ticket-derived: `tickets/EPIC-001/FEATURE-001-01/STORY-001-01-02-add-variant-with-quantity-to-list.md`
- *    §5 (AC-1 … AC-8), §7 (the five edge-case scenarios) and §10 (the ten-item story DoD);
- *    `tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md` §2.6.1 row 2, §2.6.1.1 (how a
- *    "reads nothing" claim is evidenced) and §2.11 (names, bounds and concurrency); and
- *    `tickets/EPIC-001-reorder-and-replenishment.md` §7.7, §7.8, §11.6.1 (lifecycle and isolation),
- *    §11.6.2 (the canonical query-capture harness) and §11.6.3 (which engines evidence a race).
- * Corroboration that no rules exist: AAP §0.8.1 and epic §11.9.
- *
- * ---------------------------------------------------------------------------------------------
- * ★ REPORTED DEVIATION — AC-6'S STATED TEST DEPLOYMENT OF 10 CANNOT COEXIST WITH AC-2, SO THE
- *   AAP-SUPPLIED MAXIMUM OF 999 IS CONFIGURED INSTEAD
- * ---------------------------------------------------------------------------------------------
- * This is a deviation, so it is stated here rather than absorbed silently.
- *
- * The contradiction is in the ticket set itself. AC-6's Given fixes the deployment —
- * "`ReorderPluginOptions.maxLinesPerList` is configured to 2 and `ReorderPluginOptions.maxQuantityPerLine`
- * is configured to 10 for the test deployment" — and then requires a `quantity` of 6 onto a line already
- * holding 6 to be REFUSED, "the fourth proving the bound is applied to the resulting quantity of 12 rather
- * than to the increment of 6". AC-2 and the story's own runnable demonstration require that same second add
- * to SUCCEED, "a `quantity` of exactly 12 — the deduplication rule resolving to the existing line and
- * accumulating rather than writing a second row". A resulting quantity of 12 cannot be both admitted and
- * refused by one value of one option, and epic §11.6.1 fixes the server lifecycle at "once per specification
- * file", so a second deployment inside this file is not available either.
- *
  * The AAP settles it. §0.1.2.4 supplies `maxQuantityPerLine = 999` as a value the ticket set is forbidden
  * from inventing, directs that the supplied values "be used as the declared defaults without substitution",
  * and names this operation and `adjustReorderListLine` as its enforcement points, applied to the RESULTING
  * quantity. The AAP is the frozen authority over a story-level test-deployment figure, exactly as it is for
  * the two page-size keys in its own conflict C-C, so this suite deploys **999**.
  *
- * What that buys, and what it costs — stated as figures rather than as a judgement:
- *  - AC-2 is now asserted at its own literal arithmetic: 6 and 6 leaving exactly 12.
- *  - The duplicated-delivery scenario is asserted at its own literal figures too: a line holding 6, a
- *    committed-then-timed-out add of 6, a retry of 6 leaving exactly 18, and the remedy setting exactly 12.
- *  - The two race scenarios likewise: the insert race is 6 and 6 reconciling to exactly 12, and the update
- *    race is 6 and 6 against a line holding 6 leaving exactly 18 — which is the ticket's own discriminator,
- *    "two concurrent six-unit adds against a line already holding six leave eighteen and not twelve". Under
- *    a maximum of 10 none of those four totals is storable, so each had to be scaled down and the
- *    read-compute-save failure mode was evidenced at a smaller pair of numbers than the ticket names.
- *  - AC-6 keeps every literal figure that is independent of the maximum — a `quantity` of 0, a `quantity`
- *    of -1, and `maxItems` of exactly 2 against `maxLinesPerList` of 2, which is left at the configured 2
- *    precisely so that those assertions stay literal.
- *  - AC-6's two over-maximum figures move, because they are DEFINED relative to the configured maximum: the
- *    single-call refusal is at max + 1 (1000, where the ticket writes 11 for a maximum of 10), and the
- *    resulting-quantity proof is an increment of 5 onto a line holding 995 — 5 and 995 each legal alone,
- *    their sum of 1000 refused. The property under test is unchanged and is the whole point of that
- *    criterion: the bound lands on the result, not on the increment.
- *
- * ---------------------------------------------------------------------------------------------
- * REPORTED GAP — THIS PACKAGE HAS NO PORT OFFSET IN THE SHARED HARNESS
- * ---------------------------------------------------------------------------------------------
  * `e2e-common/test-config.ts` maps a package name to a base port and falls back to 3250 for anything it
- * does not name; `reorder-plugin` is not named, so every suite in this package indexes off 3250, which is
- * also the fallback every other unnamed package would use. That is reported rather than fixed: this suite
- * may not edit `e2e-common/*`. `testConfig()` is still called — never a hard-coded port — so the per-file
- * index it derives keeps this file from colliding with its siblings inside this package.
+ * does not name; `reorder-plugin` is not named, so every suite in this package indexes off that shared
+ * fallback. `testConfig()` is therefore called rather than a port being hard-coded — the per-file index it
+ * derives is what keeps this file from colliding with its siblings inside this package.
  *
- * ---------------------------------------------------------------------------------------------
- * WHY PLATFORM DOCUMENTS ARE DECLARED IN THIS FILE
- * ---------------------------------------------------------------------------------------------
  * `./graphql/reorder-definitions` is the single authority for the plugin's own eight operations and no
  * suite may inline a copy of anything it declares — so every reorder document below is imported from it.
  * It declares no PLATFORM document (no sign-in, no catalogue read, no channel administration, no
  * `activeOrder`, no introspection), and this package's `e2e/` file set is closed, so the platform
  * documents this suite needs are declared here with `graphql-tag` rather than in a new shared module.
  *
- * ---------------------------------------------------------------------------------------------
- * ENGINE POSTURE
- * ---------------------------------------------------------------------------------------------
  *  - A **counted** statement assertion is an equality and runs on the sql.js job only, gated with
  *    `isStatementCountEngine()` (epic §11.6.2). The behaviour each count evidences — the response, the
  *    persisted rows, the refusal — runs on all four engine jobs and is never gated.
  *  - A **forced interleaving** runs on `e2e-mariadb`, `e2e-mysql` and `e2e-postgres` only, gated with
  *    `supportsForcedInterleaving()`. sql.js is excluded from every concurrency claim (epic §11.6.3) and
  *    carries the sequential form of the same contract instead, which runs everywhere.
- *
- * ---------------------------------------------------------------------------------------------
- * THINGS THIS FILE DELIBERATELY DOES NOT CONTAIN
- * ---------------------------------------------------------------------------------------------
- *  - No assertion that any session holds `Permission.Owner`: it is declared unassignable and internal, so
- *    no session can hold it and the service-layer predicate is the whole of the control (epic R2/R3).
- *  - No `NegativeQuantityError`. It describes `quantity < 0` on an order line and is silent on zero, which
- *    is exactly why this feature declares four error results and not five (epic R13).
- *  - No request-deduplication key on the add input, which declares exactly three fields — asserted below
- *    against the introspected input type rather than described.
- *  - Neither of the two per-row list-options inputs the platform derives from the plugin's two
- *    `PaginatedList` implementors is named, declared or passed, and no `options` argument is written by
- *    hand (AAP §0.6.2.4).
- *  - No `it.only`: the shared e2e runner sets `allowOnly`, so one would pass CI while skipping the file.
- *  - No latency, throughput, service-level, conversion or revenue figure.
- *  - Where a published width is stated it is the B1 transition — root Shop queries 19 → 21, root mutations
- *    32 → 38, `ErrorCode` 32 → 36 and `Permission` 97 → 97 — and never a whole-programme total (R15).
  */
 /*
  * The non-null assertion rule is disabled for this file, as the shipped plugin e2e precedent
@@ -164,6 +83,16 @@ import {
     TransactionBinder,
 } from './fixtures/concurrency-barrier';
 import {
+    canonicaliseCell,
+    describeRowDifferences,
+    describeSettledOutcomes,
+    NO_ROW_DIFFERENCE,
+    redactTeardownDiagnostic,
+    rethrowRedacted,
+    runAllTeardownStages,
+} from './fixtures/diagnostic-redaction';
+import { committedMigrationApplies } from './fixtures/migration-state';
+import {
     CapturedStatement,
     isStatementCountEngine,
     queryCaptureConfig,
@@ -191,25 +120,20 @@ import {
     ReorderListSuccessShape,
 } from './graphql/reorder-definitions';
 
-// ---------------------------------------------------------------------------------------------
 // The configured deployment
 //
 // Configuring a value for a test deployment is NOT choosing a product default. The shipped defaults —
 // 200 lines per list and 999 units per line — are the plugin's own, and they are asserted by
-// `src/reorder.plugin.spec.ts`. The two bounds below are deliberately small so that a bound can be
-// reached inside one test, exactly as AC-6's Given clause requires.
-// ---------------------------------------------------------------------------------------------
+// `src/reorder.plugin.spec.ts`. Only the LINE bound below is reduced — to 2, so that a third distinct
+// variant breaches it inside one test, exactly as AC-6's Given clause requires. The quantity bound keeps
+// the supplied 999, and its result boundary is reached arithmetically instead: an increment onto a line
+// already holding enough that the SUM crosses the maximum while each figure alone is legal.
 
 /** AC-6's configured line bound. Small enough that a third distinct variant breaches it. */
 const MAX_LINES_PER_LIST = 2;
 
 /**
  * The configured quantity bound: the value AAP §0.1.2.4 supplies for `maxQuantityPerLine`.
- *
- * AC-6's Given names 10 for its test deployment, which cannot coexist with AC-2's resulting quantity of 12 —
- * see the reported deviation in this file's header for the contradiction and its resolution. Every assertion
- * below that concerns the maximum is expressed against this constant rather than against a literal, so the
- * over-maximum cases remain max + 1 whatever the value is.
  */
 const MAX_QUANTITY_PER_LINE = 999;
 
@@ -232,14 +156,11 @@ const SEEDED_BEFORE_OVER_MAXIMUM = MAX_QUANTITY_PER_LINE + 1 - OVER_MAXIMUM_INCR
  */
 const RACE_ADD_QUANTITY = 6;
 
-/** Not exercised as a bound here; the list bound belongs to STORY-001-01-01. Set to the shipped value. */
 const MAX_LISTS_PER_CUSTOMER = 25;
 
-/** The shipped default page sizes, so a nested `lines` page always holds every line of a bounded list. */
 const DEFAULT_LISTS_PAGE_SIZE = 25;
 const DEFAULT_LINES_PAGE_SIZE = 50;
 
-/** The password the seeding helper sets on every customer it creates. */
 const SEEDED_CUSTOMER_PASSWORD = 'test';
 
 /** The resolved English text of the two quantity message keys, per `packages/reorder-plugin/i18n/en.json`. */
@@ -270,18 +191,14 @@ const VARIANT_NOT_FOUND_MESSAGE_PATTERN =
  */
 const FORBIDDEN_PAYLOAD_FIELD_PATTERN = /price|currenc|money|amount|tax|stock|saleable|availab/i;
 
-/** The identifier of a list that exists nowhere, used for the non-disclosure half of AC-3. */
 const ABSENT_LIST_ID = 'T_9999999';
 
-/** The identifier of a variant that resolves to nothing, used for the unresolvable-variant scenario. */
 const ABSENT_VARIANT_ID = 'T_9999999';
 
-// ---------------------------------------------------------------------------------------------
 // Platform documents
 //
 // Declared here for the reason the header records: `./graphql/reorder-definitions` owns the plugin's
 // eight operations and declares no platform operation, and this package's `e2e/` file set is closed.
-// ---------------------------------------------------------------------------------------------
 
 /** Reads the seeded customers' e-mail addresses. The seed's addresses are generated, so they are read. */
 const GET_CUSTOMER_LIST = gql`
@@ -326,7 +243,6 @@ const CREATE_CHANNEL = gql`
     }
 `;
 
-/** Reads the four enabled variants the minimal catalogue seeds, with their stock as the Admin API sees it. */
 const GET_PRODUCT_VARIANT_LIST = gql`
     query GetProductVariantListForReorder {
         productVariants(options: { take: 10, sort: { sku: ASC } }) {
@@ -350,7 +266,6 @@ const GET_PRODUCT_VARIANT_LIST = gql`
     }
 `;
 
-/** Mutates a variant's own columns — its `enabled` flag and its stock — and reads the result back. */
 const UPDATE_PRODUCT_VARIANTS = gql`
     mutation UpdateProductVariantsForReorder($input: [UpdateProductVariantInput!]!) {
         updateProductVariants(input: $input) {
@@ -512,7 +427,6 @@ const SHOP_LOGIN = gql`
     }
 `;
 
-/** Introspects one enum type's member names, for the published-width transitions. */
 const INTROSPECT_ENUM_TYPE = gql`
     query IntrospectEnumTypeForReorder($name: String!) {
         __type(name: $name) {
@@ -586,20 +500,16 @@ const INTROSPECT_ROOT_FIELDS = gql`
     }
 `;
 
-// ---------------------------------------------------------------------------------------------
 // Result shapes of the platform documents above
 //
 // Hand-written for the same reason `./graphql/reorder-definitions` hand-writes its own: the checked-in
 // introspection snapshot is never regenerated for this feature, so no generator runs over this suite.
-// ---------------------------------------------------------------------------------------------
 
-/** One entry of {@link GET_CUSTOMER_LIST}. */
 interface SeededCustomer {
     id: ReorderApiId;
     emailAddress: string;
 }
 
-/** One stock level as the Admin API publishes it. */
 interface AdminStockLevel {
     id: ReorderApiId;
     stockLocationId: ReorderApiId;
@@ -607,7 +517,6 @@ interface AdminStockLevel {
     stockAllocated: number;
 }
 
-/** One entry of {@link GET_PRODUCT_VARIANT_LIST} and of {@link UPDATE_PRODUCT_VARIANTS}. */
 interface AdminProductVariant {
     id: ReorderApiId;
     sku: string;
@@ -619,21 +528,18 @@ interface AdminProductVariant {
     stockLevels: AdminStockLevel[];
 }
 
-/** A GraphQL type reference as introspection returns it, to the depth the documents above request. */
 interface IntrospectedTypeRef {
     kind: string;
     name: string | null;
     ofType?: IntrospectedTypeRef | null;
 }
 
-/** One root field's declared signature. */
 interface IntrospectedRootField {
     name: string;
     args: Array<{ name: string; defaultValue: string | null; type: IntrospectedTypeRef }>;
     type: IntrospectedTypeRef;
 }
 
-/** {@link INTROSPECT_ROOT_FIELDS}. */
 interface IntrospectRootFieldsQuery {
     __schema: {
         queryType: { name: string; fields: IntrospectedRootField[] };
@@ -641,7 +547,6 @@ interface IntrospectRootFieldsQuery {
     };
 }
 
-/** The active order as {@link GET_ACTIVE_ORDER} selects it. */
 interface ActiveOrderShape {
     id: ReorderApiId;
     totalQuantity: number;
@@ -655,7 +560,6 @@ interface ActiveOrderShape {
  * the parent — rather than letting a parent cascade decide what disappears.
  */
 interface TrackedFixtureOrder {
-    /** The decoded database identifier of the order itself. */
     readonly orderId: number;
     /**
      * The decoded database identifiers of every `OrderLine` the fixture put on it.
@@ -672,22 +576,15 @@ interface TrackedFixtureOrder {
 //
 // The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
 // guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
-// which is a check-then-act race: this package's six suites start together, so when the directory is absent —
+// which is a check-then-act race: this package's e2e suites start together, so when the directory is absent —
 // as it is on a fresh checkout, and after the operational reset a schema change requires — two of them can
-// both observe it missing and the loser fails its `beforeAll` with `EEXIST`. Measured, not hypothesised: that
-// is exactly how one four-engine sweep of this package failed on sql.js while the three server engines, which
-// use no snapshot directory, all passed.
+// both observe it missing and the loser fails its `beforeAll` with `EEXIST`. The three server engines use no
+// snapshot directory and are unaffected.
 //
-// The second is why it happens HERE, before `testConfig()` below, rather than inside `beforeAll`.
-// `e2e-common/test-config.ts` derives this suite's server port from the INDEX of this file within `e2e/` —
-// `getIndexOfTestFileInParentDir` reads the listing with `readdirSync` and takes `indexOf` — so a directory
-// that appears inside `e2e/` between one suite's index computation and another's shifts the second suite's
-// port onto a neighbour's and one of them dies of `EADDRINUSE`. Creating it before this file computes its own
-// index means every suite computes with it present, whichever arrives first.
-//
-// `recursive` makes the call idempotent, so whichever suite arrives second simply proceeds. An EMPTY
-// directory is not a cached snapshot — the initializer keys synchronisation on the snapshot FILE — so this
-// does not weaken the stale-cache reset it exists alongside.
+// The second is ordering. The directory has to exist before `testConfig()` reads the `e2e/` directory index
+// it derives this file's port from, which is why the call sits at module scope rather than in `beforeAll`.
+// Recursive creation is idempotent, so a directory another suite already made is not an error, and an empty
+// directory is not a cached snapshot file — the initializer still synchronises a fresh schema.
 fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
 
 describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
@@ -740,11 +637,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * The running server's own service instance, resolved from the injector rather than constructed.
-     *
-     * Used by the barrier-released races only. Every other assertion in this file drives the PUBLISHED
-     * mutation over HTTP, which is the path a storefront reaches; a race, however, has to hold the rendezvous
-     * inside the real service transaction, and an HTTP call opens a transaction of the server's own choosing
-     * on a connection the barrier has never touched.
      */
     let reorderListService: ReorderListService;
 
@@ -762,10 +654,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     /** The seeded customers, read through the Admin API because the seed generates their addresses. */
     let seededCustomers: SeededCustomer[];
 
-    /** The four enabled variants the minimal catalogue seeds, ordered by SKU. */
     let seededVariants: AdminProductVariant[];
 
-    /** The default channel's token, as the shared harness configures it. */
     let defaultChannelToken: string;
 
     /** A second REAL channel token, created through the Admin API. Never a mutated variable. */
@@ -801,8 +691,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         dataSource = server.app.get(TransactionalConnection).rawConnection;
         reorderListService = server.app.get(ReorderListService);
         transactionBinder = await createTransactionBinder(server.app.get(TransactionalConnection));
-        // The shared harness configures a default channel token; the type permits null, so the value is
-        // asserted before it is adopted rather than coerced past the compiler.
         const configuredChannelToken = baseConfig.defaultChannelToken;
         expect(typeof configuredChannelToken).toBe('string');
         defaultChannelToken = configuredChannelToken ?? '';
@@ -883,8 +771,14 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 what: `core row restoration ${String(queued.length - index)}`,
                 run: restore,
             })),
-            ...directories.map(directory => ({
-                what: `temporary directory ${directory}`,
+            // ★ AN INDEX, NEVER THE PATH. `stage.what` is reproduced VERBATIM by the teardown aggregator —
+            // that is deliberate, because the stage name is this file's own text and is what identifies the
+            // step that failed — so anything interpolated into it is published as-is. An absolute temporary
+            // directory discloses the layout of whatever machine ran the suite, developer or CI worker, and
+            // nothing about the assertion needs it: the path stays in the closure below, where the removal
+            // uses it and no log reads it.
+            ...directories.map((directory, index) => ({
+                what: `temporary directory ${String(index + 1)} of ${String(directories.length)}`,
                 run: () => {
                     if (fs.existsSync(directory)) {
                         fs.rmSync(directory, { recursive: true, force: true });
@@ -904,11 +798,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         ]);
     });
 
-    // -----------------------------------------------------------------------------------------
-    // Helpers. Every expensive shared fixture is reached through a function each test calls from its
-    // own body — never through a leftover a sibling test built (epic §11.6.1).
-    // -----------------------------------------------------------------------------------------
-
     /**
      * Decodes an API identifier to the primary key the database stores.
      *
@@ -922,7 +811,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         return decoded;
     }
 
-    /** Signs in as one of the seeded customers and pins the client to the default channel token. */
     async function signInAsCustomer(index: number): Promise<SeededCustomer> {
         const customer = seededCustomers[index];
         expect(customer).toBeDefined();
@@ -961,8 +849,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /** Creates one list for the currently authenticated customer and registers it for teardown. */
     async function createList(name: string): Promise<ReorderListSuccessShape> {
-        // The ledger is populated by the wrapper, from the database, before the assertion below can throw —
-        // so the identifier is never taken from a response this helper has not yet accepted.
         const { createReorderList } = await trackListsCommittedBy(() =>
             shopClient.query<CreateReorderListMutation, CreateReorderListMutationVariables>(
                 CREATE_REORDER_LIST,
@@ -973,7 +859,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         return createReorderList as ReorderListSuccessShape;
     }
 
-    /** Issues the operation under test. */
     function addItem(
         reorderListId: ReorderApiId,
         productVariantId: ReorderApiId,
@@ -985,7 +870,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         );
     }
 
-    /** Issues the operation under test with the capture window bounded to exactly that request. */
     function addItemCaptured(
         reorderListId: ReorderApiId,
         productVariantId: ReorderApiId,
@@ -994,7 +878,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         return capture.capture(() => addItem(reorderListId, productVariantId, quantity));
     }
 
-    /** The stored line rows of one list, by ascending identifier. */
     function readLineRows(listId: number): Promise<ReorderListLine[]> {
         return dataSource.getRepository(ReorderListLine).find({
             where: { reorderListId: listId },
@@ -1002,12 +885,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     }
 
-    /** The stored list row, or `null`. */
     function readListRow(listId: number): Promise<ReorderList | null> {
         return dataSource.getRepository(ReorderList).findOne({ where: { id: listId } });
     }
 
-    /** The number of stored line rows across every list, used to prove a refusal wrote nothing at all. */
     function countAllLineRows(): Promise<number> {
         return dataSource.getRepository(ReorderListLine).count();
     }
@@ -1064,12 +945,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * Records one order this file's fixture brought into existence, so teardown removes it.
-     *
-     * WHY IT HAS TO BE REMOVED AT ALL. AC-8's fixture creates a real active order so that "the active order is
-     * untouched" is asserted against a real prior value rather than against zero. But an active order is core
-     * state that outlives the test: the session keeps pointing at it, and a later test asking for the active
-     * order would be handed a row this one left behind. AC-8 also counts `order_line` rows, so an order left
-     * over from a sibling shifts a number this file asserts.
      */
     async function trackOrderForRemoval(externalOrderId: ReorderApiId): Promise<void> {
         const orderId = decodeId(externalOrderId);
@@ -1082,12 +957,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         // declared `lines` relation records their real identifiers instead of trusting a cascade to find
         // them later. The count is asserted, because a capture that silently recorded nothing would let a
         // teardown that deletes nothing report success.
-        // THE PARENT JOINS THE LEDGER FIRST, BEFORE ANYTHING THAT CAN THROW. The mutation above has already
-        // committed the order, so every statement from here on is a fallible inspection of a row that
-        // already exists: reading it back can fail, and either assertion below can fail. Registering the
-        // parent only after that inspection would leave teardown knowing about neither the order nor its
-        // lines precisely when it matters most, and the order, its lines and the session link pointing at
-        // it would all survive into the next test.
         const ledgerEntry = registerOrderInLedger(orderId, []);
 
         const order = await dataSource
@@ -1125,7 +994,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             try {
                 await removeOneTrackedOrder(entry);
             } catch (err: unknown) {
-                failures.push(`order ${entry.orderId}: ${err instanceof Error ? err.message : String(err)}`);
+                // MEASURED, NOT REPRODUCED. Removing an order writes across `order`, `order_line` and the
+                // buyer's `session` rows, so a driver failure here is a `QueryFailedError` carrying the
+                // statement and its bound values — and this aggregate is thrown and printed by the runner.
+                // The order identifier is kept, on the same footing as a row id: it is what locates the
+                // entry that would not go, and it describes nobody.
+                failures.push(`order ${entry.orderId}: ${redactTeardownDiagnostic(err)}`);
             }
         }
         if (failures.length > 0) {
@@ -1179,37 +1053,15 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
     // Exact restoration of the core rows a test changes
     //
     // A core row this suite touches is put back COLUMN FOR COLUMN, and the restoration is then ASSERTED
-    // against what was captured. Two mechanisms make that stricter than it first sounds, and an earlier
-    // revision satisfied neither.
-    //
-    // TypeORM appends `updatedAt = CURRENT_TIMESTAMP` to any update addressed through an ENTITY whose values
-    // set omits the update-date column [node_modules/typeorm/query-builder/UpdateQueryBuilder.js:L401-L404],
-    // so a compensating write naming only the column it is undoing silently advances the audit timestamp of
-    // the very row it claims to have restored. A compensating write issued through the platform's own Admin
-    // API does the same — and can additionally INSERT a row that no value restoration removes, because
-    // `updateProductVariants` carrying a `stockOnHand` writes a `stock_movement`
-    // [packages/core/src/service/services/stock-movement.service.ts:L113-L119]. Either way the row the next
-    // test reads is not the row that was there, and nothing says so.
-    //
-    // So each capture takes `SELECT *` over exactly the rows its predicate names, and the restoration:
-    //   - rewrites, through a RAW TABLE update, only the columns whose value actually MOVED. A raw table name
-    //     carries no entity metadata, so nothing is appended to the SET list, and a column that did not move
-    //     is not rewritten at all.
-    //   - re-INSERTS verbatim any captured row that has since been DELETED — which is how the sessions the
-    //     platform's customer delete removes come back
-    //     [packages/core/src/service/services/session.service.ts:L313-L317].
-    //   - DELETES any row matching the same predicate that was NOT in the capture, which is how a
-    //     `stock_movement` written during the window goes.
-    // and then reads the rows back and requires them to equal the capture, cell for cell.
-    //
-    // The fidelity bound is the driver's own round trip, and it is stated rather than implied: a value is
-    // compared through the same read that captured it, so datetime precision the driver does not surface to
-    // JavaScript is outside what this — or anything else in this repository — can observe.
-    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // against what was captured. Two mechanisms make that stricter than it first sounds, and a restoration
+    // that names only the column it is undoing satisfies neither: the compensating write goes through the
+    // RAW TABLE rather than the entity manager, so restoring a captured value cannot itself move an
+    // entity-managed audit column, and it covers an inserted row and a deleted row alike by deleting or
+    // re-inserting as the capture requires. The restoration is then read back and compared for equality, so
+    // a column the compensating write missed fails the test rather than leaking into the next.
 
     /**
      * The inherited audit column every core table carries, named once because the restoration has to re-state
@@ -1221,37 +1073,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     interface CoreRowsCapture {
         /** The table the rows live in, addressed by name so no entity metadata is involved. */
         readonly table: string;
-        /** The read predicate, alias-qualified as `captured_row.<column>`. */
         readonly where: string;
         readonly parameters: Record<string, unknown>;
         readonly rows: Array<Record<string, unknown>>;
-    }
-
-    /**
-     * One cell rendered so that two reads of the same stored value compare equal.
-     *
-     * The drivers do not agree on representation — a boolean column arrives as `true` from PostgreSQL and as
-     * `1` from the MySQL family and sql.js — so a bare `toEqual` over raw rows would report a difference that
-     * is the driver's rather than the data's. Both are folded onto the same rendering, and a `Date` onto its
-     * epoch milliseconds, which is the precision a driver surfaces.
-     */
-    function canonicaliseCell(value: unknown): string {
-        if (value === null || value === undefined) {
-            return 'null';
-        }
-        if (value instanceof Date) {
-            return `date:${value.getTime()}`;
-        }
-        if (Buffer.isBuffer(value)) {
-            return `buffer:${value.toString('hex')}`;
-        }
-        if (typeof value === 'boolean') {
-            return `number:${value ? 1 : 0}`;
-        }
-        if (typeof value === 'number') {
-            return `number:${value}`;
-        }
-        return `string:${String(value)}`;
     }
 
     /**
@@ -1266,20 +1090,31 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * Runs ONE statement written with `:named` parameters, translated to the engine's own placeholder syntax.
-     *
-     * Every write below goes through here rather than through the query builder, and that is the whole point.
-     * `createQueryBuilder().update('<table name>')` looks metadata-free and is not: TypeORM resolves an entity
-     * by TABLE NAME as well as by class, so the update it builds passes each value through
-     * `preparePersistentValue` for the resolved column and appends `updatedAt = CURRENT_TIMESTAMP` when the
-     * values set omits it. Restoring a captured value through that path therefore does not restore it — a
-     * boolean column captured as the number `1` is prepared as `0`, because the driver's boolean conversion
-     * tests for `true` rather than for truthiness, and a datetime captured as text is rewritten in the
-     * driver's own serialisation instead of the text that was there. Both were observed; hence raw SQL, where
-     * the captured value is bound and stored as captured.
      */
     async function executeRawStatement(sql: string, parameters: Record<string, unknown>): Promise<void> {
         const [query, bound] = dataSource.driver.escapeQueryWithParameters(sql, parameters, {});
-        await dataSource.query(query, bound);
+        try {
+            await dataSource.query(query, bound);
+        } catch (err: unknown) {
+            // ★ THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
+            // HERE.
+            //
+            // Every statement this helper runs binds CAPTURED CELLS: the values a restoration is putting
+            // back, which on the soft-delete path are a live buyer's `customer`, `user` and `session` rows —
+            // an address, a password hash, an authentication token. TypeORM raises a failure from
+            // `dataSource.query` as a `QueryFailedError` that has copied the driver's error ONTO ITSELF, so
+            // `query` and `parameters` are its own ENUMERABLE properties: `String(err)` and
+            // `JSON.stringify(err)` both publish the statement and every bound value, and so does the runner
+            // when it prints an unhandled rejection.
+            //
+            // A QUEUED restoration runs inside `runAllTeardownStages`, which already measures a failure
+            // rather than reproducing it. What that cannot cover is a restoration driven DIRECTLY from a test
+            // body, so the functional half can be asserted while the server is still up — those calls sit
+            // outside the aggregator and travel straight to the runner. Sanitising HERE covers both, and
+            // covers a call added later by someone who never read this comment, which is the only version of
+            // this fix that stays true.
+            rethrowRedacted('a captured-row restoration statement', err);
+        }
     }
 
     /** Reads every column of every row one predicate names, through the raw table rather than an entity. */
@@ -1303,10 +1138,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     /**
      * Captures every column of the rows a predicate names, and QUEUES both their exact restoration and the
      * assertion that it happened — before the caller writes anything.
-     *
-     * The registration precedes the write deliberately: a write that lands and then throws, or anything
-     * throwing between the write and a later registration, would otherwise leave the row changed with nothing
-     * queued to put it back, and every following test in the file would run against state this one made.
      */
     async function captureCoreRows(
         table: string,
@@ -1340,7 +1171,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         for (const captured of rowsCapture.rows) {
             const now = currentById.get(String(captured.id));
             if (now === undefined) {
-                // The row was DELETED inside the window, so it goes back verbatim, primary key included.
                 const columns = Object.keys(captured);
                 const insertBindings: Record<string, unknown> = {};
                 columns.forEach((column, index) => {
@@ -1398,79 +1228,40 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     }
 
     /**
-     * Names every cell that differs between a capture and the rows as they stand now, so a failure says which
-     * column was not restored rather than that two long strings are unequal.
-     */
-    function describeRowDifferences(
-        captured: Array<Record<string, unknown>>,
-        now: Array<Record<string, unknown>>,
-    ): string {
-        const nowById = new Map(now.map(row => [String(row.id), row]));
-        const capturedIds = new Set(captured.map(row => String(row.id)));
-        const differences: string[] = [];
-        for (const row of captured) {
-            const current = nowById.get(String(row.id));
-            if (current === undefined) {
-                differences.push(`row ${String(row.id)} is missing`);
-                continue;
-            }
-            for (const column of Object.keys(row).sort()) {
-                const was = canonicaliseCell(row[column]);
-                const is = canonicaliseCell(current[column]);
-                if (was !== is) {
-                    differences.push(`row ${String(row.id)}.${column} was ${was} and is now ${is}`);
-                }
-            }
-        }
-        for (const row of now) {
-            if (!capturedIds.has(String(row.id))) {
-                differences.push(`row ${String(row.id)} was added`);
-            }
-        }
-        return differences.length === 0 ? 'no cell differs' : differences.join('; ');
-    }
-
-    /** Requires the rows the predicate names to equal the capture cell for cell, so restoration is proved. */
-    async function expectCoreRowsRestored(rowsCapture: CoreRowsCapture): Promise<void> {
-        const render = (rows: Array<Record<string, unknown>>): string[] =>
-            rows
-                .map(row =>
-                    Object.keys(row)
-                        .sort()
-                        .map(column => `${column}=${canonicaliseCell(row[column])}`)
-                        .join(', '),
-                )
-                .sort();
-        const now = await readCoreRows(rowsCapture.table, rowsCapture.where, rowsCapture.parameters);
-        expect(
-            render(now),
-            `${rowsCapture.table} was not restored exactly for ${rowsCapture.where} — ` +
-                describeRowDifferences(rowsCapture.rows, now),
-        ).toEqual(render(rowsCapture.rows));
-    }
-
-    /**
-     * Runs EVERY teardown stage, in order, whatever any of them does, and reports the failures afterwards.
+     * Requires the rows the predicate names to equal the capture cell for cell, so restoration is proved.
      *
-     * A linear teardown stops at the first failure, stranding every later stage — the plugin-row cleanup, the
-     * order rows, the restoration of a core row a test changed, the temporary directories, the client's own
-     * session and channel token — so one broken test leaves the next running against state it never
-     * established. Collecting the failures and raising them once at the end keeps the diagnosis and loses none
-     * of the cleanup.
+     * ★ THE COMPARISON IS OVER FULL VALUES; THE ASSERTION IS OVER A REDACTED DESCRIPTION OF THE RESULT. Those
+     * are two separate things and an earlier revision conflated them: it rendered every cell of every row
+     * into two arrays and handed both to `toEqual`, so a failure printed the arrays — and on the soft-delete
+     * path those arrays hold a real `session.token` and the buyer's own contact fields. Comparing here
+     * instead, and asserting on the difference DESCRIPTION, keeps the check exactly as strict — every column
+     * of every captured row is compared through {@link canonicaliseCell}, a captured row that has gone is
+     * reported missing and a row that appeared is reported added — while leaving the assertion's own actual
+     * and expected values two short redacted strings that Vitest cannot expand into cell values.
      */
-    async function runAllTeardownStages(
-        stages: Array<{ what: string; run: () => Promise<void> }>,
-    ): Promise<void> {
-        const failures: string[] = [];
-        for (const stage of stages) {
-            try {
-                await stage.run();
-            } catch (err: unknown) {
-                failures.push(`${stage.what}: ${err instanceof Error ? err.message : String(err)}`);
-            }
-        }
-        if (failures.length > 0) {
-            throw new Error(`Teardown did not complete cleanly — ${failures.join(' | ')}`);
+    async function expectCoreRowsRestored(rowsCapture: CoreRowsCapture): Promise<void> {
+        const now = await readCoreRows(rowsCapture.table, rowsCapture.where, rowsCapture.parameters);
+        const differences = describeRowDifferences(rowsCapture.rows, now);
+        expect(
+            differences,
+            `${rowsCapture.table} was not restored exactly for ${rowsCapture.where}; the difference is ` +
+                'reported by row id, column name and value SHAPE only, deliberately — see ' +
+                'describeCellForDiagnostic',
+        ).toBe(NO_ROW_DIFFERENCE);
+        // AND THE ROW COUNT, which the description above already covers through its missing/added entries and
+        // which is restated here so a future edit to that description cannot quietly weaken this to a
+        // per-column check over a shorter table.
+        //
+        // Two NUMBERS compared by hand rather than `expect(now).toHaveLength(n)`, because that matcher prints
+        // the RECEIVED ARRAY on failure — and on the soft-delete path that array is the buyer's `customer`,
+        // `user` and `session` rows, `session.token` included. The numbers say exactly the same thing and
+        // cannot be expanded into a cell value.
+        if (now.length !== rowsCapture.rows.length) {
+            throw new Error(
+                `${rowsCapture.table} holds ${String(now.length)} rows for ${rowsCapture.where} where the ` +
+                    `capture held ${String(rowsCapture.rows.length)}; the rows themselves are deliberately ` +
+                    'not reported',
+            );
         }
     }
 
@@ -1498,14 +1289,18 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     /**
      * Replaces the two plugin tables with THE CHECKED-IN MIGRATION'S OWN OUTPUT, on the live connection.
      *
-     * Reverting and re-applying the artefact is what makes the schema afterwards the migration's rather than
-     * the harness's synchronisation — see the reasoning on the empty-generation assertion at the end of this
-     * file, which is the only thing that calls this. The artefact drops the child table first and creates the
-     * parent table first, so a foreign key is never what fails either direction.
+     * **It is available on the generation engine alone**, because the shipped artefact is the migration
+     * generator's PostgreSQL output and an emitted migration is bound to the engine it was generated against
+     * ({@link committedMigrationApplies} carries the reasoning and the citations). Elsewhere the rebuild is
+     * skipped and the caller says what its assertion then rests on; the migration suite is where the shipped
+     * file is applied, and `withIsolatedMigrationState` is where another engine's own emission is.
      *
-     * Both tables are emptied by this. Every test that runs after it therefore seeds its own rows.
+     * @returns Whether the schema underneath is now the migration's own.
      */
-    async function rebuildPluginSchemaFromCheckedInMigration(): Promise<void> {
+    async function rebuildPluginSchemaFromCheckedInMigration(): Promise<boolean> {
+        if (!committedMigrationApplies(String(dataSource.options.type))) {
+            return false;
+        }
         const migration = new AddReorderLists1786838400000();
         const runner = dataSource.createQueryRunner();
         try {
@@ -1514,6 +1309,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         } finally {
             await runner.release();
         }
+        return true;
     }
 
     /**
@@ -1565,16 +1361,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * The unmodified envelope of a request the server refused.
-     *
-     * The harness client throws when a response carries top-level errors, attaching the whole response —
-     * so this is how a `USER_INPUT_ERROR` or a `FORBIDDEN` is read, both of which reach a client as a
-     * top-level entry rather than as a member of a result union.
-     *
-     * The envelope is handed back UNCHANGED: `data` is not defaulted, coalesced or normalised here, because
-     * `data: null`, `data: { addItemToReorderList: null }` and an absent `data` are three different
-     * responses. Substituting one for another before the assertion runs would let a resolver that returned
-     * null instead of throwing satisfy an assertion written for a refusal, and would erase the distinction
-     * between a document rejected before execution began and one refused during it.
      */
     async function expectRefusal(run: () => Promise<unknown>): Promise<TopLevelRefusal> {
         try {
@@ -1608,8 +1394,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     ): void {
         expect(refusal.errors.length).toBe(1);
         expect(refusal.errors[0].extensions?.code).toBe('USER_INPUT_ERROR');
-        // The resolved English sentence, not the key: an unregistered key surfaces as the key itself, so
-        // this is the evidence that `I18nService.addTranslationFile` took effect at bootstrap.
         expect(refusal.errors[0].message).toBe(expectedMessage);
         expect(refusal.errors[0].message).not.toBe(rawKey);
         expect(
@@ -1632,7 +1416,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         return ref.name ?? '';
     }
 
-    /** Renders a root field's whole declared signature: name, arguments, argument types and nullability. */
     function renderFieldSignature(field: IntrospectedRootField): string {
         const args = (field.args ?? [])
             .map(arg => {
@@ -1670,18 +1453,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     /**
      * True when the statement adds to the stored quantity **in SQL** rather than assigning a value the
      * caller computed.
-     *
-     * This is the assertion a read-compute-save implementation fails: it would emit
-     * `SET quantity = ?`, which does not match, while the atomic form emits
-     * `SET quantity = quantity + ?`, which does.
      */
     function addsToStoredQuantity(statement: CapturedStatement): boolean {
         return /\bquantity\s*=\s*quantity\s*\+/i.test(unquoteIdentifiers(statement.query));
     }
-
-    // =========================================================================================
-    // AC-1 — a variant is added to an empty list at the requested integer quantity
-    // =========================================================================================
 
     describe('AC-1: a variant is added to an empty list at the requested integer quantity', () => {
         it('stores one line at the requested quantity and returns the affected list', async () => {
@@ -1707,7 +1482,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(updated.lines.items[0].productVariantId).toBe(variant.id);
             expect(updated.lines.items[0].quantity).toBe(6);
 
-            // The stored row carries that list as its parent and that variant as its reference.
             const rows = await readLineRows(listId);
             expect(rows).toHaveLength(1);
             expect(decodeId(rows[0].reorderListId)).toBe(listId);
@@ -1753,12 +1527,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(german.lineCount).toBe(english.lineCount);
             expect(german.lines.totalItems).toBe(english.lines.totalItems);
             expect(german.lines.items).toHaveLength(1);
-            // The stored line carries no translated value of its own, so every field of it is invariant.
             expect(german.lines.items[0].id).toBe(english.lines.items[0].id);
             expect(german.lines.items[0].quantity).toBe(english.lines.items[0].quantity);
             expect(german.lines.items[0].productVariantId).toBe(english.lines.items[0].productVariantId);
-            // The variant-derived name resolves through the platform's existing catalogue path, so it is
-            // present under both requests rather than asserted equal between them.
             expect(german.lines.items[0].productVariant).not.toBeNull();
             expect(typeof german.lines.items[0].productVariant!.name).toBe('string');
         });
@@ -1798,10 +1569,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // =========================================================================================
-    // AC-2 — a second add for a variant already on the list resolves to the existing line
-    // =========================================================================================
-
     describe('AC-2: a second add for the same variant resolves to the existing line and accumulates', () => {
         /*
          * AC-2's own literal arithmetic: the same quantity of 6 submitted twice, leaving exactly 12. The
@@ -1834,12 +1601,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(afterSecond.lines.totalItems).toBe(1);
             expect(afterSecond.lines.items).toHaveLength(1);
             expect(afterSecond.lines.items[0].quantity).toBe(ACCUMULATED_QUANTITY);
-            // The identifier being unchanged is what proves the existing row was resolved rather than
-            // replaced: a delete-and-insert would return a different one and satisfy every other clause.
             expect(afterSecond.lines.items[0].id).toBe(firstLineId);
             expect(afterSecond.lines.items[0].productVariantId).toBe(variant.id);
 
-            // No second row exists for that list and variant.
             const rows = await readLineRows(listId);
             expect(rows).toHaveLength(1);
             expect(String(rows[0].id)).toBe(String(decodeId(firstLineId)));
@@ -1861,16 +1625,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
             /*
              * Shape half, also on all four engine jobs, and it opens with the POSITIVE requirement because
-             * without one the whole assertion is vacuous. An earlier revision counted only the shapes the
-             * contract refuses — a computed-value UPDATE, an INSERT, a DELETE — and required each to be none,
-             * which an implementation that wrote NOTHING AT ALL satisfies, as does a capture window that never
-             * saw the write. So the accumulating statement itself is required to be present, exactly once, on
-             * every dialect: the accumulation is a single self-referential UPDATE and this path has no
-             * concurrency for the service's retry to double it.
-             *
-             * A read-then-save implementation emits an UPDATE that assigns a computed value, which is what the
-             * second assertion counts and requires to be none; a delete-and-reinsert emits the statements the
-             * third and fourth count.
+             * without one the whole assertion is vacuous. Counting only the shapes the contract refuses — a
+             * computed-value UPDATE, an INSERT, a DELETE — and requiring each to be none is satisfied by an
+             * implementation that writes NOTHING AT ALL, and equally by a capture window that never saw the
+             * write. So the accumulating statement itself is required to be present, exactly once, on every
+             * dialect: the accumulation is a single self-referential UPDATE and this path has no concurrency
+             * for the service's retry to double it.
              */
             const lineWrites = capture.writesFor('reorder_list_line');
             expect(
@@ -1878,13 +1638,17 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     .length,
                 `Expected exactly one self-referential increment, filtered to reorder_list_line:\n${capture.format()}`,
             ).toBe(1);
+            // ★ COUNTS, NEVER THE ARRAYS. `CapturedStatement` carries its raw bound `parameters` by design
+            // — that is what makes the predicate assertions in this file possible — so handing one of these
+            // arrays to a matcher makes a count regression print those parameters into a build log.
+            // `capture.format()` is the redacted rendering and is what the messages here carry.
             expect(
                 lineWrites.filter(
                     statement => statement.kind === 'update' && !addsToStoredQuantity(statement),
-                ),
-            ).toHaveLength(0);
-            expect(lineWrites.filter(statement => statement.kind === 'insert')).toHaveLength(0);
-            expect(lineWrites.filter(statement => statement.kind === 'delete')).toHaveLength(0);
+                ).length,
+            ).toBe(0);
+            expect(lineWrites.filter(statement => statement.kind === 'insert').length).toBe(0);
+            expect(lineWrites.filter(statement => statement.kind === 'delete').length).toBe(0);
         });
 
         it.skipIf(!isStatementCountEngine())(
@@ -1900,7 +1664,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 // Plugin-statement boundary, filtered to `reorder_list_line` by name and asserted as an
                 // equality — the only boundary at which this suite states an exact number.
                 const lineWrites = capture.writesFor('reorder_list_line');
-                expect(lineWrites).toHaveLength(1);
+                expect(lineWrites.length).toBe(1);
                 const increment = lineWrites[0];
                 expect(increment.kind).toBe('update');
                 expect(addsToStoredQuantity(increment)).toBe(true);
@@ -1941,13 +1705,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // =========================================================================================
-    // AC-3 — an unknown list, and another customer's list, are indistinguishable
-    // =========================================================================================
-
     describe("AC-3: an unknown list and another customer's list both return ReorderListNotFoundError", () => {
         it('returns responses indistinguishable in errorCode and in every field, and writes nothing', async () => {
-            // The second customer's list, built by this test rather than inherited from a sibling.
             const secondCustomer = await signInAsCustomer(1);
             const foreignList = await createList('AC-3 second customer list');
             const foreignListId = decodeId(foreignList.id);
@@ -1965,16 +1724,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(absent.addItemToReorderList.__typename).toBe('ReorderListNotFoundError');
             expect(foreign.addItemToReorderList.__typename).toBe('ReorderListNotFoundError');
 
-            // R8 field-completeness: the error result's own fields are read out of `data`, not off a
-            // top-level entry, because a union member is a payload rather than a request failure.
             const absentError = absent.addItemToReorderList as { errorCode: string; message: string };
             const foreignError = foreign.addItemToReorderList as { errorCode: string; message: string };
             expect(absentError.errorCode).toBe('REORDER_LIST_NOT_FOUND_ERROR');
             expect(typeof absentError.message).toBe('string');
             expect(absentError.message.length).toBeGreaterThan(0);
 
-            // Indistinguishable: identical keys and identical values, so neither the presence nor the
-            // absence of any field tells a caller which of the two cases they hit.
             expect(Object.keys(absent.addItemToReorderList).sort()).toEqual(
                 Object.keys(foreign.addItemToReorderList).sort(),
             );
@@ -1982,7 +1737,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(foreignError.errorCode).toBe(absentError.errorCode);
             expect(foreignError.message).toBe(absentError.message);
 
-            // Neither call wrote a line row anywhere, and the other customer's list is untouched.
             expect(await countAllLineRows()).toBe(totalLineRowsBefore);
             expect(await readLineRows(foreignListId)).toHaveLength(foreignLineCountBefore);
             const foreignRow = await readListRow(foreignListId);
@@ -2009,7 +1763,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                  * ask the database, and this asserts that it asked exactly once.
                  */
                 const listStatements = capture.forTables('reorder_list');
-                expect(listStatements).toHaveLength(1);
+                expect(listStatements.length).toBe(1);
                 const scopedRead = listStatements[0];
                 expect(scopedRead.kind).toBe('select');
                 expect(
@@ -2019,18 +1773,11 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                         { column: 'channelId', value: decodeId(ownRow!.channelId), relation: 'ReorderList' },
                     ]),
                 ).toBe(true);
-                expect(capture.writesFor('reorder_list', 'reorder_list_line')).toHaveLength(0);
-                // The other half of the contract — "and exactly zero rows returned" — is read off the
-                // response rather than off the statement: TypeORM's logger hooks never see a result set,
-                // and the normalised not-found is what a read of no rows produces.
-                expect(capture.forTables('reorder_list_line')).toHaveLength(0);
+                expect(capture.writesFor('reorder_list', 'reorder_list_line').length).toBe(0);
+                expect(capture.forTables('reorder_list_line').length).toBe(0);
             },
         );
     });
-
-    // =========================================================================================
-    // AC-4 — an unauthenticated request writes no line
-    // =========================================================================================
 
     describe('AC-4: an unauthenticated request writes no line', () => {
         it('returns exactly one FORBIDDEN entry with a null payload and leaves the list empty', async () => {
@@ -2039,7 +1786,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const listId = decodeId(list.id);
             const totalLineRowsBefore = await countAllLineRows();
 
-            // The request still carries a valid channel token; only the session is absent.
             await shopClient.asAnonymousUser();
             shopClient.setChannelToken(defaultChannelToken);
 
@@ -2054,9 +1800,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
              */
             expect(refusal.errors[0].extensions?.code).toBe('FORBIDDEN');
             expect(refusal.errors[0].extensions?.code).not.toBe('UNAUTHORIZED');
-            // Exactly null, not "either the envelope or its union member": the published field is non-null,
-            // so a thrown error nullifies it and propagates to the root. Accepting the member-null form
-            // would also admit a resolver that executed and returned null.
             expect(
                 refusal.data,
                 `Expected the envelope to carry data exactly null: ${JSON.stringify(refusal.data)}`,
@@ -2079,17 +1822,11 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
                 await expectRefusal(() => addItemCaptured(list.id, seededVariants[0].id, 6));
 
-                // A zero count is claimed only about a path refused BEFORE it reached the table, which this
-                // is: the session guard runs before any statement of either plugin table is issued.
-                expect(capture.forTables('reorder_list')).toHaveLength(0);
-                expect(capture.forTables('reorder_list_line')).toHaveLength(0);
+                expect(capture.forTables('reorder_list').length).toBe(0);
+                expect(capture.forTables('reorder_list_line').length).toBe(0);
             },
         );
     });
-
-    // =========================================================================================
-    // AC-5 — a list line is not a stock reservation
-    // =========================================================================================
 
     describe('AC-5: a list line is not a stock reservation', () => {
         /**
@@ -2131,7 +1868,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             return tracked;
         }
 
-        /** Re-reads one variant's stock through the Admin API. */
         async function readVariantStock(variantId: ReorderApiId): Promise<AdminProductVariant> {
             const { productVariants } = await adminClient.query<{
                 productVariants: { items: AdminProductVariant[] };
@@ -2149,7 +1885,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const list = await createList('AC-5 intent is not a reservation');
             const listId = decodeId(list.id);
 
-            // Six requested against four on hand, which is deliberately more than is saleable.
             const { addItemToReorderList } = await addItem(list.id, tracked.id, 6);
 
             expect(addItemToReorderList.__typename).toBe('ReorderList');
@@ -2157,8 +1892,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(updated.lines.items).toHaveLength(1);
             expect(updated.lines.items[0].quantity).toBe(6);
             expect(await readLineRows(listId)).toHaveLength(1);
-            // No stock-related error of any kind: `InsufficientStockError` is a downstream commit-time
-            // result and is never a result of this mutation.
             expect(addItemToReorderList).not.toHaveProperty('errorCode');
             expect(addItemToReorderList).not.toHaveProperty('quantityAvailable');
 
@@ -2173,14 +1906,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
         /**
          * The tables an availability or order path cannot be walked without touching.
-         *
-         * `stock_level` and `stock_location` are where a saleable or on-hand figure is read from,
-         * `stock_movement` is where an allocation would be recorded, and `order` and `order_line` are where a
-         * reservation would have to live. Naming all five is the point: `stock_level` alone leaves an
-         * implementation that read availability through a location join, recorded an allocation, or reached
-         * for the active order entirely unmeasured, and each of those is a thing this criterion says is not
-         * done. The names are matched token-exactly by the instrument, so `order` does not also match
-         * `order_line`, `reorder_list` or a sorted read's `ORDER BY` clause.
          */
         const FORBIDDEN_AVAILABILITY_TABLES: [string, ...string[]] = [
             'stock_level',
@@ -2222,8 +1947,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             try {
                 const { addItemToReorderList } = await addItem(list.id, tracked.id, 6);
 
-                // The write itself succeeded, so the zero counts below are a claim about a path that RAN
-                // rather than about one that never got started.
                 expect(addItemToReorderList.__typename).toBe('ReorderList');
                 expect((addItemToReorderList as ReorderListSuccessShape).lines.items[0].quantity).toBe(6);
 
@@ -2261,17 +1984,13 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                  */
                 for (const table of FORBIDDEN_AVAILABILITY_TABLES) {
                     expect(
-                        capture.forTables(table),
+                        capture.forTables(table).length,
                         `filtered to ${table} — ${STATEMENT_COUNT_ENGINE_REASON}\n${capture.format()}`,
-                    ).toHaveLength(0);
+                    ).toBe(0);
                 }
             },
         );
     });
-
-    // =========================================================================================
-    // AC-6 — a quantity outside its bounds, and a breached line bound
-    // =========================================================================================
 
     describe('AC-6: a quantity outside its bounds is a request-level input error', () => {
         it('refuses a quantity of 0 with the positive-integer message and writes nothing', async () => {
@@ -2349,7 +2068,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(await countAllLineRows()).toBe(totalLineRowsBefore);
             const rows = await readLineRows(listId);
             expect(rows).toHaveLength(1);
-            // The refused add left the stored quantity exactly where it was.
             expect(rows[0].quantity).toBe(SEEDED_BEFORE_OVER_MAXIMUM);
         });
 
@@ -2400,7 +2118,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(rowsAtCapacity).toHaveLength(MAX_LINES_PER_LIST);
             const totalLineRowsBefore = await countAllLineRows();
 
-            // A third DISTINCT variant, which would create a third line.
             const { addItemToReorderList } = await addItem(list.id, seededVariants[MAX_LINES_PER_LIST].id, 1);
 
             expect(addItemToReorderList.__typename).toBe('ReorderListLimitError');
@@ -2477,10 +2194,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // =========================================================================================
-    // AC-7 — an ordinary customer session reaches the operation; a foreign channel token does not
-    // =========================================================================================
-
     describe('AC-7: an ordinary customer session succeeds and a foreign channel token reaches nothing', () => {
         it('succeeds for a session holding only the permission the Customer Role carries', async () => {
             await shopClient.asAnonymousUser();
@@ -2521,8 +2234,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(updated.lines.items).toHaveLength(1);
             expect(updated.lines.items[0].quantity).toBe(6);
 
-            // The stored row's owning customer is the authenticated customer, derived from the session
-            // rather than from any argument — no argument can nominate a different owner.
             const row = await readListRow(listId);
             expect(row).not.toBeNull();
             expect(decodeId(row!.customerId)).toBe(decodeId(customer.id));
@@ -2537,7 +2248,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(await readLineRows(listId)).toHaveLength(1);
             const totalLineRowsBefore = await countAllLineRows();
 
-            // A second REAL channel, created through the Admin API in `beforeAll` — never a mutated token.
             expect(secondChannelToken).not.toBe(defaultChannelToken);
             shopClient.setChannelToken(secondChannelToken);
 
@@ -2550,22 +2260,14 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(await countAllLineRows()).toBe(totalLineRowsBefore);
             const rows = await readLineRows(listId);
             expect(rows).toHaveLength(1);
-            // The list created under one channel token is not reachable under another, and the one line it
-            // already held is unchanged.
             expect(rows[0].quantity).toBe(6);
         });
     });
-
-    // =========================================================================================
-    // AC-8 — the existing order operations are unchanged and the active order is untouched
-    // =========================================================================================
 
     describe('AC-8: the existing order operations are unchanged and the active order is untouched', () => {
         it('leaves the active order total quantity exactly as it was and writes no OrderLine', async () => {
             await signInAsCustomer(0);
 
-            // The active order is built by this test, through the existing Shop mutation, so the recorded
-            // prior value is a real one rather than zero by default.
             const { addItemToOrder } = await trackOrdersCommittedBy(() =>
                 shopClient.query<{
                     addItemToOrder: { __typename: string; id?: ReorderApiId; totalQuantity?: number };
@@ -2573,8 +2275,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             );
             expect(addItemToOrder.__typename).toBe('Order');
             expect(addItemToOrder.id, 'The fixture order has no identifier to track').toBeDefined();
-            // Queued for removal the moment it exists, so a failure anywhere below still leaves no order
-            // behind for the next test to inherit as its own baseline.
             await trackOrderForRemoval(addItemToOrder.id as ReorderApiId);
 
             const before = await shopClient.query<{ activeOrder: ActiveOrderShape | null }>(GET_ACTIVE_ORDER);
@@ -2583,7 +2283,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(recordedTotalQuantity).toBe(3);
             const orderLinesBefore = await dataSource.getRepository(OrderLine).count();
 
-            // The setup this criterion reads after: one completed list add, whose own outcome AC-1 asserts.
             const list = await createList('AC-8 order untouched');
             const listAdd = await addItem(list.id, seededVariants[1].id, 6);
             expect(listAdd.addItemToReorderList.__typename).toBe('ReorderList');
@@ -2608,7 +2307,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(snapshotActiveOrder).toBeDefined();
             expect(runtimeActiveOrder).toBeDefined();
 
-            // Name, arguments, argument types, return type and nullability, all in one rendered string.
             expect(renderFieldSignature(runtimeActiveOrder!)).toBe(
                 renderFieldSignature(snapshotActiveOrder!),
             );
@@ -2681,7 +2379,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const runtimeErrorCodes = errorCodeType.__type!.enumValues.map(value => value.name);
             const runtimePermissions = permissionType.__type!.enumValues.map(value => value.name);
 
-            // Additive only: every baseline member survives under its own name.
             for (const member of snapshot.errorCodes) {
                 expect(runtimeErrorCodes).toContain(member);
             }
@@ -2703,10 +2400,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(runtimePermissions).toHaveLength(97);
         });
     });
-
-    // =========================================================================================
-    // The published input's shape — exactly three fields, and no request-deduplication key
-    // =========================================================================================
 
     describe('AddItemToReorderListInput declares exactly three fields', () => {
         it('publishes reorderListId, productVariantId and quantity, and nothing else', async () => {
@@ -2740,10 +2433,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // =========================================================================================
-    // The plugin's message catalogue — all four keys resolve to English rather than passing through
-    // =========================================================================================
-
     describe('The plugin registers its message catalogue at bootstrap', () => {
         /*
          * Three of the four keys are reachable through `addItemToReorderList` and are asserted at their own
@@ -2752,9 +2441,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          * story's operation cannot reach — so it is exercised here through the list-creation helper this
          * suite already uses for its own fixtures. The claim is about the CATALOGUE, not about that
          * operation's behaviour, which STORY-001-01-01 and STORY-001-01-03 own.
-         *
-         * An unregistered key surfaces as the key itself, so a resolved English sentence is the only evidence
-         * that `I18nService.addTranslationFile` actually took effect.
          */
         it('resolves the name-rejection key to English text, not to the key itself', async () => {
             await signInAsCustomer(0);
@@ -2769,18 +2455,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(refusal.errors).toHaveLength(1);
             expect(refusal.errors[0].extensions?.code).toBe('USER_INPUT_ERROR');
             expect(refusal.errors[0].message).not.toBe('error.reorder-list-name-empty');
-            // The registered sentence interpolates the fixed length bound, so a resolved message proves both
-            // that the catalogue loaded and that the interpolation variable is spelled as the file spells it.
             expect(refusal.errors[0].message).toBe(
                 'The reorder list name must be between 1 and 191 characters once surrounding whitespace ' +
                     'is removed, and must not contain control or zero-width characters',
             );
         });
     });
-
-    // =========================================================================================
-    // §7 Scenario — zero, null or empty collection, and an incomplete request
-    // =========================================================================================
 
     describe('Scenario: the target list holds zero lines and the request itself is incomplete', () => {
         it('refuses a request that omits the non-null quantity before any resolver executes', async () => {
@@ -2796,12 +2476,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 }),
             );
 
-            // Refused by the platform's own document validation, so there is no payload at all rather than
-            // a null field: `quantity` is declared non-nullable in the published input object.
             expect(refusal.errors.length).toBeGreaterThanOrEqual(1);
-            // A document rejected BEFORE execution begins carries no `data` entry at all, which is a
-            // different envelope from the `data: null` an execution-time refusal produces. The distinction is
-            // asserted rather than coalesced away, because it is the evidence that nothing executed.
             expect(
                 'data' in refusal,
                 `Expected no data entry on a pre-execution rejection: ${JSON.stringify(refusal)}`,
@@ -2816,8 +2491,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const listId = decodeId(list.id);
             const totalLineRowsBefore = await countAllLineRows();
 
-            // A different request from the one above, and both are made: one omits the field, one supplies
-            // null for it.
             const refusal = await expectRefusal(() =>
                 shopClient.query(ADD_ITEM_TO_REORDER_LIST_WITH_NULL_QUANTITY, {
                     reorderListId: list.id,
@@ -2826,9 +2499,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             );
 
             expect(refusal.errors.length).toBeGreaterThanOrEqual(1);
-            // A document rejected BEFORE execution begins carries no `data` entry at all, which is a
-            // different envelope from the `data: null` an execution-time refusal produces. The distinction is
-            // asserted rather than coalesced away, because it is the evidence that nothing executed.
             expect(
                 'data' in refusal,
                 `Expected no data entry on a pre-execution rejection: ${JSON.stringify(refusal)}`,
@@ -2847,13 +2517,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
             expect(refusal.errors).toHaveLength(1);
             expect(refusal.errors[0].extensions?.code).toBe('USER_INPUT_ERROR');
-            // The resolved English sentence, not the raw key — the evidence that the plugin's catalogue was
-            // registered at bootstrap.
             expect(refusal.errors[0].message).toMatch(VARIANT_NOT_FOUND_MESSAGE_PATTERN);
             expect(refusal.errors[0].message).not.toBe(VARIANT_NOT_FOUND_KEY);
-            // Exactly null, not "either the envelope or its union member": the published field is non-null,
-            // so a thrown error nullifies it and propagates to the root. Accepting the member-null form
-            // would also admit a resolver that executed and returned null.
             expect(
                 refusal.data,
                 `Expected the envelope to carry data exactly null: ${JSON.stringify(refusal.data)}`,
@@ -2874,9 +2539,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(refusal.errors[0].extensions?.code).toBe('USER_INPUT_ERROR');
             expect(refusal.errors[0].message).toMatch(VARIANT_NOT_FOUND_MESSAGE_PATTERN);
             expect(refusal.errors[0].message).not.toBe(VARIANT_NOT_FOUND_KEY);
-            // Exactly null, not "either the envelope or its union member": the published field is non-null,
-            // so a thrown error nullifies it and propagates to the root. Accepting the member-null form
-            // would also admit a resolver that executed and returned null.
             expect(
                 refusal.data,
                 `Expected the envelope to carry data exactly null: ${JSON.stringify(refusal.data)}`,
@@ -2886,17 +2548,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // =========================================================================================
-    // §7 Scenario — the variant being added is disabled
-    // =========================================================================================
-
     describe('Scenario: an item unavailable, deleted or disabled since the last purchase', () => {
         it('proceeds for a disabled variant, because a saved list records intent rather than availability', async () => {
             const variant = seededVariants[2];
             await adminClient.asSuperAdmin();
-            // The variant is a core row this test did not create, so EVERY COLUMN of it is captured and its
-            // exact restoration queued before the flag is flipped. Issuing the inverse Admin mutation would
-            // put the flag back and advance the row's `updatedAt` while doing so.
             await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
                 variantId: decodeId(variant.id),
             });
@@ -2926,10 +2581,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(rows[0].quantity).toBe(6);
         });
     });
-
-    // =========================================================================================
-    // §7 Scenario — the catalogue price of the variant being added has moved
-    // =========================================================================================
 
     describe('Scenario: a price changed since the last purchase', () => {
         it('proceeds with no warning, because the line stores no price for a change to invalidate', async () => {
@@ -2966,8 +2617,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const updated = addItemToReorderList as ReorderListSuccessShape;
             expect(updated.lines.items).toHaveLength(1);
             expect(updated.lines.items[0].quantity).toBe(6);
-            // Nothing on the returned line or on the stored row could have gone stale, because neither
-            // carries a monetary value at all. Copying a price onto a list line would be a defect.
             expect(updated.lines.items[0]).not.toHaveProperty('price');
             expect(updated.lines.items[0]).not.toHaveProperty('currencyCode');
             const rows = await readLineRows(listId);
@@ -2975,10 +2624,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(Object.keys(rows[0]).some(key => FORBIDDEN_PAYLOAD_FIELD_PATTERN.test(key))).toBe(false);
         });
     });
-
-    // =========================================================================================
-    // §7 Scenario — a duplicated request rather than a duplicated intent
-    // =========================================================================================
 
     describe('Scenario: the same add is delivered twice and this operation cannot tell the difference', () => {
         it('accumulates on the retry and offers the absolute set as the deterministic remedy', async () => {
@@ -3007,27 +2652,21 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 PRE_EXISTING_QUANTITY,
             );
 
-            // The call that the server committed and whose response the client never received.
             const committed = await addItem(list.id, variant.id, DELIVERED_QUANTITY);
             expect(committed.addItemToReorderList.__typename).toBe('ReorderList');
             expect((committed.addItemToReorderList as ReorderListSuccessShape).lines.items[0].quantity).toBe(
                 PRE_EXISTING_QUANTITY + DELIVERED_QUANTITY,
             );
 
-            // The client retries the identical mutation, unchanged, because that call timed out at the
-            // transport after the server had committed it.
             const retry = await addItem(list.id, variant.id, DELIVERED_QUANTITY);
 
             expect(retry.addItemToReorderList.__typename).toBe('ReorderList');
             const afterRetry = retry.addItemToReorderList as ReorderListSuccessShape;
             expect(afterRetry.lines.items).toHaveLength(1);
-            // 18, and the figure is the whole point: a replay would leave 12 and report the first call's
-            // result, which is a guarantee this operation does not make and does not pretend to.
             expect(afterRetry.lines.items[0].quantity).toBe(ACCUMULATED_AFTER_RETRY);
             expect(afterRetry.lines.items[0].id).toBe(lineId);
             expect(await readLineRows(listId)).toHaveLength(1);
 
-            // The remedy, asserted in the same test rather than described: an absolute set, repeated.
             const remedy = await shopClient.query<
                 AdjustReorderListLineMutation,
                 AdjustReorderListLineMutationVariables
@@ -3055,10 +2694,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // =========================================================================================
-    // §7 Scenario — concurrent modification, and the engine split that decides what evidences it
-    // =========================================================================================
-
     describe('Scenario: two requests add to the same list at the same moment', () => {
         /** Escapes an identifier the way the configured driver does, so one statement reads on all four. */
         function escapeName(identifier: string): string {
@@ -3069,12 +2704,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          * One side of a race, expressed as THE REAL `addItemToReorderList` SERVICE OPERATION executed on this
          * participant's own connection inside its own held transaction.
          *
-         * The precheck — the read the race is about — runs on that same connection, and the harness itself
-         * puts the rendezvous between the two phases: both prechecks complete, both participants are
-         * registered and released together, and only then does either write begin. There is no `arrive()` for
-         * a body to forget to await, which is what makes {@link runBarrieredPair} evidence rather than an
-         * ordering hope. `Promise.all` alone would satisfy none of that.
-         *
          * WHY THE WRITE IS NOT THE HTTP CALL. An HTTP request opens a transaction of the server's own choosing
          * on a connection this barrier has never touched, so the rendezvous would sit entirely outside the
          * operation under test: the two requests could be serialised end to end and the run would still look
@@ -3083,17 +2712,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          * never overlapped. Binding the context puts the whole operation on the held connection, so the
          * accumulation, the deduplication constraint and the conditional counter update are all exercised
          * inside the window the assertion claims.
-         *
-         * The published mutation is NOT abandoned by this: the sequential form of each of these contracts
-         * drives it over HTTP on every engine, as does every other criterion in this file.
-         *
-         * `expectedLinesBeforeEitherWrite` is asserted in the write phase rather than merely recorded. It is
-         * what distinguishes the insert race from the update race, and a run whose participants did not both
-         * observe the stated starting state evidences neither.
-         *
-         * The list identifier is interpolated into the precheck's statement rather than bound, because the
-         * four drivers disagree about placeholder syntax and the value is a number this suite's own fixture
-         * produced.
          */
         function addItemParticipant(
             label: string,
@@ -3126,9 +2744,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                             'participant wrote, so this run evidences no race',
                     ).toBe(expectedLinesBeforeEitherWrite);
                     const boundContext = transactionBinder.bind(sessionContext, ctx.manager);
-                    // Asserted rather than trusted: a context that silently lost its binding would run the
-                    // operation on a connection of the platform's choosing, and the run would report a clean
-                    // serialisation while evidencing nothing about the race.
                     expect(
                         transactionBinder.managerOf(boundContext),
                         `${label} is not bound to its own barrier transaction`,
@@ -3143,9 +2758,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     // so both callers are provably past their own reads and short of their own writes when
                     // they are let go — which is the window the accumulation, the deduplication constraint
                     // and the conditional counter update all exist to survive.
-                    //
-                    // The hold is restored in a `finally` so a failing operation cannot leave this
-                    // participant's query runner patched for the harness's own teardown statements.
                     const hold = preWrite.install(ctx);
                     try {
                         // INTERNAL identifiers, not the `T_n` forms a client sends. The platform decodes
@@ -3166,22 +2778,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         }
 
         /**
-         * The rendezvous every barriered participant in this scenario is held at, and the assertion that it
-         * actually held them.
-         *
-         * `tables` names both plugin tables because the first write differs by path — the capacity claim
-         * updates `reorder_list` while the accumulation updates `reorder_list_line` — and either is the
-         * boundary this race needs. A platform write elsewhere in the transaction cannot trip it.
-         */
-        /**
          * Whether this engine holds the parent list row EXCLUSIVELY for a line write, in which case the two
          * inner-rendezvous cases below cannot certify an interleaving and are skipped here.
-         *
-         * ★ WHY A SKIP RATHER THAN A DIFFERENT ASSERTION, AND WHAT STILL CARRIES THE CONTRACT.
-         *
-         * The list read is the same one the service makes: `ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES`
-         * in `src/service/reorder-list.service.ts` and `EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES` in the
-         * fixture are the same two engines, so this gate cannot drift from the behaviour it gates on.
          *
          * On the MySQL family a transaction that will write only a line takes the parent exclusively, because
          * two transactions holding it shared were measured to deadlock at the line row once that row is removed
@@ -3189,22 +2787,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          * unrecoverable savepoint error rather than as the retriable deadlock it is. Two accumulations against
          * ONE list therefore serialise at the parent by design, which is exactly what an inner rendezvous
          * requiring both participants to arrive at their own first write cannot observe: the second participant
-         * is still waiting for the parent when the hold's budget expires. That is the design being honoured, not
-         * a defect being hidden.
-         *
-         * The insert race is skipped on the same engines for a narrower, instrument-level reason, stated as
-         * what was observed rather than as a property relied upon: holding both transactions open across their
-         * first writes leaves the loser's bounded reconciliation racing the winner's COMMIT instead of waiting
-         * on its uncommitted unique-index entry, and the loser then exhausts
-         * `MAX_ADD_RECONCILIATION_ATTEMPTS` on `Duplicate entry … for key
-         * 'UQ_reorder_list_line_list_variant'`. No production request holds a peer at its first write, so this
-         * is a limit of the instrument on this engine.
-         *
-         * WHAT STILL PROVES THE CONTRACT EVERYWHERE. The sequential form of each of these two contracts runs on
-         * every engine including sql.js and this one, and carries the arithmetic and the single surviving row;
-         * the interleaved form runs on PostgreSQL, where the parent is held shared and the instrument can
-         * certify that both participants were inside the pre-write window together. sql.js is excluded from
-         * every concurrency claim for its own separate reason (`SQLJS_EXCLUSION_REASON`).
+         * is still waiting for the parent when the hold's budget expires. That is the design being honoured,
+         * not a defect being hidden.
          */
         function holdsParentExclusivelyForLineWrites(): boolean {
             return EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES.includes(resolveConfiguredEngine());
@@ -3219,16 +2803,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
         /**
          * Asserts the inner rendezvous did its job, which a race claim rests on entirely.
-         *
-         * A run in which one participant never reached its write would look identical in its final state to a
-         * run in which both did, so "both were held" is asserted rather than assumed. The certification is
-         * PER HOLD rather than an aggregate, and that distinction is the point: two arrivals and a
-         * whole-rendezvous release flag cannot tell "both waited together" apart from "one waited, gave up,
-         * wrote, and the other arrived afterwards". `PreWriteHold.releasedBy()` can only read `'arrival'` for
-         * a hold that was STILL WAITING when the set completed, so asserting it on each participant is what
-         * rules the sequential run out. The instrument itself refuses that run as well — a timed-out or
-         * cancelled hold rejects instead of delegating its write — and `failureReason()` is asserted here so
-         * a refusal is reported as itself rather than as some downstream state mismatch.
          */
         function expectHeldBeforeTheirOwnWrites(preWrite: PreWriteRendezvous): void {
             expect(
@@ -3275,8 +2849,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         }
 
         /**
-         * Every outcome of a pair rendered for a diagnostic, INCLUDING the reason a rejected participant
-         * carries — without which a race failure reports only that a participant rejected and not why.
+         * Every outcome of a pair rendered for a diagnostic, through the shared describer.
+         *
+         * A rejected participant here is a service call over a real connection, so its reason is a TypeORM
+         * `QueryFailedError` carrying the statement and its bound values. The shared describer names the error
+         * class, the driver code and the failure classification without reproducing any of it; the FULFILLED
+         * side is this suite's own domain object, so this file decides what about it is worth saying.
          */
         function describeOutcomes(
             outcomes: Array<{
@@ -3286,17 +2864,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 reason?: unknown;
             }>,
         ): string {
-            return outcomes
-                .map(outcome =>
-                    outcome.status === 'fulfilled'
-                        ? `${outcome.label}=${serviceResultTypename(outcome.value)}`
-                        : `${outcome.label} REJECTED: ${
-                              outcome.reason instanceof Error
-                                  ? outcome.reason.message
-                                  : String(outcome.reason)
-                          }`,
-                )
-                .join(' | ');
+            return describeSettledOutcomes(outcomes, outcome => serviceResultTypename(outcome.value));
         }
 
         /** The result each caller of a barriered pair actually received, sorted for a stable comparison. */
@@ -3311,12 +2879,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
         /**
          * One side of a SEQUENTIAL pair, expressed as the PUBLISHED mutation over HTTP.
-         *
-         * The sequential form makes no interleaving claim, so there is nothing for a barrier to hold and no
-         * reason to bypass the transport: driving it over HTTP is what keeps the published operation — its
-         * resolver, its `@Transaction()`, its union serialisation — covered on all four engine jobs, including
-         * the single-connection family that runs no barriered form at all. The barriered participants above
-         * bind to the service instead, for the reason stated there.
          */
         function sequentialApiAddParticipant(
             label: string,
@@ -3341,19 +2903,18 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         /**
          * The request context an authenticated client's next request would arrive with, built through the
          * platform's OWN guard path.
-         *
-         * `fromRequest` rather than `create`, and the difference is load-bearing: `create` hard-codes
-         * `isAuthorized: true` and `authorizedAsOwnerOnly: false`, whereas this operation is gated on
-         * `Permission.Owner` — a member no session can hold — so a real request produces the opposite pair and
-         * it is the service's own ownership predicate rather than the gate that decides the outcome. A race
-         * driven with a context the guard could never produce would assert against a path no buyer reaches.
          */
         async function shopContextFor(client: SimpleGraphQLClient): Promise<RequestContext> {
             const session = await server.app.get(SessionService).getSessionFromToken(client.getAuthToken());
+            // A SCALAR, uniformly with every other session assertion in this package. This one asserts the
+            // session EXISTS, so it can only fail with `undefined` as the actual and cannot render a
+            // `CachedSession` today — but the direction of an assertion is one edit away from reversing, and
+            // the value on the other side of it carries the session token. Comparing here removes the
+            // question rather than answering it.
             expect(
-                session,
+                session !== undefined,
                 'The client holds no session, so no authenticated context can be built',
-            ).toBeDefined();
+            ).toBe(true);
             const channelTokenKey =
                 server.app.get(ConfigService).apiOptions.channelTokenKey ?? 'vendure-token';
             const request = { query: {}, headers: { [channelTokenKey]: defaultChannelToken } };
@@ -3416,8 +2977,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 const listId = decodeId(list.id);
                 const variant = seededVariants[0];
 
-                // One authenticated context per caller, built before the pair starts so that resolving the
-                // session and the channel is never work done inside a held transaction.
                 const sessionContext = await shopContextFor(shopClient);
                 const preWrite = createAddItemPreWriteRendezvous();
 
@@ -3448,8 +3007,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 expect(result.a.releasedBeforeWrite).toBe(true);
                 expect(result.b.releasedBeforeWrite).toBe(true);
                 expectHeldBeforeTheirOwnWrites(preWrite);
-                // Neither participant saw a line before either wrote, which is what makes this the insert
-                // race rather than the update race.
                 expect(result.a.status, describeOutcomes([result.a, result.b])).toBe('fulfilled');
                 expect(result.b.status, describeOutcomes([result.a, result.b])).toBe('fulfilled');
 
@@ -3465,7 +3022,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 ]);
                 const rows = await readLineRows(listId);
                 expect(rows).toHaveLength(1);
-                // Exactly 12, "being the sum of both requested quantities" as the scenario puts it.
                 expect(rows[0].quantity).toBe(RACE_ADD_QUANTITY * 2);
                 const row = await readListRow(listId);
                 expect(row).not.toBeNull();
@@ -3515,8 +3071,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 // second would read the first's committed 12, reaching 18 by serialisation rather than by
                 // atomicity and evidencing nothing.
                 expectHeldBeforeTheirOwnWrites(preWrite);
-                // Both prechecks saw the one existing line, so both requests took the update path and no
-                // insert was attempted — which is why the uniqueness constraint decides nothing here.
                 expect(
                     result.a.status === 'fulfilled' && result.a.value !== undefined,
                     describeOutcomes([result.a, result.b]),
@@ -3549,7 +3103,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 await signInAsCustomer(0);
                 const list = await createList('Race line bound');
                 const listId = decodeId(list.id);
-                // One line below the configured bound, so exactly one of the two new lines can be created.
                 await addItem(list.id, seededVariants[0].id, 1);
                 expect(await readLineRows(listId)).toHaveLength(MAX_LINES_PER_LIST - 1);
 
@@ -3594,8 +3147,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     fulfilledServiceTypenames([result.a, result.b]),
                     describeOutcomes([result.a, result.b]),
                 ).toEqual(['ReorderList', 'ReorderListLimitError']);
-                // The REFUSED CALLER'S OWN RETURN VALUE, asserted field by field on the object the resolver
-                // would hand the union resolver rather than on a re-serialised copy of it.
                 const limitError = [result.a, result.b]
                     .map(outcome => (outcome.status === 'fulfilled' ? outcome.value : undefined))
                     .find((value): value is ReorderListLimitError => value instanceof ReorderListLimitError);
@@ -3605,7 +3156,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 expect(limitError!.maxItems).toBe(MAX_LINES_PER_LIST);
                 expect(limitError!.message.length).toBeGreaterThan(0);
 
-                // The stored line count is exactly the maximum rather than one over it.
                 const rows = await readLineRows(listId);
                 expect(rows).toHaveLength(MAX_LINES_PER_LIST);
                 const row = await readListRow(listId);
@@ -3665,27 +3215,27 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 b: repositoryInsertParticipant('duplicate-insert', listId, variantRowId, 1),
             });
 
-            // The named per-variant uniqueness object is what refuses the second write: no service pre-check
-            // is in the path at all, because the row is written straight through the repository.
-            expect(result.fulfilled).toHaveLength(1);
-            expect(result.rejected).toHaveLength(1);
+            // COUNTS, not the outcome arrays: each entry carries its raw rejection reason.
+            expect(result.fulfilled.length, describeSettledOutcomes([result.a, result.b])).toBe(1);
+            expect(result.rejected.length, describeSettledOutcomes([result.a, result.b])).toBe(1);
             expect(result.loser?.label).toBe('duplicate-insert');
-            const reason = String(
-                (result.rejected[0] as { reason?: unknown }).reason instanceof Error
-                    ? ((result.rejected[0] as { reason: Error }).reason.message ?? '')
-                    : ((result.rejected[0] as { reason?: unknown }).reason ?? ''),
-            );
+            const rejection: unknown = (result.rejected[0] as { reason?: unknown }).reason;
+            const reason = String(rejection instanceof Error ? (rejection.message ?? '') : (rejection ?? ''));
             // Every one of the four drivers names the offending relation in its own message, whether it
             // reports a constraint or the unique index the MySQL family stores under the same name.
-            expect(reason.toLowerCase()).toContain('reorder_list_line');
+            //
+            // THE PREDICATE READS THE RAW MESSAGE; THE ASSERTION DOES NOT. `expect(reason).toContain(...)`
+            // would make the driver's own text the matcher ACTUAL, which Vitest prints on failure — and on
+            // MySQL that text is `Duplicate entry '<the value>' for key '<the name>'`. The boolean says the
+            // same thing, and the redacted description beside it names the relation the driver mentioned.
+            expect(
+                reason.toLowerCase().includes('reorder_list_line'),
+                `the refusal named no plugin relation: ${redactTeardownDiagnostic(rejection)}`,
+            ).toBe(true);
 
             expect(await readLineRows(listId)).toHaveLength(1);
         });
     });
-
-    // =========================================================================================
-    // This suite's empty-generation obligation
-    // =========================================================================================
 
     /** The plugin's own migrations directory, whose contents this suite must leave untouched. */
     const pluginMigrationsDirectory = path.join(__dirname, '../src/migrations');
@@ -3705,19 +3255,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          * and only if that log's `upQueries` is non-empty, and returns `undefined` otherwise. It forces
          * `synchronize: false` and `migrationsRun: false` on the connection it opens, so the schema it diffs
          * is whatever is already in the database (`packages/core/src/migrate.ts`).
-         *
-         * WHICH IS THE WHOLE DIFFICULTY. Every initializer this suite can run under builds the schema by
-         * SYNCHRONISING the entity declarations — the sql.js initializer enables synchronisation while it
-         * populates, and the MySQL and PostgreSQL initializers force it outright — so a generator run against
-         * the schema as booted reports "no changes" whether the checked-in migration is faithful, broken, or
-         * absent. An empty result against a synchronised schema is therefore not evidence of anything.
-         *
-         * So the schema is REBUILT FROM THE CHECKED-IN MIGRATION first, and both halves of the evidence are
-         * then taken against that: the generator's own decision input read from the running server's
-         * connection, which is what names the offending statements when it fails, and the platform entry
-         * point itself, which is what proves the decision rather than reproducing it. Falsifiable in both
-         * directions: adding a column to either entity makes the log non-empty, and so does a migration whose
-         * output no longer matches the entities on this engine.
          */
         it('leaves the platform generator with nothing to emit against the migration-created schema', async () => {
             const outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reorder-add-item-generated-'));
@@ -3726,9 +3263,18 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const snapshotDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reorder-add-item-schema-'));
             temporaryDirectories.push(snapshotDirectory);
 
-            await rebuildPluginSchemaFromCheckedInMigration();
+            const schemaIsTheMigrations = await rebuildPluginSchemaFromCheckedInMigration();
 
-            // FIRST HALF — the generator's own decision input, read from the running server's connection.
+            // WHAT THE ASSERTION RESTS ON, which differs by engine and is recorded rather than glossed. On the
+            // generation engine the diff is taken against a schema the shipped artefact built, so an empty
+            // result means the artefact and the entities agree. Elsewhere it is taken against the synchronised
+            // schema, where an empty result means the entities carry no pending change — weaker, but still the
+            // claim this story owns, which is that it adds no column and needs no migration of its own.
+            expect(
+                schemaIsTheMigrations,
+                'the rebuild must run on exactly the engine the shipped artefact was generated against',
+            ).toBe(committedMigrationApplies(String(dataSource.options.type)));
+
             const log = await dataSource.driver.createSchemaBuilder().log();
             const namesPluginTable = (query: string) =>
                 /reorder_list(_line)?/i.test(unquoteIdentifiers(query));
@@ -3788,9 +3334,244 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(now).toEqual(pluginMigrationsAtCollection);
         });
     });
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────────────────
+    // CORRUPT PERSISTED STATE IS NOT COMPOUNDED — the portable half of conflict C-E, exercised live.
+    //
+    // `CHK_reorder_list_line_count_non_negative` and `CHK_reorder_list_line_quantity_positive` are declared
+    // on the entities and do materialise on PostgreSQL and the SQLite family, but TypeORM 0.3.28 discards
+    // them on MySQL and MariaDB. On those two engines a row violating either invariant is therefore storable
+    // by anything writing outside this service — a repair script, a second application sharing the schema,
+    // direct SQL. That much this plugin cannot prevent. What must not follow is this service COMPOUNDING the
+    // violation: handing out capacity that a negative counter merely appears to permit, or adding to a
+    // quantity the column may not hold and storing the result.
+    //
+    // Each case below seeds the violation through raw SQL exactly as such a writer would, then drives the
+    // published mutation. The seeding is expected to SUCCEED where the constraint is absent and to be
+    // REFUSED where it is present, so one case is meaningful on all four engines: it evidences the database
+    // constraint on the engines that have it, and the service-level floor on the engines that do not.
+    describe('corrupt persisted state is refused rather than compounded', () => {
+        /**
+         * True when a caught failure is a CHECK violation **naming the constraint the caller expected**.
+         *
+         * BOTH halves are required, and requiring only one is the bug this replaced. The engine's own code
+         * establishes the CLASS of failure; the constraint name establishes that it was THIS invariant and
+         * not another. A unique-constraint violation, a syntax error, a missing table, a denied privilege and
+         * a dropped connection all fail the first half; a violation of some other check fails the second.
+         *
+         * The codes are the engines' own and were measured rather than assumed: PostgreSQL raises SQLSTATE
+         * `23514` and puts the name in `constraint`; the SQLite family renders `CHECK constraint failed:
+         * <name>`; MySQL 8 raises errno 3819 and MariaDB 4025, which this predicate accepts for completeness
+         * even though neither engine creates these constraints in the first place. TypeORM copies the driver
+         * error onto its own `QueryFailedError`, but a driver that nests it instead is read through
+         * `driverError` so the predicate does not depend on which.
+         *
+         * Nothing read here is ever emitted. The message is tested, never printed — the caller either turns
+         * this into a discriminated outcome or hands the failure to the redactor.
+         */
+        function isRefusalByCheckConstraint(err: unknown, constraintName: string): boolean {
+            const layers = [err, (err as { driverError?: unknown })?.driverError];
+            return layers.some(layer => {
+                if (layer === null || typeof layer !== 'object') {
+                    return false;
+                }
+                const shape = layer as {
+                    code?: unknown;
+                    errno?: unknown;
+                    constraint?: unknown;
+                    message?: unknown;
+                };
+                const code = typeof shape.code === 'string' ? shape.code : '';
+                const errno = typeof shape.errno === 'number' ? shape.errno : 0;
+                const named = typeof shape.constraint === 'string' ? shape.constraint : '';
+                const message = typeof shape.message === 'string' ? shape.message : '';
+                const isCheckViolation =
+                    code === '23514' ||
+                    errno === 3819 ||
+                    errno === 4025 ||
+                    /CHECK constraint failed/i.test(message);
+                return isCheckViolation && (named === constraintName || message.includes(constraintName));
+            });
+        }
+
+        /**
+         * Attempts one invariant-violating write and says which of exactly two things happened.
+         *
+         * **It is fail-closed, and that is the entire design.** An earlier version returned a boolean and
+         * treated every failure as "the check refused it", so a syntax error, a missing column, a denied
+         * privilege, a dropped connection or a violation of some OTHER constraint would all have been read as
+         * proof that a security invariant exists — a broken test certifying an absent guard. Worse, it
+         * classified AFTER {@link executeRawStatement}, which has already replaced the driver error with a
+         * redacted one, so the evidence needed to classify correctly was gone by the time it looked.
+         *
+         * So the classification happens HERE, at the raw boundary, before anything is redacted, and only a
+         * CHECK violation naming {@link expectedCheckConstraint} is admitted. Everything else goes to the
+         * redactor and fails the test, which is the only safe direction for a helper whose output is read as
+         * evidence.
+         *
+         * @param expectedCheckConstraint - The exact named object whose refusal is the only acceptable
+         * failure. Passing a name the statement cannot violate makes every refusal rethrow, which is
+         * deliberate: this parameter is the assertion.
+         */
+        async function seedInvariantViolation(
+            sql: string,
+            parameters: Record<string, unknown>,
+            expectedCheckConstraint: string,
+        ): Promise<'accepted' | 'refused-by-expected-check'> {
+            const [query, bound] = dataSource.driver.escapeQueryWithParameters(sql, parameters, {});
+            try {
+                await dataSource.query(query, bound);
+                return 'accepted';
+            } catch (err: unknown) {
+                if (isRefusalByCheckConstraint(err, expectedCheckConstraint)) {
+                    return 'refused-by-expected-check';
+                }
+                // Not the refusal this seed was written to provoke, so it is a broken test rather than
+                // evidence of anything. It travels through the redactor because the raw failure carries the
+                // statement and every bound value on its own enumerable properties.
+                rethrowRedacted('an invariant-violation seed statement', err);
+            }
+        }
+
+        it('does not grant line capacity on the strength of a negative stored counter', async () => {
+            await signInAsCustomer(0);
+            const list = await createList('C-E negative counter');
+            const listRowId = decodeId(list.id);
+            await addItem(list.id, seededVariants[0].id, 1);
+            expect(await readListRow(listRowId)).toMatchObject({ lineCount: 1 });
+
+            const seeded = await seedInvariantViolation(
+                `UPDATE ${quotedIdentifier('reorder_list')} SET ${quotedIdentifier('lineCount')} = -1 ` +
+                    `WHERE ${quotedIdentifier('id')} = :listRowId`,
+                { listRowId },
+                'CHK_reorder_list_line_count_non_negative',
+            );
+            if (seeded === 'refused-by-expected-check') {
+                // That named constraint exists on this engine and refused the write — which is this case's
+                // assertion here, reached only because the failure identified itself as a violation of that
+                // exact object. The counter therefore still reads as the service left it, and there is
+                // nothing for the service-level floor to defend against on this engine.
+                expect(await readListRow(listRowId)).toMatchObject({ lineCount: 1 });
+                return;
+            }
+
+            // The constraint is absent, the row is now invalid, and this is the state the exploit needs.
+            const linesBefore = await countAllLineRows();
+            await expectRefusal(() => addItem(list.id, seededVariants[1].id, 1));
+
+            // NOTHING WAS BUILT ON IT. Without the claim's floor the counter would have satisfied
+            // `< maxLinesPerList`, the claim would have been granted and a line would exist here.
+            expect(await countAllLineRows()).toBe(linesBefore);
+            expect(await readLineRows(listRowId)).toHaveLength(1);
+        });
+
+        it('does not add to a stored quantity the column may not hold', async () => {
+            await signInAsCustomer(0);
+            const list = await createList('C-E non-positive quantity');
+            const listRowId = decodeId(list.id);
+            const variant = seededVariants[0];
+            await addItem(list.id, variant.id, 5);
+
+            // Zero is the sharper violation than a negative, because the total the request would produce is
+            // legal arithmetic (0 + 2 = 2): request validation passes, so only the statement's own floor
+            // stands between a row the column may not hold and a total computed from it.
+            const seeded = await seedInvariantViolation(
+                `UPDATE ${quotedIdentifier('reorder_list_line')} SET ${quotedIdentifier('quantity')} = 0 ` +
+                    `WHERE ${quotedIdentifier('reorderListId')} = :listRowId`,
+                { listRowId },
+                'CHK_reorder_list_line_quantity_positive',
+            );
+            if (seeded === 'refused-by-expected-check') {
+                expect(await readLineRows(listRowId)).toMatchObject([{ quantity: 5 }]);
+                return;
+            }
+
+            await expectRefusal(() => addItem(list.id, variant.id, 2));
+
+            // THE VIOLATION WAS NOT COMPOUNDED. Without the accumulate floor this row would now read 2 — a
+            // quantity computed from a base the column forbids, and indistinguishable thereafter from one the
+            // buyer actually asked for.
+            expect(await readLineRows(listRowId)).toMatchObject([{ quantity: 0 }]);
+        });
+
+        // ─────────────────────────────────────────────────────────────────────────────────────────────────
+        // THE SEEDER ITSELF IS FAIL-CLOSED, asserted rather than assumed.
+        //
+        // The two cases above branch on what the seeder returns, so the seeder IS part of the evidence: if it
+        // reported "the check refused it" for any failure other than that exact check, a green run would
+        // certify a guard that was never exercised — on the very engines where the constraint is absent. Each
+        // case below fails for a DIFFERENT reason that is not the expected check, and each must rethrow
+        // rather than return the refusal outcome.
+        describe('the invariant seeder admits only the refusal it was asked about', () => {
+            it('rethrows a syntactically broken statement instead of calling it a check refusal', async () => {
+                await expect(
+                    seedInvariantViolation(
+                        `UPDATE ${quotedIdentifier('reorder_list')} SET SET SET`,
+                        {},
+                        'CHK_reorder_list_line_count_non_negative',
+                    ),
+                ).rejects.toThrow();
+            });
+
+            it('rethrows a statement against a table that does not exist', async () => {
+                await expect(
+                    seedInvariantViolation(
+                        `UPDATE ${quotedIdentifier('reorder_list_no_such_table')} ` +
+                            `SET ${quotedIdentifier('lineCount')} = -1`,
+                        {},
+                        'CHK_reorder_list_line_count_non_negative',
+                    ),
+                ).rejects.toThrow();
+            });
+
+            it('rethrows a violation of a different named constraint', async () => {
+                // A genuine constraint violation, but of the per-variant uniqueness object rather than either
+                // check. This is the case a class-only test would wave through, and the reason the constraint
+                // NAME is required alongside the failure class.
+                await signInAsCustomer(0);
+                const list = await createList('C-E seeder rejects a foreign constraint');
+                const listRowId = decodeId(list.id);
+                const variant = seededVariants[0];
+                await addItem(list.id, variant.id, 1);
+                const [line] = await readLineRows(listRowId);
+
+                await expect(
+                    seedInvariantViolation(
+                        `INSERT INTO ${quotedIdentifier('reorder_list_line')} ` +
+                            `(${quotedIdentifier('createdAt')}, ${quotedIdentifier('updatedAt')}, ` +
+                            `${quotedIdentifier('reorderListId')}, ${quotedIdentifier('productVariantId')}, ` +
+                            `${quotedIdentifier('quantity')}) VALUES ` +
+                            `(:now, :now, :listRowId, :variantRowId, 1)`,
+                        {
+                            now: new Date(),
+                            listRowId,
+                            variantRowId: decodeId(line.productVariantId),
+                        },
+                        'CHK_reorder_list_line_quantity_positive',
+                    ),
+                ).rejects.toThrow();
+            });
+
+            it('reports the accepted case as accepted rather than as a refusal', async () => {
+                // The positive control. Without it the three cases above would also pass against a seeder
+                // that rethrew unconditionally and could never return either outcome.
+                await signInAsCustomer(0);
+                const list = await createList('C-E seeder accepts a legal write');
+                const listRowId = decodeId(list.id);
+
+                const outcome = await seedInvariantViolation(
+                    `UPDATE ${quotedIdentifier('reorder_list')} SET ${quotedIdentifier('lineCount')} = 0 ` +
+                        `WHERE ${quotedIdentifier('id')} = :listRowId`,
+                    { listRowId },
+                    'CHK_reorder_list_line_count_non_negative',
+                );
+
+                expect(outcome).toBe('accepted');
+            });
+        });
+    });
 });
 
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
 // THE PRE-WRITE RENDEZVOUS, CERTIFIED AGAINST ITS OWN FALSE-PASS.
 //
 // The three races above rest entirely on one claim: that both callers were between their own reads and their
@@ -3804,14 +3585,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 //   4. B unblocks, reads A's committed state, and reaches its hold.
 //
 // If step 3 RELEASED A's write, then by step 4 every aggregate reads perfectly — two installs, two arrivals,
-// a release "by arrival" — while the two callers never overlapped, and a read-compute-save accumulation
-// would leave the correct total purely by serialisation. So step 3 must FAIL the rendezvous instead, and
-// that behaviour is asserted here rather than assumed of the fixture.
-//
-// These cases need no server, no connection and no engine: the rendezvous is driven with fabricated
-// participants whose `query` records what it was asked to run. That is what makes "the held statement was
-// never delegated" an observation of a list rather than an inference.
-// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// a release "by arrival" — while the two callers never overlapped, and a read-compute-save accumulation would
+// leave the correct total purely by serialisation. So step 3 must FAIL the rendezvous instead, and that
+// behaviour is asserted here rather than assumed of the fixture.
 
 describe('the pre-write rendezvous refuses to certify a sequential run', () => {
     /** A write against a plugin table, which is what the rendezvous is told to intercept. */
@@ -3821,11 +3597,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
 
     /**
      * A fabricated participant: enough of the context for the rendezvous, and a `query` that records.
-     *
-     * `alreadyCancelled` reproduces the ONE behaviour of the real context that a naive fixture would miss:
-     * `BarrierParticipantContext.onCancelled` invokes its listener SYNCHRONOUSLY, inside the registration
-     * call, when the pair has already been abandoned. A participant reaching its write after that is the
-     * hardest path through the rendezvous, and a fixture that only ever cancels later cannot reach it.
      */
     function fabricateParticipant(
         label: string,
@@ -3908,11 +3679,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
         // timer never does — and the defect this guards against is that timer being left pending for the rest
         // of its bound afterwards, holding the wait's closure and the rendezvous state it captures reachable,
         // and then elapsing inside whichever LATER test is running by then.
-        //
-        // It is invisible from the wait's own result, which is correct either way, so it is observed at the
-        // only place it shows: the timer handle the wait creates, and whether that handle reaches
-        // `clearTimeout`. The bound is deliberately far longer than this test, so a timer left pending could
-        // not have expired on its own before the assertion runs — only a real `clearTimeout` satisfies it.
         const realSetTimeout = globalThis.setTimeout;
         const realClearTimeout = globalThis.clearTimeout;
         const mutableGlobal = globalThis as unknown as {
@@ -4016,10 +3782,10 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
         const hold = rendezvous.install(abandoned.ctx);
 
         const attempt = abandoned.ctx.queryRunner.query(TARGETED_WRITE);
-        // WAITED ON A RENDEZVOUS EVENT, NOT ON A TIMER. An earlier revision yielded one event-loop turn and
-        // ASSUMED the interceptor had registered by then; a turn is not an observation, and the assumption
-        // would have made this case pass on a build where the hold was never registered at all. The arrival
-        // is the event that says the hold exists, so it is the thing waited on.
+        // WAITED ON A RENDEZVOUS EVENT, NOT ON A TIMER. Yielding a fixed number of event-loop turns and
+        // ASSUMING the interceptor has registered by then is not an observation, and it would let this case
+        // pass on a build where the hold was never registered at all. The arrival is the event that says the
+        // hold exists, so it is the thing waited on.
         expect(
             await rendezvous.waitForArrivals(1),
             'the participant never reached its write, so there was no hold to cancel',

@@ -20,10 +20,9 @@
  *    terminal branch, so a zero on one side and a non-zero on the other localises the difference to
  *    exhaustiveness and to nothing else. Any drift above the terminal branch — a changed import, a
  *    renamed type, a reordered or reworded arm, even a differing comment — dissolves that isolation and
- *    lets the two statuses diverge for a reason nobody is measuring. The two halves are therefore edited
- *    together and kept byte-identical everywhere except that branch, and a reviewer can confirm the
- *    property directly by diffing them: the only difference is the terminal region at the end of the
- *    function, and every line above it matches.
+ *    lets the two statuses diverge for a reason nobody is measuring. The two halves are therefore kept
+ *    byte-identical everywhere except that branch: a diff between them contains only the terminal region
+ *    at the end of the function, and every line above it matches.
  *
  * 2. HOW THE PAIR IS COMPILED.
  *    The assertion is owned by `packages/reorder-plugin/e2e/reorder-list-read.e2e-spec.ts`. Each half is
@@ -49,18 +48,17 @@
  *    are handled, nothing is left unhandled, and there is nothing for the compiler to refuse.
  *    AC-8 describes the exhaustive half as carrying "a `never`-typed exhaustiveness check in its final
  *    branch and no `default`" and the defaulted half as "identical but carrying a `default` branch", so
- *    what differs between them is the FINAL BRANCH ITSELF. The reading that a `default` clause could
- *    simply be ADDED while the trailing assignment was retained was tested rather than assumed, and it is
- *    wrong: with a returning `default` present the statement after the switch is unreachable, and
+ *    what differs between them is the FINAL BRANCH ITSELF. Adding a `default` clause while retaining the
+ *    trailing assignment does not produce the defaulted half: with a returning `default` present the
+ *    statement after the switch is unreachable, and
  *    TypeScript type-checks unreachable code against the DECLARED type of the subject rather than against
  *    a narrowed one, so `const unhandled: never = code;` is refused with TS2322 naming the whole declared
  *    union — and a project electing `allowUnreachableCode: false` would additionally raise TS7027. A
  *    control shaped that way would exit non-zero for a reason having nothing to do with exhaustiveness
  *    and would isolate nothing, defeating the only purpose the pair has. The swap is consequently the
- *    minimal faithful reading of AC-8 and not a liberty taken with it. It is recorded here because a
- *    future editor who "restores" the trailing check to the defaulted half in order to make the two files
- *    match line-for-line would silently destroy the evidence: the one difference between them is
- *    deliberate, and it is the only one permitted.
+ *    minimal faithful reading of AC-8 and not a liberty taken with it. Restoring the trailing check to
+ *    the defaulted half so that the two files match line-for-line destroys the evidence: the one
+ *    difference between them is deliberate, and it is the only one permitted.
  *
  * 4. WHY THE ENUM GROWS AT ALL, AND WHY THAT CANNOT BE OPTED OUT OF.
  *    The enum's members are derived from every object type implementing the `ErrorResult` interface
@@ -93,10 +91,10 @@
  *    §0.4.1.5) — the snapshot is also structurally incapable of carrying this plugin, since the script
  *    that produces it declares its own configuration with `plugins: [AdminUiPlugin]` and never imports a
  *    plugin's [scripts/codegen/download-introspection-schema.ts:L46]. And nothing here declares the four
- *    added members: an earlier revision of this pair widened the imported 32-member baseline with a
- *    plugin-local literal union spelling them out, which made the exhaustive half's failure evidence of
- *    that local declaration rather than of the schema's growth — a fixture asserting its own premise. The
- *    members below arrive only because the live schema published them.
+ *    added members. Widening the imported 32-member baseline with a plugin-local literal union spelling
+ *    them out would make the exhaustive half's failure evidence of that local declaration rather than of
+ *    the schema's growth — a fixture asserting its own premise. The members below arrive only because the
+ *    live schema published them.
  *
  *    Consequently the generated module is a BUILD PRODUCT of the specification run: it is written before
  *    the two compilations and removed after them, it is git-ignored, and neither half of this pair can be
@@ -106,10 +104,10 @@
  * 6. NEITHER HALF IS EVER IMPORTED, SO NEITHER CAN BREAK THE BUILD OR ANY TEST RUN.
  *    Neither file is imported by `packages/reorder-plugin/index.ts`, nor by anything under
  *    `packages/reorder-plugin/src/`, nor by any specification — they have no importer at all, by design.
- *    The package build emits only what is reachable from the barrel, because `tsconfig.build.json` names
- *    `./index.ts` as its single `files` entry, following the shipped sibling
- *    [packages/harden-plugin/tsconfig.build.json:L6-L8]; so `bun run build`, `bun run ci` and the unit
- *    suite never type-check either file. The end-to-end runner does not collect them either: it matches
+ *    The package build emits only what is reachable from its two declared roots — `tsconfig.build.json`
+ *    names `./index.ts`, the barrel, and the one migration under `src/migrations/`, which the manifest's
+ *    `files` entry publishes and a deployment may register by glob — and neither half of this pair is
+ *    reachable from either, so `bun run build`, `bun run ci` and the unit suite never type-check them. The end-to-end runner does not collect them either: it matches
  *    `**\/*.e2e-spec.ts` only [e2e-common/vitest.config.mts:L7], and the `.fixture.ts` suffix is
  *    deliberately outside that pattern. Neither file may be renamed to `*.e2e-spec.ts`. Each half's exit
  *    status is asserted by the specification that names its project rather than by being reachable from

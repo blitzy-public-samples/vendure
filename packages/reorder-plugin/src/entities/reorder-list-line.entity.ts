@@ -1,5 +1,5 @@
 import { DeepPartial, EntityId, ID, ProductVariant, VendureEntity } from '@vendure/core';
-import { Check, Column, Entity, Index, ManyToOne, Unique } from 'typeorm';
+import { Check, Column, Entity, ManyToOne, Unique } from 'typeorm';
 
 import { ReorderList } from './reorder-list.entity';
 
@@ -11,7 +11,7 @@ import { ReorderList } from './reorder-list.entity';
  * that" rather than merely "these things" — the per-line quantity is the whole reason this table
  * exists rather than a plain membership set.
  *
- * Five characteristics are load-bearing, and each is easy to undo by accident:
+ * Four characteristics are load-bearing, and each is easy to undo by accident:
  *
  * 1. De-duplication is a *database* constraint and not a service convention. At most one row may
  *    exist for a given list-and-variant pair, and `UQ_reorder_list_line_list_variant` over
@@ -42,19 +42,22 @@ import { ReorderList } from './reorder-list.entity';
  * 4. A line does not know how many siblings it has. The line total a list reports is the stored
  *    counter on {@link ReorderList}, written in the same transaction as every insert and delete here,
  *    so nothing on this entity derives, caches or duplicates it.
- * 5. **Both foreign keys are indexed, and the second index exists for a predicate no request issues.**
- *    `UQ_reorder_list_line_list_variant` leads with `reorderListId`, so it already serves every lookup
- *    this plugin performs — a list's own lines, and the one line a list holds for a variant. Nothing led
- *    with `productVariantId`, though, and the engine needs one: `ON DELETE CASCADE` on
- *    {@link ReorderListLine.productVariant} means a *hard* deletion of a variant makes the engine find
- *    every line row referencing it, and PostgreSQL and SQLite index the referenced key rather than the
- *    referencing column, so that probe would scan the whole line table — the largest table this feature
- *    owns. `IDX_reorder_list_line_variant` is the index for it. The path is rare rather than absent:
- *    the platform's own variant deletion is a soft delete, so this fires only for a hard delete issued
- *    outside the shipped operations — which is also the one drift the stored line counter's repair
- *    exists to correct. (The MySQL family creates a foreign-key index of its own accord, so there the
- *    declaration is redundant rather than wrong; declaring it keeps the four engines' schemas the same
- *    shape.)
+ *
+ * **This entity declares exactly two named database objects, and a third is not a free addition.**
+ * The feature contract enumerates five named objects across the two plugin tables — two here and
+ * three on {@link ReorderList} — and requires the count itself to be asserted "so an addition is
+ * visible rather than absorbed" [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.4, §5].
+ * An earlier revision also declared a variant-only index for the cascade that fires when a variant is
+ * hard-deleted; it was withdrawn because it is a sixth object the contract does not authorise, and
+ * because nothing this plugin does needs it: `UQ_reorder_list_line_list_variant` leads with
+ * `reorderListId` and therefore already serves every lookup the service performs — a list's own
+ * lines, and the one line a list holds for a variant — no operation issues a predicate led by
+ * `productVariantId` alone, the MySQL family creates an index for a foreign key of its own accord,
+ * and the platform's own variant deletion is a *soft* delete, so the cascade fires only for a hard
+ * delete issued outside the shipped operations. That path is also the one drift the stored line
+ * counter's repair exists to correct, so it is covered rather than ignored. An index this feature
+ * genuinely needs belongs in the contract first, so that the entity, the migration and the tests all
+ * move together.
  *
  * `id`, `createdAt` and `updatedAt` are inherited from {@link VendureEntity} and are deliberately not
  * re-declared here, though all three are part of this entity's published contract. `createdAt` is
@@ -76,7 +79,6 @@ import { ReorderList } from './reorder-list.entity';
  */
 @Entity()
 @Unique('UQ_reorder_list_line_list_variant', ['reorderListId', 'productVariantId'])
-@Index('IDX_reorder_list_line_variant', ['productVariantId'])
 @Check('CHK_reorder_list_line_quantity_positive', '"quantity" > 0')
 export class ReorderListLine extends VendureEntity {
     constructor(input?: DeepPartial<ReorderListLine>) {
@@ -184,6 +186,24 @@ export class ReorderListLine extends VendureEntity {
      * in depth rather than as a portable guarantee: TypeORM emits check constraints on PostgreSQL and
      * the SQLite family but skips them silently on MySQL and MariaDB, so the invariant has to be
      * upheld by the service on every write path whatever the engine.
+     *
+     * It is, and the enforcement divides into two kinds that are worth keeping apart rather than summing.
+     * On the ACCUMULATING path the bound is carried by the statement's own `WHERE` — the increment is
+     * predicated on `quantity <= maxQuantityPerLine - increment`, so the database declines a write whose
+     * resulting value would breach the maximum, on every engine. The other two writes that set this
+     * column — the insert of a new line, and the absolute set of `adjustReorderListLine` — carry ownership
+     * and identity conjuncts only, with no value bound: an insert has no value to predicate on, and the
+     * absolute set is refused before the statement is built. What refuses a bad quantity there is
+     * therefore an IN-PROCESS guard, run before any write on both paths. On PostgreSQL and the SQLite
+     * family the check constraint stands behind that guard; on MySQL and MariaDB the guard is the only
+     * thing standing.
+     *
+     * So what the missing constraint costs on MySQL and MariaDB is two things, not one: the defence
+     * against a write that does not come through this plugin at all — direct SQL, or another application
+     * sharing the schema — which those two engines will accept, storing a zero or negative quantity; and,
+     * for the insert and the absolute set, the database-side backstop behind an in-process check. That gap
+     * is conflict C-E, it is unresolved, and it is stated in the package README rather than left to be
+     * discovered.
      *
      * Note also that the add path accumulates onto this value with a single atomic statement rather
      * than reading it, computing a new total and saving that back. Read-then-save loses one of two

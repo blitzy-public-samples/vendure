@@ -1,21 +1,17 @@
 /*
- * -------------------------------------------------------------------------------------------------------
  * Unit specification for reorder list name canonicalisation — what it pins, and what it deliberately does
  * not claim.
- * -------------------------------------------------------------------------------------------------------
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing asserted below is, or derives from, a user-specified rule. Every clause pinned here traces to
- * FEATURE-001-01 section 2.10.1 or section 2.11, to STORY-001-01-01 acceptance criterion 1 or 2, or to
- * EPIC-001 ruling R13 or R17, and is attributed at the assertion that pins it. The absence of a rules
- * document has not been treated as licence to assert less.
  *
  * Where this file lives, and why. It sits beside the module it tests and carries the `.spec.ts` suffix,
- * which is this repository's stated convention for a unit test [CONTRIBUTING.md:L428]. The package's Vitest
- * configuration confines unit discovery to `src/**&#47;*.spec.ts` and excludes `e2e/**` outright, so this
- * file is found by that pattern and the package's `test` script is what runs it. The e2e suites are
- * collected separately, by the shared `*.e2e-spec.ts` configuration under `e2e-common/`, which is what
- * supplies their database initializers and their far longer timeouts — none of which this file needs.
+ * which is this repository's stated convention for a unit test [CONTRIBUTING.md:L428]. The suffix, not a
+ * directory boundary, is what selects the runner: the package's Vitest configuration declares no `include`
+ * and no `exclude` of its own, so discovery is Vitest's default `**&#47;*.{test,spec}.?(c|m)[jt]s?(x)`.
+ * That pattern requires a LITERAL `.spec.` or `.test.` delimiter before the extension, so a `.spec.ts`
+ * file is collected wherever it sits and however many dots precede it, while `.e2e-spec.ts` — whose
+ * `spec` is preceded by a hyphen — is never collected by it at all. So the package's `test` script is what
+ * runs this file. The e2e suites are collected separately, by the shared `*.e2e-spec.ts` configuration under
+ * `e2e-common/`, which is what supplies their database initializers and their far longer timeouts — none
+ * of which this file needs.
  *
  * Why this specification carries more weight than its subject's size suggests. The whole of the list-name
  * contract is decided by string arithmetic, and it was extracted into pure functions precisely so that
@@ -25,7 +21,7 @@
  * individually, and the whitespace the pipeline legitimately consumes is driven as its own negative
  * control so that a refusal cannot be mistaken for correct behaviour.
  *
- * What this file does not do, stated so that a later reader does not add it. It touches no database, boots
+ * What this file does not do. It touches no database, boots
  * no server, mocks nothing and loads no fixture — an import of an entity, a service or a connection here
  * would mean the specification had drifted from its subject. It asserts no latency, throughput,
  * service-level or other invented figure of any kind, and no timing at all.

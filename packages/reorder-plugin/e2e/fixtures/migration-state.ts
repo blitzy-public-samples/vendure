@@ -5,8 +5,8 @@
  *
  * Three of this package's suites assert that their story adds no schema delta — STORY-001-01-02,
  * STORY-001-01-03 and STORY-001-01-04 each own no migration and each must show that they need none. That
- * assertion has one precondition it cannot skip, and an earlier revision of all three skipped it: **the schema
- * the generator is diffed against has to have been created by the migration.** Under the end-to-end harness it
+ * assertion has one precondition it cannot skip: **the schema the generator is diffed against has to have
+ * been created by the migration.** Under the end-to-end harness it
  * is not. `packages/testing/src/initializers/mysql-initializer.ts` L16 and
  * `packages/testing/src/initializers/postgres-initializer.ts` L15 force `synchronize = true`, the sql.js
  * initializer enables it while it populates, and `e2e-common/test-config.ts` sets it per engine branch — so the
@@ -21,15 +21,14 @@
  * ## The second thing it exists for
  *
  * One generation carries the DDL of exactly one engine (`packages/core/src/migrate.ts` L127 serialises
- * `driver.createSchemaBuilder().log()`), so the shipped artefact was generated once per engine family and
- * carries all three sets of statements, dispatching on the connection's own driver. That is what lets the
- * migration suite run a genuine data-bearing up → down → up cycle **of the shipped file** on every engine it
- * claims rather than on one, and it is why {@link committedMigrationApplies} asks the artefact which
- * connections it covers instead of restating an engine name this module would have to keep in step.
+ * `driver.createSchemaBuilder().log()`), and the shipped artefact is one generation: PostgreSQL's. So a
+ * data-bearing up → down → up cycle **of the shipped file** is available on PostgreSQL and nowhere else,
+ * which is what {@link committedMigrationApplies} answers.
  *
- * Where a connection falls outside that coverage the artefact refuses it, and this module then does what a
- * deployment on such a connection does: **generates that connection's own migration through the same lifecycle
- * and applies that**. {@link generateMigrationForEngine} exposes the same route to a caller that needs the
+ * On every other connection this module does what a deployment on that connection does: **generates that
+ * connection's own migration through the same lifecycle and applies that**. The cycle is therefore genuine on
+ * all four engines while the artefact under it differs, which is the honest shape of the obligation rather
+ * than a weakening of it. {@link generateMigrationForEngine} exposes the same route to a caller that needs the
  * generator's verdict rather than the shipped file's.
  *
  * Nothing here hand-writes DDL, and nothing here is allowed to: EPIC-001 section 7.8 L604 makes the lifecycle
@@ -37,12 +36,6 @@
  * a file, and that file is what is loaded and run.
  *
  * ## Attribution
- *
- * **No user-specified rules were provided for this project** — the rules document was read and returned exactly
- * that, and EPIC-001 section 11.9 records the same finding independently. Nothing in this file derives from a
- * user-specified rule. Every obligation it serves is prompt-derived (the plan's sections 0.7.2 and 0.7.1) or
- * ticket-derived (EPIC-001 sections 7.8 and 11.6, STORY-001-01-01's Definition of Done), and each is cited as
- * such where it is discharged.
  *
  * @since 3.8.0
  */
@@ -57,30 +50,14 @@ import * as ts from 'typescript';
 import { ReorderPlugin, ReorderPluginOptions } from '../../index';
 import { AddReorderLists1786838400000 } from '../../src/migrations/1786838400000-add-reorder-lists';
 
+import { describeTeardownStage, redactTeardownDiagnostic } from './diagnostic-redaction';
+
 /** The two plugin tables, parent first — the order the migration must create them in. */
 const PLUGIN_TABLES = ['reorder_list', 'reorder_list_line'] as const;
 
 /**
  * @description
  * Every column each plugin table carries **and nothing else**, sorted, frozen here as a literal.
- *
- * ## Why a literal rather than a derivation
- *
- * This is the one part of the no-delta evidence that does not read the entity metadata, and that is the
- * entire point of it. A check that compares the database against the entity declarations cannot catch a story
- * that added a column to an entity on an engine whose migration is regenerated from those same declarations —
- * the generator would emit the new column, the engine would create it, and the comparison would come back
- * empty. Comparing against a literal closes that: the literal does not move when an entity does, so the
- * addition shows up as an extra column on **every** engine.
- *
- * ## What the columns are
- *
- * `id`, `createdAt` and `updatedAt` are inherited from `VendureEntity`
- * (`packages/core/src/entity/base/base.entity.ts` L28-L33) and are part of the contract even though neither
- * entity re-declares them. Beyond those, `reorder_list` carries exactly five — the owning customer, the owning
- * channel, the display name, the canonical name key and the denormalised line count — and `reorder_list_line`
- * exactly three. No contact detail, no free-text note, no serialised request context, no monetary column, and
- * neither of the two withdrawn claim columns.
  *
  * @since 3.8.0
  */
@@ -153,11 +130,6 @@ export interface IsolatedMigrationState {
     /**
      * The column names each plugin table actually carries in the migration-created schema, sorted, read out of
      * the engine's own catalogue.
-     *
-     * Compared against {@link EXPECTED_PLUGIN_TABLE_COLUMNS} this is the engine-independent half of the
-     * no-delta evidence: it moves when the database moves and stays put when the entity declarations move, so
-     * a column a story added is visible on every engine rather than only on the one the shipped migration
-     * targets.
      */
     pluginTableColumns(): Promise<Record<string, string[]>>;
 }
@@ -166,45 +138,23 @@ export interface IsolatedMigrationState {
  * @description
  * Whether the checked-in migration can be applied on the given connection.
  *
- * **The families are named here because the artefact does not publish them.** The shipped migration exports
- * its class and nothing else: it resolves the engine family and the connection's own schema or database from
- * the `QueryRunner` it is handed, and builds every identifier through TypeORM's own table API, so it applies
- * on any connection whose driver belongs to one of the three families below and on any schema that connection
- * is configured for. There is therefore no schema condition to apply — the earlier revision's `public`-only
- * restriction belonged to a per-dialect artefact carrying pre-rendered SQL, and no longer exists.
- *
- * A caller reading `false` here generates a migration rather than exercising the shipped file, so drift in
- * this list shows up as weaker evidence rather than as a failure; the migration suite is what proves the
- * shipped file really applies on each engine the jobs run.
+ * **Only where the dialect matches, and the list is short for a structural reason.** The shipped migration is
+ * the platform migration generator's own output, and `generateMigration` serialises the statements one
+ * configured engine's schema builder logged into `queryRunner.query(<SQL>)` calls
+ * (`packages/core/src/migrate.ts:L127-L179`). An emitted migration is therefore bound to the engine it was
+ * generated against — plan section 0.2.3.1 records that as a known limitation of the form section 0.5.2.2
+ * prescribes — and the shipped file was generated against PostgreSQL, because of the four targets that is the
  *
  * @param engine - The TypeORM driver type, as read off the connection rather than off an environment variable.
  */
 export function committedMigrationApplies(engine: string): boolean {
-    return [
-        'postgres',
-        'aurora-postgres',
-        'mysql',
-        'mariadb',
-        'aurora-mysql',
-        'sqlite',
-        'sqljs',
-        'better-sqlite3',
-        'expo',
-    ].includes(engine);
+    return ['postgres', 'aurora-postgres'].includes(engine);
 }
 
 /**
  * @description
  * Generates a migration for the engine `config` points at, through the platform's own lifecycle, and loads the
  * class out of the file it wrote.
- *
- * **The file is the artefact under test, not a convenience.** `generateMigration` writes TypeScript, so the
- * text it produced is transpiled in memory and evaluated to recover the class — which means the statements
- * applied are provably the statements the generator emitted, rather than a second serialisation of the same
- * schema-builder log that could drift from it. The transpile is `typescript`'s own, at the version the root
- * manifest pins exactly, and no module resolution is involved: the generated file's only import is
- * `MigrationInterface` and `QueryRunner`, both used in type position alone, so TypeScript elides it and the
- * evaluated module requires nothing at all.
  *
  * @param config - A configuration whose `dbConnectionOptions` point at the database to diff. It must NOT list
  * this migration in its own `migrations`, or the generator would be diffing against a schema it is about to
@@ -240,17 +190,6 @@ export async function generateLifecycleMigration(
 /**
  * @description
  * Generates the migration this engine's own lifecycle emits, from a schema carrying the core entities alone.
- *
- * **This is the generator's verdict, obtained the way a first deployment obtains it.** An isolated database is
- * created, its core schema is synchronised with the plugin absent — and asserted to carry neither plugin table,
- * because a pre-existing one would make the diff empty and the result a transcription rather than a generation —
- * and the generator is then run against it with the plugin registered and its own migration withheld. The
- * caller receives the file the generator wrote, loaded and ready to apply or to read.
- *
- * It exists so that a suite can compare the shipped artefact against a FRESH generation on the engine it is
- * running on, which is the only assertion that proves the composed file still carries that engine's own
- * statements. A dialect-marker heuristic over the file's text cannot do that: it recognises which engine wrote
- * some statement, not whether every statement is still the one that engine writes today.
  *
  * The returned `dispose` releases both the temporary directory and the isolated database, so a caller owes it
  * exactly one call in its own teardown.
@@ -455,12 +394,12 @@ export async function withIsolatedMigrationState<T>(
         };
         return await work(state);
     } finally {
-        // EVERY STEP IS ATTEMPTED, and that is a correction rather than a tidying. An earlier revision awaited
-        // these in sequence, so a rejection while removing the first temporary directory skipped the generated
-        // migration's disposal, skipped dropping the isolated DATABASE — a leak that outlives the process — and
-        // skipped restoring the platform configuration, which would have left every later case in the file
-        // running against the platform's defaults instead of the server it started with. The first failure is
-        // the least important thing here; the steps after it are the ones that matter.
+        // EVERY STEP IS ATTEMPTED, rather than awaited in sequence. Awaiting in sequence would let a rejection
+        // while removing the first temporary directory skip the generated migration's disposal, skip dropping
+        // the isolated DATABASE — a leak that outlives the process — and skip restoring the platform
+        // configuration, leaving every later case in the file running against the platform's defaults instead
+        // of the server it started with. The first failure is the least important thing here; the steps after
+        // it are the ones that matter.
         await attemptEveryCleanup([
             ...temporaryDirectories.map(directory => ({
                 what: `removing the temporary directory ${directory}`,
@@ -503,9 +442,6 @@ export interface CleanupStep {
  * isolated database, mutated process state and a running server are independent of one another, and each is
  * released here regardless of the others.
  *
- * Failures are collected rather than swallowed, and a single error naming all of them is thrown once every step
- * has been attempted, so a teardown fault is still loud — it simply no longer costs the steps behind it.
- *
  * @param steps - The steps, attempted in the order given.
  * @throws Where one or more steps failed, after all of them have been attempted, with every failure named.
  * @since 3.8.0
@@ -516,7 +452,21 @@ export async function attemptEveryCleanup(steps: readonly CleanupStep[]): Promis
         try {
             await step.run();
         } catch (error) {
-            failures.push(`${step.what} — ${error instanceof Error ? error.message : String(error)}`);
+            // ★ NOTHING FROM THE CAUGHT FAILURE IS CARRIED HERE, ONLY A DESCRIPTION OF IT — and the step
+            // label is guarded on the same footing as the reason.
+            //
+            // The steps this releases are a query runner, a data source, a GENERATED DIRECTORY, an isolated
+            // database, mutated process state and a running server. So a failure arriving here is either a
+            // driver error — a TypeORM `QueryFailedError`, which has copied the driver's own error onto
+            // itself and therefore carries the statement and its bound parameters as enumerable properties —
+            // or a filesystem error, whose message is an absolute path describing the machine that ran the
+            // suite. This aggregate is thrown, printed by the runner and read in a build log.
+            //
+            // The label is guarded too, and that is not belt-and-braces: the natural way to make a per-item
+            // cleanup step readable is to interpolate the item, and here the items ARE temporary directories
+            // and database names. `describeTeardownStage` refuses a label carrying a path separator, an `@`
+            // or an over-budget length rather than trusting every future step declaration to be reviewed.
+            failures.push(`${describeTeardownStage(step.what)} — ${redactTeardownDiagnostic(error)}`);
         }
     }
     if (failures.length > 0) {
@@ -526,10 +476,6 @@ export async function attemptEveryCleanup(steps: readonly CleanupStep[]): Promis
         );
     }
 }
-
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// Internals
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
 
 /**
  * @description
@@ -667,10 +613,6 @@ function configFor(
 /**
  * Creates the core schema in the isolated database with the plugin **absent**, and asserts that neither plugin
  * table came out of it.
- *
- * The assertion is the point rather than a precaution: were a plugin table present here, the migration applied
- * next would fail on an object that already exists, or worse succeed against a schema it did not build, and
- * every delta taken afterwards would be measuring the schema builder against itself.
  */
 async function synchroniseCoreSchema(
     serverConfig: Required<VendureConfig>,
@@ -753,11 +695,6 @@ export async function openDataSource(options: DataSourceOptions): Promise<DataSo
 
 /**
  * Runs work that may write `process.exitCode`, and puts it back.
- *
- * `runMigrations` does not re-throw when it is not driven from the Vendure CLI: it logs and sets
- * `process.exitCode = 1` (`packages/core/src/migrate.ts` L52-L58). Leaving that behind would fail the whole
- * test process at exit for a migration failure a suite had already asserted, so the code is read, restored, and
- * turned into a thrown error here.
  */
 async function withRestoredExitCode(work: () => Promise<string[]>): Promise<string[]> {
     const saved = process.exitCode;
@@ -788,9 +725,6 @@ async function withRestoredExitCode(work: () => Promise<string[]>): Promise<stri
  * type position and TypeScript elides it. The `require` handed to the evaluated module therefore exists only to
  * make a future generator change fail loudly rather than silently: it answers with an empty object so a
  * type-only import that stopped being elided still works, and nothing else can smuggle a dependency in.
- *
- * The class's name matters as much as its body: TypeORM parses the trailing digits of the name to order
- * migrations and records that name in its bookkeeping table, so it is read off the class rather than restated.
  */
 function loadMigrationClass(
     source: string,

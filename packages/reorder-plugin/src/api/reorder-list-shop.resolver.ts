@@ -1,14 +1,5 @@
 /*
- * -------------------------------------------------------------------------------------------------------
  * The eight Shop API operations of FEATURE-001-01, and the narrow set of things this file is for.
- * -------------------------------------------------------------------------------------------------------
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing here is, or derives from, a user-specified rule. Every constraint stated below traces to
- * FEATURE-001-01 (sections 2.6 to 2.12), to one of STORY-001-01-01 through STORY-001-01-04, to an EPIC-001
- * settled ruling (R2, R3, R9, R10, R14, R15), or to a cited line of this repository, and is attributed as
- * such wherever it is stated. The absence of a rules document has not been treated as licence to lower the
- * bar anywhere in this file.
  *
  * WHAT THIS FILE IS. A gated, transactional boundary over `ReorderListService`. It divides cleanly, and the
  * division is worth stating precisely because the rule below is easier to check against a specific claim than
@@ -41,8 +32,8 @@
  * false. And the counter statement, its compare-and-set guard and the nested page both of them read all belong
  * to the service.
  *
- * FOUR HELPFUL-LOOKING ADDITIONS THAT WOULD EACH BE A DEFECT HERE. Every one of them is the kind of change
- * a reviewer might ask for, so each is named with the reason it is refused:
+ * FOUR HELPFUL-LOOKING ADDITIONS THAT WOULD EACH BE A DEFECT HERE. Each is named with the reason it is
+ * refused:
  *
  * 1. An ownership check. `@Allow(Permission.Owner)` below is NOT the access control, and neither is
  *    anything in this file. `Owner` is declared `assignable: false, internal: true` (the `Owner`
@@ -106,7 +97,6 @@
  * names a different one. This checkout declares 3.7.0, so the next minor derives to 3.8.0 — computed from
  * that declared version plus the guide's rule, and never a quotation from the guide, which does not state
  * the value. The authoritative tickets record the same derivation.
- * -------------------------------------------------------------------------------------------------------
  */
 
 import { Inject } from '@nestjs/common';
@@ -147,10 +137,9 @@ import {
 } from './reorder-list-entity.resolver';
 
 /*
- * WHY THERE IS NO CACHE KEY HERE ANY MORE. The single-list-read licence used to be a key in the platform's
- * request-scoped cache, re-exported from this file so both resolvers spelled it once. It is now module-private
- * state in the entity resolver, keyed on the object the read returned, and this file marks it by calling that
- * resolver's own setter. The change is a correction rather than a tidy-up: the platform's cache is keyed on the
+ * WHY THE SINGLE-LIST-READ LICENCE IS NOT A CACHE KEY. It is module-private state in the entity resolver,
+ * keyed on the object the read returned, and this file marks it by calling that resolver's own setter rather
+ * than by writing a key both files would have to spell. The platform's request-scoped cache is keyed on the
  * `RequestContext` INSTANCE, and a field resolver does not reliably receive the instance a root resolver did —
  * the platform binds a context per handler and a field resolver reads the shared request slot
  * (`packages/core/src/api/decorators/request-context.decorator.ts`), which in a multi-root document can hold
@@ -255,9 +244,8 @@ type ReorderListEntity = NonNullable<Awaited<ReturnType<ReorderListService['getR
  * Every method is gated with `@Allow(Permission.Owner)`, every mutation runs inside a transaction, and every
  * method calls the identically named {@link ReorderListService} method. **No access control, no domain
  * validation, no ordering, no clamping, no error translation and no payload assembly lives in this class** —
- * the service owns all of it, so that there is exactly one implementation of each invariant to review. The
- * file-level comment above records, for each of the four additions a reader is most likely to want here, why
- * adding it would be a defect.
+ * the service owns all of it, so each invariant has exactly one implementation. The file-level comment above
+ * records why each of four plausible additions here would be a defect.
  *
  * **The six mutations are pure delegates**: each forwards its arguments and returns the service's result
  * untouched.

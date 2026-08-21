@@ -1,68 +1,20 @@
 /*
- * -------------------------------------------------------------------------------------------------------
- * Provenance and divergence record for `ReorderPluginOptions`.
- * -------------------------------------------------------------------------------------------------------
- * The five keys below do not share one authority, and a maintainer who cannot tell them apart cannot tell
- * which of them a ticket may still renegotiate. This block records where each came from so that neither
- * divergence in it is discovered later as an unexplained addition.
+ * `ReorderPluginOptions` has exactly five keys, every one optional, integer, finite and at least 1, and
+ * every one validated at plugin initialisation so that a malformed value fails the boot with a named error
+ * identifying the offending key rather than silently degrading a bound. `init({})` is therefore valid and
+ * yields the five declared defaults.
  *
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing in this file is a user-specified rule, and no rule forces any key into it. Every constraint
- * stated here traces to EPIC-001 section 7.10 (the plugin option ledger), to FEATURE-001-01 section 2.11,
- * to STORY-001-01-01, or to a cited line of this repository, and is attributed accordingly. The absence of
- * a rules document has not been treated as licence to lower the bar anywhere in this file.
+ * `@since 3.8.0` on each member is a derivation rather than a quotation: the contribution guide requires a
+ * new public API to name the next minor version, this checkout declares 3.7.0, and 3.8.0 appears nowhere in
+ * the repository.
  *
- * Keys 1 to 3 are ledgered. `maxListsPerCustomer`, `maxLinesPerList` and `maxQuantityPerLine` are declared
- * by EPIC-001 section 7.10, which is the single authority for every configured key in that epic and carries
- * exactly twenty-six of them. STORY-001-01-01 is the declaring owner of these three "and of no others";
- * STORY-001-01-02 and STORY-001-01-03 read them and declare none.
- *
- * Keys 4 and 5 are not in that ledger, and the divergence is reported rather than absorbed. This is the
- * conflict the plan records as C-C. Neither `defaultReorderListsPageSize` nor
- * `defaultReorderListLinesPageSize` appears in any of the ledger's twenty-six rows. The epic instead
- * records the per-surface default page size as an OPEN architectural decision at its section 8.2, observing
- * that the platform supplies no per-operation default beneath its own maximum and that absent one an
- * omitted page size resolves to that maximum. This run's supplied decisions close that item by directing
- * the values 25 and 50 be declared as plugin options, so they are declared here and the epic's open item is
- * thereby resolved for this run.
- *
- * Why the run's decision outranks the ledger's sole-authority claim, stated rather than assumed. The
- * decisions block exists precisely to close decisions the ticket set is forbidden from inventing, and it
- * directs that the supplied values not be substituted. The precedence ladder that governs this work orders
- * conflicts among tickets — the published schema over a story, the epic over a feature contract on a
- * cross-file ruling — and does not order a run-level decision against a ticket's own open item, which is
- * what section 8.2 records this as. Silently adding these keys and silently dropping them would both be
- * wrong; they are declared, and the divergence from the twenty-six-key ledger is reported in the pull
- * request body with both sections cited. These two are the only two identifiers in this feature not fixed
- * by a ticket.
- *
- * Required became defaulted, which is the second reported divergence. The ledger marks all three ledgered
- * keys "Required, no value in this set", and STORY-001-01-01 asks initialisation to fail when one is
- * absent. This run supplies 25, 200, 999, 25 and 50 as the declared defaults without substitution, which
- * makes every key defaulted rather than required and is why every member below is optional. No value has
- * been invented and no supplied value has been substituted; the change of kind is reported in the pull
- * request body alongside the ledger divergence above.
- *
- * The `@since 3.8.0` tags below are a derivation and are flagged as one. The contribution guide requires a
- * new public API to carry a `@since` tag naming what will be the next minor version, and its own literal
- * example names a different version entirely. This checkout declares 3.7.0, so the next minor derives to
- * 3.8.0. The guide never states that value, so the tag is computed from the checkout's version plus the
- * guide's rule rather than quoted from it — which is also how the authoritative tickets, where the same
- * derived value does appear, present it. Should the branch decision route this work to a major release
- * instead, the derived tag changes with it.
- *
- * Deliberate absences, so that they read as rulings rather than as gaps. There is no sixth key. In
- * particular there is no name-length option: the list-name bound is the fixed constant 191 that equals the
- * `name` column's declared width, a value above the column would be a database error rather than a
- * validated rejection and a value below it would restrict what no engine restricts, so such an option would
- * carry exactly one legal value. It lives in `constants.ts` as `MAX_LIST_NAME_LENGTH` instead, and
- * FEATURE-001-01 section 2.11 settles that it is a constant and not an option. There is likewise no
- * seat-cap option, which the ledger assigns to STORY-001-06-01; no retention or purge key, no deletion,
- * anonymisation or purge behaviour shipping ahead of the epic's customer-data-lifecycle ruling; no strategy
- * key; and no event key. The identifiers those absent options would have used are deliberately not written
- * anywhere in this package, so a search for one finds nothing rather than finding a comment.
- * -------------------------------------------------------------------------------------------------------
+ * There is no sixth key, and the absences are deliberate rather than pending. The list-name bound is not
+ * configurable: it is the fixed constant `MAX_LIST_NAME_LENGTH` in `constants.ts`, equal to the `name`
+ * column's declared width, so an option would carry exactly one legal value — above it a write is a
+ * database error rather than a validated rejection, below it the plugin would restrict what no engine
+ * restricts. Seat caps belong to the sharing feature, and retention, purge, strategy and event keys belong
+ * to features that ship no disposal or instrumentation behaviour here. The identifiers those options would
+ * use are written nowhere in this package, so a search for one finds nothing rather than finding a comment.
  */
 
 /**
@@ -180,14 +132,6 @@ export interface ReorderPluginOptions {
      * @description
      * The page size the `activeCustomerReorderLists` query applies where a caller supplies no `take`.
      *
-     * This key is **not** part of EPIC-001 section 7.10, the ledger that declares itself the single
-     * authority for every configured key and that carries only three keys for this feature. The epic
-     * instead records the per-surface default page size as an open architectural decision at its section
-     * 8.2. This run's supplied decisions close that decision by directing the value be declared as an
-     * option, so it is declared here. Together with `defaultReorderListLinesPageSize` it is one of only two
-     * identifiers in this feature not fixed by a ticket, and the divergence from the ledger is reported in
-     * the pull request body.
-     *
      * The value is stricter than the platform's own fallback rather than looser, which is what keeps the
      * published contract intact: `apiOptions.shopListQueryLimit` defaults to 100 and `ListQueryBuilder`
      * substitutes that maximum when no page size is supplied, so a default of 25 still satisfies the
@@ -212,11 +156,6 @@ export interface ReorderPluginOptions {
      * default of 100, so a client that omits the argument entirely still receives a bounded page rather
      * than every line of the list. `lineCount` remains on the parent type for a client that needs only a
      * summary and no page of lines at all.
-     *
-     * Like `defaultReorderListsPageSize`, this key is **not** in EPIC-001 section 7.10 and exists because
-     * this run's supplied decisions close the open per-surface page-size decision the epic records at its
-     * section 8.2. The two are the only identifiers in this feature not fixed by a ticket, and the
-     * divergence is reported in the pull request body.
      *
      * Must be an integer, finite, and at least 1.
      *

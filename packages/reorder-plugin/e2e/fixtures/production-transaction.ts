@@ -6,17 +6,17 @@
  *
  * `runBarrieredPair` gives each participant a query runner with its own transaction already open, runs both
  * prechecks, holds both participants at a rendezvous, releases them together, and only then lets either write.
- * That machinery is sound. What an earlier revision of this package's race cases did with it was not: the
- * precheck ran on the participant's held connection, and then the *write* went somewhere else entirely — over
- * HTTP to the running server, which opened a transaction of its own on a connection the barrier had never
- * heard of, or through a hand-written statement that resembled the service's but was not it. One of those
- * proves that two HTTP calls made at roughly the same time produce one winner; the other proves that a
- * statement the test wrote behaves as the test expects. Neither proves anything about the interleaving the
- * production code actually performs, because in neither case were the two production transactions the two
- * transactions the barrier held.
+ * That machinery is sound; what a race case does with it decides whether the claim holds. Running the
+ * precheck on the participant's held connection and then sending the *write* somewhere else entirely — over
+ * HTTP to the running server, which opens a transaction of its own on a connection the barrier has never
+ * heard of, or through a hand-written statement that resembles the service's but is not it — proves something
+ * else. One shape proves that two HTTP calls made at roughly the same time produce one winner; the other
+ * proves that a statement the test wrote behaves as the test expects. Neither proves anything about the
+ * interleaving the production code performs, because in neither case are the two production transactions the
+ * two transactions the barrier held.
  *
- * The mutate suite said so outright, in a comment this module exists to falsify: "a participant cannot borrow
- * the service's transaction, so it issues the statement itself on the connection the barrier holds." It can.
+ * It is often assumed that a participant cannot borrow the service's transaction, and must therefore issue
+ * the statement itself on the connection the barrier holds. It can borrow it, and this module is how.
  *
  * ## How
  *
@@ -54,13 +54,8 @@
  * {@link resolveOwnerRequestContext} asserts the flag rather than trusting it, so a mis-wired gate fails at
  * setup with a diagnostic instead of yielding a race that quietly proves nothing.
  *
- * ## Attribution
- *
- * **No user-specified rules were provided for this project** — the rules document was read and returned
- * exactly that, and EPIC-001 section 11.9 records the same finding independently. Nothing here derives from a
- * user-specified rule. The obligations it serves are ticket-derived (EPIC-001 section 7.8's requirement that a
- * race claim rest on an explicit barrier, and section 11.6.3's exclusion of `e2e-sqljs` from concurrency
- * evidence) and prompt-derived (the plan's section 0.7.5).
+ * The obligations it serves are EPIC-001 section 7.8's requirement that a race claim rest on an explicit
+ * barrier and section 11.6.3's exclusion of `e2e-sqljs` from concurrency evidence.
  *
  * @since 3.8.0
  */
@@ -160,21 +155,12 @@ export async function resolveOwnerRequestContext(
  * The symbol-keyed property the RUNNING platform reads its transactional entity manager from, discovered from
  * the platform itself rather than trusted from an import.
  *
- * ★ WHY THIS IS DISCOVERED AND NOT IMPORTED, which is a correction and the reason the fixture grew a
- * post-condition. `TRANSACTION_MANAGER_KEY` is `Symbol('TRANSACTION_MANAGER')` — a fresh, unique value each
- * time that module is instantiated. An earlier revision set the binding under the symbol reached by the deep
- * import `@vendure/core/dist/common/constants`, which is the same value as the server's ONLY while both load a
- * single instance of that module. Under the e2e runner they do not: the suite's import is transformed by Vite
- * while the server reaches the same file through Node's own CommonJS require, so two `Symbol()` values exist
- * and a property set under one is invisible to code reading the other. The binding then failed silently —
- * `TransactionWrapper` found no inherited manager, opened a transaction on a connection of its own, and every
- * "production statement inside the barrier's transaction" claim was false while every assertion still passed.
- * It was visible only as a hang once a test held a lock the service would need: two extra connections waiting
- * on `Lock: transactionid` while both participant runners sat idle in transaction.
- *
- * Discovery removes the possibility rather than documenting it. The platform is asked to open a transaction and
- * hand a context to a callback — which is precisely where `TransactionWrapper` writes the key — and the symbol
- * is read back off that context. Whatever instance the server loaded, this is its key.
+ * ★ WHY THIS IS DISCOVERED AND NOT IMPORTED, and why the fixture carries a post-condition for it.
+ * `TRANSACTION_MANAGER_KEY` is `Symbol('TRANSACTION_MANAGER')` — a fresh, unique value each time that module
+ * is instantiated. Setting the binding under the symbol reached by the deep import
+ * `@vendure/core/dist/common/constants` is the same value as the server's ONLY while both load a single
+ * instance of that module. Under the e2e runner they do not: the suite's import is transformed by Vite while
+ * the server reaches the same file through Node's own CommonJS require, so two `Symbol()` values exist and a
  *
  * @param providers - The running server's Nest application, for resolving `TransactionalConnection`.
  * @param ctx - Any valid context; it is neither mutated nor written through.
@@ -213,11 +199,6 @@ export async function resolveTransactionManagerKey(
 /**
  * @description
  * Returns a copy of `ctx` whose database access is bound to `queryRunner`'s already-open transaction.
- *
- * The binding is the symbol-keyed property `TransactionalConnection` and `TransactionWrapper` both read, so a
- * service given this context issues every statement on that runner. `RequestContext.copy()` is
- * `Object.assign` over a fresh prototype-linked object, and `Object.assign` carries own enumerable **symbol**
- * properties — which is why the binding survives the copy `TransactionWrapper` makes of it.
  *
  * @throws Where the runner is released or has no open transaction, because binding to either would let the
  * service silently open a transaction of its own and reintroduce the very gap this module closes.
@@ -274,12 +255,6 @@ export async function runInParticipantTransaction<T>(
      * commits a transaction of its own leaves this runner untouched. The binding could therefore fail silently
      * and every assertion downstream still passed, because the outcomes a barrier produces from two concurrent
      * service calls on their own connections often match the outcomes it produces from two held transactions.
-     *
-     * Counting the statements the operation issues on THIS runner settles it directly: a production call routed
-     * onto a connection of the platform's choosing issues none here, and the run is refused rather than reported
-     * as an interleaving it never demonstrated. The counter wraps `query`, which is the single method every
-     * TypeORM path — repository, query builder and raw — funnels through, and it is restored in a `finally` so a
-     * throwing operation cannot leave the runner instrumented.
      */
     const runner = host.queryRunner as QueryRunner & { query: QueryRunner['query'] };
     const uninstrumentedQuery = runner.query.bind(runner);

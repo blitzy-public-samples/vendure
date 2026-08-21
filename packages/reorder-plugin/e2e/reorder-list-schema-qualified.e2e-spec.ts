@@ -45,9 +45,6 @@
  * covers under a two-segment path; and the in-process SQLite engine has neither. The harness's initializers
  * offer no non-public-schema server, which is why this suite builds its connections itself rather than asking
  * for one.
- *
- * **No user-specified rules were provided for this project** — the rules document was read and returned exactly
- * that, which EPIC-001 section 11.9 records independently. Nothing here derives from a user-specified rule.
  */
 import { CurrencyCode, LanguageCode } from '@vendure/common/lib/generated-types';
 import {
@@ -239,10 +236,6 @@ describe.skipIf(!runsOnThisEngine)(
         });
     },
 );
-
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// Fixture
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
 
 /** What the configured schema was seeded with, carried to the decoy seeder and to the service builder. */
 interface SeededRows {

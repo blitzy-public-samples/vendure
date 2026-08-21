@@ -26,6 +26,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { DataSourceOptions } from 'typeorm';
+
 import { NavModifierPlugin } from './test-plugins/nav-modifier-plugin/nav-modifier-plugin';
 // import { FieldTestPlugin } from './test-plugins/field-test/field-test-plugin';
 import { ReviewsPlugin } from './test-plugins/reviews/reviews-plugin';
@@ -123,11 +124,11 @@ export const devConfig: VendureConfig = {
         ...getDbConfig(),
         // FEATURE-001-01: `synchronize` is declared HERE, after every spread, and that position is the point
         // of it. A later key wins, and every branch of `getDbConfig()` returns `synchronize: true`, so the
-        // `synchronize: false` that used to sit ABOVE the spread was silently overwritten — the file read as
-        // though it made a guarantee it did not deliver.
+        // same key declared ABOVE the spread would be silently overwritten and the file would read as though
+        // it made a guarantee it did not deliver.
         //
-        // The value is now derived, because the two things this configuration is used for want opposite
-        // answers and the entry point is what distinguishes them:
+        // The value is derived, because the two things this configuration is used for want opposite answers
+        // and the entry point is what distinguishes them:
         //
         //   * Driving the migration lifecycle. `packages/dev-server/migration.ts` is the only entry point
         //     that calls `generateMigration`, `runMigrations` or `revertLastMigration`, and a migration-driven
@@ -139,24 +140,22 @@ export const devConfig: VendureConfig = {
         //     (`packages/core/src/migrate.ts:L197-L204`). So this line agrees with the platform rather than
         //     substituting for it, and a misread of the entry point cannot make a migration run synchronise.
         //
-        //   * Booting or populating a dev server. This keeps the dev server's long-standing `true`, because
-        //     `packages/dev-server` ships NO core migrations — the `migrations/*.ts` pattern above names a
-        //     directory that does not exist — so a blanket `false` would leave `bun run populate` and
-        //     `bun run dev` facing a database with no tables at all. That asymmetry is the dev server's own
-        //     design and predates this feature.
+        //   * Booting or populating a dev server, where it stays `true`. `packages/dev-server` ships NO core
+        //     migrations — the `migrations/*.ts` pattern above names a directory that does not exist — so a
+        //     blanket `false` leaves `bun run populate` and `bun run dev` facing a database with no tables at
+        //     all.
         //
-        // Two ways of making a BOOT migration-owned were considered here and rejected on evidence rather
-        // than on taste, and both fail for the same missing piece — there are no core migrations to run
-        // first. `migrationsRun: true` runs migrations BEFORE synchronizing (`DataSource.initialize`,
+        // Neither of the two ways of making a BOOT migration-owned works, and both fail on that same missing
+        // piece. `migrationsRun: true` runs migrations BEFORE synchronizing (`DataSource.initialize`,
         // node_modules/typeorm/data-source/DataSource.js:L151-L157), so on a fresh database this plugin's
-        // migration would run against one with no `customer`, `channel` or `product_variant` for its
-        // foreign keys to reference. Declaring `synchronize: false` on the plugin's own entities would keep
-        // the schema builder off those two tables everywhere, but TypeORM's own contract for that option is
-        // that "schema sync will and migrations ignore this entity"
-        // (node_modules/typeorm/decorator/options/EntityOptions.d.ts:L31-L35), which would also leave every
-        // e2e suite — all of which are synchronization-driven by their initializers — with no tables at all.
-        // The migration-owned flow itself is exercised end to end by the plugin's own e2e suite, against a
-        // schema created by the migration with synchronization off.
+        // migration meets one with no `customer`, `channel` or `product_variant` for its foreign keys to
+        // reference. Declaring `synchronize: false` on the plugin's own entities keeps the schema builder off
+        // those two tables everywhere, but TypeORM's contract for that option is that "schema sync will and
+        // migrations ignore this entity"
+        // (node_modules/typeorm/decorator/options/EntityOptions.d.ts:L31-L35), which leaves every e2e suite —
+        // all of them synchronization-driven by their initializers — with no tables at all. The
+        // migration-owned flow is exercised by the plugin's own e2e suites instead, against a schema the
+        // migration created with synchronization off.
         synchronize: !IS_MIGRATION_ENTRY_POINT,
     },
     paymentOptions: {
@@ -279,13 +278,14 @@ export const devConfig: VendureConfig = {
  * layout the package happens to be installed in.
  *
  * **Registered only on a migration-driven connection, and that restriction is the point of it.** The caller
- * gates this on {@link IS_MIGRATION_ENTRY_POINT}, so the plugin's migration is visible to
- * `bun run migration:generate|run|revert` and invisible to a server boot or a population run. Without that
- * gate the shipped boot path is incoherent, and provably so rather than arguably:
+ * gates this on {@link IS_MIGRATION_ENTRY_POINT}, so the plugin's migration is visible to the `generate`,
+ * `run` and `revert` subcommands of `packages/dev-server/migration.ts` and invisible to a server boot or a
+ * population run. Without that gate the shipped boot path is incoherent, and provably so rather than
+ * arguably:
  *
  *   1. `packages/dev-server/index.ts:L8-L9` runs `runMigrations(devConfig)` and then `bootstrap(devConfig)`.
- *      That ordering is this package's own and predates this feature; what predates it too is a `migrations`
- *      pattern naming a directory that does not exist, so `runMigrations` was a no-op.
+ *      Both that ordering and the `migrations` pattern naming a directory which does not exist are this
+ *      package's own, so on a boot `runMigrations` has nothing to apply.
  *   2. A migration connection is forced to `synchronize: false` (`packages/core/src/migrate.ts:L197-L204`),
  *      so on a FRESH database the plugin's migration would run before `customer`, `channel` and
  *      `product_variant` exist — the three tables its references point at — and could not succeed.
@@ -295,8 +295,8 @@ export const devConfig: VendureConfig = {
  *      migration finds them already standing. The migration would be recorded as applied against a schema it
  *      did not author, after having failed once without stopping anything.
  *
- * Gating removes that whole chain by restoring step 1 to what it was: a boot runs no plugin migration at all,
- * and the schema builder owns the dev schema openly rather than behind a migration's name. This package ships
+ * Gating removes that whole chain: a boot runs no plugin migration at all, and the schema builder owns the
+ * dev schema openly rather than behind a migration's name. This package ships
  * **no core migrations**, so a migration-owned dev schema is not available to any plugin here — the AAP
  * records that at section 0.4.3 as a discovered property of this harness rather than something a plugin
  * changes. The ordered flow that IS migration-owned belongs to a real deployment and is written out in the

@@ -1,7 +1,7 @@
 import { DataSource, EntityManager, QueryRunner } from 'typeorm';
 import { describe, expect, it } from 'vitest';
 
-import { runSequentialPair } from './concurrency-barrier';
+import { ConcurrencyBarrier, runSequentialPair } from './concurrency-barrier';
 
 /**
  * The two-connection harness's TEARDOWN CONTRACT, tested where it is hardest to reach: on a query runner
@@ -26,9 +26,11 @@ import { runSequentialPair } from './concurrency-barrier';
  * seeded — this file is as pure as the fixture it tests.
  *
  * ★ **WHICH RUNNER EXECUTES IT, AND WHY THAT ONE.** The `e2e-spec` suffix places it in the end-to-end run
- * [e2e-common/vitest.config.mts:L7], which owns everything under `e2e/`; the package's unit run reaches
- * into `src` and nowhere else, so a `.spec.ts` here would breach that boundary. Its sibling
- * `migration-state.e2e-spec.ts` sits here for exactly the same reason.
+ * [e2e-common/vitest.config.mts:L7], which owns everything under `e2e/`. The suffix is the whole of the
+ * selection: the package's own configuration declares no `include` and no `exclude`, so its discovery is
+ * Vitest's default pattern, which requires a literal `.spec.` and therefore collects an ordinary `.spec.ts`
+ * wherever it sits — including here — while never collecting an `.e2e-spec.ts`. Its sibling
+ * `migration-state.e2e-spec.ts` carries the suffix for exactly the same reason.
  *
  * ★ **AN ADDITION TO THE PLANNED FILE SET, DECLARED HERE.** AAP §0.5.1.8 enumerates
  * `e2e/fixtures/concurrency-barrier.ts` as a fixture module and enumerates no spec for it, so this file is
@@ -67,6 +69,11 @@ interface FakeRunnerFaults {
      * the harness's `ownsRunner` false — so it is how the "genuinely foreign" branch is reached.
      */
     initiallyInTransaction?: boolean;
+    /**
+     * `release()` rejects with this exact value, so the harness's teardown-failure diagnostic can be
+     * driven with a rejection of a chosen SHAPE — specifically a TypeORM-shaped one.
+     */
+    releaseFailsWith?: unknown;
 }
 
 /**
@@ -148,6 +155,11 @@ function createFakeRunner(
         },
         release: () => {
             journal.calls.push('release');
+            if ('releaseFailsWith' in faults) {
+                // NOT marked released: a release that rejected did not release, and the harness's own
+                // diagnostic is what this fault exists to reach.
+                return Promise.reject(faults.releaseFailsWith);
+            }
             released = true;
             return Promise.resolve();
         },
@@ -249,11 +261,11 @@ describe('the two-connection harness, when a runner cannot be read', () => {
         );
 
         // A READABLE COUNTER IS NOT A SUBSTITUTE FOR A READABLE FLAG, and this is the case that says so.
-        // With a depth to compare, the harness *could* have told its own nested level from an outer one and
-        // carried on — which is precisely what it used to do: it treated the substituted `active: true` as
-        // proof of a foreign owner, opened and committed a level inside it, and then, because a foreign
-        // connection is deliberately never released and never quarantined, left the pool connection it had
-        // taken with nobody responsible for giving it back. Certainty, not the counter, decides.
+        // With a depth to compare, the harness *could* tell its own nested level from an outer one and carry
+        // on — treating the substituted `active: true` as proof of a foreign owner, opening and committing a
+        // level inside it, and then, because a foreign connection is deliberately never released and never
+        // quarantined, leaving the pool connection it had taken with nobody responsible for giving it back.
+        // Certainty, not the counter, decides.
         expect(failure).toBeInstanceOf(Error);
         const message = (failure as Error).message;
         expect(message).toContain('transaction flag could not be read');
@@ -414,12 +426,417 @@ describe('the two-connection harness, when a runner STOPS being readable mid-cha
         expect(message).toContain('within 8 closes');
         expect(journal.calls.filter(call => call === 'commitTransaction').length).toBeLessThanOrEqual(18);
 
-        // A NOTE ON WHICH OF THESE TWO CASES FALSIFIES WHICH CHANGE, so a later reader does not mistake one
-        // for the other. The foreign case above is the one that fails without the certainty check, because
+        // WHICH OF THESE TWO CASES FALSIFIES WHICH CHANGE.
+        // The foreign case above is the one that fails without the certainty check, because
         // there a substituted value produced a positive certification. Here the baseline was inactive, so
         // the value comparison already disagreed and the runner was already quarantined; what this case
         // pins down is the OWNERSHIP SPLIT — that the same unreadable state disposes of a borrowed
         // connection by quarantine and a foreign one by report alone, and that the borrowed one is never
         // released on the way.
+    });
+});
+
+describe('the two-connection harness, when a teardown failure has to be reported', () => {
+    /**
+     * A rejection shaped exactly as TypeORM raises one, driver fields and all.
+     *
+     * ★ THE SHAPE IS THE POINT. TypeORM copies the driver's error ONTO the `QueryFailedError` it raises, so
+     * `query`, `parameters` and `driverError` become its own ENUMERABLE properties. That is why an ordinary
+     * `Error` serialises to `{}` and this does not — and it is why a diagnostic built with `value.message`
+     * or `JSON.stringify(value)` published the statement and every bound value into a build log.
+     */
+    function driverRejection(email: string): Error {
+        return Object.assign(
+            new Error(`Duplicate entry '${email}' for key 'UQ_reorder_list_line_list_variant'`),
+            {
+                name: 'QueryFailedError',
+                code: 'ER_DUP_ENTRY',
+                errno: 1062,
+                query: 'INSERT INTO `customer` (`emailAddress`) VALUES (?)',
+                parameters: [email],
+                driverError: { sqlMessage: `Duplicate entry '${email}'`, sqlState: '23000' },
+            },
+        );
+    }
+
+    it('measures the failure rather than reproducing it, and still names what a reader needs', async () => {
+        // ★ WHY THIS CASE MATTERS HERE RATHER THAN ONLY IN THE REDACTION FIXTURE'S OWN SPEC. A participant of
+        // this harness writes STRAIGHT THROUGH THE REPOSITORY, so a rejection it produces is the most
+        // sensitive error object this package ever holds. The harness raises its teardown diagnostic as an
+        // ordinary error, the runner prints it, and a build log is readable by everyone who can see the
+        // build. This asserts the delegation to the shared redactor, not the redactor itself.
+        const email = 'someone.real@example.invalid';
+        const journal: RunnerJournal = { calls: [] };
+        const faults: FakeRunnerFaults = { releaseFailsWith: driverRejection(email) };
+        const dataSource = createFakeDataSource(
+            [createFakeRunner(journal, faults), createFakeRunner(journal, faults)],
+            journal,
+        );
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant('writes-first'),
+            b: inertParticipant('writes-second'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+
+        // WHAT A READER NEEDS: which participant's connection would not go back, the error class, the
+        // enumerated driver code and errno, and how the failure classifies.
+        expect(message).toContain('writes-first');
+        expect(message).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+        expect(message).toContain('[unique-violation]');
+
+        // WHAT IT MUST NOT CARRY: the statement, its bound values, the driver's own sentence, the SQLSTATE.
+        for (const secret of [email, 'INSERT', 'VALUES', '23000', 'Duplicate']) {
+            expect(message.includes(secret), `the harness diagnostic disclosed "${secret.slice(0, 3)}"`).toBe(
+                false,
+            );
+        }
+    });
+
+    it('refuses a participant label that carries a value', async () => {
+        // A participant is named by whoever wrote the case, and the same pressure that interpolates a reason
+        // into a diagnostic interpolates an identifier into a name. The label is guarded on the same footing.
+        const email = 'someone.real@example.invalid';
+        const journal: RunnerJournal = { calls: [] };
+        const faults: FakeRunnerFaults = { releaseFailsWith: new Error('the pool refused it') };
+        const dataSource = createFakeDataSource(
+            [createFakeRunner(journal, faults), createFakeRunner(journal, faults)],
+            journal,
+        );
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant(`writes-for-${email}`),
+            b: inertParticipant('writes-second'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect((failure as Error).message.includes(email)).toBe(false);
+    });
+});
+
+describe('the exported barrier primitive, driven directly rather than through a pair driver', () => {
+    // ★ WHY THE PRIMITIVE NEEDS ITS OWN CASES. `runBarrieredPair` and `runSequentialPair` resolve their
+    // labels before they ever reach this class, so every guard exercised through them is the DRIVER's. A
+    // suite may construct `ConcurrencyBarrier` itself — it is exported — and then this class's own
+    // constructor, `arrive()` and `dispose()` are the only boundary a caller's label or failure crosses.
+    // Everything below drives it directly, for that reason.
+
+    const EMAIL = 'someone.real@example.invalid';
+    const TOKEN = ['s3cr3t', 'session', 'token', '4f2c81b9'].join('-');
+    const HOST_PATH = '/var/folders/T/reorder-plugin-a1b2c3/migrations';
+    const CONTROL = 'writes\u0007\u200b\nfake-log-line: OK';
+
+    /** A rejection shaped exactly as TypeORM raises one: driver fields as enumerable own properties. */
+    function driverRejection(): Error {
+        return Object.assign(
+            new Error(`Duplicate entry '${EMAIL}' for key 'UQ_reorder_list_line_list_variant'`),
+            {
+                name: 'QueryFailedError',
+                code: 'ER_DUP_ENTRY',
+                errno: 1062,
+                query: 'INSERT INTO `customer` (`emailAddress`) VALUES (?)',
+                parameters: [EMAIL],
+                driverError: { sqlMessage: `Duplicate entry '${EMAIL}'`, sqlState: '23000' },
+            },
+        );
+    }
+
+    /** Fails naming which value leaked, without putting the value itself in the message. */
+    function expectNoValueIn(text: string, values: readonly string[]): void {
+        for (const value of values) {
+            expect(text.includes(value), `the diagnostic disclosed "${value.slice(0, 3)}"`).toBe(false);
+        }
+    }
+
+    it('publishes no part of a value-bearing label through the timeout diagnostic', async () => {
+        // The timeout message is the one a hung rendezvous produces and therefore the one most likely to be
+        // read in a build log. It names who arrived and who did not, from BOTH the arrival list and
+        // `expectedLabels` — so both are asserted here.
+        const barrier = new ConcurrencyBarrier(2, {
+            timeoutMs: 20,
+            expectedLabels: [`expects-${EMAIL}`, `expects-${HOST_PATH}`],
+        });
+
+        const failure = await barrier.arrive(`writes-for-${EMAIL}`).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toContain('Concurrency barrier timed out');
+        expectNoValueIn(message, [EMAIL, HOST_PATH]);
+    });
+
+    it('publishes no part of a control-character label, so a log line cannot be forged', async () => {
+        // CWE-117: a newline in a label splits one log record into two, and the second can be spelled to
+        // look like a passing step. The label guard's length and shape rules refuse it wholesale.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 20, expectedLabels: [CONTROL] });
+
+        const failure = await barrier.arrive(CONTROL).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        const message = (failure as Error).message;
+        expect(message.includes('fake-log-line')).toBe(false);
+        expect(message.includes('\u0007')).toBe(false);
+        expect(message.includes('\u200b')).toBe(false);
+    });
+
+    it('converts a foreign disposal reason before storing it or rejecting anyone with it', async () => {
+        // ★ THE SINK WITH THREE OUTLETS. `dispose()` stored a caller's Error unchanged, handed it to every
+        // waiting participant, and had its `.message` replayed by every later arrival. A driver error carries
+        // the statement and its bound parameters as enumerable own properties, so all three published them.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+        const waiting = barrier.arrive('writes-first').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        barrier.dispose(driverRejection());
+
+        // OUTLET ONE — the participant that was already waiting.
+        const rejected = await waiting;
+        expect(rejected).toBeInstanceOf(Error);
+        const rejectedMessage = (rejected as Error).message;
+        expect(rejectedMessage).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+        expect(rejectedMessage).toContain('[unique-violation]');
+        expectNoValueIn(rejectedMessage, [EMAIL, 'INSERT', 'VALUES', '23000', 'Duplicate']);
+        // Nothing foreign was stored, so a serialising reporter finds no driver payload either.
+        expect(JSON.stringify(rejected)).toBe('{}');
+        expect((rejected as { cause?: unknown }).cause).toBeUndefined();
+
+        // OUTLET TWO — a later arrival, which replayed the stored message verbatim.
+        const late = await barrier.arrive('arrives-late').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+        const lateMessage = (late as Error).message;
+        expect(lateMessage).toContain('no longer');
+        expectNoValueIn(lateMessage, [EMAIL, 'INSERT', 'VALUES', '23000', 'Duplicate']);
+    });
+
+    it('refuses a token-bearing disposal reason that is not an Error at all', async () => {
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+        const waiting = barrier.arrive('writes-first').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        barrier.dispose([TOKEN, EMAIL]);
+
+        expectNoValueIn(((await waiting) as Error).message, [TOKEN, EMAIL]);
+    });
+
+    it('keeps two refused labels DISTINCT, so refusing one cannot turn a leak into a hang', async () => {
+        // ★ THE HAZARD THE ORDINAL EXISTS FOR. A label is also the identity a repeat arrival is deduplicated
+        // by, so replacing every refused label with one shared constant would merge two participants, hold
+        // the distinct-arrival count below the release threshold and hang the rendezvous. Both labels here
+        // are refused and the barrier must still release on the second arrival.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+        const first = barrier.arrive(`writes-for-${EMAIL}`);
+        const second = barrier.arrive(`writes-for-${HOST_PATH}`);
+
+        await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+        expect(barrier.released, 'two refused labels were merged into one participant').toBe(true);
+        // And they are reported as distinct ordinals rather than as one string.
+        expect(new Set(barrier.arrivedLabels).size).toBe(2);
+        expectNoValueIn(barrier.arrivedLabels.join(' '), [EMAIL, HOST_PATH]);
+    });
+
+    it('still counts a REPEAT arrival of the same refused label exactly once', async () => {
+        // The other half of the same property: stable per raw label. Arriving twice with one refused label
+        // must not satisfy a two-participant barrier, or a test would read a rendezvous that never happened
+        // as evidence of an interleaving.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 40 });
+        // The first arrival's promise is settled by the same timeout as the second, so it MUST carry a
+        // handler: left bare it becomes an unhandled rejection, which Vitest reports as a run-level error
+        // and which fails the suite while every assertion still passes.
+        const firstArrival = barrier.arrive(`writes-for-${EMAIL}`).then(
+            () => undefined,
+            () => undefined,
+        );
+        const failure = await barrier.arrive(`writes-for-${EMAIL}`).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure, 'a repeated refused label was counted as two participants').toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain('Concurrency barrier timed out');
+        expect(new Set(barrier.arrivedLabels).size).toBe(1);
+        await firstArrival;
+    });
+
+    it('keeps a safe label intact, because the diagnostic has to stay readable', async () => {
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 20, expectedLabels: ['adjust', 'remove'] });
+
+        const failure = await barrier.arrive('adjust').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        const message = (failure as Error).message;
+        expect(message).toContain('Arrived: adjust');
+        expect(message).toContain('Did not arrive: remove');
+    });
+
+    // ★ RENDERED-IDENTITY OWNERSHIP. The ordinal that makes a refused label safe is itself a string a
+    // caller could pass, so the substitute and the accepted set overlap — and the identity a barrier
+    // deduplicates by is exactly what the release threshold counts. Two participants sharing one identity
+    // therefore do not leak anything; they HANG, which is a worse failure than the one the guard prevents.
+    // Both arrival orders are covered because only one of them collided, and an implementation can be
+    // right in one order and wrong in the other.
+    describe('the identity a barrier deduplicates by is never shared by two participants', () => {
+        it('keeps them distinct when the REFUSED label arrives first and claims the ordinal', async () => {
+            // The order that collided. The refused label renders to `<participant-1>`; the accepted label is
+            // literally `<participant-1>`, passes the character allowlist untouched, and used to be handed
+            // the identity the first one already owned.
+            const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+            const refused = barrier.arrive(`writes-for-${EMAIL}`);
+            const collides = barrier.arrive('<participant-1>');
+
+            await expect(Promise.all([refused, collides])).resolves.toEqual([undefined, undefined]);
+            expect(barrier.released, 'two participants were merged into one identity').toBe(true);
+            expect(new Set(barrier.arrivedLabels).size).toBe(2);
+            expect(barrier.arrivedLabels.join(' ').includes(EMAIL)).toBe(false);
+        });
+
+        it('keeps them distinct when the ORDINAL-SHAPED label arrives first', async () => {
+            // The opposite order, which happened not to collide. Asserted so it cannot start to.
+            const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+            const accepted = barrier.arrive('<participant-1>');
+            const refused = barrier.arrive(`writes-for-${EMAIL}`);
+
+            await expect(Promise.all([accepted, refused])).resolves.toEqual([undefined, undefined]);
+            expect(barrier.released).toBe(true);
+            expect(new Set(barrier.arrivedLabels).size).toBe(2);
+        });
+
+        it('keeps them distinct when the ordinal-shaped label came from expectedLabels', async () => {
+            // The constructor resolves `expectedLabels` through the same map, so it can claim an ordinal
+            // before any arrival — a third ordering, and the one no arrival-only test reaches.
+            const barrier = new ConcurrencyBarrier(2, {
+                timeoutMs: 5_000,
+                expectedLabels: ['<participant-1>', '<participant-2>'],
+            });
+            const first = barrier.arrive(`writes-for-${EMAIL}`);
+            const second = barrier.arrive(`reads-for-${EMAIL}`);
+
+            await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+            expect(barrier.released).toBe(true);
+            expect(new Set(barrier.arrivedLabels).size).toBe(2);
+            expect(barrier.arrivedLabels.join(' ').includes(EMAIL)).toBe(false);
+        });
+
+        it('still counts a repeat arrival once when its identity was ordinalised twice over', async () => {
+            // Stability has to survive the ownership stepping: the same raw label must resolve to the same
+            // identity on its second arrival even though reaching that identity took two attempts.
+            const barrier = new ConcurrencyBarrier(3, { timeoutMs: 60, expectedLabels: ['<participant-1>'] });
+            const first = barrier.arrive(`writes-for-${EMAIL}`).then(
+                () => undefined,
+                () => undefined,
+            );
+            const repeat = await barrier.arrive(`writes-for-${EMAIL}`).then(
+                () => undefined,
+                (reason: unknown) => reason,
+            );
+
+            // Three expected, two distinct identities so far, so it must NOT have released.
+            expect(repeat, 'a repeated label was counted twice').toBeInstanceOf(Error);
+            expect(new Set(barrier.arrivedLabels).size).toBe(1);
+            await first;
+        });
+
+        it('lets a pair driver run when the REFUSED label is A and the ordinal-shaped one is B', async () => {
+            // ★ THE SYMMETRIC DIRECTION, and the one that survived the first fix. The ordinal substitute is
+            // itself a string a caller can pass, so the collision is possible either way round: here A is
+            // refused and renders `<participant-1>`, and B is literally `<participant-1>`, accepted
+            // untouched by the character allowlist. Advancing B only when B had itself been refused covered
+            // the other direction and left this one, and the pair was rejected as indistinguishable when it
+            // was nothing of the kind. An implementation can be right in one direction and wrong in the
+            // other, so both are asserted.
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            const result = await runSequentialPair(dataSource, {
+                a: inertParticipant(`writes-for-${EMAIL}`),
+                b: inertParticipant('<participant-1>'),
+            });
+
+            expect(result.a.status).toBe('fulfilled');
+            expect(result.b.status).toBe('fulfilled');
+            expect(result.a.label).not.toBe(result.b.label);
+            expect(`${String(result.a.label)} ${String(result.b.label)}`.includes(EMAIL)).toBe(false);
+        });
+
+        it('still refuses a pair the caller named IDENTICALLY, which is a different question', async () => {
+            // Collision avoidance must not swallow the caller mistake it sits next to. Two participants
+            // named the same thing cannot be told apart in any diagnostic, so the pair is unusable as
+            // evidence and is refused — and the refusal is keyed on the RAW labels, so ordinalising a
+            // rendered collision cannot quietly turn this into two silently-renamed participants.
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            await expect(
+                runSequentialPair(dataSource, {
+                    a: inertParticipant('writes-twice'),
+                    b: inertParticipant('writes-twice'),
+                }),
+            ).rejects.toThrow(/must be distinguishable/);
+        });
+
+        it('refuses an identically-named pair even when both labels were themselves refused', async () => {
+            // The same rule under redaction: two equal refused labels are still one caller mistake, and the
+            // refusal must fire on the raw equality rather than be hidden by both rendering to an ordinal.
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            const attempt = runSequentialPair(dataSource, {
+                a: inertParticipant(`writes-for-${EMAIL}`),
+                b: inertParticipant(`writes-for-${EMAIL}`),
+            });
+
+            await expect(attempt).rejects.toThrow(/must be distinguishable/);
+            // And the refusal itself reproduces nothing of the label it is complaining about.
+            await expect(attempt).rejects.not.toThrow(new RegExp(EMAIL.replace('.', '\\.')));
+        });
+
+        it('lets a pair driver run when one label is ordinal-shaped and the other is refused', async () => {
+            // The same overlap in the two-label resolver. Before the ordinal stepped past A, this pair was
+            // rejected outright as indistinguishable — loud rather than silent, but still a legitimate pair
+            // refused. It must simply run.
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            const result = await runSequentialPair(dataSource, {
+                a: inertParticipant('<participant-2>'),
+                b: inertParticipant(`writes-for-${EMAIL}`),
+            });
+
+            expect(result.a.status).toBe('fulfilled');
+            expect(result.b.status).toBe('fulfilled');
+            expect(result.a.label).not.toBe(result.b.label);
+            expect(`${String(result.a.label)} ${String(result.b.label)}`.includes(EMAIL)).toBe(false);
+        });
     });
 });

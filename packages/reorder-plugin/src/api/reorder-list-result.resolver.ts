@@ -143,7 +143,6 @@ type ReorderListResult =
 @Resolver()
 export class ReorderListResultResolver {
     /*
-     * ─────────────────────────────────────────────────────────────────────────────────────────────
      * THE DECORATOR ORDER BELOW IS LOAD-BEARING. DO NOT SWAP THE TWO LINES.
      *
      * `@Resolver(name)` in its method form writes BOTH the resolver-type metadata and the resolver-
@@ -200,7 +199,6 @@ export class ReorderListResultResolver {
      * platform reads a request from. Leaving the parameters bare is what keeps the payload in the
      * first position, since Nest passes the executor's own arguments straight through when a handler
      * decorates none of them.
-     * ─────────────────────────────────────────────────────────────────────────────────────────────
      */
 
     /**

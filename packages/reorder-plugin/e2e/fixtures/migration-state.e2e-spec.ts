@@ -59,7 +59,9 @@ describe('attemptEveryCleanup', () => {
                     recordingStep(ran, 'second'),
                     recordingStep(ran, 'third'),
                 ]),
-            ).rejects.toThrow(/first failed/);
+                // Keyed on the STEP LABEL, not on the failure message: the message is measured rather
+                // than reproduced, and the label is what identifies the step that broke anyway.
+            ).rejects.toThrow(/1 of 3 failed: first —/);
 
             expect(ran, 'a step behind the failure did not run').toEqual(['first', 'second', 'third']);
         });
@@ -74,7 +76,7 @@ describe('attemptEveryCleanup', () => {
                     recordingStep(ran, 'sync-thrower', { message: 'thrown outright', asynchronous: false }),
                     recordingStep(ran, 'after-sync'),
                 ]),
-            ).rejects.toThrow(/thrown outright/);
+            ).rejects.toThrow(/1 of 2 failed: sync-thrower —/);
 
             expect(ran).toEqual(['sync-thrower', 'after-sync']);
         });
@@ -89,7 +91,7 @@ describe('attemptEveryCleanup', () => {
                     recordingStep(ran, 'b', { message: 'b failed', asynchronous: false }),
                     recordingStep(ran, 'destroy-the-server'),
                 ]),
-            ).rejects.toThrow(/a failed/);
+            ).rejects.toThrow(/2 of 3 failed: a —/);
 
             expect(ran).toContain('destroy-the-server');
         });
@@ -114,23 +116,90 @@ describe('attemptEveryCleanup', () => {
                         },
                     },
                 ]),
+                // The step labels, the fraction, and each failure MEASURED — its class, its
+                // classification and its length — rather than either message reproduced.
             ).rejects.toThrow(
                 new RegExp(
                     'teardown attempted every step and 2 of 3 failed: ' +
-                        'dropping the isolated database — no such database; ' +
-                        'restoring the platform configuration — config already reset',
+                        'dropping the isolated database — Error \\[unclassified\\] ' +
+                        'mentioning nothing recognised \\(message withheld, 16 chars\\); ' +
+                        'restoring the platform configuration — Error \\[unclassified\\] ' +
+                        'mentioning nothing recognised \\(message withheld, 20 chars\\)',
                 ),
             );
         });
 
-        it('reports a non-Error rejection without losing it', async () => {
-            // A driver or a mock can reject with something that is not an `Error`; the diagnosis must still
-            // carry it rather than printing an empty message.
+        it('reports a non-Error rejection without losing that there was one', async () => {
+            // A driver or a mock can reject with something that is not an `Error`. It is still MEASURED —
+            // its type and its length — rather than printed, because the thing most likely to arrive here
+            // as a bare non-Error is a bound parameter that was thrown.
             await expect(
                 attemptEveryCleanup([
                     { what: 'releasing a query runner', run: () => Promise.reject('a bare string') },
                 ]),
-            ).rejects.toThrow(/releasing a query runner — a bare string/);
+            ).rejects.toThrow(/releasing a query runner — string \[unclassified\]/);
+        });
+
+        it('reproduces nothing from a driver failure, and still says what a reader needs', async () => {
+            // ★ THE CASE THIS AGGREGATOR EXISTS TO GET RIGHT. The steps it releases are a query runner, a
+            // data source, a generated directory, an isolated database, mutated process state and a running
+            // server — so a failure arriving here is a TypeORM `QueryFailedError`, which has copied the
+            // driver's own error onto itself and therefore carries the statement and its bound parameters as
+            // ENUMERABLE properties. This aggregate is thrown, printed by the runner and read in a build log.
+            const email = 'someone.real@example.invalid';
+            const driverFailure = Object.assign(
+                new Error(`Duplicate entry '${email}' for key 'UQ_reorder_list_line_list_variant'`),
+                {
+                    name: 'QueryFailedError',
+                    code: 'ER_DUP_ENTRY',
+                    errno: 1062,
+                    query: 'INSERT INTO `customer` (`emailAddress`) VALUES (?)',
+                    parameters: [email],
+                    driverError: { sqlMessage: `Duplicate entry '${email}'`, sqlState: '23000' },
+                },
+            );
+
+            let aggregated = '';
+            try {
+                await attemptEveryCleanup([
+                    { what: 'dropping the isolated database', run: () => Promise.reject(driverFailure) },
+                ]);
+            } catch (err: unknown) {
+                aggregated = err instanceof Error ? err.message : String(err);
+            }
+
+            // What a reader NEEDS: the step, the error class, the enumerated driver code and errno, how the
+            // failure classifies, and the schema object the driver named.
+            expect(aggregated).toContain('dropping the isolated database');
+            expect(aggregated).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+            expect(aggregated).toContain('[unique-violation]');
+            // What it must NOT carry.
+            for (const secret of [email, 'INSERT', 'VALUES', '23000', 'Duplicate']) {
+                expect(
+                    aggregated.includes(secret),
+                    `the teardown aggregate disclosed "${secret.slice(0, 3)}"`,
+                ).toBe(false);
+            }
+        });
+
+        it('refuses a step label that carries a value, because a per-resource label invites one', async () => {
+            // The natural way to make a per-item cleanup step readable is to interpolate the item — and the
+            // items here ARE temporary directories and database names, so the label is a path.
+            let aggregated = '';
+            try {
+                await attemptEveryCleanup([
+                    {
+                        what: '/var/folders/T/reorder-plugin-a1b2c3/migrations',
+                        run: () => Promise.reject(new Error('busy')),
+                    },
+                ]);
+            } catch (err: unknown) {
+                aggregated = err instanceof Error ? err.message : String(err);
+            }
+
+            expect(aggregated).toContain('<unrenderable-stage-label>');
+            expect(aggregated.includes('/var/folders')).toBe(false);
+            expect(aggregated.includes('reorder-plugin-a1b2c3')).toBe(false);
         });
 
         it('resolves silently when every step succeeds', async () => {
@@ -168,7 +237,7 @@ describe('attemptEveryCleanup', () => {
                     recordingStep(ran, 'destroy-the-server'),
                 ]),
             ).rejects.toThrow(
-                /removing the temporary directories — teardown attempted every step and 1 of 2 failed: dir-1 — busy/,
+                /removing the temporary directories — Error \[unclassified\] mentioning nothing recognised/,
             );
 
             expect(ran, 'a nested step or the outer step behind it did not run').toEqual([

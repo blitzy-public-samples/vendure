@@ -75,14 +75,10 @@
 // differ by 47 members between them (16 published only by the Shop API, 31 only by the Admin API), so a
 // document typed against the Admin enum would accept a code the Shop API can never return and reject one it
 // does. `DeletionResult` and `SortOrder` happen to carry identical members in both today, which is exactly
-// why the wrong import survives review: it is right by coincidence rather than by contract, and the
+// why the wrong import still compiles: it is right by coincidence rather than by contract, and the
 // coincidence is not a property either schema promises to keep.
 import type { DeletionResult, ErrorCode, SortOrder } from '@vendure/common/lib/generated-shop-types';
 import gql from 'graphql-tag';
-
-// ---------------------------------------------------------------------------------------------
-// Fragments
-// ---------------------------------------------------------------------------------------------
 
 /**
  * Every selectable field of `ReorderListLine`.
@@ -166,10 +162,6 @@ export const REORDER_LIST_WITH_LINES_FRAGMENT = gql`
     ${REORDER_LIST_FRAGMENT}
     ${REORDER_LIST_LINE_FRAGMENT}
 `;
-
-// ---------------------------------------------------------------------------------------------
-// Queries
-// ---------------------------------------------------------------------------------------------
 
 /**
  * The canonical collection read, with NO arguments in the document text at all.
@@ -357,7 +349,6 @@ export const GET_ACTIVE_CUSTOMER_REORDER_LIST_WITH_PAGED_LINES = gql`
     ${REORDER_LIST_LINE_FRAGMENT}
 `;
 
-// ---------------------------------------------------------------------------------------------
 // Mutations
 //
 // Every mutation selects `__typename` first and then one inline fragment per member its union
@@ -370,7 +361,6 @@ export const GET_ACTIVE_CUSTOMER_REORDER_LIST_WITH_PAGED_LINES = gql`
 //
 // All five non-delete mutations return `ReorderList` on success — including the three that operate
 // on a LINE. There is no operation whose success member is a `ReorderListLine`.
-// ---------------------------------------------------------------------------------------------
 
 /**
  * `createReorderList`. Union: `ReorderList | ReorderListNameConflictError | ReorderListLimitError`.
@@ -548,7 +538,6 @@ export const REMOVE_REORDER_LIST_LINE = gql`
     ${REORDER_LIST_WITH_LINES_FRAGMENT}
 `;
 
-// ---------------------------------------------------------------------------------------------
 // Result and variables types
 //
 // Hand-written, for the reason the header records: no generator can produce them while the
@@ -563,7 +552,6 @@ export const REMOVE_REORDER_LIST_LINE = gql`
 //
 // Supply them at the call site — `SimpleGraphQLClient.query<T, V>` accepts a plain `DocumentNode`
 // with explicit type arguments, so these documents need no typed-document wrapper.
-// ---------------------------------------------------------------------------------------------
 
 /** The GraphQL `ID` scalar, mapped as the platform's generated types map it. */
 export type ReorderApiId = string | number;
@@ -630,13 +618,11 @@ export interface ReorderListFieldsShape {
     viewerAccess: ReorderListViewerAccessShape;
 }
 
-/** A page of list lines, as `ReorderList.lines` returns it. */
 export interface PaginatedReorderListLines {
     items: ReorderListLineFieldsShape[];
     totalItems: number;
 }
 
-/** The shape {@link REORDER_LIST_WITH_LINES_FRAGMENT} returns. */
 export interface ReorderListWithLinesShape extends ReorderListFieldsShape {
     lines: PaginatedReorderListLines;
 }
@@ -742,7 +728,6 @@ export interface ReorderListLimitErrorShape {
     maxItems: number;
 }
 
-/** `ReorderListLineNotFoundError`: the addressed line is absent from the addressed list. */
 export interface ReorderListLineNotFoundErrorShape {
     __typename: 'ReorderListLineNotFoundError';
     errorCode: ReorderPluginErrorCodeByTypename['ReorderListLineNotFoundError'];
@@ -771,49 +756,37 @@ export interface DeletionResponseShape {
  * breach a bound.
  */
 
-/** `createReorderList`. */
 export type CreateReorderListResultShape =
     | ReorderListSuccessShape
     | ReorderListNameConflictErrorShape
     | ReorderListLimitErrorShape;
 
-/** `updateReorderList`. */
 export type UpdateReorderListResultShape =
     | ReorderListSuccessShape
     | ReorderListNotFoundErrorShape
     | ReorderListNameConflictErrorShape;
 
-/** `deleteReorderList`. */
 export type DeleteReorderListResultShape = DeletionResponseShape | ReorderListNotFoundErrorShape;
 
-/** `addItemToReorderList`. */
 export type AddItemToReorderListResultShape =
     | ReorderListSuccessShape
     | ReorderListNotFoundErrorShape
     | ReorderListLimitErrorShape;
 
-/** `adjustReorderListLine`. */
 export type AdjustReorderListLineResultShape =
     | ReorderListSuccessShape
     | ReorderListNotFoundErrorShape
     | ReorderListLineNotFoundErrorShape;
 
-/** `removeReorderListLine`. */
 export type RemoveReorderListLineResultShape =
     | ReorderListSuccessShape
     | ReorderListNotFoundErrorShape
     | ReorderListLineNotFoundErrorShape;
 
-// ---------------------------------------------------------------------------------------------
-// Input types, mirroring the published inputs field for field
-// ---------------------------------------------------------------------------------------------
-
-/** `CreateReorderListInput`. */
 export interface CreateReorderListInputShape {
     name: string;
 }
 
-/** `UpdateReorderListInput`. */
 export interface UpdateReorderListInputShape {
     id: ReorderApiId;
     name: string;
@@ -832,27 +805,22 @@ export interface AddItemToReorderListInputShape {
     quantity: number;
 }
 
-/** `AdjustReorderListLineInput`. The quantity is absolute, not a delta. */
 export interface AdjustReorderListLineInputShape {
     reorderListId: ReorderApiId;
     lineId: ReorderApiId;
     quantity: number;
 }
 
-/** `RemoveReorderListLineInput`. */
 export interface RemoveReorderListLineInputShape {
     reorderListId: ReorderApiId;
     lineId: ReorderApiId;
 }
 
-// ---------------------------------------------------------------------------------------------
 // Per-document result and variables types
 //
 // One pair per document, and each variables type lists exactly the variables its document declares
 // and nothing else. `GET_ACTIVE_CUSTOMER_REORDER_LISTS` declares none, so it has no variables type.
-// ---------------------------------------------------------------------------------------------
 
-/** {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS}. */
 export interface GetActiveCustomerReorderListsQuery {
     activeCustomerReorderLists: PaginatedReorderLists;
 }
@@ -862,12 +830,10 @@ export interface GetActiveCustomerReorderListQuery {
     activeCustomerReorderList: ReorderListWithLinesShape | null;
 }
 
-/** Variables of {@link GET_ACTIVE_CUSTOMER_REORDER_LIST}. */
 export interface GetActiveCustomerReorderListQueryVariables {
     id: ReorderApiId;
 }
 
-/** {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_INCLUDE_SHARED}. */
 export interface GetActiveCustomerReorderListsIncludeSharedQuery {
     activeCustomerReorderLists: PaginatedReorderLists;
 }
@@ -890,7 +856,6 @@ export interface GetActiveCustomerReorderListsIncludeSharedQueryVariables {
     includeShared?: boolean | null;
 }
 
-/** {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_INCLUDE_SHARED}. */
 export interface GetActiveCustomerReorderListIncludeSharedQuery {
     activeCustomerReorderList: ReorderListWithLinesShape | null;
 }
@@ -907,7 +872,6 @@ export interface GetActiveCustomerReorderListIncludeSharedQueryVariables {
     includeShared?: boolean | null;
 }
 
-/** {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_PAGINATED}. */
 export interface GetActiveCustomerReorderListsPaginatedQuery {
     activeCustomerReorderLists: PaginatedReorderLists;
 }
@@ -931,7 +895,6 @@ export interface GetActiveCustomerReorderListsPaginatedQueryVariables {
     idSort?: SortOrder | null;
 }
 
-/** {@link GET_ACTIVE_CUSTOMER_REORDER_LISTS_WITH_LINE_PAGES}. */
 export interface GetActiveCustomerReorderListsWithLinePagesQuery {
     activeCustomerReorderLists: PaginatedReorderListsWithLines;
 }
@@ -946,7 +909,6 @@ export interface GetActiveCustomerReorderListsWithLinePagesQueryVariables {
     linesTake?: number | null;
 }
 
-/** {@link GET_ACTIVE_CUSTOMER_REORDER_LIST_WITH_PAGED_LINES}. */
 export interface GetActiveCustomerReorderListWithPagedLinesQuery {
     activeCustomerReorderList: ReorderListWithLinesShape | null;
 }
@@ -966,27 +928,22 @@ export interface GetActiveCustomerReorderListWithPagedLinesQueryVariables {
     linesIdSort?: SortOrder | null;
 }
 
-/** {@link CREATE_REORDER_LIST}. */
 export interface CreateReorderListMutation {
     createReorderList: CreateReorderListResultShape;
 }
 
-/** Variables of {@link CREATE_REORDER_LIST}. */
 export interface CreateReorderListMutationVariables {
     input: CreateReorderListInputShape;
 }
 
-/** {@link UPDATE_REORDER_LIST}. */
 export interface UpdateReorderListMutation {
     updateReorderList: UpdateReorderListResultShape;
 }
 
-/** Variables of {@link UPDATE_REORDER_LIST}. */
 export interface UpdateReorderListMutationVariables {
     input: UpdateReorderListInputShape;
 }
 
-/** {@link DELETE_REORDER_LIST}. */
 export interface DeleteReorderListMutation {
     deleteReorderList: DeleteReorderListResultShape;
 }
@@ -996,32 +953,26 @@ export interface DeleteReorderListMutationVariables {
     id: ReorderApiId;
 }
 
-/** {@link ADD_ITEM_TO_REORDER_LIST}. */
 export interface AddItemToReorderListMutation {
     addItemToReorderList: AddItemToReorderListResultShape;
 }
 
-/** Variables of {@link ADD_ITEM_TO_REORDER_LIST}. */
 export interface AddItemToReorderListMutationVariables {
     input: AddItemToReorderListInputShape;
 }
 
-/** {@link ADJUST_REORDER_LIST_LINE}. */
 export interface AdjustReorderListLineMutation {
     adjustReorderListLine: AdjustReorderListLineResultShape;
 }
 
-/** Variables of {@link ADJUST_REORDER_LIST_LINE}. */
 export interface AdjustReorderListLineMutationVariables {
     input: AdjustReorderListLineInputShape;
 }
 
-/** {@link REMOVE_REORDER_LIST_LINE}. */
 export interface RemoveReorderListLineMutation {
     removeReorderListLine: RemoveReorderListLineResultShape;
 }
 
-/** Variables of {@link REMOVE_REORDER_LIST_LINE}. */
 export interface RemoveReorderListLineMutationVariables {
     input: RemoveReorderListLineInputShape;
 }

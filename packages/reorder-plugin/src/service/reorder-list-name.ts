@@ -1,13 +1,5 @@
 /*
- * -------------------------------------------------------------------------------------------------------
  * Reorder list name canonicalisation — provenance, and why this module is pure.
- * -------------------------------------------------------------------------------------------------------
- * Attribution. No user-specified rules were provided for this project: the rules document was read and
- * returned exactly that, and EPIC-001 reaches the same finding independently in its own section 11.9.
- * Nothing in this file is, or derives from, a user-specified rule. Every constraint stated below traces to
- * FEATURE-001-01 section 2.10.1 or section 2.11, to STORY-001-01-01 acceptance criterion 2, to EPIC-001
- * ruling R13, or to a cited line of this repository, and is attributed as such wherever it is stated. The
- * absence of a rules document has not been treated as licence to lower the bar anywhere in this file.
  *
  * Why this module holds no decorator, no injectable, no repository and no I/O of any kind. A list name is
  * the only free text this feature persists, it arrives from a public caller, and the whole of its contract
@@ -137,7 +129,6 @@ const LEADING_AND_TRAILING_WHITESPACE = new RegExp(
  */
 const INTERNAL_WHITESPACE_RUN = new RegExp(`[${WHITESPACE_CHARACTER_CLASS}]+`, 'g');
 
-/** The single character every collapsed whitespace run becomes: U+0020, an ordinary space. */
 const COLLAPSED_WHITESPACE_REPLACEMENT = ' ';
 
 /**

@@ -119,16 +119,18 @@ const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
  *    every write filters on all three, and `IDX_reorder_list_customer_channel` is the index that
  *    predicate is served by.
  * 3. `lineCount` is stored rather than derived. See that property's own description.
- * 4. **Both foreign keys are indexed, and the second index exists for a predicate no request issues.**
- *    `IDX_reorder_list_customer_channel` leads with `customerId`, so it serves both the ownership
- *    predicate and any probe for a customer's rows. Nothing led with `channelId`, though — and the
- *    engine needs one, because `ON DELETE CASCADE` on {@link ReorderList.channel} means deleting a
- *    channel makes the engine find every row of this table referencing it. PostgreSQL and SQLite index
- *    the *referenced* key automatically and the *referencing* column not at all, so that probe would
- *    scan the whole table — a cost that grows with every buyer's lists while the deletion it serves
- *    stays a single administrative act. `IDX_reorder_list_channel` is the index for it. (The MySQL
- *    family creates an index for a foreign key of its own accord, so there the declaration is
- *    redundant rather than wrong; declaring it keeps the four engines' schemas the same shape.)
+ *
+ * **This entity declares exactly three named database objects, and a fourth is not a free
+ * addition.** The feature contract enumerates five named objects across the two plugin tables —
+ * three here and two on {@link ReorderListLine} — and requires the count itself to be asserted "so
+ * an addition is visible rather than absorbed"
+ * [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.4, §5]. An earlier revision also
+ * declared a channel-only index for the cascade that fires when a channel is deleted; it was
+ * withdrawn because it is a sixth object the contract does not authorise, and because nothing
+ * depends on it: no operation issues a predicate led by `channelId` alone, the MySQL family creates
+ * an index for a foreign key of its own accord, and a channel deletion is a single administrative
+ * act rather than a request path. An index this feature genuinely needs belongs in the contract
+ * first, so that the entity, the migration and the tests all move together.
  *
  * `id`, `createdAt` and `updatedAt` are inherited from {@link VendureEntity} and are deliberately not
  * re-declared here, though all three are part of this entity's published contract.
@@ -145,7 +147,6 @@ const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
 @Entity()
 @Unique('UQ_reorder_list_customer_channel_name_key', ['customerId', 'channelId', 'nameKey'])
 @Index('IDX_reorder_list_customer_channel', ['customerId', 'channelId'])
-@Index('IDX_reorder_list_channel', ['channelId'])
 @Check('CHK_reorder_list_line_count_non_negative', '"lineCount" >= 0')
 export class ReorderList extends VendureEntity {
     constructor(input?: DeepPartial<ReorderList>) {
@@ -225,14 +226,14 @@ export class ReorderList extends VendureEntity {
      * lives in the plugin's own name helper alongside the length and emptiness checks, so that the one
      * service owning this table applies it before any uniqueness comparison.
      *
-     * The declared width of 191 is an engine constraint rather than a product choice, and the
-     * constraint is inherited rather than direct: it is `nameKey` — and only `nameKey` — that
-     * participates in `UQ_reorder_list_customer_channel_name_key`, and 191 four-byte UTF-8
-     * characters is the length that keeps that composite index inside the key-size limit on the
-     * MySQL and MariaDB engines. This column participates in no index at all; it is held at the
-     * same width because it stores the same buyer input as the value `nameKey` is derived from, so
-     * a width that admitted a longer display name than its own canonical form could be stored under
-     * would make the pair unstorable rather than merely asymmetric.
+     * The declared width of 191 is an engine constraint rather than a product choice, and this
+     * column inherits it rather than causing it. Only `nameKey` is indexed — it alone participates
+     * in `UQ_reorder_list_customer_channel_name_key` — and 191 four-byte UTF-8 characters is the
+     * length that keeps that composite index inside the key-size limit on the MySQL and MariaDB
+     * engines. This column is in no index at all; it is held at the same width because it stores the
+     * same buyer input that `nameKey` is derived from, so a width admitting a longer display name
+     * than its own canonical form could be stored under would make the pair unstorable rather than
+     * merely asymmetric.
      * The plugin's `MAX_LIST_NAME_LENGTH` constant is the same number by requirement and not by
      * coincidence — the two must be changed together or not at all, and there is deliberately no
      * option to configure either. It is not imported here, because an entity must not depend on the
@@ -304,6 +305,22 @@ export class ReorderList extends VendureEntity {
      * Be aware that the constraint is a defence in depth and not a portable guarantee: TypeORM emits
      * check constraints on PostgreSQL and the SQLite family but skips them silently on MySQL and
      * MariaDB, so the invariant must also be upheld by the service on every write path.
+     *
+     * It is, and the enforcement divides into two kinds that are worth keeping apart rather than summing.
+     * Two of the three writes carry the floor as a value predicate in their OWN statement, so the
+     * database evaluates it on all four engines: the increment is predicated on
+     * `lineCount < maxLinesPerList` and the decrement on `lineCount > 0`. The third — the compare-and-set
+     * repair — carries ownership and the stale counter in its predicate and no value bound, so what
+     * refuses a bad total there is an IN-PROCESS guard: a total that is not a non-negative safe integer is
+     * refused before the statement is built, and nothing is written. On PostgreSQL and the SQLite family
+     * the check constraint stands behind that guard; on MySQL and MariaDB the guard is the only thing
+     * standing.
+     *
+     * So what the missing constraint costs on MySQL and MariaDB is two things, not one: the defence
+     * against a write that does not come from this plugin at all — direct SQL, or another application
+     * sharing the schema — and, for the repair specifically, the database-side backstop behind an
+     * in-process check. That gap is conflict C-E, it is unresolved, and it is stated in the package README
+     * rather than left to be discovered.
      *
      * @since 3.8.0
      */
