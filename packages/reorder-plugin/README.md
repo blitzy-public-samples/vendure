@@ -28,12 +28,12 @@ The floor is deliberately left at the 3.3 line rather than narrowed to exclude t
 releases: narrowing it would refuse to boot on the whole 3.3–3.7.1 range, which is a support-policy
 decision for the maintainers rather than a change this package should make on its own.
 
-This is stated here, in the package's own documentation, and deliberately nowhere else. An earlier
-revision also wrote a `warn` line at every boot naming the four advisories and the release that fixes
-them. It was accurate, and it was withdrawn: a hardcoded advisory list and version floor inside a
-feature plugin has no way to refresh itself, so it would eventually tell an operator something that had
-stopped being true, and a plugin's bootstrap log is not where a platform's patch posture belongs.
-Follow Vendure's own release and advisory notes, which are current by construction.
+This is stated here, in the package's own documentation, and deliberately nowhere else. The plugin
+writes no boot-time `warn` line naming the four advisories and the release that fixes them, and that
+silence is a decision rather than an omission: a hardcoded advisory list and version floor inside a
+feature plugin has no way to refresh itself, so it would eventually tell an operator something that
+had stopped being true, and a plugin's bootstrap log is not where a platform's patch posture
+belongs. Follow Vendure's own release and advisory notes, which are current by construction.
 
 ## Usage
 
@@ -63,11 +63,19 @@ package.
 
 Every option is optional and any key you omit takes its documented default, so
 `ReorderPlugin.init({})` is a valid call that yields exactly the defaults in the table below.
-Whatever you do supply is still checked: all five values are validated once, at plugin
-initialisation rather than at request time, and a malformed value **fails plugin initialisation
-with a named configuration error identifying the offending key**. A bound that silently degraded
-to "admit everything" would be worse than no bound at all, because nothing would fail while the
-guarantee was gone.
+Whatever you do supply is checked before a request can ever reach it, never at request time, and a
+malformed value **fails startup with a named configuration error identifying the offending key**. A
+bound that silently degraded to "admit everything" would be worse than no bound at all, because
+nothing would fail while the guarantee was gone.
+
+That check runs **twice**, and the second run is not redundant. `init()` validates all five values
+as it resolves them, which is what refuses a bad configuration at the point it is written. Bootstrap
+then re-validates the same five against the registration it is actually about to serve with — five
+integer comparisons, and the only check that covers a server registered with the bare
+`ReorderPlugin` class, whose `init()` never ran. Bootstrap also applies the one bound `init()`
+cannot, because it is a property of the server rather than of the option set: both page sizes are
+checked against that server's own `apiOptions.shopListQueryLimit`, above which every read omitting
+`take` would fail on a server that had started healthily and reported nothing.
 
 **Each call to `init()` returns a registration bound to the values that call resolved.** If one
 process holds two servers — a multi-tenant host, or a test file that builds two configurations
@@ -180,11 +188,23 @@ account for. Making the harness migration-owned end to end would mean authoring 
 which are files outside this package; its synchronization-driven boot is its own long-standing design and
 is left as it is.
 
-The three-step order above is not only documented, it is **executed**: an end-to-end test drops the
-tables synchronization created, applies this migration with `synchronize` off, and then drives
-`createReorderList`, `addItemToReorderList` and `activeCustomerReorderList` over a Shop API whose
-connection can no longer create anything — so what those operations run against is provably the
-migration's own output. That case runs on PostgreSQL, because the shipped file is PostgreSQL DDL.
+The three-step order above is not only documented, it is **executed**, on whichever engine the run
+configures. `e2e/reorder-list-migration.e2e-spec.ts` applies a migration to an isolated database
+through the platform lifecycle — this checked-in file where the dialect matches it, and that
+engine's own lifecycle emission otherwise — and nothing is dropped first, because the harness
+registers no plugin and so the schema builder never created either table: the suite asserts they
+were absent beforehand, which is what makes the migration provably their only author. It then reads
+the named objects out of the engine's own catalogue, attempts the write each named constraint
+forbids straight through the repository so the refusal is demonstrably the database's, and runs the
+data-bearing up, down and up cycle that checks the seeded core rows survive the revert.
+
+What runs _against_ that migrated schema is a separate block, and it drives the service rather than
+the Shop API: `adjustReorderListLine`, `addItemToReorderList` and `removeReorderListLine` are called
+against a non-default configured schema while an adversarial list of the same identifier, owned by
+somebody else, sits in the search path — so a statement that resolved to the wrong schema would read
+the decoy and be caught. That block runs on PostgreSQL alone, since it is the only configured engine
+that renders a qualified identifier. The Shop API paths over these operations are covered by the
+four functional suites, against those suites' own synchronized schema.
 
 **The statements are frozen in the file, not read from the entity classes.** Every table, column,
 width, named unique, named index, named check constraint and cascading reference is written out as

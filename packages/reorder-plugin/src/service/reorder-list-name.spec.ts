@@ -549,12 +549,13 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('accepts every other invisible or formatting character, storing it byte for byte', () => {
-            // THE BOUNDARY OF THE REFUSAL, AND IT IS DELIBERATELY NARROW. An earlier revision refused every
-            // character in `\p{Cc}`, `\p{Cf}` and `\p{Default_Ignorable_Code_Point}` on the grounds that an
-            // invisible character in a name a buyer reads back is a deception vector. That reached far past the
-            // contract and cost real names: `Default_Ignorable_Code_Point` covers the variation selectors, so
-            // EVERY emoji written with a presentation selector was refused — "Favourites ❤️", "Notes ✏️" — and
-            // `\p{Cf}` adds U+00AD SOFT HYPHEN, so a hyphenated paste was refused as well.
+            // THE BOUNDARY OF THE REFUSAL, AND IT IS DELIBERATELY NARROW. The rejection covers four explicit
+            // ranges and no general Unicode property class. Refusing every character in `\p{Cc}`, `\p{Cf}` and
+            // `\p{Default_Ignorable_Code_Point}` is the tempting generalisation — an invisible character in a
+            // name a buyer reads back is a deception vector — but it reaches far past the contract and costs
+            // real names: `Default_Ignorable_Code_Point` covers the variation selectors, so EVERY emoji written
+            // with a presentation selector would be refused — "Favourites ❤️", "Notes ✏️" — and `\p{Cf}` adds
+            // U+00AD SOFT HYPHEN, so a hyphenated paste would be refused as well.
             const acceptedFormattingCases: Array<NameCase & { expected: CanonicalReorderListName }> = [
                 {
                     label: 'U+061C ARABIC LETTER MARK between two words',

@@ -2819,27 +2819,59 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             },
         );
 
-        /**
-         * How long two queued requests are given to reach a line write while the parent row is held.
-         * A window this side of the request timeout, so the holder is still holding when it answers.
-         */
-        const QUEUED_BEFORE_WRITE_PROBE_MS = 900;
+        /** How long the pair is given to BOTH reach the held parent before the run is declared unqueued. */
+        const QUEUE_WAIT_BUDGET_MS = 8_000;
+
+        /** Polling interval while waiting for that state. */
+        const QUEUE_POLL_MS = 25;
 
         /** How long the released requests are given to finish once the parent row is free. */
         const FORCED_ORDERING_BUDGET_MS = 20_000;
+
+        /** How long the teardown is given to drain any request still in flight. */
+        const DRAIN_BUDGET_MS = 30_000;
+
+        /**
+         * The outcome of the last forced-ordering run's drain, asserted by this block's own `afterEach`.
+         *
+         * Reported through a flag rather than thrown from the helper's `finally`: a throw there would REPLACE
+         * whatever failure got the run into teardown, which is the one diagnostic a reader needs. A leak is
+         * still a test failure — just one raised after the original error has been allowed to surface.
+         */
+        let forcedOrderingDrain: 'none' | 'drained' | 'leaked' = 'none';
+
+        afterEach(() => {
+            const outcome = forcedOrderingDrain;
+            forcedOrderingDrain = 'none';
+            expect(
+                outcome,
+                "A forced-ordering request was still in flight when its case ended, so this file's later " +
+                    'cases ran against rows an outstanding request could still be mutating',
+            ).not.toBe('leaked');
+        });
 
         /** What one forced-ordering run observed, so each case asserts the evidence rather than re-deriving it. */
         interface ForcedOrderingEvidence {
             /** Both real API results, in the order the two requests were issued. */
             readonly typenames: readonly string[];
-            /** Whether NEITHER request had written a line row while the parent was held. */
-            readonly neitherWroteALineWhileHeld: boolean;
+            /** Whether BOTH requests were observed queued at the parent before either was released. */
+            readonly bothQueuedAtTheParent: boolean;
+            /**
+             * Parent statements that TAKE THE ROW seen while it was held: the conditional capacity claim on the
+             * insert branch, or the locking read on the accumulate branch. One per request, so this is
+             * per-request evidence rather than an aggregate that one request alone could satisfy.
+             */
+            readonly parentBlockingStatementsWhileHeld: number;
+            /**
+             * Line-table READS seen while the parent was held. One per request, and the precondition that makes
+             * the final quantity a discriminator: both callers must have read the stored quantity before either
+             * could write.
+             */
+            readonly lineReadsWhileHeld: number;
+            /** Line-table WRITES seen while held — asserted empty, and named when not. */
+            readonly lineWritesWhileHeld: readonly string[];
             /** Whether NEITHER request had settled while the parent was held. */
             readonly neitherSettledWhileHeld: boolean;
-            /** Line-table writes seen while the parent was held — asserted empty, and named when not. */
-            readonly lineWritesWhileHeld: readonly string[];
-            /** Parent-table statements seen while the parent was held: the queue itself, so it is asserted non-empty. */
-            readonly parentStatementsWhileHeld: number;
             /** Line-table writes seen after the release, which is what proves the pair then ran for real. */
             readonly lineWritesAfterRelease: number;
         }
@@ -2861,9 +2893,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          * tries to roll back to. A request is the only caller that gets depth zero.
          *
          * The ordering is imposed from OUTSIDE both requests, by holding their parent row exclusively on a
-         * separate connection. Every step of the evidence is then positive: both requests are proved to have
-         * issued statements against the parent and NO write against the line table while the row is held, the
-         * hold is released, and both real results and the final row are asserted.
+         * separate connection, and the run WAITS FOR BOTH to arrive rather than sleeping for a fixed period: a
+         * fixed window would pass on a run where only one request reached the parent and the other started
+         * after the release, which is ordinary sequential execution wearing this test's name.
          */
         async function runForcedParentOrdering(args: {
             listApiId: ReorderApiId;
@@ -2872,14 +2904,15 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             quantity: number;
         }): Promise<ForcedOrderingEvidence> {
             const holder = dataSource.createQueryRunner();
+            const inFlight: Array<Promise<unknown>> = [];
             let held = false;
             try {
                 await holder.connect();
                 await holder.startTransaction();
                 held = true;
                 // The parent row, exclusively, on a connection neither request owns. Both branches of the add
-                // reach this row before they write a line — the accumulation takes it as its lock and the
-                // insert writes it as its capacity claim — so this one statement queues either branch.
+                // reach this row before they write a line — the accumulation takes it with a locking read and
+                // the insert writes it as its capacity claim — so this one statement queues either branch.
                 await holder.query(
                     `SELECT ${escapeName('id')} FROM ${escapeName('reorder_list')} ` +
                         `WHERE ${escapeName('id')} = ${args.listRowId} FOR UPDATE`,
@@ -2905,22 +2938,51 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     // The rejection is re-read by the `await` below; this only stops a transient
                     // unhandled-rejection warning while the request is deliberately left in flight.
                     tracked.catch(() => undefined);
+                    inFlight.push(tracked);
                     return tracked;
                 }
                 const first = track(addItem(args.listApiId, args.variantApiId, args.quantity));
                 const second = track(addItem(args.listApiId, args.variantApiId, args.quantity));
 
-                // Both requests are given a window to get as far as the engine will let them. What is asserted
-                // afterwards is what they did NOT manage — no line write — beside what they DID: statements
-                // against the parent row they are queued on.
-                await new Promise<void>(resolve => {
-                    setTimeout(resolve, QUEUED_BEFORE_WRITE_PROBE_MS).unref?.();
-                });
+                /**
+                 * A parent statement that TAKES the row, as opposed to the operation's opening admission read.
+                 * The admission read is a plain `SELECT ... LIMIT 1` carrying no lock clause and does not queue
+                 * against the hold; what queues is the accumulate branch's `SELECT ... FOR UPDATE` or the
+                 * insert branch's `UPDATE reorder_list SET lineCount = lineCount + 1 ...`. Both shapes are
+                 * matched, because which one a request reaches depends on its branch.
+                 */
+                const takesTheParent = (statement: CapturedStatement): boolean =>
+                    statement.kind === 'update' ||
+                    /\bfor update\b|\bfor share\b|\block in share mode\b/i.test(statement.query);
+                const parentBlockers = (): number =>
+                    capture.forTables('reorder_list').filter(takesTheParent).length;
+                const lineReads = (): number =>
+                    capture.forTables('reorder_list_line').filter(s => s.kind === 'select').length;
+
+                // Waits for the state the claim rests on rather than for a duration: BOTH requests past their
+                // own line read and queued on the parent. Abandoned early if either settles, because a request
+                // that finished while the row was held was never ordered behind it — reported, not hidden.
+                const deadline = Date.now() + QUEUE_WAIT_BUDGET_MS;
+                let bothQueuedAtTheParent = false;
+                for (;;) {
+                    if (parentBlockers() >= 2 && lineReads() >= 2) {
+                        bothQueuedAtTheParent = true;
+                        break;
+                    }
+                    if (settledCount > 0 || Date.now() >= deadline) {
+                        break;
+                    }
+                    await new Promise<void>(resolve => {
+                        setTimeout(resolve, QUEUE_POLL_MS).unref?.();
+                    });
+                }
+
                 const lineWritesWhileHeld = capture
                     .forTables('reorder_list_line')
                     .filter(statement => statement.kind !== 'select')
                     .map(statement => statement.kind);
-                const parentStatementsWhileHeld = capture.forTables('reorder_list').length;
+                const parentBlockingStatementsWhileHeld = parentBlockers();
+                const lineReadsWhileHeld = lineReads();
                 const neitherSettledWhileHeld = settledCount === 0;
 
                 // Releases the queue. Whichever request the engine admits first writes its line and commits;
@@ -2943,16 +3005,20 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
                 return {
                     typenames: settled.map(result => result.addItemToReorderList.__typename),
-                    neitherWroteALineWhileHeld: lineWritesWhileHeld.length === 0,
-                    neitherSettledWhileHeld,
+                    bothQueuedAtTheParent,
+                    parentBlockingStatementsWhileHeld,
+                    lineReadsWhileHeld,
                     lineWritesWhileHeld,
-                    parentStatementsWhileHeld,
+                    neitherSettledWhileHeld,
                     lineWritesAfterRelease,
                 };
             } finally {
                 capture.disable();
-                // Attempted whatever happened above, and nested so the release is not conditional on the
-                // rollback succeeding: a leaked runner holds a pool slot for the rest of the suite.
+                // THE LOCK GOES FIRST, THEN THE REQUESTS ARE DRAINED, and that order is the whole point. A
+                // request still in flight is blocked on this hold, so draining before releasing would wait out
+                // the drain budget for nothing. Released here whatever happened above, and nested so the
+                // release is not conditional on the rollback succeeding: a leaked runner holds a pool slot for
+                // the rest of the suite.
                 try {
                     if (held) {
                         await holder.rollbackTransaction();
@@ -2960,22 +3026,43 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 } finally {
                     await holder.release();
                 }
+                // No request is left running past this point, on ANY exit path — a timeout, a rejection or an
+                // assertion failure included. `afterEach` deletes this test's plugin rows, and a request still
+                // mutating them would contaminate every later case and bury the failure that got here.
+                if (inFlight.length > 0) {
+                    forcedOrderingDrain = await Promise.race([
+                        Promise.allSettled(inFlight).then(() => 'drained' as const),
+                        new Promise<'leaked'>(resolve => {
+                            setTimeout(() => resolve('leaked'), DRAIN_BUDGET_MS).unref?.();
+                        }),
+                    ]);
+                }
             }
         }
 
         /** The forced-ordering evidence every case of this shape asserts, so no case can assert less. */
         function expectForcedOrdering(evidence: ForcedOrderingEvidence): void {
             expect(
-                evidence.parentStatementsWhileHeld,
-                'Neither request issued a statement against the parent row while it was held, so nothing ' +
-                    'was queued and this run evidences no forced ordering',
-            ).toBeGreaterThan(0);
+                evidence.bothQueuedAtTheParent,
+                'The two requests were never both observed queued at the held parent row, so this run may be ' +
+                    'ordinary sequential execution rather than a forced ordering',
+            ).toBe(true);
+            expect(
+                evidence.parentBlockingStatementsWhileHeld,
+                'Fewer than two parent-taking statements were issued while the row was held, so only one ' +
+                    'request was queued on it and the other ran outside the window',
+            ).toBeGreaterThanOrEqual(2);
+            expect(
+                evidence.lineReadsWhileHeld,
+                'Fewer than two line reads were issued while the parent was held, so both callers had NOT ' +
+                    'read the stored quantity before either could write and the final quantity discriminates ' +
+                    'nothing',
+            ).toBeGreaterThanOrEqual(2);
             expect(
                 evidence.lineWritesWhileHeld,
                 'A request wrote a line row while the parent was held exclusively on another connection, ' +
                     'so the parent is not taken before the line write on this engine',
             ).toEqual([]);
-            expect(evidence.neitherWroteALineWhileHeld).toBe(true);
             expect(
                 evidence.neitherSettledWhileHeld,
                 'A request completed while the parent row was still held, so it was never ordered behind it',
@@ -3045,10 +3132,15 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 const rows = await readLineRows(listId);
                 expect(rows).toHaveLength(1);
                 /*
-                 * 6 + 6 + 6 = 18, the scenario's own discriminator. A read-compute-save implementation leaves
-                 * 12 even under a forced ordering: the queued caller resumes holding the 6 it read before it
-                 * was queued, computes 12, stores 12, and one buyer's six units are gone. Only an increment
-                 * addressed by line id — `quantity = quantity + :delta` — reaches 18 here.
+                 * 6 + 6 + 6 = 18, and it discriminates here because of a precondition this run ASSERTS rather
+                 * than assumes: `expectForcedOrdering` requires two line reads while the parent was still
+                 * held, so BOTH callers had read the stored 6 before either could write. The operation reads
+                 * the line (`findLineForVariant`) BEFORE it takes the parent, which is why that is reachable
+                 * under a forced ordering at all. A read-compute-save implementation therefore leaves 12 — the
+                 * queued caller resumes holding the 6 it read, computes 12, stores 12, and one buyer's six
+                 * units are gone. Only an increment addressed by line id — `quantity = quantity + :delta` —
+                 * reaches 18. Were the parent taken before the line read, both callers would read 6 then 12
+                 * and 18 would prove nothing; the two-line-read assertion is what rules that out.
                  */
                 expect(rows[0].quantity).toBe(RACE_ADD_QUANTITY * 3);
                 const row = await readListRow(listId);

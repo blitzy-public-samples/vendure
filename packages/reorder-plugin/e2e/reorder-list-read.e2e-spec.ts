@@ -2329,9 +2329,11 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 BASELINE_PERMISSION_MEMBER_COUNT,
             );
 
-            // THE RUNTIME WIDTH, as baseline PLUS this feature's own additions. These are F-101's figures and
-            // not EPIC-001 section 6.5's cumulative ledger for all eight features, which would be 23 / 42 / 38
-            // / 101 and is what ruling R15 exists to keep out of an assertion like this one.
+            // THE RUNTIME WIDTH, as baseline PLUS this feature's own additions. Ruling R15 admits only a
+            // transition the asserting change actually owns, so every figure below is F-101's own. The
+            // epic's ledger accumulates across all of its features, and its totals are deliberately not
+            // restated here: quoting them alongside these assertions is precisely how a reader comes to
+            // check this plugin against a width it never delivers.
             const liveQueries = sortedFieldNames(liveSchema, liveSchema.queryType.name);
             const liveMutations = sortedFieldNames(
                 liveSchema,
