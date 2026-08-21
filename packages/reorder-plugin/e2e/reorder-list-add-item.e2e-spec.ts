@@ -2829,25 +2829,56 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         const FORCED_ORDERING_BUDGET_MS = 20_000;
 
         /** How long the teardown is given to drain any request still in flight. */
-        const DRAIN_BUDGET_MS = 30_000;
+        const DRAIN_BUDGET_MS = 10_000;
+
+        /**
+         * The longest a single forced-ordering run can take from its own budgets alone, worst case.
+         *
+         * Derived rather than written down, so reducing or raising any budget above cannot leave this stale.
+         */
+        const FORCED_ORDERING_INTERNAL_BUDGET_MS =
+            QUEUE_WAIT_BUDGET_MS + FORCED_ORDERING_BUDGET_MS + DRAIN_BUDGET_MS;
+
+        /**
+         * The per-case timeout both forced-ordering cases declare, and the reason they declare one at all.
+         *
+         * The shared runner allows 30 s under CI and 15 s locally
+         * (`e2e-common/vitest.config.mts`), while this run's own budgets can legitimately consume
+         * {@link FORCED_ORDERING_INTERNAL_BUDGET_MS} before the teardown has finished. Left on the default, the
+         * runner would ABANDON a slow case part-way through the helper, and an abandoned case is exactly the
+         * condition the drain exists to prevent: the requests keep running while `afterEach` deletes the rows
+         * they are writing. The override therefore is the guarantee, not a convenience — it is what makes the
+         * teardown reachable on the paths that need it. The margin covers this case's own seeding.
+         */
+        const FORCED_ORDERING_CASE_TIMEOUT_MS = FORCED_ORDERING_INTERNAL_BUDGET_MS + 30_000;
 
         /**
          * The outcome of the last forced-ordering run's drain, asserted by this block's own `afterEach`.
          *
-         * Reported through a flag rather than thrown from the helper's `finally`: a throw there would REPLACE
+         * Reported through a flag rather than thrown from the helper's teardown: a throw there would REPLACE
          * whatever failure got the run into teardown, which is the one diagnostic a reader needs. A leak is
          * still a test failure — just one raised after the original error has been allowed to surface.
          */
         let forcedOrderingDrain: 'none' | 'drained' | 'leaked' = 'none';
 
+        /** Teardown steps that failed on the last run, reported the same way and for the same reason. */
+        let forcedOrderingTeardownFailures: readonly string[] = [];
+
         afterEach(() => {
             const outcome = forcedOrderingDrain;
+            const failures = forcedOrderingTeardownFailures;
             forcedOrderingDrain = 'none';
+            forcedOrderingTeardownFailures = [];
             expect(
                 outcome,
                 "A forced-ordering request was still in flight when its case ended, so this file's later " +
                     'cases ran against rows an outstanding request could still be mutating',
             ).not.toBe('leaked');
+            expect(
+                failures,
+                'A forced-ordering teardown step failed. It was recorded rather than thrown so it could not ' +
+                    'displace the failure that got the run into teardown, and it is raised here instead',
+            ).toEqual([]);
         });
 
         /** What one forced-ordering run observed, so each case asserts the evidence rather than re-deriving it. */
@@ -2874,6 +2905,67 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             readonly neitherSettledWhileHeld: boolean;
             /** Line-table writes seen after the release, which is what proves the pair then ran for real. */
             readonly lineWritesAfterRelease: number;
+        }
+
+        /** What one forced-ordering teardown did, so a case asserts it rather than inferring it. */
+        interface ForcedOrderingTeardownOutcome {
+            /** Whether every in-flight request finished, or the drain budget ran out first. */
+            readonly drain: 'none' | 'drained' | 'leaked';
+            /** One entry per teardown step that failed, named. Empty when every step succeeded. */
+            readonly failures: readonly string[];
+        }
+
+        /**
+         * The forced-ordering teardown, in the one order that is safe, and NEVER throwing.
+         *
+         * Two properties matter here and neither is expressible by ordinary `try`/`finally` nesting.
+         *
+         * **The drain cannot be skipped.** It is the last statement and every step before it is caught, so no
+         * failure anywhere in the teardown can jump over it. Nesting the drain in a `finally` around the
+         * release would not achieve this: a throwing release would run the drain and then propagate, and a
+         * throwing rollback would do the same, in both cases REPLACING the exception that got the run into
+         * teardown with a teardown detail. That is the exact failure mode this shape exists to avoid.
+         *
+         * **The hold is released before the drain, not after.** A request queued on the held row cannot
+         * finish while it is held, so draining first would burn the whole drain budget and then report a leak
+         * that release alone would have cleared.
+         *
+         * Every failure is RETURNED rather than raised, and the caller's `afterEach` is what raises it. So a
+         * broken teardown is still a test failure, just one that arrives after the primary diagnostic has
+         * been allowed to surface.
+         *
+         * Steps are injected so the failure paths are testable without a database that can be made to fail.
+         */
+        async function runForcedOrderingTeardown(steps: {
+            rollback?: () => Promise<void>;
+            release: () => Promise<void>;
+            drain?: () => Promise<'drained' | 'leaked'>;
+        }): Promise<ForcedOrderingTeardownOutcome> {
+            const failures: string[] = [];
+            const note = (what: string, err: unknown): void => {
+                failures.push(`${what}: ${err instanceof Error ? err.message : String(err)}`);
+            };
+            if (steps.rollback !== undefined) {
+                try {
+                    await steps.rollback();
+                } catch (err) {
+                    note('rollback', err);
+                }
+            }
+            try {
+                await steps.release();
+            } catch (err) {
+                note('release', err);
+            }
+            let drain: 'none' | 'drained' | 'leaked' = 'none';
+            if (steps.drain !== undefined) {
+                try {
+                    drain = await steps.drain();
+                } catch (err) {
+                    note('drain', err);
+                }
+            }
+            return { drain, failures };
         }
 
         /**
@@ -3014,29 +3106,27 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 };
             } finally {
                 capture.disable();
-                // THE LOCK GOES FIRST, THEN THE REQUESTS ARE DRAINED, and that order is the whole point. A
-                // request still in flight is blocked on this hold, so draining before releasing would wait out
-                // the drain budget for nothing. Released here whatever happened above, and nested so the
-                // release is not conditional on the rollback succeeding: a leaked runner holds a pool slot for
-                // the rest of the suite.
-                try {
-                    if (held) {
-                        await holder.rollbackTransaction();
-                    }
-                } finally {
-                    await holder.release();
-                }
-                // No request is left running past this point, on ANY exit path — a timeout, a rejection or an
-                // assertion failure included. `afterEach` deletes this test's plugin rows, and a request still
-                // mutating them would contaminate every later case and bury the failure that got here.
-                if (inFlight.length > 0) {
-                    forcedOrderingDrain = await Promise.race([
-                        Promise.allSettled(inFlight).then(() => 'drained' as const),
-                        new Promise<'leaked'>(resolve => {
-                            setTimeout(() => resolve('leaked'), DRAIN_BUDGET_MS).unref?.();
-                        }),
-                    ]);
-                }
+                // No request is left running past this point, on ANY exit path — a timeout, a rejection, an
+                // assertion failure or a teardown step of its own that fails. `afterEach` deletes this test's
+                // plugin rows, and a request still mutating them would contaminate every later case and bury
+                // the failure that got here. The ordering and the no-throw guarantee both live in
+                // `runForcedOrderingTeardown`, which is unit-tested on each of those failure paths.
+                const teardown = await runForcedOrderingTeardown({
+                    rollback: held ? () => holder.rollbackTransaction() : undefined,
+                    release: () => holder.release(),
+                    drain:
+                        inFlight.length > 0
+                            ? () =>
+                                  Promise.race([
+                                      Promise.allSettled(inFlight).then(() => 'drained' as const),
+                                      new Promise<'leaked'>(resolve => {
+                                          setTimeout(() => resolve('leaked'), DRAIN_BUDGET_MS).unref?.();
+                                      }),
+                                  ])
+                            : undefined,
+                });
+                forcedOrderingDrain = teardown.drain;
+                forcedOrderingTeardownFailures = teardown.failures;
             }
         }
 
@@ -3108,6 +3198,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 expect(row).not.toBeNull();
                 expect(row!.lineCount).toBe(1);
             },
+            FORCED_ORDERING_CASE_TIMEOUT_MS,
         );
 
         it.skipIf(!supportsForcedInterleaving() || !holdsParentExclusivelyForLineWrites())(
@@ -3147,7 +3238,132 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 expect(row).not.toBeNull();
                 expect(row!.lineCount).toBe(1);
             },
+            FORCED_ORDERING_CASE_TIMEOUT_MS,
         );
+
+        // The forced-ordering teardown's own failure paths. These run on EVERY engine, including the ones
+        // that skip the forced-ordering cases themselves, because what they cover is the shape of the
+        // teardown rather than any engine's locking behaviour — and a teardown that could skip its drain
+        // would silently let one leaked request contaminate every later case in this file.
+        describe('the forced-ordering teardown', () => {
+            /** A drain that records that it ran, so "the drain was reached" is an observation. */
+            function trackedDrain(result: 'drained' | 'leaked' = 'drained'): {
+                run: () => Promise<'drained' | 'leaked'>;
+                calls: () => number;
+            } {
+                let calls = 0;
+                return {
+                    run: () => {
+                        calls += 1;
+                        return Promise.resolve(result);
+                    },
+                    calls: () => calls,
+                };
+            }
+
+            it('drains, and names no failure, when every step succeeds', async () => {
+                const drain = trackedDrain();
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: () => Promise.resolve(),
+                    release: () => Promise.resolve(),
+                    drain: drain.run,
+                });
+                expect(outcome).toEqual({ drain: 'drained', failures: [] });
+                expect(drain.calls()).toBe(1);
+            });
+
+            it('STILL DRAINS when the rollback throws, and names the rollback', async () => {
+                // The path the previous shape got wrong: a throwing rollback ran the release and then
+                // propagated, jumping straight over the drain and leaving both requests in flight.
+                const drain = trackedDrain();
+                let released = false;
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: () => Promise.reject(new Error('rollback refused')),
+                    release: () => {
+                        released = true;
+                        return Promise.resolve();
+                    },
+                    drain: drain.run,
+                });
+                expect(drain.calls(), 'the drain was skipped by the failing rollback').toBe(1);
+                expect(released, 'the hold was left unreleased by the failing rollback').toBe(true);
+                expect(outcome.drain).toBe('drained');
+                expect(outcome.failures).toEqual(['rollback: rollback refused']);
+            });
+
+            it('STILL DRAINS when the release throws, and names the release', async () => {
+                const drain = trackedDrain();
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: () => Promise.resolve(),
+                    release: () => Promise.reject(new Error('release refused')),
+                    drain: drain.run,
+                });
+                expect(drain.calls(), 'the drain was skipped by the failing release').toBe(1);
+                expect(outcome.drain).toBe('drained');
+                expect(outcome.failures).toEqual(['release: release refused']);
+            });
+
+            it('STILL DRAINS when both the rollback and the release throw, naming both', async () => {
+                const drain = trackedDrain();
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: () => Promise.reject(new Error('rollback refused')),
+                    release: () => Promise.reject(new Error('release refused')),
+                    drain: drain.run,
+                });
+                expect(drain.calls()).toBe(1);
+                expect(outcome.failures).toEqual(['rollback: rollback refused', 'release: release refused']);
+            });
+
+            it('never throws, so it cannot displace the failure that got the run into teardown', async () => {
+                // Every step failing at once, including the drain itself. The whole point of the shape is
+                // that this RESOLVES rather than rejects.
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: () => Promise.reject(new Error('rollback refused')),
+                    release: () => Promise.reject(new Error('release refused')),
+                    drain: () => Promise.reject(new Error('drain refused')),
+                });
+                expect(outcome.drain).toBe('none');
+                expect(outcome.failures).toEqual([
+                    'rollback: rollback refused',
+                    'release: release refused',
+                    'drain: drain refused',
+                ]);
+            });
+
+            it('reports a leak rather than hiding it, and still releases when nothing is held', async () => {
+                // `rollback` is omitted, which is how the live helper expresses "the hold was never taken or
+                // was already committed". The release and the drain must both still run.
+                let released = false;
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: undefined,
+                    release: () => {
+                        released = true;
+                        return Promise.resolve();
+                    },
+                    drain: () => Promise.resolve('leaked'),
+                });
+                expect(released, 'the runner was not released when no rollback was needed').toBe(true);
+                expect(outcome).toEqual({ drain: 'leaked', failures: [] });
+            });
+
+            it('gives each forced-ordering case a timeout above its own worst-case internal budget', () => {
+                // THE ORDERING THAT MAKES THE DRAIN REACHABLE. The runner allows 30 s under CI and 15 s
+                // locally, and this run's own budgets can exceed both, so without the override the runner
+                // would abandon a slow case part-way through the helper and the drain would never run.
+                expect(FORCED_ORDERING_INTERNAL_BUDGET_MS).toBe(
+                    QUEUE_WAIT_BUDGET_MS + FORCED_ORDERING_BUDGET_MS + DRAIN_BUDGET_MS,
+                );
+                expect(
+                    FORCED_ORDERING_INTERNAL_BUDGET_MS,
+                    'the internal budget now fits inside the default runner timeout, so the per-case ' +
+                        'override is no longer what makes the teardown reachable and this reasoning is stale',
+                ).toBeGreaterThan(30_000);
+                expect(
+                    FORCED_ORDERING_CASE_TIMEOUT_MS,
+                    'a forced-ordering case can now be abandoned by the runner before its teardown finishes',
+                ).toBeGreaterThan(FORCED_ORDERING_INTERNAL_BUDGET_MS);
+            });
+        });
 
         it.skipIf(!supportsForcedInterleaving())(
             `admits exactly one of two simultaneous adds at the line bound on ${resolveConfiguredEngine()}`,

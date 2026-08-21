@@ -198,13 +198,18 @@ the named objects out of the engine's own catalogue, attempts the write each nam
 forbids straight through the repository so the refusal is demonstrably the database's, and runs the
 data-bearing up, down and up cycle that checks the seeded core rows survive the revert.
 
-What runs _against_ that migrated schema is a separate block, and it drives the service rather than
-the Shop API: `adjustReorderListLine`, `addItemToReorderList` and `removeReorderListLine` are called
-against a non-default configured schema while an adversarial list of the same identifier, owned by
-somebody else, sits in the search path — so a statement that resolved to the wrong schema would read
-the decoy and be caught. That block runs on PostgreSQL alone, since it is the only configured engine
-that renders a qualified identifier. The Shop API paths over these operations are covered by the
-four functional suites, against those suites' own synchronized schema.
+A SEPARATE block in the same file covers schema qualification, and it is provisioned differently on
+purpose: `synchronisedDataSource` opens each schema with `migrations: []`, `migrationsRun: false`
+and `synchronize: true`, so what it exercises is a separately SYNCHRONIZED schema-qualified fixture
+and not the migrated schema above. That is the right provisioning for what it asks, because the
+question is whether every statement resolves to the schema its connection was configured with rather
+than to the search path. It drives the service rather than the Shop API — `adjustReorderListLine`,
+`addItemToReorderList` and `removeReorderListLine` — against a non-default configured schema, while
+an adversarial list of the same identifier, owned by somebody else, sits in the search path, so a
+statement that resolved to the wrong schema would read the decoy and be caught. That block runs on
+PostgreSQL alone, since it is the only configured engine that renders a qualified identifier. The
+Shop API paths over all eight operations are covered by the four functional suites, against those
+suites' own synchronized schema.
 
 **The statements are frozen in the file, not read from the entity classes.** Every table, column,
 width, named unique, named index, named check constraint and cascading reference is written out as
