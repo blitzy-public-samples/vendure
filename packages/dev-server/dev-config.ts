@@ -268,10 +268,6 @@ function getDbConfig(): DataSourceOptions {
             };
         case 'sqljs':
             console.log('Using sql.js connection');
-            // The one branch that supplies no `synchronize`, so the `false` declared on
-            // `dbConnectionOptions` above is what takes effect here. See the note beside `migrations`:
-            // it is why a failed migration leaves this engine with an empty schema rather than one the
-            // schema builder provisioned.
             return {
                 type: 'sqljs',
                 autoSave: true,

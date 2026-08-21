@@ -2942,8 +2942,14 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             drain?: () => Promise<'drained' | 'leaked'>;
         }): Promise<ForcedOrderingTeardownOutcome> {
             const failures: string[] = [];
-            const note = (what: string, err: unknown): void => {
-                failures.push(`${what}: ${err instanceof Error ? err.message : String(err)}`);
+            // THE STAGE LABEL IS OURS, THE FAILURE IS NOT. `failures` is compared against `[]` by this
+            // block's `afterEach`, so every entry is printed into a build log on the path that matters most.
+            // A driver rejection can carry a statement, its bound values, a connection string, a session
+            // token or a customer's address, so only the harness-authored stage name is reproduced verbatim
+            // and the failure itself goes through the same redactor every other teardown in this package
+            // uses — class, driver code and classification, with the message withheld.
+            const note = (stage: 'rollback' | 'release' | 'drain', err: unknown): void => {
+                failures.push(`${stage}: ${redactTeardownDiagnostic(err)}`);
             };
             if (steps.rollback !== undefined) {
                 try {
@@ -3246,6 +3252,14 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         // teardown rather than any engine's locking behaviour — and a teardown that could skip its drain
         // would silently let one leaked request contaminate every later case in this file.
         describe('the forced-ordering teardown', () => {
+            /**
+             * The three failures the cases below inject, named so each expectation can be composed from the
+             * VERY error that was thrown rather than from a copy of its text. Their messages are harmless.
+             */
+            const rollbackFailure = new Error('rollback refused');
+            const releaseFailure = new Error('release refused');
+            const drainFailure = new Error('drain refused');
+
             /** A drain that records that it ran, so "the drain was reached" is an observation. */
             function trackedDrain(result: 'drained' | 'leaked' = 'drained'): {
                 run: () => Promise<'drained' | 'leaked'>;
@@ -3278,7 +3292,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 const drain = trackedDrain();
                 let released = false;
                 const outcome = await runForcedOrderingTeardown({
-                    rollback: () => Promise.reject(new Error('rollback refused')),
+                    rollback: () => Promise.reject(rollbackFailure),
                     release: () => {
                         released = true;
                         return Promise.resolve();
@@ -3288,45 +3302,52 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 expect(drain.calls(), 'the drain was skipped by the failing rollback').toBe(1);
                 expect(released, 'the hold was left unreleased by the failing rollback').toBe(true);
                 expect(outcome.drain).toBe('drained');
-                expect(outcome.failures).toEqual(['rollback: rollback refused']);
+                expect(outcome.failures).toEqual([`rollback: ${redactTeardownDiagnostic(rollbackFailure)}`]);
+                expect(
+                    outcome.failures[0],
+                    'the raw failure text reached the reported outcome',
+                ).not.toContain('refused');
             });
 
             it('STILL DRAINS when the release throws, and names the release', async () => {
                 const drain = trackedDrain();
                 const outcome = await runForcedOrderingTeardown({
                     rollback: () => Promise.resolve(),
-                    release: () => Promise.reject(new Error('release refused')),
+                    release: () => Promise.reject(releaseFailure),
                     drain: drain.run,
                 });
                 expect(drain.calls(), 'the drain was skipped by the failing release').toBe(1);
                 expect(outcome.drain).toBe('drained');
-                expect(outcome.failures).toEqual(['release: release refused']);
+                expect(outcome.failures).toEqual([`release: ${redactTeardownDiagnostic(releaseFailure)}`]);
             });
 
             it('STILL DRAINS when both the rollback and the release throw, naming both', async () => {
                 const drain = trackedDrain();
                 const outcome = await runForcedOrderingTeardown({
-                    rollback: () => Promise.reject(new Error('rollback refused')),
-                    release: () => Promise.reject(new Error('release refused')),
+                    rollback: () => Promise.reject(rollbackFailure),
+                    release: () => Promise.reject(releaseFailure),
                     drain: drain.run,
                 });
                 expect(drain.calls()).toBe(1);
-                expect(outcome.failures).toEqual(['rollback: rollback refused', 'release: release refused']);
+                expect(outcome.failures).toEqual([
+                    `rollback: ${redactTeardownDiagnostic(rollbackFailure)}`,
+                    `release: ${redactTeardownDiagnostic(releaseFailure)}`,
+                ]);
             });
 
             it('never throws, so it cannot displace the failure that got the run into teardown', async () => {
                 // Every step failing at once, including the drain itself. The whole point of the shape is
                 // that this RESOLVES rather than rejects.
                 const outcome = await runForcedOrderingTeardown({
-                    rollback: () => Promise.reject(new Error('rollback refused')),
-                    release: () => Promise.reject(new Error('release refused')),
-                    drain: () => Promise.reject(new Error('drain refused')),
+                    rollback: () => Promise.reject(rollbackFailure),
+                    release: () => Promise.reject(releaseFailure),
+                    drain: () => Promise.reject(drainFailure),
                 });
                 expect(outcome.drain).toBe('none');
                 expect(outcome.failures).toEqual([
-                    'rollback: rollback refused',
-                    'release: release refused',
-                    'drain: drain refused',
+                    `rollback: ${redactTeardownDiagnostic(rollbackFailure)}`,
+                    `release: ${redactTeardownDiagnostic(releaseFailure)}`,
+                    `drain: ${redactTeardownDiagnostic(drainFailure)}`,
                 ]);
             });
 
@@ -3344,6 +3365,60 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 });
                 expect(released, 'the runner was not released when no rollback was needed').toBe(true);
                 expect(outcome).toEqual({ drain: 'leaked', failures: [] });
+            });
+
+            it('reproduces no part of a teardown failure that carries a statement, a token or an address', async () => {
+                // THE CASE THE OTHER SIX CANNOT MAKE. Their injected messages are harmless, so they would
+                // pass just as well against a `note()` that reproduced the message verbatim. This one carries
+                // every class of thing a driver rejection actually leaks, and asserts that none of it
+                // survives into `failures` — which this block's `afterEach` prints into a build log.
+                const SECRET_SQL =
+                    'insert into reorder_list_line (reorderListId, productVariantId, quantity) values (7, 42, 6)';
+                const SECRET_TOKEN = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+                const SECRET_EMAIL = 'hayden.zieme12@hotmail.com';
+                const SECRET_DSN = 'postgres://vendure:password@127.0.0.1:5432/vendure';
+                const hostile = new Error(
+                    `duplicate key while running ${SECRET_SQL} for ${SECRET_EMAIL} ` +
+                        `session ${SECRET_TOKEN} on ${SECRET_DSN}`,
+                );
+                (hostile as { code?: string }).code = 'ER_DUP_ENTRY';
+
+                const outcome = await runForcedOrderingTeardown({
+                    rollback: () => Promise.reject(hostile),
+                    release: () => Promise.resolve(),
+                    drain: () => Promise.resolve('drained'),
+                });
+
+                expect(outcome.failures).toHaveLength(1);
+                const reported = outcome.failures[0];
+                for (const secret of [SECRET_SQL, SECRET_TOKEN, SECRET_EMAIL, SECRET_DSN]) {
+                    expect(reported, 'a teardown failure reproduced a value it must withhold').not.toContain(
+                        secret,
+                    );
+                }
+                // Nor any fragment of them: a substring check alone would pass on a report that carried the
+                // password, the local part of the address or a single column name.
+                for (const fragment of [
+                    'password',
+                    'hayden',
+                    'hotmail',
+                    'reorderListId',
+                    'productVariantId',
+                    'values',
+                    '127.0.0.1',
+                    '5432',
+                ]) {
+                    expect(reported, `a teardown failure reproduced the fragment ${fragment}`).not.toContain(
+                        fragment,
+                    );
+                }
+                // AND IT IS STILL USEFUL. The stage is named verbatim because the harness authored it, and
+                // the driver's own enumerated code survives because it identifies the fault without
+                // reproducing anything of the statement that caused it.
+                expect(reported.startsWith('rollback: ')).toBe(true);
+                expect(reported).toContain('ER_DUP_ENTRY');
+                expect(reported).toContain('message withheld');
+                expect(reported).toBe(`rollback: ${redactTeardownDiagnostic(hostile)}`);
             });
 
             it('gives each forced-ordering case a timeout above its own worst-case internal budget', () => {
