@@ -617,10 +617,12 @@ const MONETARY_OR_STOCK_FIELD = /price|money|amount|currency|tax|stock|inventory
 
 const capture = new QueryCaptureLogger();
 
-// The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
-// guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
-// which is a check-then-act race: this package's e2e suites start together, so when the directory is absent —
-// both observe it missing and the loser fails its `beforeAll` with `EEXIST`. The three server engines use no
+// THE SQL.JS SNAPSHOT DIRECTORY, CREATED IDEMPOTENTLY AND AT MODULE SCOPE, FOR TWO SEPARATE REASONS. The first
+// is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync` guarded by a
+// preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35), which is a
+// check-then-act race: this package's e2e suites start together, so when the directory is absent — as it is on
+// a fresh checkout, and after the operational reset a schema change requires — two of them can both observe it
+// missing and the loser fails its `beforeAll` with `EEXIST`.
 fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
 const reorderPluginRegistration = ReorderPlugin.init({
     maxListsPerCustomer: MAX_LISTS_PER_CUSTOMER,
@@ -713,6 +715,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
      */
     let secondShopClient: SimpleGraphQLClient;
 
+    // Portable database access
+    //
     // Raw statements below carry NO bound parameters, deliberately. The four target engines disagree on
     // placeholder syntax — PostgreSQL renders `$1` while the others render `?` — so a parameterised raw
     // statement is portable only by accident. Anything needing a VALUE goes through a repository, which
@@ -794,7 +798,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
      */
     async function shopContextFor(client: SimpleGraphQLClient): Promise<RequestContext> {
         const session = await server.app.get(SessionService).getSessionFromToken(client.getAuthToken());
-        // side of this assertion carries the session token, and the direction of an assertion is one edit
+        // A SCALAR, uniformly with every other session assertion in this package: the value on the other side
+        // of this assertion carries the session token, and the direction of an assertion is one edit away from
+        // reversing.
         expect(
             session !== undefined,
             'The client holds no session, so no authenticated context can be built',
@@ -807,7 +813,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         expect(ctx.authorizedAsOwnerOnly).toBe(true);
         expect(ctx.channel.token).toBe(E2E_DEFAULT_CHANNEL_TOKEN);
         expect(ctx.activeUserId).toBeDefined();
-        // has, so `fromRequest` alone yields `custom` and a race would then be exercising a
+        // And it identifies as the SHOP API, which a direct service call does not get for free: the platform
+        // reads the api type off the resolver's `info` argument, which no direct call has, so `fromRequest`
+        // alone yields `custom` and a race would then exercise a branch no buyer's request reaches.
+        // `asShopApiContext` self-checks both the result and that this context is left unchanged.
         const shopCtx = asShopApiContext(ctx);
         expect(shopCtx.apiType).toBe('shop');
         return shopCtx;
@@ -870,7 +879,11 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         await restoreCoreRowsExactly(softDelete.user);
     }
 
-    // equality, so a column the compensating write missed fails the test rather than leaking into the next.
+    // Exact restoration of the core rows a test changes. A core row this suite touches is put back COLUMN FOR
+    // COLUMN, and the restoration is then ASSERTED against what was captured. Two mechanisms make that stricter
+    // than it first sounds: the compensating write goes through the RAW TABLE rather than the entity manager,
+    // so restoring a captured value cannot itself move an entity-managed audit column, and it covers an
+    // inserted row and a deleted row alike by deleting or re-inserting as the capture requires.
 
     /**
      * The inherited audit column every core table carries, named once because the restoration has to re-state
@@ -906,10 +919,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             await dataSource.query(query, bound);
         } catch (err: unknown) {
             // THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
-            // Every statement this helper runs binds CAPTURED CELLS: the values a restoration is putting
-            // an address, a password hash, an authentication token. TypeORM raises a failure from
-            // `JSON.stringify(err)` both publish the statement and every bound value, and so does the runner
-            // outside the aggregator and travel straight to the runner. Sanitising HERE covers both, and
+            // HERE. Every statement this helper runs binds CAPTURED CELLS: the values a restoration is putting
+            // back, which on the soft-delete path are a live buyer's `customer`, `user` and `session` rows — an
+            // address, a password hash, an authentication token.
             rethrowRedacted('a captured-row restoration statement', err);
         }
     }
@@ -987,8 +999,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             if (moved.length === 0) {
                 continue;
             }
-            // AND THE UPDATE-DATE COLUMN IS ALWAYS RE-STATED, even when it did not move. On the MySQL family
-            // from its SET list is re-timestamped BY THE ENGINE, below TypeORM and below this helper. That was
+            // AND THE UPDATE-DATE COLUMN IS ALWAYS RE-STATED, even when it did not move.
             if (UPDATE_DATE_COLUMN in captured && !moved.some(([column]) => column === UPDATE_DATE_COLUMN)) {
                 moved.push([UPDATE_DATE_COLUMN, captured[UPDATE_DATE_COLUMN]]);
             }
@@ -1031,7 +1042,14 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 'reported by row id, column name and value SHAPE only, deliberately — see ' +
                 'describeCellForDiagnostic',
         ).toBe(NO_ROW_DIFFERENCE);
+        // AND THE ROW COUNT, which the description above already covers through its missing/added entries and
+        // which is restated here so a future edit to that description cannot quietly weaken this to a
+        // per-column check over a shorter table.
+        //
+        // Two NUMBERS compared by hand rather than `expect(now).toHaveLength(n)`, because that matcher prints
+        // the RECEIVED ARRAY on failure — and on the soft-delete path that array is the buyer's `customer`,
         // `user` and `session` rows, `session.token` included. The numbers say exactly the same thing and
+        // cannot be expanded into a cell value.
         if (now.length !== rowsCapture.rows.length) {
             throw new Error(
                 `${rowsCapture.table} holds ${String(now.length)} rows for ${rowsCapture.where} where the ` +
@@ -1058,7 +1076,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             const first = ((rows ?? []) as Array<Record<string, unknown>>)[0];
             return Number(first?.total ?? -1);
         };
-        // engines spell a positional placeholder three different ways, and this file's statements have to
+        // `actingCustomerDbId` is a decoded integer, so it is interpolated rather than bound: the three engines
+        // spell a positional placeholder three different ways, and this file's statements have to work
+        // unchanged on all four.
         const identified: unknown = await queryRunner.query(
             `SELECT ${esc('emailAddress')} FROM ${esc('customer')} WHERE ${esc('id')} = ${Number(
                 actingCustomerDbId,
@@ -1221,7 +1241,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         transactionBinder = await createTransactionBinder(server.app.get(TransactionalConnection));
         queryRunner = dataSource.createQueryRunner();
         esc = (identifier: string) => dataSource.driver.escape(identifier);
+        // Read from metadata rather than written out: a repository query's default alias is the entity
         // metadata's own name, and the capture predicates below must name the alias the statement actually
+        // uses. Hard-coding it would make a rename of the entity class look like a scoping failure.
         listAlias = dataSource.getMetadata(ReorderList).name;
 
         await adminClient.asSuperAdmin();
@@ -1246,8 +1268,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         const resolvedDefaultChannel = defaultChannel as AdminChannel;
         defaultChannelDbId = decodeId(resolvedDefaultChannel.id);
 
-        // test's fixture: no test below mutates it, and the channel-scope cases send its real token rather
-        // than mutating a variable, which is the third of FEATURE-001-01 section 2.6.1's four matrix rules.
+        // The SECOND REAL CHANNEL, created once because it is immutable shared setup rather than any one test's
+        // fixture: no test below mutates it, and the channel-scope cases send its real token rather than
+        // mutating a variable, which is the third of FEATURE-001-01 §2.6.1's four matrix rules.
         const taxZone = resolvedDefaultChannel.defaultTaxZone;
         const shippingZone = resolvedDefaultChannel.defaultShippingZone;
         expect(taxZone, 'The default channel declares no default tax zone').toBeDefined();
@@ -1276,7 +1299,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
 
         secondShopClient = new SimpleGraphQLClient(suiteConfig, shopApiUrl);
 
-        // snapshot cannot move and must be neither edited nor regenerated (AAP section 0.4.1.5).
+        // Introspected ONCE, from the booted server carrying the plugin. Comparing a runtime schema against the
+        // untouched snapshot is the only correct way to evidence the delta: the introspection that produces
+        // `schema-shop.json` declares its own configuration and never reads a plugin's, so the snapshot cannot
+        // move and must be neither edited nor regenerated (AAP §0.4.1.5).
         const introspected = await shopClient.query<ShopSchemaShapeQuery>(SHOP_SCHEMA_SHAPE);
         liveSchema = introspected.__schema;
 
@@ -1287,7 +1313,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
     }, TEST_SETUP_TIMEOUT_MS);
 
     afterAll(async () => {
-        // its success path leaks a listening port into the next file. The query runner is released first
+        // `server.destroy()` is called UNCONDITIONALLY and last: a suite that tears the server down only on its
+        // success path leaks a listening port into the next file. The query runner is released first inside a
+        // `try` so that a release failure cannot skip the teardown that matters.
         try {
             if (queryRunner && queryRunner.isReleased === false) {
                 await queryRunner.release();
@@ -1298,6 +1326,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
     });
 
     beforeEach(async () => {
+        // Each test's own scope, established here and never inherited: the restore queue starts empty, the
+        // capture window starts closed and empty, both plugin tables start empty, and the acting session is
         // freshly authenticated on the default channel token.
         restoreActions = [];
         capture.reset();
@@ -1308,7 +1338,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
     });
 
     afterEach(async () => {
-        // the client's channel token is reset last.
+        // Every stage runs, whatever any of them does, and the failures are reported once at the end. Core rows
+        // this test mutated are restored FIRST and in reverse order, so a later mutation layered on an earlier
+        // one unwinds in the order it was applied; the plugin rows go next, child table before parent; the
+        // client's channel token is reset last.
         const queued = restoreActions.slice().reverse();
         restoreActions = [];
         await runAllTeardownStages([
@@ -1328,6 +1361,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
     });
 
     // The four staged checkpoints (STORY-001-01-01 section 2.1)
+    //
+    // They run BEFORE the first domain assertion and each depends only on the layers below it, so a red
+    // result at checkpoint N with 1..N-1 green names the layer that broke. Each assertion carries its own
+    // diagnostic, and no checkpoint reaches the list-creation logic.
 
     describe('staged checkpoints', () => {
         it('checkpoint 1: the plugin module loads and the server boots with ReorderPlugin registered', () => {
@@ -1337,7 +1374,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expect(server.app, diagnostic).toBeDefined();
             const registeredPlugins = server.app.get(ConfigService).plugins;
             expect(registeredPlugins, diagnostic).toContain(reorderPluginRegistration);
-            // the INJECTOR rather than off the static, because the injector is what the service and the
+            // The options the server is serving requests with are the options this file configured, so a later
+            // criterion asserting `maxItems` of 2 is asserting the bound actually in force. Read out of the
+            // INJECTOR rather than off the static, because the injector is what the service and the resolvers
+            // read: this asserts the value this registration was created with reached them.
             const injected = server.app.get<ResolvedReorderPluginOptions>(REORDER_PLUGIN_OPTIONS);
             expect(injected.maxListsPerCustomer, diagnostic).toBe(MAX_LISTS_PER_CUSTOMER);
             expect(injected.maxLinesPerList, diagnostic).toBe(MAX_LINES_PER_LIST);
@@ -1349,17 +1389,23 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         });
 
         // WHY THIS ONE CHECKPOINT IS ENGINE-CONDITIONAL, AND WHERE THE FOUR-ENGINE CYCLE IS INSTEAD.
+        //
+        // This case drives the CHECKED-IN artefact's own `up()` and `down()` on the live connection, and an
         // emitted migration is bound to the engine it was generated against ({@link committedMigrationApplies}
         // carries the citations), so those two methods can only be called where the dialect matches. That is a
+        // property of the artefact rather than a gap in the checkpoint: `e2e/reorder-list-migration.e2e-spec.ts`
         // owns the data-bearing up → down → up cycle and runs it on ALL FOUR engines, applying the checked-in
         // artefact where the dialect matches and the migration this engine's own lifecycle emits otherwise. So
+        // what is conditional here is which FILE the cycle is spelled in, never whether the cycle is measured.
         it.skipIf(!committedMigrationApplies(resolveConfiguredEngine()))(
             'checkpoint 2: the checked-in migration applies and reverts on this engine, against a plugin-less baseline',
             async () => {
-                // are wrong ON THIS ENGINE — a failure here on one engine with three green localises the defect to
-                // that engine rather than to the plugin.
+                // Diagnostic on failure: the checked-in migration, or the entity definitions it has to agree
+                // with, are wrong ON THIS ENGINE — a failure here on one engine with three green localises the
+                // defect to that engine rather than to the plugin.
                 const diagnostic = `checkpoint 2 (the checked-in migration on ${resolveConfiguredEngine()})`;
 
+                // Both tables are addressable by the names the entity declarations produce, which is what every
                 // table-filtered statement count below relies on, and what the migration has to agree with.
                 expect(dataSource.getMetadata(ReorderList).tableName, diagnostic).toBe(LIST_TABLE);
                 expect(dataSource.getMetadata(ReorderListLine).tableName, diagnostic).toBe(LINE_TABLE);
@@ -1432,8 +1478,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                     (await queryRunner.hasTable(LIST_TABLE)) && (await queryRunner.hasTable(LINE_TABLE));
                 const neitherPresent = async (): Promise<boolean> =>
                     !(await queryRunner.hasTable(LIST_TABLE)) && !(await queryRunner.hasTable(LINE_TABLE));
-                // `QueryFailedError` arrives carrying its statement, its bound parameters and the driver's own
-                // whatever the others do, describes each failure through the shared redactor and raises one
+                // THROUGH THE SANCTIONED AGGREGATOR, not a hand-rolled loop that kept `e.message`.
                 let restoreFailure: unknown;
                 try {
                     await runAllTeardownStages([
@@ -1491,7 +1536,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 expect(liveQueries.get(name), `${diagnostic}: root query ${name} changed`).toBe(signature);
             }
 
-            // FEATURE-001-01's whole surface. So what is asserted is baseline-plus-owned-additions: nothing was
+            // THIS STORY ADDS NO QUERY, and the form of that assertion matters.
             const addedQueries = [...liveQueries.keys()].filter(name => !baselineQueries.has(name)).sort();
             for (const name of addedQueries) {
                 expect(
@@ -1506,6 +1551,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
 
         it('checkpoint 4: a seeded session authenticates and the gate marks the context owner-only', async () => {
             // DIAGNOSTIC ON FAILURE: the seed, the credential, the channel token or the `@Allow` wiring is
+            // wrong — never the list-creation logic, which no assertion has reached yet, and never a permission
+            // registration, of which this story has none.
             const diagnostic = 'checkpoint 4 (seed / credential / channel token / @Allow wiring)';
 
             const { activeCustomer } = await shopClient.query<GetActiveCustomerQuery>(
@@ -1558,10 +1605,12 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
 
             expect(result.name).toBe(BASE_LIST_NAME);
             expect(result.name.length).toBe(BASE_LIST_NAME.length);
+            // Exactly zero, and stated as an identity rather than as falsiness: this story writes no line row
             // at all, the first arriving with `addItemToReorderList` in STORY-001-01-02.
             expect(result.lineCount).toBe(0);
             expect(result.lines.totalItems).toBe(0);
             expect(result.lines.items).toEqual([]);
+            // The forward-compatible sharing shape, published now and truthful now: the shared set is empty by
             // construction because no grant table exists until FEATURE-001-06.
             expect(result.viewerAccess).toEqual({ access: 'OWNED', grantedCapabilities: [] });
             expect(await countAllLines()).toBe(0);
@@ -1602,6 +1651,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         it('createReorderList returns a markup-bearing name byte-for-byte', async () => {
             const result = expectCreated(await createReorderList(MARKUP_LIST_NAME));
 
+            // Neither escaped, nor stripped, nor interpreted as markup, nor entity-decoded: the field carries
+            // DATA and every consumer renders it as text. This story owns the transport half of that guarantee
             // only; the rendering half belongs to STORY-001-08-03 in batch B5 and is not claimed here.
             expect(result.name).toBe(MARKUP_LIST_NAME);
             expect(result.name).toContain('<b>');
@@ -1746,7 +1797,12 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         });
 
         it('createReorderList accepts an emoji name and stores every code point of it', async () => {
-            // submitted string trimmed and collapsed and NOTHING ELSE [AAP §0.1.2.5]. An earlier revision of
+            // The other side of AC-2. AC-2 refuses four malformed names; the criterion does not license
+            // refusing anything else, and the display value is the submitted string trimmed and collapsed and
+            // NOTHING ELSE [AAP §0.1.2.5]. So a name is refused for a named class of characters rather than for
+            // the whole `\p{Default_Ignorable_Code_Point}` property: a variation selector is what makes an
+            // emoji render the way a phone keyboard writes it, and a zero-width joiner is what an emoji
+            // sequence is built from, so both are content and both are accepted here.
             const emojiName = 'Favourites \u2764\uFE0F \u{1F468}\u200D\u{1F469}\u200D\u{1F467} Co\u00ADop';
 
             const created = expectCreated(await createReorderList(emojiName));
@@ -1834,9 +1890,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 precheck: async () =>
                     // ON THE SHARED CONNECTION, NOT THIS PARTICIPANT'S TRANSACTION, and that is a correctness
                     // requirement rather than a preference. Under the MySQL family's default REPEATABLE READ, a
-                    // transaction's snapshot is fixed by its first CONSISTENT read — so a precheck issued inside
-                    // the participant's own transaction would fix it BEFORE the service's locking read, and the
-                    // and the participant's transaction reaches the service uncontaminated, exactly as a real
+                    // transaction's snapshot is fixed by its first CONSISTENT read — so a precheck issued
+                    // inside the participant's own transaction would fix it BEFORE the service's locking read,
+                    // and the bound count the service then takes would answer from a snapshot older than the
+                    // winner's commit. The harness would be creating the very lost-update it set out to detect.
                     dataSource
                         .getRepository(ReorderList)
                         .count({ where: { customerId: actingCustomerDbId, channelId: defaultChannelDbId } }),
@@ -1909,6 +1966,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             async () => {
                 // THE PLUGIN-STATEMENT BOUNDARY, the only boundary at which an exact number is asserted, and
                 // the counted form of the refused-write contract of FEATURE-001-01 section 2.6.1.1. The
+                // BEHAVIOURAL half of the same claim — the limit error and the unchanged row count — is
                 // asserted by the ungated case above and therefore runs on all four engine jobs.
                 await seedLists('AC-4 instrumented', MAX_LISTS_PER_CUSTOMER);
 
@@ -1930,6 +1988,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 ).toBe(0);
                 // And that one statement is SCOPED: the acting customer and the active channel are mandatory
                 // conjuncts of its predicate, with each value bound to its own column. The ownership helper is
+                // used rather than a name search precisely because a disjunction, a swapped binding or a
                 // sub-query-supplied token would satisfy a name search and scope nothing.
                 expect(
                     whereRequiresScopedPredicates(scoped[0], [
@@ -1944,13 +2003,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         it.skipIf(!supportsForcedInterleaving())(
             `locks the owning customer row and no second table on ${resolveConfiguredEngine()}`,
             async () => {
-                // THE BLAST RADIUS OF THE LOCK, ASSERTED AS A STATEMENT SHAPE.
-                // The list bound is enforced by counting and inserting inside one transaction under a
-                // pessimistic lock on the owning `customer` row, and the lock's WIDTH is a property no payload
-                // can show. TypeORM renders `setLock('pessimistic_write')` as a bare `FOR UPDATE` with no `OF`
-                // list, and a bare `FOR UPDATE` locks a row in EVERY table the statement reads — so a shape
-                // "customer"."userId"` would hold a lock on a `user` row too, for the whole of the
-                // transaction, on a row an authentication path may itself be writing. Nothing about the
+                // THE BLAST RADIUS OF THE LOCK, ASSERTED AS A STATEMENT SHAPE. The list bound is enforced by
+                // counting and inserting inside one transaction under a pessimistic lock on the owning
+                // `customer` row, and the lock's WIDTH is a property no payload can show.
                 capture.reset();
                 const created = await capture.capture(() => createReorderList('Customer lock scope'));
                 expect(created.__typename).toBe('ReorderList');
@@ -1965,6 +2020,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 // And it is its TRANSACTION's first statement, which the bound separately depends on: on the
                 // MySQL family a plain read issued before the lock would fix this transaction's read view
                 // before the lock was held, and the count would then answer from a snapshot older than a
+                // competing creator's commit.
                 const beforeOnSameConnection = capture.statements.filter(
                     statement =>
                         statement.runnerId === locked[0].runnerId && statement.sequence < locked[0].sequence,
@@ -1980,6 +2036,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             `createReorderList admits exactly one of two barrier-released creates on ${resolveConfiguredEngine()}`,
             async () => {
                 // FORCED INTERLEAVING, on the three engine jobs that run a database server this suite can open
+                // two independent connections against. It is skipped on the single-connection family, which
+                // runs the sequential form below instead — see SEQUENTIAL_FORM_NOTE for the stated reason.
                 await seedLists('AC-4 racing held', MAX_LISTS_PER_CUSTOMER - 1);
                 expect(await countLists(actingCustomerDbId, defaultChannelDbId)).toBe(
                     MAX_LISTS_PER_CUSTOMER - 1,
@@ -1998,6 +2056,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                     b: racingCreate('second-writer', secondContext, 'AC-4 racing beta', 1),
                 });
 
+                // Both callers RESOLVE here — one with a list and one with a refusal — so `fulfilled` is the
+                // right accessor and `winner`/`loser`, which require exactly one rejection, are correctly
+                // undefined. The harness has already refused to return a result unless both participants were
                 // held at the rendezvous and released before writing; asserting it makes that explicit.
                 expect(
                     outcome.rejected.length,
@@ -2028,6 +2089,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
 
         it('createReorderList admits exactly one of two sequential creates at the bound on every engine', async () => {
             // The SEQUENTIAL form of the same contract, ungated so that it runs on all four engine jobs. On the
+            // single-connection family this is the only form available, and SEQUENTIAL_FORM_NOTE states what it
+            // does and does not evidence — it is quoted in the assertion message so a failure carries it.
             await seedLists('AC-4 sequential held', MAX_LISTS_PER_CUSTOMER - 1);
             await secondShopClient.asUserWithCredentials(
                 actingCustomer.emailAddress,
@@ -2061,7 +2124,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expectExactlyOneTopLevelError(response, FORBIDDEN_ERROR_CODE);
             expect(response.errors[0].extensions?.code).not.toBe('UNAUTHORIZED');
 
-            // THE REFUSAL COMES FROM THE SERVICE'S OWN OWNERSHIP GUARD, NOT FROM THE GATE. `@Allow` lists
+            // THE REFUSAL COMES FROM THE SERVICE'S OWN OWNERSHIP GUARD, NOT FROM THE GATE.
             expect(await readAllListRows()).toEqual([]);
             expect(await countLists(actingCustomerDbId, defaultChannelDbId)).toBe(0);
             expect(await countAllLines()).toBe(0);
@@ -2119,9 +2182,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 precheck: async () =>
                     // ON THE SHARED CONNECTION, NOT THIS PARTICIPANT'S TRANSACTION, and that is a correctness
                     // requirement rather than a preference. Under the MySQL family's default REPEATABLE READ, a
-                    // transaction's snapshot is fixed by its first CONSISTENT read — so a precheck issued inside
-                    // the participant's own transaction would fix it BEFORE the service's locking read, and the
-                    // and the participant's transaction reaches the service uncontaminated, exactly as a real
+                    // transaction's snapshot is fixed by its first CONSISTENT read — so a precheck issued
+                    // inside the participant's own transaction would fix it BEFORE the service's locking read,
+                    // and the bound count the service then takes would answer from a snapshot older than the
+                    // winner's commit. The harness would be creating the very lost-update it set out to detect.
                     dataSource.getRepository(ReorderList).count({
                         where: {
                             customerId: actingCustomerDbId,
@@ -2135,19 +2199,19 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                         `${label} saw the name already held before either participant wrote, so this run ` +
                             'evidences no race',
                     ).toBe(0);
-                    // THE REAL SERVICE OPERATION, on this participant's own held transaction. Over HTTP the
-                    // server would open its own transaction on a connection this barrier never touched, and
+                    // THE REAL SERVICE OPERATION, on this participant's own held transaction.
                     const boundContext = transactionBinder.bind(sessionContext, ctx.manager);
                     expect(
                         transactionBinder.managerOf(boundContext),
                         `${label} is not bound to its own barrier transaction`,
                     ).toBe(ctx.manager);
-                    // this harness. `createReorderList` takes a pessimistic write lock on the owning customer
-                    // row as its FIRST statement (`getLockedOwnerScope`, taken for lock ORDER across the
-                    // service), so a second caller for the same customer blocks there and can never reach its
-                    // own write while the first is held: a two-participant hold placed here would deadlock
-                    // hold does establish is that the operation's first statement against a plugin table was
-                    // here rather than quietly turn this race back into two independent requests.
+                    // A one-participant pre-write hold, which fires and continues rather than waiting, and the
+                    // participant count is one for a reason that belongs to the operation rather than to this
+                    // harness. `createReorderList` takes a pessimistic write lock on the owning customer row as
+                    // its FIRST statement (`getLockedOwnerScope`, taken for lock ORDER across the service), so
+                    // a second caller for the same customer blocks there and can never reach its own write
+                    // while the first is held: a two-participant hold placed here would deadlock both callers
+                    // until its deadline.
                     const hold = preWrite.install(ctx);
                     try {
                         return await reorderListService.createReorderList(boundContext, { name });
@@ -2186,7 +2250,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             const conflict = refused[0];
             expect(conflict.errorCode).toBe('REORDER_LIST_NAME_CONFLICT_ERROR');
             expect(conflict.conflictingNameKey.length).toBeGreaterThan(0);
-            // no driver text, no SQL fragment and no constraint name — a raw driver message can disclose the
+            // NEITHER execution returns a database-level failure to the caller, so the mapped message carries
+            // no driver text, no SQL fragment and no constraint name.
             expectNoDriverDetail(conflict.message);
         }
 
@@ -2234,6 +2299,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 const secondContext = await shopContextFor(secondShopClient);
 
                 // One rendezvous per participant, for the participant-count reason documented in
+                // racingSameNameCreate: these two callers cannot be held simultaneously, so each is held singly
+                // and each is asserted to have fired.
                 const firstPreWrite = createPreWriteRendezvous({
                     participants: 1,
                     tables: [LIST_TABLE],
@@ -2260,11 +2327,14 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                     ),
                 });
 
-                // a matcher. The describer beside it is the redacted diagnostic.
+                // A COUNT: a settled outcome carries its raw rejection reason, so the array must not reach a
+                // matcher. The describer beside it is the redacted diagnostic.
                 expect(outcome.rejected.length, describeAbandonedPair(outcome)).toBe(0);
                 expect(outcome.fulfilled.length).toBe(2);
                 expect(outcome.a.releasedBeforeWrite).toBe(true);
                 expect(outcome.b.releasedBeforeWrite).toBe(true);
+                // The WINNER's first write on the list table went through its own held connection. Exactly one
+                // of the two reaches a write at all: the loser is refused before writing anything, by the
                 // scoped duplicate count it takes under the lock the winner has already released.
                 expect(
                     firstPreWrite.arrivedCount() + secondPreWrite.arrivedCount(),
@@ -2400,7 +2470,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                                 });
                             } finally {
                                 // Recorded before the patch is removed, so the statement the operation was
-                                // reason is read rather than a whole-rendezvous aggregate.
+                                // stopped at can be named in a diagnostic, and so the hold's OWN release reason
+                                // is read rather than a whole-rendezvous aggregate.
                                 heldBeforeItsOwnInsert = hold.heldBefore();
                                 holdReleasedBy = hold.releasedBy();
                                 hold.restore();
@@ -2420,16 +2491,17 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                             // operation locked is requested `NOWAIT`, so the answer is a refusal carrying the
                             // engine's own lock-not-available code — which is proof both that the statement
                             // reached the database and that the row was held by another transaction. Nothing
+                            // here is inferred from how long anything took.
                             const offeredAt = Date.now();
                             refusalWhileHeld = await offerCompetingLock(ctx.queryRunner);
                             refusalElapsedMs = Date.now() - offeredAt;
 
-                            // transaction committed by this harness — at which point the lock is free.
+                            // Releases the held operation, which then inserts, returns, and has its transaction
+                            // committed by this harness — at which point the lock is free.
                             preWrite.arriveExternally();
 
                             // THE SECOND HALF, ALSO A POSITIVE EVENT. The identical statement is re-offered
-                            // until the engine grants it. The commit that frees the row happens on the other
-                            // correct response; the budget bounds the loop so a lock that never frees fails
+                            // until the engine grants it.
                             const deadline = Date.now() + LOCK_REACQUIRE_BUDGET_MS;
                             for (;;) {
                                 offersAfterRelease += 1;
@@ -2474,8 +2546,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                         'before the competing lock was ever offered',
                 ).toBe('arrival');
 
-                // AND THE ENGINE REFUSED THE COMPETING LOCK WHILE IT WAS HELD, then granted it once the
-                // elapsed time and both prove the statement was dispatched. Together they say: no second
+                // AND THE ENGINE REFUSED THE COMPETING LOCK WHILE IT WAS HELD, then granted it once the window
+                // closed. Both halves are answers the database gave, so neither is an inference from elapsed
+                // time and both prove the statement was dispatched.
                 expect(
                     refusalWhileHeld,
                     'The engine granted the competing lock while the creating operation was held between ' +
@@ -2528,8 +2601,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         });
 
         it('the database refuses a duplicate written directly through the repository, on every engine', async () => {
-            // THE CONSTRAINT-SHAPE HALF, and it runs on all four engine jobs including sql.js. The duplicate is
-            // than an interleaving, which is exactly why every engine carries them.
+            // THE CONSTRAINT-SHAPE HALF, and it runs on all four engine jobs including sql.js.
             const created = expectCreated(await createReorderList(BASE_LIST_NAME));
             const row = await readTheOnlyListRow();
             const storedKey = String(row.nameKey);
@@ -2566,7 +2638,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expect(outcome.loser?.label).toBe('writes-the-duplicate-directly');
             const reason = (outcome.b as { reason: unknown }).reason;
             const reasonText = reason instanceof Error ? reason.message : String(reason);
-            // the message beside it is the shared redactor's description, which names the constraint when the
+            // The predicate reads the raw text; the message does not. `identifiesNameConflictConstraint` is an
+            // internal boolean over the driver's own words — which is exactly where raw text belongs — and the
+            // message beside it is the shared redactor's description, which names the constraint when the
+            // driver did because that constraint is one of this package's own literals.
             expect(
                 identifiesNameConflictConstraint(reasonText),
                 `The refusal identified neither ${NAME_CONFLICT_CONSTRAINT} nor its qualified column list ` +
@@ -2578,9 +2653,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
         });
 
         it('createReorderList admits the same name under a second real channel token', async () => {
+            // The CHANNEL dimension, discharged by a named test rather than by prose. The uniqueness rule is
             // scoped to the owning customer AND the active channel, so the same name under a second REAL token
             // proceeds. A second token is sent rather than a variable mutated, which is the third of
-            // FEATURE-001-01 section 2.6.1's four matrix rules.
+            // FEATURE-001-01 §2.6.1's four matrix rules.
             const created = expectCreated(await createReorderList(BASE_LIST_NAME));
             const storedKey = String((await readTheOnlyListRow()).nameKey);
             expect(await countLists(actingCustomerDbId, defaultChannelDbId)).toBe(1);
@@ -2745,8 +2821,12 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
     });
 
     // The five edge-case scenarios of STORY-001-01-01 section 7
+    //
+    // Each is its own named test, because a scenario outside the automation gate is untested behaviour
     // whatever the prose around it says — which is exactly why the duplicate-name race was promoted out of
+    // that section into AC-7 rather than left in it. Two of the three unconditionally required categories
     // resolve to PROCEED rather than to a block or a warning, and that is asserted honestly rather than
+    // force-fitted into a failure the operation cannot have.
 
     describe('section 7 scenarios', () => {
         it('scenario 1: an empty starting state proceeds, giving lineCount 0 and exactly one list', async () => {
@@ -2779,6 +2859,7 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             });
             await setEnabled(false);
 
+            // Then PROCEED, with no warning and no audit record. The counted form of "reads no variant at all"
             // is gated to the engine on which a statement count is deterministic; the behavioural half — that
             // the create succeeds regardless — is asserted below on all four engines.
             capture.reset();
@@ -2792,8 +2873,11 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expect(await countAllLines()).toBe(0);
 
             if (isStatementCountEngine()) {
-                // arrive only with STORY-001-01-02. This is the one place a zero-statement claim is legitimate —
-                // unlike a claim of zero statements against `reorder_list`, which no correct implementation
+                // ZERO is reachable here and is therefore asserted as a number: a list is created EMPTY, so
+                // this operation has no reason to resolve a variant or to read an availability figure, and
+                // lines arrive only with STORY-001-01-02. This is the one place a zero-statement claim is
+                // legitimate — unlike a claim of zero statements against `reorder_list`, which no correct
+                // implementation could satisfy.
                 expect(
                     capture.count('product_variant'),
                     `filtered to product_variant — ${STATEMENT_COUNT_ENGINE_REASON}\n${capture.format()}`,
@@ -2845,6 +2929,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             expect(currentPrice, 'the price read back is not the changed price').toBe(changedPrice);
             expect(currentPrice).not.toBe(priorPrice);
 
+            // WHEN the buyer creates a list, THEN PROCEED, with no warning: the `reorder_list` table stores no
+            // monetary column, so this story holds no price that could go stale. Copying a price onto a list
+            // row would be a defect rather than an optimisation, and a price delta is computed at preview time
             // by FEATURE-001-03.
             capture.reset();
             const created = expectCreated(
@@ -2903,6 +2990,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
 
         it('scenario 4: the narrow translation and the second channel halves of the same-name race', async () => {
             // The concurrent same-name race itself is AC-7, which is why it was promoted out of section 7. This
+            // scenario keeps the two halves of it that are NOT a duplicate of that criterion.
+            //
             expectCreated(await createReorderList(BASE_LIST_NAME));
             const storedKey = String((await readTheOnlyListRow()).nameKey);
             const conflict = expectNameConflict(await createReorderList(BASE_LIST_NAME));
@@ -2917,8 +3006,9 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                 'unique constraint',
                 'insert into',
             ]) {
-                // THE NEEDLE IS THE DISCLOSURE, so naming it is the whole diagnostic. Interpolating the
-                // message beside it would reproduce the leak this assertion exists to catch, into the very
+                // THE NEEDLE IS THE DISCLOSURE, so naming it is the whole diagnostic. Interpolating the message
+                // beside it would reproduce the leak this assertion exists to catch, into the very log the
+                // assertion is read in.
                 expect(lowered, `The mapped message discloses "${needle}"`).not.toContain(needle);
             }
             expect(await countLists(actingCustomerDbId, defaultChannelDbId)).toBe(1);
@@ -2937,7 +3027,11 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             const storedKey = String((await readTheOnlyListRow()).nameKey);
             expect(await countLists(actingCustomerDbId, defaultChannelDbId)).toBe(1);
 
+            // FORM ONE — the soft delete exactly as the scenario's Given cites it: the `deletedAt` marker on
+            // the `customer` row, which is what makes `Customer` soft-deletable. It is set through the
             // repository — one row, by identifier, engine-portably — so that the buyer's SESSION survives,
+            // which is what makes the scenario's own `When` reachable at all: "createReorderList is executed
+            // again with that same name, FIRST BY A SESSION FOR THE SOFT-DELETED CUSTOMER".
             const softDeleteCapture = await captureSoftDeleteState(actingCustomerDbId);
             expect(softDeleteCapture.customer.rows.length, 'the acting customer row was not captured').toBe(
                 1,
@@ -3003,7 +3097,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             const sessionAfterDelete = await server.app
                 .get(SessionService)
                 .getSessionFromToken(buyerAuthToken);
+            // A SCALAR, never the session. `expect(sessionAfterDelete).toBeUndefined()` prints the RECEIVED
+            // VALUE on the regression it exists to catch — and that value is a `CachedSession`, whose contract
             // carries the session TOKEN and the cached user identifier. Comparing to `undefined` here and
+            // asserting the boolean says exactly the same thing and has nothing to render.
             expect(sessionAfterDelete === undefined, 'The soft delete left a live session behind').toBe(true);
             const refusedLogin = await shopClient.asUserWithCredentials(
                 actingCustomer.emailAddress,
@@ -3031,7 +3128,8 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
                     ? directDuplicateFailure.message
                     : String(directDuplicateFailure);
             // Same division as above: the boolean reads the raw text, the message carries the redactor's
-            // description. On MySQL the raw text is `Duplicate entry '<value>' for key '<name>'`, so the
+            // description. On MySQL the raw text is `Duplicate entry '<value>' for key '<name>'`, so the value
+            // the write attempted is in it.
             expect(
                 identifiesNameConflictConstraint(directFailureText),
                 `The refusal identified neither ${NAME_CONFLICT_CONSTRAINT} nor its qualified column list ` +
@@ -3039,7 +3137,10 @@ describe('STORY-001-01-01 createReorderList (Shop API)', () => {
             ).toBe(true);
             expect(await countListsWithKey(actingCustomerDbId, defaultChannelDbId, storedKey)).toBe(1);
 
+            // This story implements no deletion, anonymisation or purge behaviour on either table (EPIC-001
             // ruling R19 — the lifecycle pass belongs to FEATURE-001-07 in batch B5). Asserted as the absence
+            // of both a mechanism and a place to record one: no column on either table could carry a retention
+            // decision, and the surviving row's name is byte-identical rather than anonymised.
             const listColumns = dataSource
                 .getMetadata(ReorderList)
                 .columns.map(column => column.databaseName);

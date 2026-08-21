@@ -214,7 +214,8 @@ export class ConcurrencyBarrier {
         }
         this.timeoutMs = timeoutMs;
         this.autoRelease = options.autoRelease !== false;
-        // by `describeTimeout()` — the diagnostic a hung rendezvous produces, and therefore the one most
+        // Labels are normalised at intake because `describeTimeout()` renders them into the diagnostic a hung
+        // rendezvous produces, which is the one most likely to be read in a build log.
         this.expectedLabels = (options.expectedLabels === undefined ? [] : options.expectedLabels).map(
             label => this.safeLabel(label),
         );
@@ -226,8 +227,9 @@ export class ConcurrencyBarrier {
      * distinct arrived labels reaches the participant count.
      */
     arrive(rawLabel: string): Promise<void> {
-        // the EXPORTED primitive: `runBarrieredPair` and `runSequentialPair` resolve their labels before
-        // boundary a label crosses. Normalising here rather than at each render site covers the late-arrival
+        // This is the exported primitive, and a suite may drive it directly, so normalising a caller's label
+        // here covers the late-arrival rejection, `describeTimeout()`, `arrivedLabels` and any render site
+        // added later.
         const label = this.safeLabel(rawLabel);
         if (this.failure) {
             return Promise.reject(
@@ -243,7 +245,8 @@ export class ConcurrencyBarrier {
         if (this.hasReleased) {
             return Promise.resolve();
         }
-        // The timer starts on the first arrival rather than at construction, so a barrier that is
+        // The timer starts on the first arrival rather than at construction, so a barrier that is built and
+        // never used holds no timer and cannot keep the process alive.
         this.startTimer();
         const waited = new Promise<void>((resolve, reject) => {
             this.waiters.push({ label, resolve, reject });
@@ -311,12 +314,13 @@ export class ConcurrencyBarrier {
             return;
         }
         if (this.hasReleased) {
-            // A released barrier has nobody left to reject, so the only thing left to do is make
-            // reject even though this rendezvous completed successfully — and the tidy-up call the
+            // A released barrier has nobody left to reject, so the only thing left to do is make sure no timer
+            // outlives the test.
             this.clearTimer();
             return;
         }
-        // holds a foreign error: see {@link asHarnessFailure}.
+        // A foreign reason is converted before it is stored or rejected with, so nothing downstream holds a
+        // foreign error: see {@link asHarnessFailure}.
         this.failure = asHarnessFailure(
             reason,
             'The concurrency barrier was disposed before it was released.',
@@ -463,6 +467,8 @@ export interface TransactionBinder {
 export function asShopApiContext(ctx: RequestContext): RequestContext {
     const before = ctx.apiType;
     // `copy()` is the platform's own shallow copy, which is what the transaction binder also builds on, so the
+    // private field carrying the api type is an own property of the copy and reassigning it cannot reach the
+    // original. The cast is confined to this one line.
     const shopCtx = ctx.copy();
     (shopCtx as unknown as { _apiType: RequestContext['apiType'] })._apiType = 'shop';
     if (shopCtx.apiType !== 'shop') {
@@ -547,6 +553,7 @@ async function assertBindingIsHonoured(
     const runner = connection.rawConnection.createQueryRunner();
     try {
         // CONNECTED AND OPENED INSIDE the protected region. A `startTransaction` that throws after `connect`
+        // succeeded would otherwise leave a connected runner with no `finally` to reclaim it, and this helper
         // runs once per suite that uses the barrier — so the leak would be permanent for that run.
         await runner.connect();
         await runner.startTransaction();
@@ -564,7 +571,9 @@ async function assertBindingIsHonoured(
             );
         }
     } finally {
-        // reclaiming: a leaked one holds a pool slot for the rest of the suite.
+        // Nested so the release is not conditional on the rollback succeeding. A rollback can fail on a
+        // connection the server already closed, and a leaked runner holds a pool slot for the rest of the
+        // suite.
         try {
             if (runner.isTransactionActive) {
                 await runner.rollbackTransaction();
@@ -793,9 +802,10 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     ];
     const runners = await createDistinctRunners(dataSource);
 
-    // and committing afterwards: on MySQL, MariaDB and PostgreSQL the second writer blocks on the
-    // first writer's row lock until that transaction commits, so a harness that holds both
-    // commits back deadlocks — and the symptom is an opaque test timeout, not a harness error.
+    // Both chains start back to back with no `await` between them, and each commits as soon as its own write
+    // returns. Do NOT await both writes and commit afterwards: on MySQL, MariaDB and PostgreSQL the second
+    // writer blocks on the first writer's row lock until that transaction commits, so holding both commits back
+    // deadlocks — and the symptom is an opaque test timeout, not a harness error.
     const chainA = runParticipantChain(
         runners[0],
         labels[0],
@@ -825,10 +835,11 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     const abandoned = await raceAgainstDeadline(tracked, pairTimeoutMs);
 
     if (abandoned) {
-        // the rendezvous is disposed, so a participant still waiting there fails immediately instead of
-        // here*, because its chain is blocked and will never reach its own `finally` — and a released
-        // connection is also what unblocks a body stuck inside the driver, which is the only cancellation
-        // cannot tear down concurrently with a chain that did reach its own teardown.
+        // Three independent steps. Abandon every participant waiting on something this harness cannot reach;
+        // dispose the rendezvous so a still-waiting participant fails immediately instead of running out its
+        // own timer; then reclaim each unsettled participant's connection from here, because its chain is
+        // blocked and will never reach its own `finally` — and releasing the connection is also what unblocks a
+        // body stuck inside the driver, the only cancellation TypeORM offers portably.
         cancelToken(token, state);
         barrier.dispose(
             harnessError(
@@ -840,8 +851,8 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
         throw harnessError(buildAbandonedPairMessage(tracked, pairTimeoutMs, state, barrier));
     }
 
-    // barrier that released normally this only clears the timer, so it cannot invalidate a
-    // rendezvous a caller still holds — see ConcurrencyBarrier.dispose.
+    // Guarantees the timeout cannot outlive the test. On a barrier that released normally this only clears the
+    // timer, so it cannot invalidate a rendezvous a caller still holds — see ConcurrencyBarrier.dispose.
     barrier.dispose(harnessError('The barriered pair has finished; its rendezvous is no longer in use.'));
 
     const result = assembleBarrierResult(
@@ -850,8 +861,11 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     );
     // `true`: this driver's whole claim is the interleaving, so a run in which either participant was
     // not held at the rendezvous and released from it before writing is refused rather than returned.
+    // The chains already refuse to *commit* such a participant; this refuses to hand the caller a
+    // *result* built from a pair that was never inside the window together, however that came about.
     assertHarnessIntegrity(state, result, true);
-    // A completed run whose teardown reported anything is not usable as evidence: a leaked connection or
+    // A completed run whose teardown reported anything is not usable as evidence: a leaked connection or an
+    // unclosed level is a failure at the point it happened rather than an unexplained hang two tests later.
     assertNoTeardownFailure(state, result);
     return result;
 }
@@ -870,11 +884,12 @@ export async function runSequentialPair<A, B, PA = undefined, PB = undefined>(
     const labels = resolveDistinctLabels(participants);
     const commitOnSuccess = options.commitOnSuccess !== false;
     const state: ChainState = { settled: 0, teardownErrors: [] };
-    // concurrently to abandon. The token exists so that a phase written for either driver can consult
+    // Never cancelled in this mode, because there is no concurrent pair to abandon. The token exists so a phase
+    // written for either driver can consult `ctx.cancelled()` unconditionally.
     const token: CancellationToken = { cancelled: false, listeners: [] };
 
-    // No barrier is created at all in this mode, so there is no timer to clear because there was
-    // than both up front, so that on an engine whose driver caches one runner the second participant
+    // No barrier is created at all in this mode, so there is no timer to clear because there was never anything
+    // to wait for.
     const outcomeA = await runParticipantChain(
         dataSource.createQueryRunner(),
         labels[0],
@@ -899,8 +914,9 @@ export async function runSequentialPair<A, B, PA = undefined, PB = undefined>(
     );
 
     const result = assembleBarrierResult(outcomeA, outcomeB);
-    // `false`: there is no rendezvous in this mode, so being held at one is not a precondition of
-    // are still reported, because a leaked connection is a leaked connection in either mode.
+    // `false`: there is no rendezvous in this mode, so being held at one is not a precondition of anything and
+    // both participants running unheld is exactly what was asked for. Teardown failures are still reported,
+    // because a leaked connection is a leaked connection in either mode.
     assertHarnessIntegrity(state, result, false);
     return result;
 }
@@ -1133,7 +1149,8 @@ async function settleRunner(
     connectionAcquired: boolean,
 ): Promise<void> {
     if (readRunnerFlag(() => queryRunner.isReleased, false)) {
-        // "unreadable" resolves to "not released" so a leak is attempted rather than assumed away.
+        // Already released, by this path or the other side of the claim. Nothing left to do, and "unreadable"
+        // resolves to "not released" so a leak is attempted rather than assumed away.
         return;
     }
     const observed = readTransactionState(queryRunner);
@@ -1168,7 +1185,8 @@ async function settleRunner(
         return;
     }
     // Bounded, and only ever the levels above the baseline. `restoreTransactionBaseline` records its own
-    // it cannot sit here forever behind a stalled statement.
+    // diagnostics, so a failure inside it is already on the record; what this adds is the guarantee that it
+    // cannot sit here forever behind a stalled statement.
     const restored = await attemptWithinBudget(
         () => restoreTransactionBaseline(queryRunner, baseline, label, state),
         DEFAULT_CLEANUP_ACTION_TIMEOUT_MS,
@@ -1270,7 +1288,9 @@ async function reclaimAbandonedRunners(
         }
         const claim = claims[index];
         if (!claimCleanup(claim)) {
-            // Doing it here as well would race it — two concurrent rollbacks or releases on one
+            // The participant's own chain reached its teardown first and owns this runner's cleanup. Doing it
+            // here as well would race it — two concurrent rollbacks or releases on one connection — so the
+            // claim decides, once, which side is responsible.
             reclaims.push(awaitClaimedCleanup(claim, tracked[index].label, state.teardownErrors));
             continue;
         }
@@ -1280,14 +1300,18 @@ async function reclaimAbandonedRunners(
                 tracked[index].label,
                 state,
                 dataSource,
-                // arrived carrying a foreign transaction, so nothing of its owner's is touched — and with
+                // The facts the chain published rather than assumptions: `ownsRunner` false leaves a foreign
+                // transaction untouched, and `connectionAcquired` is what decides between quarantining an
+                // uncertain runner and leaving it alone.
                 claim === undefined ? { active: false, depth: undefined, certain: false } : claim.baseline,
                 claim === undefined ? true : claim.ownsRunner,
                 claim === undefined ? false : claim.connectionAcquired,
             ),
         );
     }
-    // outcome into a recorded diagnostic. Running the two concurrently is what stops a stalled rollback
+    // `Promise.all` is safe here precisely because `settleRunner` never rejects — it converts every outcome
+    // into a recorded diagnostic — and running both concurrently stops a stalled rollback on one connection
+    // from delaying the other's release by its whole budget.
     await Promise.all(reclaims);
 }
 
@@ -1406,20 +1430,23 @@ async function runParticipantChain<T>(
         }
         return cleanupOwned;
     };
-    // The transaction state of the runner as this participant found it. Everything this chain closes
+    // The transaction state of the runner as this participant found it. Everything this chain closes is
+    // measured against it, so a level that was already open is never this participant's to end.
     let baseline: TransactionState = { active: false, depth: undefined, certain: false };
-    // whether a transaction level is its to close. A runner that arrived already inside a transaction
-    // else's transaction (and its locks) still open on it, and would leave that owner holding a
+    // Whether the CONNECTION is this participant's to give back is a different question from whether a
+    // transaction level is. Releasing a runner that arrived inside an outer transaction would return a
+    // connection to the pool with somebody else's transaction and locks still open on it, so such a runner is
+    // restored to its baseline and left alone.
     let ownsRunner = false;
-    // Whether this chain got as far as taking a pool connection. Distinct from every ownership question
+    // Whether this chain got as far as taking a pool connection. Distinct from every ownership question above:
+    // a runner that was never connected has nothing to release and nothing to quarantine, while one that was
+    // connected must reach exactly one of those two outcomes.
     let connectionAcquired = false;
-    // Whether this chain still has a transaction level of its own open. Derived from OBSERVED runner
-    // state rather than from whether startTransaction() resolved — see the inner catch — and cleared
+    // Whether this chain still has a transaction level of its own open.
     let ownsTransaction = false;
     let baselineRestorationAttempted = false;
-    // Returns the runner to the transaction state it arrived in, once, from whichever of the failure
-    // what BarrierOutcomeBase.settledOrder promises; the `finally` calls it so that a path which
-    // never reaches the failure branch still cannot release a connection with a transaction on it.
+    // Returns the runner to the transaction state it arrived in, once, from whichever of the failure path and
+    // the `finally` is reached first.
     const restoreBaseline = async (): Promise<void> => {
         if (baselineRestorationAttempted) {
             return;
@@ -1428,10 +1455,9 @@ async function runParticipantChain<T>(
         if (!ownsTransaction) {
             return;
         }
-        // {@link settleRunner}. `restoreTransactionBaseline` ends with `rollbackTransaction()`, and a
-        // rollback queued behind a stalled statement never settles. Awaiting that here without a bound is
-        // the one failure a single-owner {@link CleanupClaim} cannot survive: this chain either never
-        // the whole-pair watchdog finds a cleanup it must not race, so the connection is NEITHER released
+        // BOUNDED, on the same budget and for the same reason as every step inside {@link settleRunner}.
+        // `restoreTransactionBaseline` ends with `rollbackTransaction()`, and a rollback queued behind a
+        // stalled statement never settles.
         const restored = await attemptWithinBudget(
             () => restoreTransactionBaseline(queryRunner, baseline, label, state),
             DEFAULT_CLEANUP_ACTION_TIMEOUT_MS,
@@ -1458,12 +1484,17 @@ async function runParticipantChain<T>(
         // state it cannot certify.
     };
     try {
-        // Read the transaction state FIRST, inside this `try` and before anything else touches the
-        // transaction — so the baseline means exactly what the closes below assume. And it is inside
+        // Read the transaction state FIRST, inside this `try` and before anything else touches the runner. A
+        // level that is already open belongs to somebody else, and every close below is measured against this
+        // reading. Two properties make this the right position for it.
         baseline = readTransactionState(queryRunner);
-        // An already-open transaction makes the CONNECTION foreign too, not just the level. This is
+        // An already-open transaction makes the CONNECTION foreign too, not just the level. This is decided
+        // here, before anything is opened on the runner and before any path can release it, so the refusals
+        // below are genuinely refusals to touch it.
         ownsRunner = !baseline.active;
-        // measures against the same baseline and the same connection ownership this chain would, rather
+        // Published to the shared record in the same synchronous step as the reading, so a deadline that fires
+        // while this chain is still stalled measures against the same baseline and connection ownership this
+        // chain would. Guessing here means rolling back or releasing work that was never this harness's.
         if (claim !== undefined) {
             claim.baseline = baseline;
             claim.ownsRunner = ownsRunner;
@@ -1480,15 +1511,18 @@ async function runParticipantChain<T>(
                     'connection behind it has already gone.',
             );
         }
-        // its own before its transaction opens. Two participants must never share one connection:
-        // a single connection cannot hold two open transactions, so it cannot interleave, and a
+        // `connect()` is called explicitly so this participant holds a pool connection of its own before its
+        // transaction opens. One connection cannot hold two open transactions, so two participants sharing one
+        // cannot interleave and a test built on it would prove serialisation.
         await queryRunner.connect();
         connectionAcquired = true;
         if (claim !== undefined) {
             claim.connectionAcquired = true;
         }
         if (baseline.active && baseline.depth === undefined) {
-            // again: with a transaction already open, the public `isTransactionActive` flag reads
+            // Refused in both modes, including the sequential nesting this module otherwise supports: with a
+            // transaction already open, `isTransactionActive` reads `true` before and after, so a level opened
+            // here could never be shown to have been closed again.
             throw harnessError(
                 `Participant '${label}' was handed a query runner that is already inside a ` +
                     'transaction and does not expose a nesting depth, so a level opened on it could ' +
@@ -1500,9 +1534,10 @@ async function runParticipantChain<T>(
             );
         }
         if (barrier !== undefined && baseline.active) {
-            // Refused rather than nested. A transaction opened on this runner now would be a
-            // SAVEPOINT inside somebody else's transaction — sharing its connection and its locks,
-            // interleaving whatever the test then asserted. Failing here also keeps the teardown
+            // Refused rather than nested. A transaction opened on this runner now would be a SAVEPOINT inside
+            // somebody else's transaction — sharing its connection and its locks, invisible to it, and
+            // impossible to commit independently — so it could not evidence an interleaving whatever the test
+            // then asserted.
             throw harnessError(
                 `Participant '${label}' was handed a query runner that is already inside a ` +
                     'transaction, so it cannot evidence an interleaving: anything it opened now would ' +
@@ -1514,35 +1549,37 @@ async function runParticipantChain<T>(
             );
         }
         try {
-            // The isolation level is whatever the caller asked for. Omitted means the engine's own
-            // default, which differs between engines and is then part of what the test asserts.
-            // enough: every installed driver marks the runner transactional before it issues BEGIN, so a
+            // The isolation level is whatever the caller asked for. Omitted means the engine's own default,
+            // which differs between engines and is then part of what the test asserts.
             if (claim !== undefined) {
                 claim.ownsTransaction = true;
             }
             await queryRunner.startTransaction(isolationLevel);
             ownsTransaction = true;
         } catch (startError) {
-            // A rejection here does NOT mean no transaction exists. TypeORM flips
-            // `isTransactionActive` to true and only then issues the statements that open the
-            // transaction — `driver/mysql/MysqlQueryRunner.js:L83` ahead of the isolation statement
-            // at L93 and START TRANSACTION at L95, `driver/postgres/PostgresQueryRunner.js:L113`
-            // ahead of L122-L124, `driver/sqlite-abstract/AbstractSqliteQueryRunner.js:L61` ahead of
-            // its PRAGMA and BEGIN — so a failure from any of those statements can leave the runner
-            // carrying a half-started transaction whose flag is set while its depth was never
-            // incremented. On PostgreSQL that half-start is a genuinely open server-side transaction
-            // (START TRANSACTION is issued before the isolation statement), which is exactly why it
+            // A rejection here does NOT mean no transaction exists. TypeORM flips `isTransactionActive` to true
+            // and only then issues the statements that open the transaction —
+            // `driver/mysql/MysqlQueryRunner.js:L83` ahead of the isolation statement at L93 and START
+            // TRANSACTION at L95, `driver/postgres/PostgresQueryRunner.js:L113` ahead of L122-L124,
+            // `driver/sqlite-abstract/AbstractSqliteQueryRunner.js:L61` ahead of its PRAGMA and BEGIN — so a
+            // failure from any of those statements can leave the runner carrying a half-started transaction
+            // whose flag is set while its depth was never incremented.
             ownsTransaction = hasStateAboveBaseline(queryRunner, baseline);
             throw startError;
         }
-        // Post-start certification, run before any caller phase. `startTransaction` resolving is not
+        // Post-start certification, run before any caller phase. `startTransaction` resolving is not by itself
+        // proof that this chain now holds a level it will be able to account for, and every guarantee below it
+        // — that a fulfilled participant's work completed, that teardown restores what it found, that nothing
+        // foreign is ended — rests on that accounting. So the state is read once, here, while the situation is
+        // still unambiguous, and anything short of certifiable is refused rather than carried into a caller's
+        // precheck and write.
         const opened = readTransactionState(queryRunner);
         const lostDepthReporting = baseline.depth !== undefined && opened.depth === undefined;
         if (lostDepthReporting) {
-            // level is open: a driver that stopped publishing it across `startTransaction`. Nothing
-            // this is the one moment when doing so is unambiguous — `startTransaction` has returned and
-            // no caller code has run, so the innermost level is certainly this chain's. Ownership is
-            // transaction, and a close that fails is reported and not retried.
+            // The nesting counter was readable at baseline and is gone now this chain's level is open, so
+            // nothing afterwards could distinguish that level from any other. It closes the level it just
+            // opened first, because `startTransaction` has returned and no caller code has run — the one moment
+            // when the innermost level is certainly this chain's.
             ownsTransaction = false;
             let closedTheLevel = true;
             try {
@@ -1568,8 +1605,8 @@ async function runParticipantChain<T>(
             );
         }
         if (!hasStateAboveBaseline(queryRunner, baseline)) {
-            // `startTransaction` resolved and yet the runner looks exactly as it did beforehand: no
-            // caller's write outside any transaction this chain controls and then report it committed,
+            // `startTransaction` resolved and yet the runner looks exactly as it did beforehand: no level this
+            // chain could later commit, roll back or account for.
             ownsTransaction = false;
             throw harnessError(
                 `Participant '${label}' called startTransaction successfully and the runner is ` +
@@ -1590,7 +1627,10 @@ async function runParticipantChain<T>(
                     try {
                         listener();
                     } catch (listenerError) {
-                        // the phase that called `onCancelled`. A broken unblock hook is why the
+                        // Recorded AND rethrown. The abandonment error has already been thrown, so anything
+                        // appended to the teardown diagnostics now can never reach it; rethrowing puts the
+                        // failure in the phase that called `onCancelled`. A broken unblock hook is why the
+                        // participant will not come back.
                         state.teardownErrors.push(
                             `a cancellation listener registered by '${label}' after abandonment threw: ` +
                                 describeReason(listenerError),
@@ -1604,17 +1644,22 @@ async function runParticipantChain<T>(
         };
         const precheckResult = spec.precheck === undefined ? undefined : await spec.precheck(context);
         if (barrier !== undefined) {
-            // The rendezvous, entered by the harness. Registration is recorded from the barrier's
+            // The rendezvous, entered by the harness. Registration is recorded from the barrier's own record
+            // before the release is awaited, so a participant held here and then rejected by a timeout or by a
+            // sibling's disposal still reports the arrival it made — while `releasedBeforeWrite`, which is what
+            // certifies the run, can only become true after the release has actually been awaited. Nothing a
+            // caller writes sits between the two, which is the whole point of splitting the phases.
             const released = barrier.arrive(label);
             arrived = barrier.arrivedLabels.indexOf(label) !== -1;
             await released;
             releasedBeforeWrite = barrier.released;
         }
         const value = await spec.write({ ...context, precheckResult });
-        // End the transaction here, in this participant's own chain, the moment its write returns.
-        // See the note in runBarrieredPair: waiting for the sibling before committing deadlocks on
-        // every engine that blocks a second writer on a row lock. A failure raised by COMMIT is
-        // exactly where a serialization failure surfaces, and it is a genuine race result. Only the
+        // End the transaction here, in this participant's own chain, the moment its write returns. See the note
+        // in runBarrieredPair: waiting for the sibling before committing deadlocks on every engine that blocks
+        // a second writer on a row lock. A failure raised by COMMIT is this participant's own outcome and not a
+        // harness fault — under SERIALIZABLE that is exactly where a serialization failure surfaces, and it is
+        // a genuine race result.
         if (ownsTransaction) {
             await endTransactionLevels(queryRunner, baseline, commitOnSuccess ? 'commit' : 'rollback');
             if (!isCertainlyAtBaseline(queryRunner, baseline)) {
@@ -1628,7 +1673,8 @@ async function runParticipantChain<T>(
                         `${describeTransactionState(readTransactionState(queryRunner))}).`,
                 );
             }
-            // Ownership is discharged the instant everything this chain opened is closed, so the
+            // Ownership is discharged the instant everything this chain opened is closed, so the teardown below
+            // cannot mistake a foreign outer level for this participant's work.
             ownsTransaction = false;
         }
         const settledOrder = state.settled++;
@@ -1640,6 +1686,8 @@ async function runParticipantChain<T>(
     } finally {
         // Teardown on every path — a sibling that threw, a rendezvous that timed out, a transaction that
         // never opened — because a leaked query runner holds a pool connection and the next test then
+        // hangs rather than failing.
+        //
         if (ownCleanup()) {
             const cleanup = (async (): Promise<void> => {
                 await restoreBaseline();
@@ -1658,8 +1706,9 @@ async function runParticipantChain<T>(
             }
             await cleanup;
         }
-        // A participant that finished without reaching the rendezvous leaves its sibling waiting
-        // completed interleaving.
+        // A participant that finished without reaching the rendezvous leaves its sibling waiting for a partner
+        // that is never coming. Disposing turns that into an immediate named failure on both sides instead of a
+        // wait that runs out the timeout.
         if (barrier !== undefined && !arrived && !barrier.released) {
             barrier.dispose(
                 harnessError(
@@ -1731,7 +1780,9 @@ function readTransactionState(queryRunner: QueryRunner): TransactionState {
         active = queryRunner.isTransactionActive;
         certain = true;
     } catch {
-        // treating this substitution as an observation. {@link readRunnerFlag} states the same rule for the
+        // Fails closed on the value and says so in the same breath: `certain: false` is what stops a caller
+        // treating this substitution as an observation. {@link readRunnerFlag} states the same rule for reads
+        // that need only the value.
         active = true;
         certain = false;
     }
@@ -1850,8 +1901,7 @@ async function restoreTransactionBaseline(
         return;
     }
     if (baseline.active && !readTransactionState(queryRunner).active) {
-        // The transaction that was ALREADY OPEN when this participant arrived is gone. Whatever ended
-        // describing a transaction that no longer exists, which reads as a clean restoration and would
+        // The transaction that was ALREADY OPEN when this participant arrived is gone.
         state.teardownErrors.push(
             `the transaction that was already open on the runner for '${label}' is no longer active, ` +
                 "so work that was not this participant's to end has been ended — its owner cannot " +
@@ -1896,9 +1946,9 @@ function normaliseTransactionDepth(queryRunner: QueryRunner, baseline: Transacti
         return false;
     }
     if (current.active !== baseline.active) {
-        // the baseline means a transaction was opened or ended rather than miscounted, and writing a
-        // number over it would describe a transaction that is not there — which is how the loss of an
-        // outer transaction came to be reported as a clean restoration. The caller reports it instead.
+        // A flag that disagrees with the baseline means a transaction was opened or ended rather than
+        // miscounted, so writing a number over it would describe a transaction that is not there. The caller
+        // reports it instead.
         return false;
     }
     if (current.depth === baseline.depth) {
@@ -1953,8 +2003,9 @@ async function createDistinctRunners(dataSource: DataSource): Promise<[QueryRunn
  * instead of discarding it — returning `undefined` when there is nothing to report.
  */
 async function releaseAbandonedRunner(queryRunner: QueryRunner): Promise<string | undefined> {
-    // attempted rather than a leak assumed away, and an unreadable `isTransactionActive` reads as ACTIVE
-    // so live work is never returned to the pool. See {@link readRunnerFlag}.
+    // Both flags are read fail-closed: an unreadable `isReleased` reads as NOT released so a release is
+    // attempted rather than a leak assumed away, and an unreadable `isTransactionActive` reads as ACTIVE so
+    // live work is never returned to the pool. See {@link readRunnerFlag}.
     if (readRunnerFlag(() => queryRunner.isReleased, false)) {
         return undefined;
     }
@@ -2086,11 +2137,15 @@ function summariseOutcome(outcome: BarrierOutcome<unknown>): string {
 function resolveDistinctLabels<A, B, PA, PB>(
     participants: BarrierParticipants<A, B, PA, PB>,
 ): [string, string] {
-    // runner and read in a build log, so a label carrying a value leaks from all of them at once; and the
+    // Guarded at intake rather than at every site a label is rendered. A caller-supplied label is interpolated
+    // into roughly thirty-five thrown diagnostics in this file, so a label carrying a value leaks from all of
+    // them at once.
     const rawA = participants.a.label === undefined ? 'a' : participants.a.label;
     const rawB = participants.b.label === undefined ? 'b' : participants.b.label;
     const labelA = safeParticipantLabel(rawA, 1);
-    // identifies an outcome and names a missing participant when the rendezvous times out, so a pair that
+    // The refusal is keyed on the raw labels and the collision avoidance on the rendered ones, which are two
+    // different questions. A label identifies an outcome and names a missing participant when the rendezvous
+    // times out, so a pair that cannot be told apart is unusable as evidence and stays refused.
     if (rawA === rawB) {
         throw harnessError(
             `Both participants are labelled '${labelA}', but the two must be distinguishable: a ` +
@@ -2126,8 +2181,9 @@ function asHarnessFailure(reason: unknown, fallbackMessage: string): Error {
     if (reason === undefined) {
         return harnessError(fallbackMessage);
     }
-    // barrier's stored `failure`, be handed to every waiting participant, and have its `.message`
-    // replayed verbatim by every later arrival. A driver error carries the statement and its bound
+    // A foreign reason is converted before it is stored, not when it is printed. A driver error carries the
+    // statement and its bound parameters as enumerable own properties, and a stored `failure` is handed to
+    // every waiting participant and replayed by every later arrival.
     return harnessError(`${fallbackMessage} Reason: ${redactTeardownDiagnostic(reason)}`);
 }
 
@@ -2353,8 +2409,7 @@ export function createPreWriteRendezvous(options: {
             state.resolve = resolve;
             state.reject = reject;
             // IN THE WAITING SET BEFORE ANYTHING THAT CAN FAIL THE RENDEZVOUS, AND THE ORDER IS THE WHOLE
-            // abandoned, so registering before joining the set would run `failRendezvous` over an empty set,
-            // intercepted statement pending for ever and hanging the suite's teardown rather than failing it.
+            // POINT.
             waiting.add(state);
             try {
                 state.timer = setTimeout(() => {
@@ -2377,7 +2432,9 @@ export function createPreWriteRendezvous(options: {
                     );
                 });
             } catch (registrationFailure: unknown) {
-                // takes the rendezvous with it: a participant this harness cannot supervise must not write.
+                // A context that can register neither a timer nor a cancellation listener leaves this hold with
+                // no way to be woken, so it is refused here rather than left to hang: a participant this
+                // harness cannot supervise must not write.
                 failRendezvous(
                     asHarnessFailure(
                         registrationFailure,
@@ -2412,7 +2469,10 @@ export function createPreWriteRendezvous(options: {
                 return Promise.resolve(true);
             }
             return new Promise<boolean>(resolve => {
-                // holding this closure and the rendezvous state it captures reachable, and then firing inside
+                // One-shot, releasing both escapes on whichever path answers first. Leaving the other alive
+                // would hold this closure and the rendezvous state it captures reachable for the rest of
+                // `waitMs` after an arrival answered the wait, then fire inside whichever later test was
+                // running.
                 let settled = false;
                 let expiry: ReturnType<typeof setTimeout> | undefined;
                 let watcher:
@@ -2460,6 +2520,7 @@ export function createPreWriteRendezvous(options: {
                 if (heldBefore === undefined && isTargetedWrite(statement)) {
                     heldBefore = statement;
                     // Throws when the rendezvous fails, so the statement below is NOT reached. That is the
+                    // whole point: a hold that was not released by arrival must not write.
                     await arrive(ctx, state);
                 }
                 return original(statement, parameters as never, useStructuredResult as never);
@@ -2470,7 +2531,9 @@ export function createPreWriteRendezvous(options: {
                 heldBefore: () => heldBefore,
                 releasedBy: () => state.releasedBy,
                 restore: () => {
-                    // the waiting set, so nothing this rendezvous created survives the test that made it.
+                    // Cleanup of last resort: it clears any timer that outlived its hold and takes the state
+                    // out of the waiting set, so nothing this rendezvous created survives the test that made
+                    // it.
                     if (state.timer !== undefined) {
                         clearTimeout(state.timer);
                         state.timer = undefined;
@@ -2485,10 +2548,12 @@ export function createPreWriteRendezvous(options: {
     };
 }
 
-// Diagnostic redaction — the one implementation every end-to-end suite in this package shares.
-// What it decides is a security property: whether a failing assertion publishes a session token, a buyer's
-// module makes "every suite redacts identically" a fact about the code rather than about the discipline of
-// callers pass a redacted string, a count or a boolean as the actual and use these helpers for the message.
+// Diagnostic redaction — the one implementation every end-to-end suite in this package shares. What it decides
+// is a security property: whether a failing assertion publishes a session token, a buyer's address, a bound
+// query parameter or the layout of the machine that ran the suite into a build log. One module makes "every
+// suite redacts identically" a fact about the code rather than about the discipline of whoever edits a copy
+// next. The rule: nothing that came from outside this package is reproduced. A caught failure is MEASURED and
+// described from fixed lists, and a stage label is refused outright if it carries a shape a value arrives in.
 
 /**
  * A stage label, rendered so that a label someone interpolated a VALUE into cannot publish it.
@@ -2607,14 +2672,15 @@ export function redactTeardownDiagnostic(err: unknown): string {
         ? rawClass
         : '<unrecognised-error-class>';
     // A driver code is an enumerated constant the driver owns — MySQL's `ER_DUP_ENTRY`, SQLite's
-    // `SQLITE_CONSTRAINT`, PostgreSQL's five-character SQLSTATE — and it is the most precise thing a log
+    // `SQLITE_CONSTRAINT`, PostgreSQL's five-character SQLSTATE — and it is the most precise thing a log can
+    // carry. Admitted only in exactly those three shapes, so no other value can arrive through it.
     const rawCode: unknown = err instanceof Error ? (err as { code?: unknown }).code : undefined;
     const code =
         typeof rawCode === 'string' && /^(ER_[A-Z_]{1,40}|SQLITE_[A-Z_]{1,40}|[0-9A-Z]{5})$/.test(rawCode)
             ? `/${rawCode}`
             : '';
-    // MySQL 8 reports 3572 for a refused `NOWAIT`, MariaDB 1205. Admitted only as a non-negative integer
-    // that lets a new engine spelling be added deliberately rather than guessed at.
+    // A numeric `errno` is the same kind of thing as a string code, and some drivers carry only that one: MySQL
+    // 8 reports 3572 for a refused `NOWAIT`, MariaDB 1205.
     const rawErrno: unknown = err instanceof Error ? (err as { errno?: unknown }).errno : undefined;
     const errno =
         typeof rawErrno === 'number' && Number.isSafeInteger(rawErrno) && rawErrno >= 0 && rawErrno <= 99999
@@ -2645,8 +2711,10 @@ export async function runAllTeardownStages(
         try {
             await stage.run();
         } catch (err: unknown) {
-            // thrown, printed by the runner and read in a build log, and a stage runs raw statements
-            // {@link redactTeardownDiagnostic} for why measuring the message beats redacting it.
+            // Only a description of the caught message is carried here, never its text. A stage runs raw
+            // statements against the `customer`, `user` and `session` rows of a live buyer, so a driver failure
+            // can arrive carrying a value it echoed back. The stage NAME is this file's own text and is kept
+            // verbatim.
             failures.push(`${describeTeardownStage(stage.what)}: ${redactTeardownDiagnostic(err)}`);
         }
     }

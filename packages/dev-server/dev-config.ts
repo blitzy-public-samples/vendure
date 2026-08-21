@@ -113,9 +113,16 @@ export const devConfig: VendureConfig = {
         // migrations of its own — the pattern above names a directory that does not exist — so its schema
         // comes from the schema builder, and `packages/dev-server/index.ts` runs `runMigrations` before
         // `bootstrap`: on an engine other than the one the plugin's migration was generated against, that call
-        // reports its failure through `process.exitCode` rather than by throwing (`migrate.ts:L52-L59`) and the
-        // boot then synchronizes as it always has. The migration-owned flow is exercised by the plugin's own
-        // e2e suites instead, against a schema the migration itself created.
+        // reports its failure through `process.exitCode` rather than by throwing (`migrate.ts:L52-L59`).
+        //
+        // What the boot then does depends on the engine, and the two cases are NOT the same. `getDbConfig()`
+        // is spread over this object, and its `postgres`, `sqlite` and `mysql`/`mariadb`/default branches each
+        // set `synchronize: true` — so on those four the schema builder still provisions the schema and the
+        // failed migration costs nothing but a non-zero exit code. Its `sqljs` branch sets no `synchronize` at
+        // all, so the `false` declared above stays effective there: a failed migration on sql.js leaves the
+        // schema EMPTY and the boot proceeds against it, which surfaces as a missing-table error on first use
+        // rather than as a migration failure. The migration-owned flow is exercised by the plugin's own e2e
+        // suites instead, against a schema the migration itself created.
         migrations: [
             path.join(__dirname, 'migrations/*.ts'),
             path.join(__dirname, '../reorder-plugin/src/migrations/*.ts'),
@@ -261,6 +268,10 @@ function getDbConfig(): DataSourceOptions {
             };
         case 'sqljs':
             console.log('Using sql.js connection');
+            // The one branch that supplies no `synchronize`, so the `false` declared on
+            // `dbConnectionOptions` above is what takes effect here. See the note beside `migrations`:
+            // it is why a failed migration leaves this engine with an empty schema rather than one the
+            // schema builder provisioned.
             return {
                 type: 'sqljs',
                 autoSave: true,

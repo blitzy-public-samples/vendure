@@ -157,15 +157,19 @@ to create: its first `CREATE TABLE` fails on an object that already exists, `run
 failure and the schema is the schema builder's rather than the migration's. There is no adopt-what-you-
 find path — the file is a list of statements, not a reconciler — so the two mechanisms must not be mixed
 in one startup sequence in either order. Note also how such a failure is reported: `runMigrations` sets
-`process.exitCode` rather than throwing, so a startup chain that ignores the exit code carries on and
-synchronizes regardless.
+`process.exitCode` rather than throwing, so a startup chain that ignores the exit code carries on — and
+synchronizes regardless only where its own configuration turns synchronization on. Where it does not, the
+chain carries on against whatever schema the failed migration left.
 
 `packages/dev-server` in this repository is exactly such a synchronization-driven harness — it ships no
 core migrations of its own, and **every branch of its connection configuration except one** turns
 `synchronize` on over the `false` its own `dbConnectionOptions` declares — MariaDB, MySQL, PostgreSQL and
 native SQLite all do. The exception is `sqljs`, which sets no `synchronize` at all, so on `DB=sqljs` the
-declared `false` stands. It
-registers this plugin's migration in the one place a registration belongs, `dbConnectionOptions.migrations`,
+declared `false` stands — and that changes the outcome rather than only the setting: a migration that
+fails there leaves the schema **empty**, because nothing else provisions it, and the boot proceeds to
+serve against it, so the first request touching either table fails on a missing table rather than on the
+migration. On the other four branches the same failed migration costs nothing but a non-zero exit code.
+It registers this plugin's migration in the one place a registration belongs, `dbConnectionOptions.migrations`,
 and its start script calls `runMigrations` before `bootstrap`. **The visible consequence is worth stating
 rather than leaving to be met in a log**: on that harness's default MariaDB the boot-time `runMigrations`
 refuses the shipped PostgreSQL DDL, logs the refusal, leaves `process.exitCode` at `1` without throwing,

@@ -315,12 +315,16 @@ function expectInitToRefuse(
     const optionsBeforeTheAttempt = ReorderPlugin.options;
 
     expect(() => ReorderPlugin.init(optionsWith(key, value))).toThrowError(ReorderPluginConfigurationError);
-    // Half two, in the form a developer reading a stack trace actually has: the offending key is legible in
+    // Half two, in the form a developer reading a stack trace actually has: the offending key is legible in the
+    // message text itself, not only as structured data beside it.
     expect(() => ReorderPlugin.init(optionsWith(key, value))).toThrowError(new RegExp(key));
 
     const error = captureInitFailure(optionsWith(key, value));
 
-    // and in a stack trace's first line.
+    // The class is named three ways, because each survives a different kind of change: `instanceof` proves the
+    // prototype chain the plugin restores explicitly, `constructor.name` proves the class identity that
+    // survives minification of the message, and `name` proves the value that appears in a serialised error and
+    // in a stack trace's first line.
     expect(error.constructor.name).toBe('ReorderPluginConfigurationError');
     expect(error.name).toBe('ReorderPluginConfigurationError');
     expect(error.optionKey).toBe(key);
@@ -523,7 +527,12 @@ describe('ReorderPlugin startup option validation', () => {
     });
 
     describe('the refused value is described by kind and never by its content', () => {
+        // The message reaches the startup log, and a rejected value arrives from whatever the deployment's
         // configuration produced — so a string may be a credential or a connection URL assigned to the wrong
+        // key, may carry newlines or terminal escapes that forge surrounding log lines, and may be arbitrarily
+        // long. `reorder.plugin.ts` therefore renders the KIND of value, plus a string's length, and never the
+        // content. These cells are what stops that guarantee being lost to a later change that interpolates the
+        // value back in.
         it('reports a string by its length and withholds its content', () => {
             const withheldValue = 'AN_OPTION_VALUE_WHOSE_CONTENT_MUST_NEVER_REACH_THE_LOG';
 
@@ -709,7 +718,9 @@ describe('the specifications this package discovers', () => {
     }
 
     it('holds exactly the declared specifications, and no undeclared one', () => {
-        // {@link UNIT_SPEC_FILES} records which entry is wider than AAP section 0.5.1.7 and why.
+        // Vitest discovers specifications by PATTERN, so the inventory is only as stated as the filesystem is:
+        // an undeclared specification joins the run merely by existing, and this assertion is what makes that
+        // visible.
         const onDisk = [...specsUnder('src'), ...specsUnder('e2e')].sort();
         expect(onDisk, 'the discovered unit inventory has changed').toEqual([...UNIT_SPEC_FILES].sort());
         for (const relative of UNIT_SPEC_FILES) {
@@ -743,7 +754,8 @@ describe('the bootstrap hook', () => {
             { addTranslationFile } as unknown as I18nService,
             {
                 dbConnectionOptions: { type: engine },
-                // (`packages/core/src/config/default-config.ts` L89), which is what a server carries unless
+                // The hook reads this to check both page sizes against the limit that will actually govern
+                // them, so the double carries it.
                 apiOptions: { shopListQueryLimit },
             } as unknown as ConfigService,
         );
@@ -765,7 +777,9 @@ describe('the bootstrap hook', () => {
     });
 
     it('writes nothing to the startup log, on any engine', () => {
-        // THE ASSERTION THAT KEEPS THE HOOK IN SCOPE. Every engine is driven, because the warning that
+        // The assertion that keeps the hook in scope. Every engine is driven, because a warning emitted here
+        // would be decided by exactly this value, and `error`, `warn` and `info` are all watched so that a
+        // line cannot appear at a different level and go unnoticed.
         const error = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
         const warn = vi.spyOn(Logger, 'warn').mockImplementation(() => undefined);
         const info = vi.spyOn(Logger, 'info').mockImplementation(() => undefined);
@@ -840,7 +854,9 @@ describe('the bootstrap hook', () => {
     );
 
     it('accepts a page size exactly equal to the server limit, because the platform test is strictly greater', () => {
-        // The boundary matters in the accepting direction too: `parseTakeSkipParams` refuses `take > limit`,
+        // The boundary matters in the accepting direction too: `parseTakeSkipParams` refuses `take > limit`, so
+        // a page size OF the limit is served. Refusing it here would be stricter than the platform and would
+        // reject a configuration that works.
         const { plugin, addTranslationFile } = bootstrapSubject('postgres', 50);
 
         expect(() => plugin.onApplicationBootstrap()).not.toThrow();

@@ -4151,9 +4151,11 @@ export class ReorderListService {
             // `CHK_reorder_list_line_count_non_negative` is what makes a negative counter unrepresentable, and
             // TypeORM does not create it on MySQL or MariaDB (conflict C-E), so on those engines this predicate
             // is the only place the floor can be asserted. It costs nothing when the counter is sound and fails
-            // closed when it is not: the refusal is classified below and reaches the caller as the ordinary
-            // limit outcome, never as a quietly widened bound. The decrement carries this guard's mirror; see
-            // `releaseLineCapacity`.
+            // closed when it is not: the refusal is classified below, and a counter below zero is separated out
+            // as `'counter-invalid'` and raised as this module's own sanitised internal data failure — NOT
+            // returned as `ReorderListLimitError`, which would state a maximum this list has not been shown to
+            // have reached. A quietly widened bound is what the predicate prevents; a limit outcome is not what
+            // the refusal becomes. The decrement carries this guard's mirror; see `releaseLineCapacity`.
             .andWhere('lineCount >= 0')
             .execute();
         if (result.affected === 1) {

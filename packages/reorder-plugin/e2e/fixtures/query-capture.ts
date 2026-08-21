@@ -237,7 +237,9 @@ function stripLeadingNoise(query: string, lexicon: DialectLexicon = UNKNOWN_LEXI
         if (trimmed.indexOf('/*') === 0) {
             const blockEnd = skipBlockComment(trimmed, 0, lexicon);
             if (executableCommentBodyRuns(trimmed, 0, lexicon)) {
-                // The engine executes this body, so the statement's real leading keyword is inside it —
+                // The engine executes this body, so the statement's real leading keyword is inside it — `/*!
+                // DELETE FROM t *&#47;` is a delete, not a comment followed by nothing. Unwrapping rather than
+                // skipping is what keeps it from classifying as `other`.
                 text = executableCommentBody(trimmed, 0, blockEnd) + trimmed.slice(blockEnd);
                 continue;
             }
@@ -400,7 +402,9 @@ function findMatchingParenthesis(
             continue;
         }
         if (character === '/' && text.charAt(index + 1) === '*') {
-            // Nested where the engine nests: a PostgreSQL CTE body containing `/* a /* b *&#47; c *&#47;`
+            // Nested where the engine nests: a PostgreSQL CTE body containing `/* a /* b *&#47; c *&#47;` ends
+            // at the last delimiter, and a non-nesting scan would find the closing parenthesis in the wrong
+            // place — or not at all — and abandon the structural parse.
             index = skipBlockComment(text, index, lexicon);
             continue;
         }
@@ -509,8 +513,9 @@ function skipTrivia(text: string, fromIndex: number, lexicon: DialectLexicon = U
             continue;
         }
         if (character === '#' && lexicon.hashComments) {
-            // Trivia on MySQL and MariaDB. Without this a `#` note anywhere inside a CTE prologue —
-            // parse dead, the statement classifies `other`, and the delete disappears from writesFor().
+            // Trivia on MySQL and MariaDB. Without this a `#` note anywhere inside a CTE prologue — `WITH #
+            // note` + newline + `x AS (...) DELETE FROM reorder_list` — stops the structural parse dead, the
+            // statement classifies `other`, and the delete disappears from writesFor().
             index = skipHashComment(text, index);
             continue;
         }
@@ -579,8 +584,8 @@ export function extractStatementTables(query: string, dialect?: string): string[
             const token = tokens[index];
             if (token.kind !== 'word') {
                 // Only a *bare* word can introduce a table. A quoted token is a name or a value, never
-                // syntax, which is what stops MySQL's `SELECT "FROM" reorder_list` — a table-less select
-                // unrelated statement could then stand in for a missing plugin write.
+                // syntax, which is what stops MySQL's `SELECT "FROM" reorder_list` — a table-less select whose
+                // string literal carries the alias `reorder_list` — from being read as a `FROM` clause.
                 continue;
             }
             if (!introducesTable(tokens, index)) {
@@ -594,8 +599,9 @@ export function extractStatementTables(query: string, dialect?: string): string[
             }
         }
     } catch {
-        // test, so the statement is reported as referencing no table rather than throwing. The
-        // statement itself is still captured, and `format()` still shows its text.
+        // A parse problem must never become a query failure or a test failure in the code under test, so the
+        // statement is reported as referencing no table rather than throwing. It is still captured, and
+        // `format()` still shows its text.
         return [];
     }
     return tables;
@@ -644,10 +650,9 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
             return [];
         }
         if (token.text === 'insert' || token.text === 'replace') {
-            // `INSERT INTO t`, and the MySQL forms that put a modifier first — `INSERT IGNORE INTO t`,
-            // depth-zero `INTO`; where the dialect omits `INTO` altogether the name follows the keyword
-            // directly. `INTO` is skipped here rather than through {@link SKIPPABLE_PRE_TABLE_WORDS},
-            // other statement form is read.
+            // `INSERT INTO t`, and the MySQL forms that put a modifier first — `INSERT IGNORE INTO t`, `INSERT
+            // LOW_PRIORITY INTO t`, `REPLACE DELAYED INTO t`. The target is whatever follows the depth-zero
+            // `INTO`; where the dialect omits `INTO` altogether the name follows the keyword directly.
             const intoIndex = depthZeroWordIndex(tokens, index + 1, 'into');
             return normaliseTableNames(
                 tableTokensAfter(tokens, intoIndex === -1 ? index + 1 : intoIndex + 1),
@@ -655,8 +660,10 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
         }
         if (token.text === 'update' && !isNonTableUpdate(tokens, index)) {
             // The certifiable shape is `UPDATE <one table> [alias] SET ...`. Recognized MySQL/MariaDB write
-            // modifiers are skipped by {@link skipWriteModifiers} before the target is read. A join, a comma
-            // {@link writeTargetsFromTokens}'s own note on why refusing beats guessing here.
+            // modifiers are skipped by {@link skipWriteModifiers} before the target is read. A join, a comma or
+            // multi-target list, a missing depth-zero `SET`, or another uncertifiable structure is refused so
+            // the caller falls back to attributing every referenced table. See {@link writeTargetsFromTokens}'s
+            // own note on why refusing beats guessing here.
             const setIndex = depthZeroWordIndex(tokens, index + 1, 'set');
             const updateFrom = skipWriteModifiers(tokens, index + 1);
             if (setIndex === -1 || depthZeroWordIndexBefore(tokens, updateFrom, setIndex, 'join') !== -1) {
@@ -666,8 +673,9 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
             return updateTargets.length === 1 ? updateTargets : [];
         }
         if (token.text === 'delete') {
-            // The certifiable shape is `DELETE FROM <one table> ...`, which also covers PostgreSQL's
-            // Recognized MySQL/MariaDB modifiers before `FROM` are skipped by {@link skipWriteModifiers}.
+            // The certifiable shape is `DELETE FROM <one table> ...`, which also covers PostgreSQL's `DELETE
+            // FROM a USING b` correctly: `USING` introduces a *source*, and only `a` loses rows. Recognized
+            // MySQL/MariaDB modifiers before `FROM` are skipped by {@link skipWriteModifiers}.
             const fromIndex = depthZeroWordIndex(tokens, index + 1, 'from');
             if (
                 fromIndex === -1 ||
@@ -804,7 +812,9 @@ function tokeniseForTableScan(query: string, lexicon: DialectLexicon): ScanToken
                 // Not a comment on this engine. `/*! ... *&#47;` and MariaDB's `/*M! ... *&#47;` are
                 // *executed* by the MySQL family, so `/*! DELETE FROM reorder_list *&#47;` really does
                 // delete rows. Dropping the body would leave the statement with no tables and a kind of
+                // `other`, and a zero-write assertion would pass over a genuine delete. The body is
                 // therefore tokenised in place — recursively, so a nested quoted or dotted name inside it
+                // is read exactly as it would be outside.
                 for (const inner of tokeniseForTableScan(executableCommentBody(query, index, end), lexicon)) {
                     tokens.push(inner);
                 }
@@ -1023,7 +1033,7 @@ function tableTokensAfter(tokens: ScanToken[], index: number): string[] {
             if (token.kind !== 'word' && token.kind !== 'quoted') {
                 return found;
             }
-            // `REFERENCES catalog.schema.reorder_list` are all ordinary PostgreSQL, and stopping at the
+            // A qualified name must be consumed whole, and the **last** segment is the table.
             let table = token.text;
             cursor++;
             while (
@@ -1082,8 +1092,8 @@ export function classifyStatement(query: string, dialect?: string): CapturedStat
             case 'SELECT':
                 return extractStatementTables(query, dialect).length === 0 ? 'other' : 'select';
             case 'WITH': {
-                // A common-table-expression prologue hides the statement's real keyword behind its
-                // through. See `classifyCteStatement` for the two cheaper implementations that both
+                // A common-table-expression prologue hides the statement's real keyword behind its definitions,
+                // so the prologue is parsed definition by definition rather than searched through.
                 const cteKind = classifyCteStatement(stripLeadingNoise(query, lexicon), lexicon);
                 if (cteKind === undefined) {
                     return 'other';
@@ -1113,7 +1123,8 @@ export function classifyStatement(query: string, dialect?: string): CapturedStat
                 return 'other';
         }
     } catch {
-        // `extractStatementTables` degrades to an empty list.
+        // Classification degrades to `other` rather than throwing, for the same reason `extractStatementTables`
+        // degrades to an empty list.
         return 'other';
     }
 }
@@ -1224,8 +1235,9 @@ function extractWherePortionWithOffset(query: string, lexicon: DialectLexicon): 
             continue;
         }
         if (character === '#' && lexicon.hashComments) {
-            // Trivia on the MySQL family, so a `#` note cannot contribute a keyword to this scan and
-            // make a comment look like a terminator or a `WHERE`. On engines where `#` is an operator
+            // Trivia on the MySQL family, so a `#` note cannot contribute a keyword to this scan and make a
+            // comment look like a terminator or a `WHERE`. On engines where `#` is an operator this branch is
+            // off and the character is scanned as ordinary text, which is what it is.
             index = skipHashComment(query, index);
             continue;
         }
@@ -1261,7 +1273,9 @@ function extractWherePortionWithOffset(query: string, lexicon: DialectLexicon): 
         }
         if (character === ';' && depth === 0 && predicateStart !== -1) {
             // A statement separator ends the predicate as surely as a clause keyword does. Reading
+            // through it would leave the `;` inside the final leaf, where it defeats the anchored
             // comparison parse and costs a correctly scoped statement its certification. Whether text
+            // *follows* the separator is a separate question, refused by
             // {@link findDepthZeroStatementExpansion}.
             return buildWherePortion(query, predicateStart, index, placeholderOffset, lexicon);
         }
@@ -1337,8 +1351,9 @@ function blankComments(text: string, lexicon: DialectLexicon = UNKNOWN_LEXICON):
         if (character === '-' && text.charAt(index + 1) === '-') {
             const following = text.charAt(index + 2);
             if (following !== '' && !isWhitespace(following)) {
-                // Not trivia either: MySQL and MariaDB require whitespace after `--`, so `--1` is
-                // {@link findUncertifiableLexicalForm} can refuse it.
+                // Not trivia either: MySQL and MariaDB require whitespace after `--`, so `--1` is subtraction
+                // there and a comment elsewhere. Left in place so {@link findUncertifiableLexicalForm} can
+                // refuse it.
                 output += '--';
                 index += 2;
                 continue;
@@ -1352,9 +1367,10 @@ function blankComments(text: string, lexicon: DialectLexicon = UNKNOWN_LEXICON):
             const commentEnd = skipBlockComment(text, index, lexicon);
             const body = text.slice(index + 2, commentEnd);
             if (isExecutableBlockComment(text, index, lexicon) || body.indexOf('/*') !== -1) {
-                // Not trivia. A MySQL or MariaDB executable comment (`/*!`, `/*M!`) runs on those
-                // engines, and a nested `/*` ends the comment in different places on PostgreSQL than
-                // {@link findUncertifiableLexicalForm} see them and refuse to certify.
+                // Not trivia. A MySQL or MariaDB executable comment (`/*!`, `/*M!`) runs on those engines, and
+                // a nested `/*` ends the comment in different places on PostgreSQL than on the rest — so
+                // leaving both in place is what lets {@link findUncertifiableLexicalForm} see them and refuse
+                // to certify.
                 output += text.slice(index, commentEnd);
             } else {
                 output += ' '.repeat(commentEnd - index);
@@ -1381,7 +1397,8 @@ function buildWherePortion(
     lexicon: DialectLexicon,
 ): WherePortion {
     const slice = blankComments(query.slice(predicateStart, predicateEnd), lexicon);
-    // Where the engine reads `"..."` as a string, the region is data and is blanked with the other
+    // Where the engine reads `"..."` as a string, the region is data and is blanked with the other literals;
+    // only where it reads it as an identifier are the quotes stripped to expose a column name.
     const withoutQuotedData = lexicon.doubleQuote === 'string' ? blankDoubleQuotedStrings(slice) : slice;
     return {
         text: stripIdentifierQuotes(withoutQuotedData),
@@ -1429,7 +1446,12 @@ function containsStandaloneToken(text: string, token: string): boolean {
     return new RegExp(`(^|[^\\w.$])${escapeForRegExp(token)}($|[^\\w.$])`).test(text);
 }
 
-// beside the row's own identifier** (FEATURE-001-01 §2.6.1.1). Three shapes satisfy a text search for
+// Predicate-shape analysis. A parser rather than a text search, stated once for the three helpers below,
+// because a scoped read or a conditional write must carry the acting customer and the active channel as
+// conjuncts beside the row's own identifier (FEATURE-001-01 §2.6.1.1) — and three shapes satisfy a text search
+// for those column names while failing that outright: an `OR` chain, in which every name is present and every
+// row in the table is reachable; an `AND` chain with the values bound in the wrong order, which has the right
+// shape and scopes to the wrong tenant; and an `EXISTS` sub-query correlated to nothing outside itself.
 
 /**
  * A boolean predicate as parsed from a `WHERE` portion. `and` and `or` carry their operands; a `leaf`
@@ -1757,13 +1779,15 @@ function findUncertifiableLexicalForm(text: string, lexicon: DialectLexicon): st
         }
         if (character === '"') {
             if (lexicon.doubleQuote === 'unknown') {
-                // column at all, so the statement is not certifiable. This is the whole reason the
-                // engine is carried on a captured statement.
+                // Neither reading can be ruled out, and they differ in whether the region constrains a column
+                // at all, so the statement is not certifiable. This is the whole reason the engine is carried
+                // on a captured statement.
                 return UNCERTIFIABLE_LEXICAL_REASONS.ambiguousDoubleQuote;
             }
             if (lexicon.doubleQuote === 'string') {
-                // The engine reads this as a string literal, and a literal is never a column, so it is
-                // rather than a predicate on `customerId`, which is exactly what the engine does.
+                // The engine reads this as a string literal, and a literal is never a column, so it is skipped
+                // as data. `"customerId" = 'customerId'` is then a comparison of two constants rather than a
+                // predicate on `customerId`, which is exactly what the engine does.
                 index = skipQuotedIdentifier(text, index);
                 continue;
             }
@@ -1774,7 +1798,8 @@ function findUncertifiableLexicalForm(text: string, lexicon: DialectLexicon): st
             continue;
         }
         if (character === '`' || character === '[') {
-            // Backticks and brackets are identifier quotes on every engine that accepts them at all and
+            // Backticks and brackets are identifier quotes on every engine that accepts them at all and are
+            // never string delimiters, so they carry no ambiguity to refuse.
             index = skipQuotedIdentifier(text, index);
             continue;
         }
@@ -2165,7 +2190,8 @@ function predicateRequires(
         return node.children.length > 0;
     }
     if (node.kind === 'uncertifiable') {
-        // tell, it must not say that it does — see {@link UNCERTIFIABLE_OPERATORS}.
+        // Fails closed. The fragment may or may not require this predicate, and because the parser cannot tell
+        // it must not say that it does — see {@link UNCERTIFIABLE_OPERATORS}.
         return false;
     }
     if (node.negated) {
@@ -2178,9 +2204,12 @@ function predicateRequires(
     if (comparison.column !== requirement.column.toLowerCase()) {
         return false;
     }
-    //    and in a self-join those are the same table — see {@link LeafComparison.qualifier}.
-    //    suite asking for `customerId` *of `ReorderList`* has said the statement is qualified; a bare
-    //    `customerId` token is then not the thing it asked about.
+    // Relation agreement is required in both directions, which is what stops either half of the pair being
+    // decided by silence. A comparison that names its relation must be matched by a requirement naming the same
+    // one, or a scope proved on a joined alias would answer for the relation whose rows came back — and in a
+    // self-join those are the same table, see {@link LeafComparison.qualifier}. A requirement that names a
+    // relation must be matched by a comparison naming it too, because a bare `customerId` token is not the
+    // qualified thing the suite asked about.
     const declaredRelation =
         typeof requirement.relation === 'string' && requirement.relation.length > 0
             ? requirement.relation.toLowerCase()
@@ -2285,7 +2314,8 @@ function predicateMentionsColumn(
         return node.children.length > 0;
     }
     if (node.kind === 'uncertifiable') {
-        // Fail closed, identically to {@link predicateRequires}, and for the stronger of the two
+        // Fail closed, identically to {@link predicateRequires}, and for the stronger of the two reasons
+        // available here.
         return false;
     }
     if (node.negated) {
@@ -2374,7 +2404,8 @@ export function whereRequiresScopedPredicates(
         }
         return true;
     } catch {
-        // A malformed statement is reported as not satisfying the requirement rather than throwing, so
+        // A malformed statement is reported as not satisfying the requirement rather than throwing, so a parse
+        // problem can never be mistaken for a scoped predicate.
         return false;
     }
 }
@@ -2406,6 +2437,7 @@ const ROW_COUNT_DECOUPLING_WORDS = ['group', 'having', 'window', 'order', 'limit
 function subqueryReturnsOneRowPerMatch(subquery: string, lexicon: DialectLexicon): boolean {
     const tokens = tokeniseForTableScan(subquery, lexicon);
     // A sub-query that does not OPEN with `SELECT` is some other statement form — a `WITH` prelude, a
+    // parenthesised expression, a `VALUES` list — and is refused rather than read through.
     if (tokens.length === 0 || tokens[0].kind !== 'word' || tokens[0].text !== 'select') {
         return false;
     }
@@ -2629,8 +2661,11 @@ function isUsableOwnershipRequirement(requirement: CorrelatedOwnershipRequiremen
         ) {
             return false;
         }
-        // caller can all present a predicate with no usable value — and {@link predicateRequires} reads an
-        // ABSENT `value` as "require only that this column is compared", which for an ownership claim would
+        // The expected value is required, and re-checked here rather than left to the type, because {@link
+        // predicateRequires} reads an ABSENT `value` as "require only that this column is compared" — which for
+        // an ownership claim would certify a sub-query whose customer and channel parameters are bound the
+        // wrong way round. A suite compiled against an older shape, a fixture that never assigned the value, or
+        // a plain-JavaScript caller can all present one.
         if (!Object.prototype.hasOwnProperty.call(predicate, 'value') || predicate.value === undefined) {
             return false;
         }
@@ -2688,7 +2723,9 @@ function leafIsCorrelatedOwnership(leafText: string, context: OwnershipContext):
     }
     const subquery = trimmed.slice(openIndex + 1, closeIndex);
     // The sub-query is re-examined for the refusals the outer statement was already checked for, because a
-    // every row of the outer statement.
+    // construct that changes which rows it returns changes whether the `EXISTS` is satisfied — and a depth-zero
+    // set operator inside it does exactly that: `WHERE 1 = 0 UNION SELECT 1` is satisfied for every row of the
+    // outer statement.
     if (
         findUncertifiableLexicalForm(subquery, context.lexicon) !== undefined ||
         findDepthZeroStatementExpansion(subquery, context.lexicon) !== undefined
@@ -2705,11 +2742,15 @@ function leafIsCorrelatedOwnership(leafText: string, context: OwnershipContext):
         return false;
     }
     // Belt and braces over the same token stream the attribution scan uses: the sub-query must touch the one
+    // table and no other, anywhere in it — including inside a nested group the single-relation scan above reads
+    // past.
     const tables = extractStatementTables(subquery, context.dialect);
     if (tables.length !== 1 || tables[0] !== relation.table) {
         return false;
     }
+    // Placeholders are NOT re-normalised here. The whole outer `WHERE` portion was normalised before it was
     // split into leaves, so every `?` inside this sub-query already carries its statement-wide `$n` position;
+    // numbering it again from zero would resolve each one to the wrong parameter.
     const portion = extractWherePortionWithOffset(subquery, context.lexicon);
     if (portion === undefined) {
         return false;
@@ -2817,7 +2858,10 @@ function isCorrelationPair(
     if (typeof correlation.outerRelation === 'string' && correlation.outerRelation.length > 0) {
         return outer.qualifier === correlation.outerRelation.toLowerCase();
     }
-    // enclosing statement writes — TypeORM does one on some engines and the other on others. What it may NOT
+    // No outer relation was declared, so the reference may be written bare or qualified by the table the
+    // enclosing statement writes — TypeORM does one on some engines and the other on others. What it may NOT be
+    // is qualified by the sub-query's own relation: `ol.id = ol.reorderListId` compares one row of the
+    // sub-query's table with itself and correlates to nothing outside it.
     if (outer.qualifier === undefined) {
         return true;
     }
@@ -2852,7 +2896,8 @@ export function whereMentionsColumns(
         }
         return true;
     } catch {
-        // A malformed statement is reported as not carrying the columns rather than throwing, so a
+        // A malformed statement is reported as not carrying the columns rather than throwing, so a parse
+        // problem can never be mistaken for a satisfied predicate.
         return false;
     }
 }
@@ -2892,7 +2937,9 @@ export function statementCarriesParameterValue(
         if (isRawArray) {
             return false;
         }
-        // The SQLite family inlines a numeric value into the statement text instead of binding it,
+        // The SQLite family inlines a numeric value into the statement text instead of binding it, so the
+        // predicate must be searched too. See this function's documentation for the driver line and for why it
+        // decides the counted assertions.
         const text = (statement as CapturedStatement).query;
         if (typeof text !== 'string' || text.length === 0) {
             return false;
@@ -2994,6 +3041,7 @@ function redactQuotedLiterals(sql: string): string {
         redacted += `'<redacted:${length}>'`;
         if (!closed) {
             // An unterminated literal — a truncated statement, or one this scanner cannot read. Everything
+            // after the opening quote has already been replaced, which fails CLOSED.
             return redacted;
         }
         index = cursor;
@@ -3311,7 +3359,8 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
         ];
         const reveal = options.revealValues === true;
         for (const entry of this.capturedStatements) {
-            // REDACTED BEFORE TRUNCATED, so a literal cut in half by the budget cannot leave its opening
+            // REDACTED BEFORE TRUNCATED, so a literal cut in half by the budget cannot leave its opening quote
+            // unmatched and its contents rendered as though they were SQL.
             const rendered = reveal ? entry.query : redactQuotedLiterals(entry.query);
             const text = rendered.length > budget ? `${rendered.slice(0, budget)}...` : rendered;
             const parts = [
@@ -3322,8 +3371,9 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
                 `tables=[${entry.tables.join(', ')}]`,
             ];
             if (entry.error !== undefined) {
-                // The driver's own message, with the values THIS statement bound removed from it and
-                // {@link redactKnownValues} for why this is not the same scan the statement text gets.
+                // The driver's own message, with the values THIS statement bound removed from it and everything
+                // the driver added — the constraint name above all — left intact. See {@link redactKnownValues}
+                // for why this is not the same scan the statement text gets.
                 parts.push(
                     `error=${reveal ? entry.error : redactKnownValues(entry.error, entry.parameters)}`,
                 );
@@ -3465,7 +3515,9 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     ): CapturedStatement {
         try {
             const text = typeof query === 'string' ? query : safeStringify(query);
-            // be known for certain. It decides how `"..."` in this statement is read, so a statement
+            // The driver type is read from the runner's own connection, the only place it can be known for
+            // certain. It decides how `"..."` in this statement is read, so a statement captured without a
+            // runner is analysed under `'unknown'` and refuses those regions.
             const dialect = resolveDriverType(queryRunner);
             return {
                 query: text,
@@ -3594,8 +3646,11 @@ export function queryCaptureConfig(capture: QueryCaptureLogger): QueryCaptureCon
     };
 }
 
+// Migration state — the migration lifecycle, isolated-database and cleanup helpers the suites share.
+//
 // The engine decides which artefact a run applies: the checked-in migration where the shipped DDL matches the
 // engine, and otherwise the migration that engine's own lifecycle emits from the same entity metadata. Both
+// routes go through the platform's `generateMigration`, so neither hand-writes DDL.
 
 /**
  * @description
@@ -3718,8 +3773,13 @@ export async function attemptEveryCleanup(steps: readonly CleanupStep[]): Promis
         try {
             await step.run();
         } catch (error) {
-            // itself and therefore carries the statement and its bound parameters as enumerable properties —
-            // The label is guarded too, and that is not belt-and-braces: the natural way to make a per-item
+            // Nothing from the caught failure is carried here, only a description of it, and the step label is
+            // guarded on the same footing as the reason. The steps this releases are a query runner, a data
+            // source, a generated directory, an isolated database, mutated process state and a running server,
+            // so a failure arriving here is either a TypeORM `QueryFailedError` — which has copied the driver's
+            // own error onto itself and therefore carries the statement and its bound parameters as enumerable
+            // properties — or a filesystem error whose message is an absolute path describing the machine that
+            // ran the suite. This aggregate is thrown, printed by the runner and read in a build log.
             failures.push(`${describeTeardownStage(step.what)} — ${redactTeardownDiagnostic(error)}`);
         }
     }

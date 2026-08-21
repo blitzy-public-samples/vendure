@@ -97,10 +97,12 @@ const DECLARED_OPTION_KEYS_SORTED = [
     'maxQuantityPerLine',
 ];
 
-// The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
-// guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
-// which is a check-then-act race: this package's e2e suites start together, so when the directory is absent —
-// both observe it missing and the loser fails its `beforeAll` with `EEXIST`. The three server engines use no
+// THE SQL.JS SNAPSHOT DIRECTORY, CREATED IDEMPOTENTLY AND AT MODULE SCOPE, FOR TWO SEPARATE REASONS. The first
+// is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync` guarded by a
+// preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35), which is a
+// check-then-act race: this package's e2e suites start together, so when the directory is absent — as it is on
+// a fresh checkout, and after the operational reset a schema change requires — two of them can both observe it
+// missing and the loser fails its `beforeAll` with `EEXIST`.
 fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
 
 const harnessConfig = mergeConfig(testConfig(), {
@@ -272,7 +274,10 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
     }, TEST_SETUP_TIMEOUT_MS);
 
     afterEach(async () => {
-        // otherwise leak an unsatisfiable range into every later test in this file.
+        // EPIC-001 §11.6.1: anything a test mutated but did not create is restored in this hook rather than
+        // only in the test's own `finally`. The negative test rewrites this plugin's compatibility metadata,
+        // and a failure between the rewrite and its restore would leak an unsatisfiable range into every later
+        // test in this file.
         Reflect.defineMetadata(PLUGIN_METADATA.COMPATIBILITY, DECLARED_COMPATIBILITY_RANGE, ReorderPlugin);
 
         const { rawConnection } = server.app.get(TransactionalConnection);
@@ -315,7 +320,12 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
     });
 
     it('publishes exactly the documented surface from the package root, and nothing else', () => {
-        // its options type (erased at run time) and both entity classes — the four symbols AAP section
+        // The surface itself, read back, as an exact set rather than a subset: the plugin class, its options
+        // type (erased at run time) and both entity classes — the four symbols AAP §0.2.4.1 names — and nothing
+        // else, because anything else reachable from here would be a compatibility promise nobody asked for.
+        // `ReorderPluginConfigurationError` and `reorderPluginMigrations` are reached by deep import instead: a
+        // caller branches on the error's properties rather than the class, and a deployment registers the
+        // emitted migration by glob.
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const rootModule = require('@vendure/reorder-plugin') as Record<string, unknown>;
         expect(Object.keys(rootModule).sort()).toEqual(
@@ -408,7 +418,10 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
     it('declares a compatibility range, and declares it as a floor rather than a caret', () => {
         const declared = getCompatibility(ReorderPlugin);
 
-        // nothing fails on [packages/core/src/bootstrap.ts:L335-L338]. A suite that only compared the
+        // Asserted separately from the value below, because absence is its own failure mode: an omitted range
+        // is not a neutral choice but a silent degradation to one informational log line that nothing fails on
+        // [packages/core/src/bootstrap.ts:L335-L338]. A suite that only compared the string would report
+        // `undefined !== '>=3.3.0'` without saying why that matters.
         expect(declared).toBeDefined();
         expect(declared).toBe(DECLARED_COMPATIBILITY_RANGE);
 
@@ -431,7 +444,12 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
             expect(app.getHttpServer().listening).toBe(true);
             expect(await probeHealthEndpoint(SATISFIED_RANGE_BOOTSTRAP_PORT)).toBe(200);
         } finally {
-            // itself [packages/core/src/config/config.module.ts]; the explicit reset below is kept
+            // Closed whether or not the assertions held, so a failure here cannot leave a second server
+            // listening and break the rest of this file. Closing also resets the global configuration by itself
+            // [packages/core/src/config/config.module.ts]; the explicit reset below is kept because the
+            // negative tests never create an application and so never reach that hook. Nested, so the reset is
+            // not conditional on the close succeeding: a close that throws is the case where a stale global
+            // configuration would otherwise survive into every later test in this file.
             try {
                 await app?.close();
             } finally {
@@ -447,8 +465,11 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
         let app: BootstrappedApp | undefined;
         let caught: unknown;
         try {
-            // plugin decorator writes [packages/core/src/plugin/vendure-plugin.ts:L170] and the same one
-            // `getCompatibility` reads [packages/core/src/plugin/plugin-metadata.ts:L56-L58]. Asserting
+            // The override is written with the platform's own metadata key — the key the plugin decorator
+            // writes [packages/core/src/plugin/vendure-plugin.ts:L170] and the one `getCompatibility` reads
+            // [packages/core/src/plugin/plugin-metadata.ts:L56-L58]. Asserting the override took effect before
+            // bootstrapping is what stops a silently ineffective rewrite being reported as a passing negative
+            // test.
             Reflect.defineMetadata(
                 PLUGIN_METADATA.COMPATIBILITY,
                 UNSATISFIABLE_COMPATIBILITY_RANGE,
@@ -463,7 +484,9 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
             }
         } finally {
             Reflect.defineMetadata(PLUGIN_METADATA.COMPATIBILITY, declared, ReorderPlugin);
-            // [packages/core/src/bootstrap.ts:L194-L197], and no application shutdown hook runs to undo
+            // `app` stays undefined on the path under test; the close is the guard for the failure mode where
+            // the platform wrongly returned an application, so that even a failing run leaves no listener
+            // behind.
             try {
                 await app?.close();
             } finally {
@@ -634,20 +657,25 @@ describe('ReorderPlugin package contract', { timeout: TEST_SETUP_TIMEOUT_MS }, (
                         expect(await runner.hasTable(LIST_TABLE)).toBe(false);
                     });
 
-                    // (`packages/core/src/migrate.ts:L42`) and on this engine that connection addresses the same
+                    // TWO. Apply the migration.
                     {
                         const migrationDrivenConfig = {
                             ...harnessConfig,
                             dbConnectionOptions: {
                                 ...harnessConfig.dbConnectionOptions,
-                                // migration entry point [packages/core/src/migrate.ts:L197-L204]. So the schema
+                                // Declared, and the platform force-assigns the same value over it for every
+                                // migration entry point [packages/core/src/migrate.ts:L197-L204], so the schema
+                                // builder cannot be what creates these tables, here or anywhere.
                                 synchronize: false,
                                 migrations: [AddReorderLists1786838400000],
                             } as DataSourceOptions,
                         };
 
                         await runMigrations(migrationDrivenConfig);
+                        // `runMigrations` resets the platform's module-level configuration in its own `finally`
                         // [packages/core/src/migrate.ts:L63], and the server this test goes on to use is still
+                        // running against it. Re-establishing it is what keeps that server's request handling
+                        // reading this suite's configuration rather than the platform default.
                         await preBootstrapConfig(harnessConfig);
 
                         await withRunner(rawConnection, async runner => {

@@ -91,7 +91,12 @@ const nameAboveBound = 'a'.repeat(MAX_LIST_NAME_LENGTH + 1);
 describe('reorder list name canonicalisation', () => {
     describe('the name length bound', () => {
         it('is a fixed constant, which is also the declared width of both stored columns', () => {
-            // forces on two of the four engines under test, so an option would carry exactly one legal
+            // The only place in this specification where the number is written out; every string driven below
+            // is built from the imported constant instead, so the assertions cannot drift from the module, from
+            // the two `varchar` columns the migration creates, or from each other. The bound is a constant
+            // rather than a plugin option deliberately: it is the width the composite unique index forces on
+            // two of the four engines under test, so an option would carry exactly one legal value and offer a
+            // deployment nothing but a way to break itself.
             expect(MAX_LIST_NAME_LENGTH).toBe(191);
         });
     });
@@ -110,7 +115,11 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('treats exactly three C0 characters as whitespace — tab, line feed and carriage return', () => {
-            // that block the pipeline consumes rather than refusing. That ordering is what stops a name
+            // These three are C0 control characters as well as whitespace, and they are the only members of
+            // that block the pipeline consumes rather than refusing. That ordering is what stops a name pasted
+            // with a tab between two words being reported as carrying a control character, and it is asserted
+            // from the other direction further down, where every other C0 character — U+000B and U+000C
+            // included — is refused.
             expect(toDisplayName('Weekly\tOrder')).toBe('Weekly Order');
             expect(toDisplayName('Weekly\nOrder')).toBe('Weekly Order');
             expect(toDisplayName('Weekly\rOrder')).toBe('Weekly Order');
@@ -183,8 +192,9 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('produces one key for two names differing only in case', () => {
-            // makes it so — which is why the same two names collide identically on every engine instead of
-            // colliding on one engine's default collation and not on another's.
+            // Uniqueness is case-insensitive, and it is the canonical column rather than a collation that makes
+            // it so — which is why the same two names collide identically on every engine instead of colliding
+            // on one engine's default collation and not on another's.
             expect(toNameKey('WEEKLY')).toBe(toNameKey('weekly'));
             expect(toNameKey('Weekly')).toBe(toNameKey('weekly'));
             expect(toNameKey('WEEKLY')).toBe('weekly');
@@ -243,13 +253,17 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('is NOT idempotent in general, which the mandated step order makes unavoidable', () => {
-            // [FEATURE-001-01:section 2.11], so NFC runs on the *cased* text and the lower-casing that
+            // Stated as a fact about the contract rather than hidden behind a selective input list. The order
+            // is fixed at trim, collapse, normalise (NFC), lower-case [FEATURE-001-01:section 2.11], so NFC
+            // runs on the *cased* text and the lower-casing that follows can expose a new composition.
             const once = toNameKey('J\u030C');
             expect(once).toBe('j\u030C');
             expect(toNameKey(once)).toBe('\u01F0');
             expect(toNameKey(once)).not.toBe(once);
 
-            // Why this is a correctness statement and not a defect to fix here. The pipeline order is
+            // Why this is a correctness statement and not a defect to fix here. The pipeline order is frozen
+            // and is asserted three ways above; changing it to gain idempotence would break the
+            // accent-preserving, case-insensitive comparison the feature specifies.
             expect(canonicaliseReorderListName('J\u030C').nameKey).toBe('j\u030C');
         });
     });
@@ -346,7 +360,8 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('measures the bound in Unicode code points, as the varchar column counts them', () => {
-            // PostgreSQL and the MySQL family count a `varchar` length in characters. Measuring code units
+            // A supplementary character occupies two UTF-16 code units and one code point, and both PostgreSQL
+            // and the MySQL family count a `varchar` length in characters.
             const supplementary = '\u{1F600}';
             const supplementaryAtBound = supplementary.repeat(MAX_LIST_NAME_LENGTH);
             const supplementaryAboveBound = supplementary.repeat(MAX_LIST_NAME_LENGTH + 1);
@@ -397,7 +412,10 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('returns the same pair each time a name is submitted, because it decides nothing about uniqueness', () => {
-            // is deliberately not a service pre-check: a read followed by an insert loses a race that a
+            // Uniqueness is the named database constraint over customer, channel and canonical key, and it is
+            // deliberately not a service pre-check: a read followed by an insert loses a race that a constraint
+            // wins. This module's whole contribution is producing the key the constraint compares, so a
+            // repeated name is not its business and it neither refuses one nor varies.
             const submitted = 'Weekly grocery restock';
             const expected = { name: submitted, nameKey: 'weekly grocery restock' };
 
@@ -439,6 +457,7 @@ describe('reorder list name canonicalisation', () => {
 
         it('refuses a name carrying a C0 control character', () => {
             // The block U+0000 to U+001F, less the three members that are whitespace and are consumed by the
+            // collapse step instead — those three are the negative control asserted above.
             const controlCases: NameCase[] = [
                 { label: 'U+0000 NULL between two words', input: 'Weekly\u0000Order' },
                 { label: 'U+0001 START OF HEADING between two words', input: 'Weekly\u0001Order' },
@@ -482,6 +501,7 @@ describe('reorder list name canonicalisation', () => {
 
         it('refuses a name carrying DELETE or a C1 control character', () => {
             // U+007F and the block U+0080 to U+009F, which are control characters that no whitespace class
+            // covers.
             const highControlCases: NameCase[] = [
                 { label: 'U+007F DELETE between two words', input: 'Weekly\u007FOrder' },
                 { label: 'U+0080 PADDING CHARACTER between two words', input: 'Weekly\u0080Order' },
@@ -496,8 +516,11 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('refuses a name carrying U+200B, the one zero-width character the contract names', () => {
+            // A zero-width space is invisible, so two names differing only by one are indistinguishable to a
+            // buyer while colliding with nothing; refusing it is what keeps an invisible difference from
             // becoming two lists nobody can tell apart. Note that the neighbouring block U+2000 to U+200A is
-            // no such role, which is why it is the one the requirements name [F-101-RQ-002].
+            // whitespace and is collapsed instead, which is why this is asserted as a character rather than as
+            // a range.
             const zeroWidthCases: NameCase[] = [
                 { label: 'U+200B ZERO WIDTH SPACE between two words', input: 'Weekly\u200BOrder' },
                 { label: 'U+200B ZERO WIDTH SPACE leading', input: '\u200BWeekly Order' },
@@ -526,10 +549,12 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('accepts every other invisible or formatting character, storing it byte for byte', () => {
-            // THE BOUNDARY OF THE REFUSAL, AND IT IS DELIBERATELY NARROW. An earlier revision refused
-            // collapsed and NOTHING ELSE [AAP §0.1.2.5], that the characters it names are U+0007 and U+200B
-            // [F-101-RQ-002], and that a name is stored verbatim while the safety of its PRESENTATION is the
-            // storefront's [FEATURE-001-01:§2.10]. So each case below is accepted and stored byte for byte,
+            // THE BOUNDARY OF THE REFUSAL, AND IT IS DELIBERATELY NARROW. An earlier revision refused every
+            // character in `\p{Cc}`, `\p{Cf}` and `\p{Default_Ignorable_Code_Point}` on the grounds that an
+            // invisible character in a name a buyer reads back is a deception vector. That reached far past the
+            // contract and cost real names: `Default_Ignorable_Code_Point` covers the variation selectors, so
+            // EVERY emoji written with a presentation selector was refused — "Favourites ❤️", "Notes ✏️" — and
+            // `\p{Cf}` adds U+00AD SOFT HYPHEN, so a hyphenated paste was refused as well.
             const acceptedFormattingCases: Array<NameCase & { expected: CanonicalReorderListName }> = [
                 {
                     label: 'U+061C ARABIC LETTER MARK between two words',
@@ -581,7 +606,9 @@ describe('reorder list name canonicalisation', () => {
                     input: 'Weekly\u034FOrder',
                     expected: { name: 'Weekly\u034FOrder', nameKey: 'weekly\u034forder' },
                 },
-                // collapsed either: the whitespace class this module uses is enumerated, so a character
+                // Characters an older Unicode table called whitespace, and the Hangul fillers. They are not
+                // collapsed either: the whitespace class this module uses is enumerated, so a character outside
+                // it survives the display transform untouched.
                 {
                     label: 'U+180E MONGOLIAN VOWEL SEPARATOR between two words',
                     input: 'Weekly\u180EOrder',
@@ -697,7 +724,11 @@ describe('reorder list name canonicalisation', () => {
         });
 
         it('refuses a value that is not a string at all', () => {
-            // put an internal error and a stack trace where a validation message belongs.
+            // The published mutation's argument is a non-nullable GraphQL `String`, checked before any resolver
+            // runs, so this branch cannot be reached through the operation. It exists because the entry point
+            // is exported and its caller may not be that operation: refusing a missing value as malformed input
+            // reports the problem, whereas letting the string transforms fail on it would put an internal error
+            // and a stack trace where a validation message belongs.
             expectListNameRejection(undefined as unknown as string, 'an undefined value is refused');
             expectListNameRejection(null as unknown as string, 'a null value is refused');
             expectListNameRejection(42 as unknown as string, 'a number is refused');
