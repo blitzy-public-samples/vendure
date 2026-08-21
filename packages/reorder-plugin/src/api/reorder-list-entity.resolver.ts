@@ -37,7 +37,8 @@
  * `packages/core/src/api/config/generate-list-options.ts` L41-L48 walks every object type's fields, which is
  * why `ReorderList.lines` receives its argument without one being written). There is no `ListQueryBuilder`
  * injected here: the service owns the build, the declared total order, the APPENDED identifier tie-break and
- * the platform clamp, so a second derivation of the sort cannot drift from the first. There is no sharing:
+ * the hand-off to the platform's own limit check — which refuses an over-limit `take` rather than reducing
+ * it — so a second derivation of the sort cannot drift from the first. There is no sharing:
  * `viewerAccess` reports the truthful values while no share row can exist, and no grant roster is read,
  * declared or assumed — that is FEATURE-001-06's. And there is no availability field of this plugin's own on
  * a line: a saved list records INTENT rather than availability, so neither `deletedAt` nor `enabled` is

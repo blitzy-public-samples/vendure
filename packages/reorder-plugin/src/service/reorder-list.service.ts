@@ -217,20 +217,30 @@ export const ENGINES_SUPPORTING_PESSIMISTIC_LOCKING: readonly string[] = ['postg
  *
  * Two adds accumulate onto one line and both hold the parent shared; the line is removed beneath both; both
  * increments then address a delete-marked record, and each transaction's follow-up current read of that record
- * (see {@link ReorderListService.findLineById}, which must take a shared lock to read current under REPEATABLE
- * READ) waits on the other's record lock from its own scan. InnoDB detects the cycle and answers `Deadlock
- * found when trying to get lock` — captured on both MariaDB 11.5 and MySQL 8, on the first attempt, at the
- * increment statement.
+ * (on the add path {@link ReorderListService.findLineForVariant}, which must take a lock to read current under
+ * REPEATABLE READ) waits on the other's record lock from its own scan. InnoDB detects the cycle and answers
+ * `Deadlock found when trying to get lock` — captured on both MariaDB 11.5 and MySQL 8, on the first attempt,
+ * at the increment statement.
  *
- * **Its consequence is not a retry but an unrecoverable failure, which is why prevention is the fix.** An
- * InnoDB deadlock rolls back the WHOLE transaction, destroying every savepoint in it. Every mutation resolver
- * carries `@Transaction()`, so this service's own transaction is a nested savepoint
- * [packages/core/src/connection/transaction-wrapper.ts]; the platform then issues `ROLLBACK TO SAVEPOINT` for
- * the scope it believes is open and receives `SAVEPOINT typeorm_1 does not exist`, and that error REPLACES the
- * deadlock error on the way out. The replacement is fatal to recovery: `ER_LOCK_DEADLOCK` is retriable by the
- * platform's own wrapper and the savepoint error is not, and this service's retry loop never sees its own
- * signal either. The masking happens inside `packages/core` and cannot be corrected from here, so the cycle
- * must not be formed in the first place.
+ * **Its consequence is a failure a buyer sees, which is why prevention is the fix rather than recovery.** An
+ * InnoDB deadlock rolls back the WHOLE transaction, destroying every savepoint in it — and how that surfaces
+ * depends on the transaction mode of the resolver that called in, which differs across the six mutations:
+ *
+ * - Five of them (`createReorderList`, `updateReorderList`, `deleteReorderList`, `adjustReorderListLine`,
+ *   `removeReorderListLine`) take `@Transaction()`'s default `'auto'` mode, so this service's own
+ *   `withTransaction` is a nested savepoint [packages/core/src/connection/transaction-wrapper.ts]. There the
+ *   platform issues `ROLLBACK TO SAVEPOINT` for a scope the engine has already discarded, receives
+ *   `SAVEPOINT typeorm_1 does not exist`, and that error REPLACES the deadlock on the way out — fatal to
+ *   recovery, because `ER_LOCK_DEADLOCK` is retriable by the platform's own wrapper and the savepoint error
+ *   is not. The masking happens inside `packages/core` and cannot be corrected from here.
+ * - `addItemToReorderList` — the one path that can form the cycle above — declares `@Transaction('manual')`,
+ *   so each of its bounded attempts opens a real transaction at DEPTH ZERO and no savepoint exists to be
+ *   masked; a deadlock there would surface as itself. The measurement above was taken through the resolvers
+ *   as they then stood, in auto mode, where it was unrecoverable; manual mode removes the masking but not the
+ *   deadlock, and a deadlock reaching a buyer is still a failure this feature has no reason to accept.
+ *
+ * Either way the cycle must not be formed in the first place, which is what the exclusive parent lock on the
+ * MySQL family achieves.
  *
  * Holding the parent exclusively costs the interleaving on these two engines — two accumulations against one
  * list serialise at the parent instead of meeting at the line — and that cost is accepted deliberately: the
@@ -1089,10 +1099,12 @@ interface ReorderListOwnerScope {
 const RESOLVED_OWNER_SCOPES = new WeakMap<ReorderList, ReorderListOwnerScope>();
 
 /**
- * The window a nested page of lines resolves to, after the platform's builder has validated and clamped the
- * caller's request. Held as a value because the window has to be taken *off* the built query — a statement
- * serving every parent on a page must not carry one parent's `LIMIT` — and then applied per parent inside the
- * ranking predicate that cuts each parent's own window in the database.
+ * The window a nested page of lines resolves to, after the platform's builder has validated the caller's
+ * request — refusing a `take` above the Shop maximum, and bounding a negative one up to zero.
+ *
+ * Held as a value because the window has to be taken *off* the built query — a statement serving every parent
+ * on a page must not carry one parent's `LIMIT` — and then applied per parent inside the ranking predicate
+ * that cuts each parent's own window in the database.
  */
 interface ResolvedLinesWindow {
     take: number;
@@ -1730,8 +1742,9 @@ export class ReorderListService {
      * options input is composed *with* the scope and can only narrow the result further.
      *
      * **Bounding is delegated to the platform, not reimplemented.** The page is resolved through
-     * `ListQueryBuilder`, which clamps the requested page to the configured Shop maximum and refuses an
-     * over-limit request outright with the platform's own input error and the platform's own message key.
+     * `ListQueryBuilder`, which REFUSES a requested page size above the configured Shop maximum outright —
+     * with the platform's own input error and the platform's own message key — rather than reducing it to
+     * fit; what it does bound is a negative `take`, which it raises to zero.
      * `ignoreQueryLimits` is left unset — the option's own documentation records that an unlimited public list
      * query can become a denial-of-service vector. What this method contributes is a *stricter* fallback than
      * the platform's own: where a caller supplies no page size the plugin's configured default applies
@@ -1789,7 +1802,7 @@ export class ReorderListService {
                         sort,
                         // The plugin's stricter fallback. The platform substitutes its own Shop maximum for
                         // an absent page size, so merging the configured default here is the only place it
-                        // can be applied without reimplementing the clamp that follows it.
+                        // can be applied without reimplementing the validation that follows it.
                         take: options?.take ?? this.defaultReorderListsPageSize,
                     },
                     {
@@ -1904,10 +1917,10 @@ export class ReorderListService {
      * stated as a pair rather than as a single statement. The rows read are bounded too: the window bounds
      * each parent's contribution, and the number of parents is bounded by the outer page.
      *
-     * **Clamping and the over-limit refusal are the platform's.** The builder is asked for the caller's
-     * window first, which is what raises the platform's own input error — with the platform's own message key
-     * — when the requested page size exceeds the configured Shop maximum; the clamped values are then read
-     * back off the built query and applied per parent. Building a query issues no statement, so this costs
+     * **The over-limit refusal is the platform's.** The builder is asked for the caller's window first, which
+     * is what raises the platform's own input error — with the platform's own message key — when the
+     * requested page size exceeds the configured Shop maximum, rather than quietly reducing it; the
+     * resolved values are then read back off the built query and applied per parent. Building a query issues no statement, so this costs
      * nothing. The window is cleared from the query before either statement executes precisely because a
      * statement serving many parents must not carry one parent's `LIMIT`.
      *
@@ -4059,9 +4072,10 @@ export class ReorderListService {
      * is not possible through the ignore form, because it takes no conflict target there.
      *
      * **So the duplicate is classified from the failure instead, by its constraint name.** A violation of
-     * `UQ_reorder_list_line_list_variant` raised by this statement leaves this transaction callback, the
-     * platform's wrapper unwinds it — `ROLLBACK TO SAVEPOINT` under a resolver's own `@Transaction()`, or
-     * `ROLLBACK` when this is the outermost — and the bounded retry in
+     * `UQ_reorder_list_line_list_variant` raised by this statement leaves this transaction callback and the
+     * platform's wrapper unwinds it with a plain `ROLLBACK`: the only caller is the add path, whose resolver
+     * declares `@Transaction('manual')`, so the attempt this statement belongs to is itself the outermost
+     * transaction and there is no enclosing savepoint to roll back to. The bounded retry in
      * {@link ReorderListService.addItemToReorderList} recognises exactly that one named constraint and
      * accumulates onto the winner's row. The unwind is what makes this safe on PostgreSQL, whose aborted
      * subtransaction would otherwise refuse every later statement: nothing later is attempted inside the failed

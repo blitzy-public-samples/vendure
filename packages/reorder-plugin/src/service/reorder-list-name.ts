@@ -348,11 +348,17 @@ function isDisallowedCodePoint(codePoint: number): boolean {
  * Refuses the submitted name.
  *
  * Every one of the four rejections funnels through here, and they all raise the identical error with the
- * identical variables. That is intentional on two counts. The registered message states the whole contract
- * in one sentence, so a buyer reading it learns the rule rather than which clause of it they broke. And
- * because the three are indistinguishable to the caller, the order in which they are evaluated has no
- * observable effect — which is what allows them to be written below in the order the requirements list them
- * rather than in whichever order would be marginally cheapest to compute.
+ * identical variables. The four grounds are: a canonical form that is empty; a display name longer than
+ * {@link MAX_LIST_NAME_LENGTH}; a disallowed code point ({@link isDisallowedCodePoint}); and a derived
+ * `nameKey` that exceeds the same bound after NFC normalisation even though the display name did not —
+ * reachable because normalisation can lengthen a string, and load-bearing because `nameKey` is the column
+ * the uniqueness constraint indexes.
+ *
+ * Funnelling them is intentional on two counts. The registered message states the whole contract in one
+ * sentence, so a buyer reading it learns the rule rather than which clause of it they broke. And because
+ * all four are indistinguishable to the caller, the order in which they are evaluated has no observable
+ * effect — which is what allows them to be written below in the order the requirements list them rather
+ * than in whichever order would be marginally cheapest to compute.
  *
  * The error class is the platform's own `UserInputError`, so the caller observes exactly one entry in the
  * response's top-level `errors` array whose `extensions.code` is exactly `USER_INPUT_ERROR`, with the

@@ -158,15 +158,15 @@ export interface ReorderPluginOptions {
      * The page size the nested `ReorderList.lines` field applies where a caller supplies no `take`.
      *
      * The field returns a paginated list, so the platform's list-options generator supplies its `options`
-     * argument and the same Shop-side limit clamps it. This value is only the fallback applied when that
-     * argument carries no page size, and at 50 it is stricter than the platform's `shopListQueryLimit`
-     * default of 100, so a client that omits the argument entirely still receives a bounded page rather
-     * than every line of the list. `lineCount` remains on the parent type for a client that needs only a
-     * summary and no page of lines at all.
+     * argument and the same Shop-side limit governs it: a supplied `take` above the limit is REFUSED, not
+     * reduced to fit. This value is only the fallback applied when that argument carries no page size, and
+     * at 50 it is stricter than the platform's `shopListQueryLimit` default of 100, so a client that omits
+     * the argument entirely still receives a bounded page rather than every line of the list. `lineCount`
+     * remains on the parent type for a client that needs only a summary and no page of lines at all.
      *
      * Must be an integer, finite, at least 1, and **no greater than the running server's own
-     * `apiOptions.shopListQueryLimit`**, for the reason given on `defaultReorderListsPageSize`: the same
-     * builder clamps the nested read, and the same refusal applies above the limit.
+     * `apiOptions.shopListQueryLimit`**, for the reason given on `defaultReorderListsPageSize`: the nested
+     * read goes through the same builder, so the same refusal applies to a value above the limit.
      *
      * @default 50
      * @since 3.8.0

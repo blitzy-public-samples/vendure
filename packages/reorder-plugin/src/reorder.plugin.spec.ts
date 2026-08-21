@@ -841,7 +841,13 @@ describe('the specifications this package discovers', () => {
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════
 
 /**
- * `onApplicationBootstrap`, and the two acts it performs — no more than two.
+ * `onApplicationBootstrap`, and the three acts it performs — no more than three.
+ *
+ * The three are: re-validating every option's integer bounds against the values actually held at boot;
+ * validating both page-size defaults against the ACTIVE `apiOptions.shopListQueryLimit`, which is a check
+ * `init()` cannot make because the configuration is not readable then; and registering the message
+ * catalogue with `I18nService`. It performs no logging of its own, which is the subject of the last case
+ * below.
  *
  * WHY THE ABSENCE IS ASSERTED RATHER THAN LEFT IMPLICIT. An earlier revision emitted two advisory lines from
  * this hook: one naming the platform's published security advisories against releases below 3.7.2, and one
@@ -875,7 +881,7 @@ describe('the bootstrap hook', () => {
             { addTranslationFile } as unknown as I18nService,
             {
                 dbConnectionOptions: { type: engine },
-                // The hook reads this to check both page sizes against the limit that will actually clamp
+                // The hook reads this to check both page sizes against the limit that will actually govern
                 // them, so the double carries it. `100` is the platform's own default
                 // (`packages/core/src/config/default-config.ts` L89), which is what a server carries unless
                 // its configuration lowers it.
@@ -1028,7 +1034,7 @@ describe('the bootstrap hook', () => {
         // A limit this plugin cannot read is the platform's own configuration to answer for. Comparing
         // against it would produce a refusal naming a plugin key for somebody else's value — and worse,
         // `25 > undefined` is false while `25 > '10'` is true, so an unguarded comparison would be
-        // arbitrary rather than merely wrong. The platform clamps with whatever it holds; this hook
+        // arbitrary rather than merely wrong. The platform applies whatever it holds; this hook
         // declines to conclude anything.
         const { plugin, addTranslationFile } = bootstrapSubject('postgres', limit);
 

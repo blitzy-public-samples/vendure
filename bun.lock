@@ -529,6 +529,14 @@
         "ioredis",
       ],
     },
+    "packages/reorder-plugin": {
+      "name": "@vendure/reorder-plugin",
+      "version": "3.7.0",
+      "devDependencies": {
+        "@vendure/common": "3.7.0",
+        "@vendure/core": "3.7.0",
+      },
+    },
     "packages/telemetry-plugin": {
       "name": "@vendure/telemetry-plugin",
       "version": "3.6.4",
@@ -2650,6 +2658,8 @@
     "@vendure/job-queue-plugin": ["@vendure/job-queue-plugin@workspace:packages/job-queue-plugin"],
 
     "@vendure/ngx-translate-extract": ["@vendure/ngx-translate-extract@9.4.2", "", { "dependencies": { "@phenomnomnominal/tsquery": "^6.1.3", "braces": "^3.0.3", "colorette": "^2.0.20", "flat": "^6.0.1", "gettext-parser": "^4.2.0", "glob": "^10.4.5", "json5": "^2.2.3", "tsconfig": "^7.0.0", "yargs": "^17.7.2" }, "peerDependencies": { "@angular/compiler": ">=17.0.0", "typescript": ">=5.2.0" }, "bin": { "ngx-translate-extract": "bin/cli.js" } }, "sha512-J7ZUv2hba3TQDoQLbKCf/hU8ILD1yKc09a/WYHYtN/xNTbLYzGv1XaSFmgPCviXBBXQX5ChTU0IXRrHsZBB3qg=="],
+
+    "@vendure/reorder-plugin": ["@vendure/reorder-plugin@workspace:packages/reorder-plugin"],
 
     "@vendure/telemetry-plugin": ["@vendure/telemetry-plugin@workspace:packages/telemetry-plugin"],
 

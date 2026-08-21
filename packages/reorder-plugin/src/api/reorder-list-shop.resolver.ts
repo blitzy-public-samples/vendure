@@ -52,9 +52,10 @@
  *    success-shaped response — which is why there are four error results here and not five, and why
  *    `NegativeQuantityError` (an `OrderLine` concern that covers `quantity < 0` and is silent on zero) is
  *    not among them.
- * 3. A clamp, a sort, or a `ListQueryBuilder` injection. The platform's builder clamps the page and
- *    refuses an over-limit request with its own input error and its own message key, and the service is
- *    what hands it the caller's window together with the appended deterministic tie-break. This file
+ * 3. A page-size decision, a sort, or a `ListQueryBuilder` injection. The platform's builder REFUSES an
+ *    over-limit request with its own input error and its own message key rather than reducing it to fit,
+ *    and the service is what hands it the caller's window together with the appended deterministic
+ *    tie-break. This file
  *    supplies exactly one page-size value — the configured default, and only where the caller supplied
  *    none — and reshapes nothing else.
  * 4. A branch on `includeShared`. Both values are accepted and answered identically because no share row
@@ -341,9 +342,9 @@ export class ReorderListShopResolver {
      *
      * **The single value this method contributes is the page size where the caller omitted one.** `take` is
      * set to the configured `defaultReorderListsPageSize` only when the caller supplied no `take`; a supplied
-     * value is left exactly as it arrived, so the platform's own clamp still applies and an over-limit
-     * request is still refused by the platform — with the platform's own input error and message key —
-     * before any row is read (STORY-001-01-04 AC-3). `ignoreQueryLimits` is left unset for the same reason:
+     * value is left exactly as it arrived, so an over-limit request is still refused by the platform — with
+     * the platform's own input error and message key, rather than being reduced to fit — before any row is
+     * read (STORY-001-01-04 AC-3). `ignoreQueryLimits` is left unset for the same reason:
      * an unlimited public list query is a denial-of-service vector, and the configured default of
      * twenty-five is *stricter* than the Shop maximum the platform would otherwise substitute.
      *

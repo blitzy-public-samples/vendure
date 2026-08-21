@@ -62,11 +62,12 @@ const USER_INPUT_ERROR_CODE = 'USER_INPUT_ERROR';
 /**
  * The one message key every name rejection carries.
  *
- * All three rejection classes share it, and that is a coordination constraint rather than a style choice:
- * the plugin's translation bundle registers exactly four keys, of which this is the only one about a name,
- * and an unregistered key would surface to the caller as the raw key text (ruling R13). It reads as a
- * combined statement — a name may be neither empty nor longer than the maximum — which is why it
- * interpolates a maximum even on the rejections that are not about length.
+ * All four rejection classes share it — an empty canonical form, a display value over the bound, a
+ * disallowed code point, and a derived `nameKey` over the bound after NFC normalisation — and that is a
+ * coordination constraint rather than a style choice: the plugin's translation bundle registers exactly
+ * four keys, of which this is the only one about a name, and an unregistered key would surface to the
+ * caller as the raw key text (ruling R13). It reads as a combined statement of the whole contract, which
+ * is why it interpolates a maximum even on the rejection that is not about length.
  */
 const LIST_NAME_REJECTED_MESSAGE_KEY = 'error.reorder-list-name-empty';
 
@@ -981,15 +982,27 @@ describe('reorder list name canonicalisation', () => {
             expectListNameRejection(42 as unknown as string, 'a number is refused');
         });
 
-        it('carries the same class, code and message key across all three rejection classes', () => {
+        it('carries the same class, code and message key across all four rejection classes', () => {
             // Stated as its own assertion because it is a coordination constraint rather than an
             // implementation detail: the translation bundle registers exactly four keys, only one of which
-            // is about a name, so an emptiness rejection, a length rejection and a disallowed-character
-            // rejection have to share it. That is also why the key interpolates a maximum on all three.
+            // is about a name, so an emptiness rejection, a display-length rejection, a
+            // disallowed-character rejection and a derived-key-length rejection all have to share it. That
+            // is also why the key interpolates a maximum on all four.
+            //
+            // The fourth input is a display value AT the bound built from U+0958, a composition exclusion
+            // NFC turns into two code points, so the key derived from it is twice the bound while the
+            // display value is within it — the one ground the caller cannot see from the input's own
+            // length. The case at 'refuses a name whose canonical key would exceed the bound…' establishes
+            // that property; this one establishes that it reports through the same class, code and key as
+            // the other three.
             const oneOfEachClass: NameCase[] = [
                 { label: 'the emptiness rejection', input: '   ' },
                 { label: 'the length rejection', input: nameAboveBound },
                 { label: 'the disallowed-character rejection', input: 'Weekly\u200BOrder' },
+                {
+                    label: 'the derived-key-length rejection',
+                    input: '\u0958'.repeat(MAX_LIST_NAME_LENGTH),
+                },
             ];
 
             for (const rejectionClass of oneOfEachClass) {

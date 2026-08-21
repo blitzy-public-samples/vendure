@@ -856,8 +856,8 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      * **Why it is here and not in `init()`.** `init()` runs while a configuration is being assembled and has
      * no access to the `apiOptions` of the server that will eventually serve with it; two servers in one
      * process may even carry different limits. `ConfigService` resolves the configuration this registration
-     * was bootstrapped into, so the comparison is made against the limit that will actually clamp these
-     * reads. The integer rules stay in `init()`, where they can fail before a server is built at all.
+     * was bootstrapped into, so the comparison is made against the limit these reads will actually be
+     * measured against. The integer rules stay in `init()`, where they can fail before a server is built at all.
      *
      * **Equal to the limit is accepted**, because the builder's own test is strictly greater — a page size of
      * exactly the limit is served, and refusing it here would be stricter than the platform.
@@ -869,8 +869,8 @@ export class ReorderPlugin implements OnApplicationBootstrap {
         const shopListQueryLimit = this.configService.apiOptions.shopListQueryLimit;
         // A limit that is not a usable positive integer is the platform's own configuration to answer for,
         // not this plugin's, and comparing against it would produce a confusing refusal naming a plugin key
-        // for somebody else's value. The platform clamps with whatever it holds; this check simply declines
-        // to draw a conclusion from a value it cannot read.
+        // for somebody else's value. The platform applies whatever it holds; this check simply declines to
+        // draw a conclusion from a value it cannot read.
         if (!Number.isInteger(shopListQueryLimit) || shopListQueryLimit < MIN_OPTION_VALUE) {
             return;
         }

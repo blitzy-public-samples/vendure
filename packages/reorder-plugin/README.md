@@ -368,20 +368,31 @@ published `Permission` enum is unchanged.
 
 ## Concurrency, and one engine difference worth knowing
 
-Every mutation runs in one transaction and takes the list row before any line row, so two requests
-against one list cannot deadlock by approaching the two rows in opposite orders. A request that will
-write only a line — adding to an existing line, or adjusting one — holds the list row in **shared**
-mode, which lets two such requests proceed together and meet at the line row, where an accumulation
-is a single `quantity = quantity + n` evaluated by the engine and therefore loses no update.
+Every write takes the list row before any line row, so two requests against one list cannot deadlock
+by approaching the two rows in opposite orders. A request that will write only a line — adding to an
+existing line, or adjusting one — holds the list row in **shared** mode, which lets two such requests
+proceed together and meet at the line row, where an accumulation is a single `quantity = quantity + n`
+evaluated by the engine and therefore loses no update.
 
-**On MySQL and MariaDB that same request holds the list row exclusively instead, so two of them
+Five of the six mutations run as exactly one transaction per request. `addItemToReorderList` is the
+exception, and deliberately: it runs in _manual_ transaction mode, so **one request can execute more
+than one transaction**. Each of its bounded attempts opens a fresh transaction at the top level, runs
+to a decision, and either commits or rolls back completely before the next attempt begins — which is
+what lets an attempt that resolved a line another request then removed be redone as an insert, holding
+none of the locks the previous attempt took. The number of attempts is bounded, every attempt is
+atomic on its own, and only one of them can commit a change. There is no partial result: an attempt
+that does not commit leaves nothing behind, including the capacity it had claimed.
+
+**On MySQL and MariaDB a line-only write holds the list row exclusively instead, so two of them
 against one list serialise.** The reason is measured rather than precautionary: with the shared mode
-there, two accumulations onto one line deadlock at the line row if that line is removed beneath them,
-and because Vendure runs each service transaction as a savepoint inside the resolver's transaction, an
-InnoDB deadlock destroys that savepoint and surfaces as an unrecoverable error rather than as the
-retriable deadlock it is. Serialising the pair prevents the cycle. The effect is a small loss of
-concurrency between two line writes on the same list on those two engines, and nothing else: the
-arithmetic, the bounds and every published result are identical on all four engines.
+there, two accumulations onto one line deadlock at the line row if that line is removed beneath them.
+Serialising the pair prevents the cycle. That matters most for the five auto-mode mutations, where
+Vendure runs the service transaction as a savepoint inside the resolver's transaction and an InnoDB
+deadlock destroys the savepoint, surfacing as an unrecoverable error rather than as the retriable
+deadlock it is; on the manual-mode add path a deadlock would surface as itself, but it is still a
+failed request and is prevented for the same reason. The effect is a small loss of concurrency between
+two line writes on the same list on those two engines, and nothing else: the arithmetic, the bounds
+and every published result are identical on all four engines.
 
 ## Errors
 
@@ -449,8 +460,9 @@ purge behaviour of its own to remove them.
 
 ## Package scripts
 
-Beyond the conventional `build`, `watch`, `lint`, `test`, `e2e` and `ci`, this package declares two
-scripts that behave unlike the rest and are documented here so their exit status is not misread:
+Beyond the conventional `build`, `watch`, `lint`, `test`, `e2e`, `bench` and `ci`, this package
+declares two scripts that behave unlike the rest and are documented here so their exit status is not
+misread:
 
 | Script                            | What it asserts                                                                          |
 | --------------------------------- | ---------------------------------------------------------------------------------------- |

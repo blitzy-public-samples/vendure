@@ -177,18 +177,25 @@ const CORRELATION_ID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-
  * Splits a logged diagnostic into its prose and its correlation id.
  *
  * An assertion that a diagnostic does not ECHO some value has to be made against the prose alone. The
- * correlation id is random hexadecimal, so it contains short substrings by chance — every one of a UUID's
- * four hyphens is followed by a hex digit, which puts `-1` inside roughly a fifth of them — and asserting
- * over the whole line would then fail on the identifier rather than on an echoed value. Returning the two
- * parts separately lets the caller assert the prose carries no value AND that the identifier is present and
- * well formed, so nothing can hide in the part that was set aside.
+ * correlation id is random hexadecimal, so it contains short substrings by chance: a v4 UUID has four
+ * hyphens, and two of the digits following them are FIXED by the format — the third group always begins
+ * `4` and the fourth always begins `8`, `9`, `a` or `b` — leaving two free hex digits, so `-1` lands
+ * inside an identifier with probability `1 - (15/16)² = 31/256`, about one line in eight. (Measured over
+ * ten thousand `crypto.randomUUID()` values: 12.4%, against the 12.1% the arithmetic predicts.) Asserting
+ * over the whole line would therefore fail on the identifier rather than on an echoed value, roughly one
+ * run in eight. Returning the two parts separately lets the caller assert the prose carries no value AND
+ * that the identifier is present and well formed, so nothing can hide in the part that was set aside.
+ *
+ * The pattern uses `[\s\S]*?` rather than `.*?` with the `s` flag deliberately: the dotAll flag is
+ * ES2018, this package's `tsconfig.json` targets `es2017`, and `tsc -p tsconfig.json` rejects the flag
+ * with TS1501. The character class is the same match under the declared target.
  *
  * @returns the prose with the trailing `(correlation id …)` removed, and the identifier itself. Where the
  * line carries no correlation id the identifier is the empty string, which fails
  * {@link CORRELATION_ID_SHAPE} rather than passing silently.
  */
 function splitCorrelationId(message: string): [prose: string, correlationId: string] {
-    const match = /^(.*?)\s*\(correlation id ([^)]*)\)\s*$/s.exec(message);
+    const match = /^([\s\S]*?)\s*\(correlation id ([^)]*)\)\s*$/.exec(message);
     return match ? [match[1], match[2]] : [message, ''];
 }
 
@@ -4778,11 +4785,12 @@ describe('ReorderListService', () => {
             expect((rejection as Error).message).not.toContain(String(storedValue));
             // The diagnostic that names what happened goes to the log, with a correlation id, and it
             // carries no value either. The value assertion is made against the PROSE alone, because the
-            // correlation id is a fresh v4 UUID and every one of its four hyphens is followed by a hex
-            // digit — so a UUID contains the two characters "-1" about a fifth of the time, and asserting
-            // over the whole line would fail on the identifier rather than on an echoed value. Splitting
-            // the two apart is what makes the claim about the value rather than about luck, and the
-            // parenthetical is asserted on its own so nothing can hide inside the part that was removed.
+            // correlation id is a fresh v4 UUID: two of the four digits following its hyphens are fixed by
+            // the format and two are free, so it contains the characters "-1" with probability 31/256 —
+            // about one line in eight — and asserting over the whole line would fail on the identifier
+            // rather than on an echoed value that often. Splitting the two apart is what makes the claim
+            // about the value rather than about luck, and the parenthetical is asserted on its own so
+            // nothing can hide inside the part that was removed. See {@link splitCorrelationId}.
             expect(loggedErrors).toHaveLength(1);
             const [prose, correlation] = splitCorrelationId(loggedErrors[0].message);
             expect(correlation, 'the diagnostic must carry a correlation id').toMatch(CORRELATION_ID_SHAPE);
