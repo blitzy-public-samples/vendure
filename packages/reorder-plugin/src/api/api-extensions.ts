@@ -1,81 +1,39 @@
 import gql from 'graphql-tag';
 
-/*
- * eslint max-len is suspended for the SDL document below, and re-enabled immediately after it.
- *
- * Two of the contract's field descriptions are longer than the 170-character limit — the one
- * explaining why `productVariant` is nullable and the one explaining why a single not-found result
- * covers four distinct conditions. They are reproduced here exactly as the feature contract writes
- * them [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:L221,L255], because a description
- * string is part of the published schema: a client reads it through introspection.
- *
- * Reflowing either one into a GraphQL block string is not a way out. A block string's value is
- * computed line by line and joined with newlines, so `"""a\nb"""` is the string "a\nb" whereas
- * `"a b"` is "a b" — the published description would change, which is precisely what may not
- * happen. Shortening them would change it too. So the line length is not negotiable and the rule
- * is suspended over the one region where it conflicts with the contract, following the same
- * mechanism the platform uses where a line cannot be shortened
- * [packages/core/src/config/catalog/collection-filter.ts:L20].
- *
- * The suspension is deliberately opened before the doc block rather than between the doc block and
- * the declaration, so that nothing separates the JSDoc from the symbol it documents and the
- * `@since` tag still reaches the generated declaration file.
- */
-/* eslint-disable max-len */
+/* eslint-disable max-len -- two contract field descriptions exceed the 170-character limit and are
+ * reproduced exactly [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:L221,L255]; a description is
+ * published through introspection, and reflowing one into a block string would change its value. */
 /**
  * @description
- * The Shop API extensions published by the ReorderPlugin, and the plugin's **published contract**: every
- * other file in the plugin implements what the document below declares.
+ * The Shop API extensions published by the ReorderPlugin, and the plugin's published contract: every other
+ * file in the plugin implements what the document below declares.
  *
- * It is transcribed from the feature contract's own SDL block
+ * Transcribed from the feature contract's own SDL block
  * [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:L153-L315], which is the single authority for this
- * surface and outranks any story ticket that disagrees with it. Everything is additive: no existing Shop API
- * type, field, argument, return type or nullability is declared, altered or shadowed, no custom permission is
- * registered, and no Admin API extension is published here — the Admin API and every dashboard surface belong
- * to FEATURE-001-08. What the document declares, what it deliberately omits, and why, is stated inside it
- * beside the declarations concerned.
+ * surface. Everything is additive: no existing Shop API type, field, argument, return type or nullability is
+ * declared, altered or shadowed, no custom permission is registered, and no Admin API extension is published
+ * here. Each deliberate omission is explained beside the declaration it concerns.
  *
- * Two rules bind a CLIENT of this contract, and neither is visible in the SDL:
+ * One rule binds a client of this contract and is not visible in the SDL: **keep a `default` branch when
+ * switching on `ErrorCode`**, because that enum is generated from every type implementing `ErrorResult`
+ * [packages/core/src/api/config/generate-error-code-enum.ts:L11-L19], so the four members these error results
+ * add are a widening that later features widen further. A second rule applies only to `deleteReorderList` and
+ * is stated beside its union below, where a client meets it.
  *
- * - **`deleteReorderList` requires one of its two `message` selections to be aliased.** Its success member is
- *   the platform's own `DeletionResponse`, whose `message` is a nullable `String`
- *   [packages/core/src/api/schema/common/common-types.graphql:L64-L67], while every error result below
- *   declares `message: String!`. Selecting `message` unaliased on BOTH members under one response key is
- *   invalid: GraphQL's overlapping-fields rule compares response shapes without unwrapping nullability, and
- *   inline fragments on mutually exclusive types relax only the name-and-arguments half of that check
- *   [node_modules/graphql/validation/rules/OverlappingFieldsCanBeMergedRule.js:doTypesConflict], so the
- *   request is refused with `GRAPHQL_VALIDATION_FAILED` before any resolver runs. Alias one branch — the
- *   plugin's own shared documents alias the success one
- *   [packages/reorder-plugin/e2e/graphql/reorder-definitions.ts]. Neither nullability may be "corrected"
- *   instead: `DeletionResponse` is a published platform type reused verbatim by ruling, and `ErrorResult`
- *   fixes `message: String!` on every implementor.
- * - **Keep a `default` branch when switching on `ErrorCode`.** That enum is generated from every type
- *   implementing `ErrorResult` [packages/core/src/api/config/generate-error-code-enum.ts:L11-L19], so the four
- *   members these error results add are a widening that later features widen further.
- *
- * The `@since` value below is a **derivation, not a quotation**: it applies the contribution guide's
- * next-minor rule [CONTRIBUTING.md:§New features] to this checkout's declared version 3.7.0
- * [packages/core/package.json:L2-L3]. The guide never states `3.8.0`, so the value must not be presented as
- * quoted from it.
+ * `@since 3.8.0` is a derivation, not a quotation: it applies the contribution guide's next-minor rule
+ * [CONTRIBUTING.md:§New features] to this checkout's declared version 3.7.0
+ * [packages/core/package.json:L2-L3].
  *
  * @since 3.8.0
  */
 export const shopApiExtensions = gql`
-    # NOTHING below references a type this document does not declare, and NOTHING below
-    # declares an \`options\` argument. That is this document's CHOICE between the two routes
-    # ruling R10 permits, and not the only route that builds: the shipped exemplar declares
-    # such an input and builds [packages/dev-server/test-plugins/reviews/api/api-extensions.ts:L39-L45].
-    # The rule is narrower: the plugin's document is merged into the schema FIRST
-    # [packages/core/src/api/config/get-final-vendure-schema.ts:L99] and the list-options generator
-    # runs AFTER it [packages/core/src/api/config/get-final-vendure-schema.ts:L100], so a document
-    # may not NAME a per-row options input it does not itself declare — that is the unknown-type
-    # failure. A document MAY declare the input bare and name it as the argument, and the generator
-    # then merges its own fields into that declaration
-    # [packages/core/src/api/config/generate-list-options.ts:L83].
-    # This document needs no extra filter key, so it declares neither input and lets the generator
-    # add the argument to every field returning a PaginatedList implementor, root or nested
-    # [packages/core/src/api/config/generate-list-options.ts:L41-L48] and
-    # [packages/core/src/api/config/generate-list-options.ts:L87-L99].
+    # This document names no type it does not itself declare, and declares no \`options\` argument.
+    # The plugin's document is merged into the schema before the list-options generator runs
+    # [packages/core/src/api/config/get-final-vendure-schema.ts:L99-L100], so naming a per-row options
+    # input this document does not declare is an unknown-type build failure. Needing no extra filter
+    # key, it declares neither input and lets the generator add the argument to every field returning a
+    # PaginatedList implementor, root or nested
+    # [packages/core/src/api/config/generate-list-options.ts:L41-L48, L87-L99].
     extend type Query {
         "Lists the authenticated customer can see in the active channel. Owner-only by default."
         activeCustomerReorderLists(includeShared: Boolean = false): ReorderListList!
@@ -157,12 +115,8 @@ export const shopApiExtensions = gql`
         totalItems: Int!
     }
 
-    # NEITHER of the two per-row options inputs the generator derives from the two list types above
-    # is declared or even named here: both are generated at run time from their target types
-    # [packages/core/src/api/config/generate-list-options.ts:L31-L60]. What fails the build is naming
-    # one that this document does not declare, because the merge happens before the generator runs
-    # [packages/core/src/api/config/get-final-vendure-schema.ts:L99-L100] — declaring it bare and
-    # naming it is the other route ruling R10 permits, and is not taken here.
+    # The two per-row options inputs the generator derives from the list types above are neither
+    # declared nor named here, for the reason stated at the head of this document.
 
     enum ReorderListAccess {
         OWNED
@@ -224,19 +178,14 @@ export const shopApiExtensions = gql`
         productVariantId: ID!
         quantity: Int!
     }
-    # THIS INPUT DECLARES NO IDEMPOTENCY KEY, AND THE ABSENCE IS A RULING RATHER THAN AN OMISSION. An
-    # earlier revision declared an optional \`idempotencyKey\` here, then withdrew it, then restored it on the
-    # ground that section 2.4 had grown a store for the claim. THAT GROUND IS FALSE against section 2.4 as
-    # it stands: \`reorder_list_line\` declares exactly five members and carries no claim column, and this
-    # epic's seven-table inventory holds no row in which a claim could be recorded
-    # [tickets/EPIC-001-reorder-and-replenishment.md:§7.8 The Seven Plugin-Owned Tables]. Accepting an
-    # argument with no storage behind it advertises a replay guarantee that cannot be kept, which is worse
-    # than making no guarantee at all -- so the argument stays withdrawn rather than the columns returning.
-    # Section 2.11 states the behaviour that replaces it: two deliveries of one add ACCUMULATE, the
-    # delivery guarantee is at-least-once and is stated as such, and \`adjustReorderListLine\` is the
-    # deterministic remedy because it SETS an absolute quantity rather than adding to one. The replay claim
-    # that does exist in this epic belongs to the reorder attempt rather than to a list line
-    # [tickets/EPIC-001/FEATURE-001-07-reorder-instrumentation.md:§2.4 Named Entities Touched].
+    # This input declares three fields and no idempotency key, and the absence is a ruling rather than an
+    # omission. Nothing stores such a claim: \`reorder_list_line\` declares exactly five members and carries
+    # no claim column, and this epic's seven-table inventory holds no row one could be recorded in
+    # [tickets/EPIC-001-reorder-and-replenishment.md:§7.8 The Seven Plugin-Owned Tables]. Accepting the
+    # argument anyway would advertise a replay guarantee that cannot be kept, which is worse than making
+    # none. Section 2.11 states the behaviour instead: two deliveries of one add ACCUMULATE, the delivery
+    # guarantee is at-least-once and is stated as such, and \`adjustReorderListLine\` is the deterministic
+    # remedy because it SETS an absolute quantity rather than adding to one.
     input AdjustReorderListLineInput {
         reorderListId: ID!
         lineId: ID!

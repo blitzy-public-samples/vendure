@@ -1,61 +1,13 @@
 /**
- * A deterministic rendezvous — a *barrier* — for e2e tests that must **prove** a race rather
- * than merely provoke one, together with the two-connection transaction drivers built on it.
- *
- * 1. **The barrier is explicit, and the harness owns it.** Both participants are held past the
- *    point the race is about — after each has performed its read or precheck, and **before either
- *    writes** — then released together. The mechanism belongs to the test, not to the platform: two
- *    transactions opened on two connections, each advanced to its own pre-write point, then
- *    both instructed to write. {@link runBarrieredPair} is that mechanism — it takes a precheck and
- *    a write per participant and puts the rendezvous between them itself, rather than asking a test
- *    author to place it correctly — and {@link ConcurrencyBarrier} is the rendezvous it is built
- *    from. It then **certifies** what it claims: a pair in which either side was not held and
- *    released before writing is refused rather than returned.
- * 2. **The engine is named, and sql.js is excluded from concurrency evidence.** See
- *    "Which engines evidence a race" below, and {@link supportsForcedInterleaving}.
- * 3. **A constraint-shape / sequential assertion carries the remaining engines, and it is a
- *    different assertion** — including a duplicate written straight through the repository so
- *    that no service code can intercept it. {@link runSequentialPair} is the sequential half.
- *    Neither obligation substitutes for the other: both are required.
- *
- * A forced-barrier or forced-interleaving assertion runs on `e2e-mariadb`, `e2e-mysql` and
- * `e2e-postgres` **only**. A lost-update probe on an accumulating column, a unique-index race
- * with one winner and one violation, and a mid-transaction failure injection all belong to that
- * class. `e2e-sqljs` is excluded from all of it: sql.js is the in-process WebAssembly SQLite
- * build that `@vendure/testing` ships as an initializer (`packages/testing/src/index.ts:L12`,
- * implemented in `packages/testing/src/initializers/sqljs-initializer.ts`), so two "concurrent"
- * transactions there run in one process against one in-memory database and cannot interleave. A
- * test written as though they could would pass by serialising, which is the worst kind of green.
- *
- * The reason is in the platform's own source rather than in a preference. The shipped scheduler
- * strategy takes a pessimistic row lock only on PostgreSQL, MySQL and MariaDB
- * (`packages/core/src/plugin/default-scheduler-plugin/default-scheduler-strategy.ts:L278-L279`,
- * whose predicate {@link FORCED_INTERLEAVING_ENGINES} mirrors) and falls back to a non-locking
- * path on SQLite and sql.js, whose own comment records that the fallback works for
- * single-connection scenarios and may race with multiple connections (same file, L317-L336).
+ * A deterministic rendezvous — a *barrier* — for e2e tests that must **prove** a race rather than merely provoke
+ * one, together with the two-connection transaction drivers built on it.
  */
 import { RequestContext, TransactionalConnection } from '@vendure/core';
 import { DataSource, EntityManager, QueryRunner } from 'typeorm';
 
-import { describeTeardownStage, redactTeardownDiagnostic } from './diagnostic-redaction';
-
 /**
- * A brand marking an error THIS MODULE AUTHORED, so its own prose can be reproduced while anything
- * foreign is measured.
- *
- * ★ **WHY PROVENANCE RATHER THAN CONTENT.** This harness's diagnostics carry a rejection reason, and that
- * channel is MIXED: the reason is usually this module's own long explanation of what it refused and why —
- * the actual diagnosis, and reproducing it verbatim is the whole point — but it can also be whatever a
- * participant's `write()` rejected with, and a participant writes straight through the repository. So the
- * same field holds both the text that must survive intact and the `QueryFailedError` whose `query` and
- * `parameters` must never be printed.
- *
- * Redacting the whole channel destroys the diagnosis; reproducing the whole channel publishes the
- * statement. Neither is acceptable, and no inspection of the TEXT can tell them apart — a message that
- * looks like prose can be a driver's, and a driver code can appear in prose. What CAN tell them apart is
- * where the error came from, which is known for certain at the moment it is constructed. Hence the stamp:
- * {@link harnessError} is the only way this module makes an error, and {@link describeReason} reproduces a
- * stamped message and measures everything else.
+ * A brand marking an error THIS MODULE AUTHORED, so its own prose can be reproduced while anything foreign is
+ * measured.
  */
 const HARNESS_AUTHORED = Symbol('reorder-plugin.concurrency-barrier.harness-authored');
 
@@ -77,11 +29,6 @@ function isHarnessAuthored(value: unknown): value is Error {
 
 /**
  * Describes a rejection reason for a diagnostic: this module's own prose verbatim, anything else MEASURED.
- *
- * See {@link HARNESS_AUTHORED} for why the decision is made on provenance. The measured form names the
- * error class, the enumerated driver code and errno, how the failure classifies and which schema objects
- * its message mentioned — which is what a reader of a failed race needs — and reproduces no part of the
- * message, the statement or its bound parameters.
  */
 function describeReason(reason: unknown): string {
     return isHarnessAuthored(reason) ? reason.message : redactTeardownDiagnostic(reason);
@@ -89,31 +36,16 @@ function describeReason(reason: unknown): string {
 
 /**
  * A participant label, kept when it is safe and replaced by a DIAGNOSTIC ORDINAL when it is not.
- *
- * ★ **WHY AN ORDINAL RATHER THAN ONE SHARED CONSTANT.** A label is not only rendered — it is also the
- * IDENTITY a repeat arrival is deduplicated by and the thing that tells two participants apart. So
- * substituting the single `<unrenderable-stage-label>` that `describeTeardownStage` returns would merge two
- * distinct participants into one, take the distinct-arrival count below the release threshold, and turn a
- * leak into a hang. An ordinal is safe AND distinct, which is what this boundary actually needs.
- *
- * @param raw - The caller's label.
- * @param ordinal - The number to use if the label is refused. Callers must make it unique among the labels
- * they are resolving together.
  */
 function safeParticipantLabel(raw: string, ordinal: number): string {
     return describeTeardownStage(raw) === raw ? raw : `<participant-${String(ordinal)}>`;
 }
 
 /**
- * @description
- * The database engines whose drivers give a test two genuinely concurrent transactions, and
- * therefore the only engines on which a forced-interleaving assertion is evidence. These are the
- * three engine jobs that run a real database server the suite can open two independent
- * connections against: `e2e-mariadb`, `e2e-mysql` and `e2e-postgres`.
- *
- * The list mirrors the platform's own predicate for "supports pessimistic locking" in
- * `packages/core/src/plugin/default-scheduler-plugin/default-scheduler-strategy.ts:L278-L279`,
- * rather than being chosen here, so that the fixture and the platform cannot drift apart.
+ * @description The database engines whose drivers give a test two genuinely concurrent transactions, and therefore
+ * the only engines on which a forced-interleaving assertion is evidence. These are the three engine jobs that run a
+ * real database server the suite can open two independent connections against: `e2e-mariadb`, `e2e-mysql` and
+ * `e2e-postgres`.
  */
 export const FORCED_INTERLEAVING_ENGINES: readonly string[] = ['postgres', 'mysql', 'mariadb'];
 
@@ -127,17 +59,8 @@ export const FORCED_INTERLEAVING_ENGINES: readonly string[] = ['postgres', 'mysq
 export const SINGLE_CONNECTION_ENGINES: readonly string[] = ['sqljs', 'sqlite', 'better-sqlite3'];
 
 /**
- * @description
- * The engines on which a transaction that will write only a reorder list LINE holds the parent list row
+ * @description The engines on which a transaction that will write only a reorder list LINE holds the parent list row
  * EXCLUSIVELY rather than shared.
- *
- * Declared here beside the other engine sets so a suite asserting a lock clause and the service choosing one
- * cannot drift apart silently. The reason is measured rather than preferential: on the MySQL family two
- * transactions holding the parent shared deadlock at the line row once that row has been removed beneath
- * them, and because every mutation runs inside a nested savepoint scope, such a deadlock destroys the
- * savepoint and the platform's unwind then reports `SAVEPOINT typeorm_1 does not exist` instead of the
- * retriable deadlock. The plugin's own account of it is at
- * `ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES` in `src/service/reorder-list.service.ts`.
  */
 export const EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES: readonly string[] = ['mysql', 'mariadb'];
 
@@ -163,12 +86,8 @@ export function resolveConfiguredEngine(): string {
 }
 
 /**
- * @description
- * Whether a forced interleaving is evidence on the given engine — the guard that keeps a barrier
+ * @description Whether a forced interleaving is evidence on the given engine — the guard that keeps a barrier
  * assertion off the engines that cannot honour it.
- *
- * Pair the gated barrier case with an **ungated** sequential case, so that the sql.js job runs a
- * real assertion rather than nothing. A skipped job is not evidence; a sequential run is.
  */
 export function supportsForcedInterleaving(
     engineOrDataSource?: string | { options: { type: string } },
@@ -191,58 +110,24 @@ export function supportsForcedInterleaving(
 }
 
 /**
- * @description
- * How long a participant may wait at a rendezvous before the barrier gives up and fails with a
- * message naming who did not arrive.
- *
- * This is a **control value that bounds a wait**, not a performance target and not an expectation
- * about how quickly anything runs. It is deliberately well below the e2e runner's own per-test
- * timeout (`e2e-common/vitest.config.mts:L12` allows 15s locally, 30s in CI and 1800s under
- * `E2E_DEBUG`) for one reason: whichever limit fires first is the message the engineer reads, and
- * "participant `b` never arrived at the barrier" is a diagnosis, whereas "test timed out" is not.
+ * @description How long a participant may wait at a rendezvous before the barrier gives up and fails with a message
+ * naming who did not arrive.
  */
 export const DEFAULT_BARRIER_TIMEOUT_MS = 5000;
 
 /**
- * @description
- * How long {@link runBarrieredPair} waits for **both** participant chains to settle before declaring the
- * pair abandoned, reclaiming its connections and throwing a named diagnosis.
- *
- * ★ This is a different bound from {@link DEFAULT_BARRIER_TIMEOUT_MS} and neither replaces the other. The
- * rendezvous timeout can only reject a participant that is *waiting at the rendezvous*; one blocked on a
- * row lock it took **before** it arrived, or on a promise a fixture forgot to settle, is not waiting there,
- * so that timer never fires for it — and where both are stuck short of arrival it never even starts.
- * Without a whole-pair deadline that case surfaces as the test runner's own timeout, which names nothing
- * and reclaims nothing. Deliberately longer than the rendezvous timeout, so that the more specific
- * diagnosis is the one normally reported.
- *
- * @since 3.8.0
+ * @description How long {@link runBarrieredPair} waits for **both** participant chains to settle before declaring
+ * the pair abandoned, reclaiming its connections and throwing a named diagnosis.
  */
 export const DEFAULT_PAIR_TIMEOUT_MS = 9000;
 
 /**
- * @description
- * The budget for a single teardown action — one rollback, one release, one pool destruction.
- *
- * Abandonment is usually caused by a stalled statement, and a stalled statement is precisely what leaves
- * `rollbackTransaction()` queued behind it forever. Awaiting that without a bound moves the hang from the
- * participant into the teardown, where it is worse: the release never happens, the sibling is never
- * reclaimed, and the named diagnosis is never thrown. Every action here is therefore bounded, and an
- * action that exceeds its budget is *reported* rather than waited on.
- *
- * @since 3.8.0
+ * @description The budget for a single teardown action — one rollback, one release, one pool destruction.
  */
 export const DEFAULT_CLEANUP_ACTION_TIMEOUT_MS = 500;
 
 /**
- * @description
- * How long the pair watchdog waits for a teardown another side has already claimed.
- *
- * Bounded because the thing being waited on is: a claimed cleanup is at most a small number of bounded
- * actions, so a multiple of one action's budget covers it, and exceeding that is itself reportable rather
- * than something to sit on.
- *
- * @since 3.8.0
+ * @description How long the pair watchdog waits for a teardown another side has already claimed.
  */
 export const CLAIMED_CLEANUP_WAIT_MS = 4 * DEFAULT_CLEANUP_ACTION_TIMEOUT_MS;
 
@@ -258,11 +143,9 @@ export const DEFAULT_PAIR_BUDGET_MS = DEFAULT_PAIR_TIMEOUT_MS + 4 * DEFAULT_CLEA
 
 export interface ConcurrencyBarrierOptions {
     /**
-     * How long a participant may wait at the rendezvous before the harness fails loudly. A
-     * control value bounding a wait, not a performance expectation. Must be a finite number
-     * greater than zero; there is deliberately no way to disable it, because an unbounded wait is
-     * the silent hang this fixture exists to prevent. Defaults to
-     * {@link DEFAULT_BARRIER_TIMEOUT_MS}.
+     * How long a participant may wait at the rendezvous before the harness fails loudly. A control value bounding a
+     * wait, not a performance expectation. Must be a finite number greater than zero; there is deliberately no way
+     * to disable it, because an unbounded wait is the silent hang this fixture exists to prevent.
      */
     timeoutMs?: number;
     /**
@@ -288,13 +171,9 @@ interface BarrierWaiter {
 }
 
 /**
- * @description
- * A rendezvous that holds every participant until all of them have arrived, then releases them
- * together. This is the primitive the whole module is built on, and it is exported because it is
- * useful on its own — see the request-level example below, and read the limitation stated with it.
- *
- * The barrier never hangs. If the timeout elapses before release, every waiter is rejected with a
- * message naming who arrived and who did not — see {@link ConcurrencyBarrierOptions.timeoutMs}.
+ * @description A rendezvous that holds every participant until all of them have arrived, then releases them
+ * together. This is the primitive the whole module is built on, and it is exported because it is useful on its own —
+ * see the request-level example below, and read the limitation stated with it.
  */
 export class ConcurrencyBarrier {
     private readonly timeoutMs: number;
@@ -303,22 +182,10 @@ export class ConcurrencyBarrier {
     private readonly labels: string[] = [];
     /**
      * Every caller label this barrier has seen, mapped to the label it renders and deduplicates by.
-     *
-     * ★ THE MAP, RATHER THAN NORMALISING AT EACH USE, IS WHAT KEEPS THE IDENTITY STABLE. `arrive()` may be
-     * called repeatedly with the same label and must count it once; the same raw label therefore has to
-     * resolve to the same safe label every time, and two DIFFERENT refused labels have to resolve to two
-     * different safe ones or the release threshold is never reached. A map keyed by the raw label delivers
-     * both, and it is per-instance because the ordinals it hands out are only meaningful within one
-     * rendezvous.
      */
     private readonly safeLabels = new Map<string, string>();
     /**
      * The inverse of {@link ConcurrencyBarrier.safeLabels}: which raw label owns each rendered one.
-     *
-     * Kept alongside rather than derived, because the question asked of it is "is this candidate already
-     * SOMEBODY ELSE'S identity", which a forward map answers only by scanning its values — and getting that
-     * question slightly wrong is what let two participants share one identity and hang the rendezvous. See
-     * {@link ConcurrencyBarrier.safeLabel}.
      */
     private readonly renderedOwners = new Map<string, string>();
     private readonly waiters: BarrierWaiter[] = [];
@@ -347,42 +214,25 @@ export class ConcurrencyBarrier {
         }
         this.timeoutMs = timeoutMs;
         this.autoRelease = options.autoRelease !== false;
-        // ★ NORMALISED AT INTAKE, like every other label this class holds. `expectedLabels` is rendered
         // by `describeTimeout()` — the diagnostic a hung rendezvous produces, and therefore the one most
-        // likely to be read in a build log — so a caller who names its expected participants after the
-        // rows they act on would publish them from there.
         this.expectedLabels = (options.expectedLabels === undefined ? [] : options.expectedLabels).map(
             label => this.safeLabel(label),
         );
     }
 
     /**
-     * @description
-     * Registers this participant's arrival and returns a promise that resolves **only** once the
-     * barrier is released. With `autoRelease` (the default) the barrier releases itself the moment
-     * the number of distinct arrived labels reaches the participant count.
-     *
-     * Calling it more than once with the same label is safe: the label counts once towards the
-     * release threshold, and every returned promise resolves on release. Calling it after the
-     * barrier has already been released resolves immediately, and calling it after
-     * {@link ConcurrencyBarrier.dispose} or after a timeout rejects with a message that says so
-     * rather than waiting for a limit that will never come.
+     * @description Registers this participant's arrival and returns a promise that resolves **only** once the
+     * barrier is released. With `autoRelease` (the default) the barrier releases itself the moment the number of
+     * distinct arrived labels reaches the participant count.
      */
     arrive(rawLabel: string): Promise<void> {
-        // ★ THE FIRST THING DONE WITH A CALLER'S LABEL, BEFORE IT IS STORED OR RENDERED ANYWHERE. This is
         // the EXPORTED primitive: `runBarrieredPair` and `runSequentialPair` resolve their labels before
-        // they get here, but a suite may drive this class directly, and then this method is the only
         // boundary a label crosses. Normalising here rather than at each render site covers the late-arrival
-        // rejection below, `describeTimeout()`, `arrivedLabels`, and any site added later.
         const label = this.safeLabel(rawLabel);
         if (this.failure) {
             return Promise.reject(
                 harnessError(
                     `Participant '${label}' arrived at a concurrency barrier that is no longer ` +
-                        // The stored failure is ALWAYS harness-authored — `dispose()` converts a foreign
-                        // reason before storing it — so `describeReason` reproduces this module's own
-                        // explanation and would measure anything else. Replaying `.message` unconditionally,
-                        // which this did, is what published a caller's driver error from here.
                         `usable. The barrier failed earlier with: ${describeReason(this.failure)}`,
                 ),
             );
@@ -394,10 +244,8 @@ export class ConcurrencyBarrier {
             return Promise.resolve();
         }
         // The timer starts on the first arrival rather than at construction, so a barrier that is
-        // built and never used holds no timer and cannot keep the process alive.
         this.startTimer();
         const waited = new Promise<void>((resolve, reject) => {
-            // Registered synchronously, so it is already in place if the auto-release below fires.
             this.waiters.push({ label, resolve, reject });
         });
         if (this.autoRelease && this.labels.length >= this.participantCount) {
@@ -464,14 +312,10 @@ export class ConcurrencyBarrier {
         }
         if (this.hasReleased) {
             // A released barrier has nobody left to reject, so the only thing left to do is make
-            // sure no timer outlives the test. Recording a failure here would be worse than
-            // useless: arrive() consults `failure` before `hasReleased`, so a later arrival would
             // reject even though this rendezvous completed successfully — and the tidy-up call the
-            // drivers in this module make when they finish would be the thing that poisoned it.
             this.clearTimer();
             return;
         }
-        // Converted BEFORE it is stored and before any waiter is rejected with it, so nothing downstream
         // holds a foreign error: see {@link asHarnessFailure}.
         this.failure = asHarnessFailure(
             reason,
@@ -486,22 +330,6 @@ export class ConcurrencyBarrier {
 
     /**
      * Resolves a caller's label to the one this barrier stores, renders and deduplicates by.
-     *
-     * Two properties, and BOTH are required for correctness rather than for tidiness. Stable per raw label,
-     * so arriving twice with one label still counts once. And INJECTIVE across raw labels, so two distinct
-     * participants can never resolve to one identity — because that identity is what the release threshold
-     * counts, and merging two participants holds the count below it and hangs the rendezvous. A guard that
-     * turns a disclosure into a deadlock is not an improvement.
-     *
-     * ★ **OWNERSHIP IS CHECKED FOR EVERY LABEL, NOT ONLY FOR A REFUSED ONE.** An earlier revision checked
-     * for a collision only while the candidate differed from the raw label — that is, only on the refused
-     * path — on the assumption that an accepted label is its own identity and cannot clash. It can. If a
-     * refused label arrives first it is rendered `<participant-1>`, and a later caller whose label is
-     * literally `<participant-1>` passes the character allowlist, is accepted unchanged, and lands on an
-     * identity the first raw label already owns. Both then deduplicate to one arrival and a two-party
-     * barrier times out. So the reverse map below is consulted for every candidate whatever its provenance,
-     * and any candidate already owned by a DIFFERENT raw label is ordinalised — including one that arrived
-     * safe.
      */
     private safeLabel(rawLabel: string): string {
         const known = this.safeLabels.get(rawLabel);
@@ -510,7 +338,6 @@ export class ConcurrencyBarrier {
         }
         let ordinal = this.safeLabels.size + 1;
         let safe = safeParticipantLabel(rawLabel, ordinal);
-        // Terminates: each turn tries a fresh ordinal and only finitely many are owned.
         while (this.renderedOwners.has(safe) && this.renderedOwners.get(safe) !== rawLabel) {
             ordinal += 1;
             safe = `<participant-${String(ordinal)}>`;
@@ -625,31 +452,17 @@ export interface TransactionBinder {
     bind(ctx: RequestContext, manager: EntityManager): RequestContext;
     /**
      * The entity manager a context is bound to, or `undefined` for a context carrying no transaction.
-     *
-     * Exported so a suite can assert the binding rather than trust it: a write phase that silently lost
-     * its binding would run the operation under test on a connection of the platform's choosing, and the
-     * run would report a clean serialisation while evidencing nothing.
      */
     managerOf(ctx: RequestContext): EntityManager | undefined;
 }
 
 /**
- * @description
- * Returns the given context as the **Shop API** context the operation under test is only ever reached
+ * @description Returns the given context as the **Shop API** context the operation under test is only ever reached
  * through, leaving the original untouched.
- *
- * That difference is not cosmetic. It decides which branch of any api-type-sensitive code a race exercises, so
- * a regression that skipped a lock, an atomic accumulation or a limit check *only* on the Shop API would leave
- * every forced ordering green: the races would be proving the `custom` branch, and the sequential HTTP tests
- * that do go through the Shop API cannot force an interleaving. The whole point of driving these races at the
- * service seam is to exercise the path a buyer reaches, and an api type no buyer's request produces defeats
- * it as surely as the wrong permission set would.
  */
 export function asShopApiContext(ctx: RequestContext): RequestContext {
     const before = ctx.apiType;
     // `copy()` is the platform's own shallow copy, which is what the transaction binder also builds on, so the
-    // private field carrying the api type is an own property of the copy and reassigning it cannot reach the
-    // original. The cast is confined to this one line.
     const shopCtx = ctx.copy();
     (shopCtx as unknown as { _apiType: RequestContext['apiType'] })._apiType = 'shop';
     if (shopCtx.apiType !== 'shop') {
@@ -671,16 +484,8 @@ export function asShopApiContext(ctx: RequestContext): RequestContext {
 }
 
 /**
- * @description
- * Builds a {@link TransactionBinder} for the **running** server, and proves it works before returning it.
- *
- * A race claim is about the implementation only if the rendezvous sits inside the operation under test.
- * Without binding, a write phase can only issue statements itself — measuring a statement a test author
- * wrote rather than the one the service issues — or call the published operation over HTTP, which opens a
- * transaction of the server's own choosing on a connection this module has never touched. Two such calls
- * can be serialised end to end by the server, and then a count-then-insert with no lock, a
- * read-compute-save accumulation, or a write reported as applied over a row it never matched all pass,
- * because the two writes never overlapped in the first place.
+ * @description Builds a {@link TransactionBinder} for the **running** server, and proves it works before returning
+ * it.
  */
 export async function createTransactionBinder(
     connection: TransactionalConnection,
@@ -742,7 +547,6 @@ async function assertBindingIsHonoured(
     const runner = connection.rawConnection.createQueryRunner();
     try {
         // CONNECTED AND OPENED INSIDE the protected region. A `startTransaction` that throws after `connect`
-        // succeeded would otherwise leave a connected runner with no `finally` to reclaim it, and this helper
         // runs once per suite that uses the barrier — so the leak would be permanent for that run.
         await runner.connect();
         await runner.startTransaction();
@@ -760,8 +564,6 @@ async function assertBindingIsHonoured(
             );
         }
     } finally {
-        // NESTED, so the release is not conditional on the rollback succeeding. A rollback can fail on a
-        // connection the server has already closed, and that is exactly the moment the runner most needs
         // reclaiming: a leaked one holds a pool slot for the rest of the suite.
         try {
             if (runner.isTransactionActive) {
@@ -784,16 +586,7 @@ async function assertBindingIsHonoured(
 export type BarrierPrecheck<P> = (ctx: BarrierParticipantContext) => Promise<P>;
 
 /**
- * @description
- * The write, run **only after both participants are held at the rendezvous and released together**.
- *
- * The split into two phases is not a stylistic preference and it is not the caller's to observe: the
- * driver runs both prechecks, holds both participants itself, releases them, and only then invokes
- * either write. Handing the body a single function plus an `arrive()` it was expected to await between its
- * read and its write could not certify what it claimed — a body that called `arrive()` without awaiting it,
- * or that returned by a path which skipped it, could write and commit while its sibling was still short of
- * the pre-write point, and the run would still look like a proven one-winner race. Ordering the phases here
- * removes the possibility rather than documenting the obligation.
+ * @description The write, run **only after both participants are held at the rendezvous and released together**.
  */
 export type BarrierWrite<P, T> = (ctx: BarrierWriteContext<P>) => Promise<T>;
 
@@ -816,22 +609,14 @@ export type BarrierIsolationLevel =
 export interface BarrierOutcomeBase {
     label: string;
     /**
-     * Whether this participant **registered** at the rendezvous — recorded the moment it does so,
-     * before the release is awaited. That timing is deliberate, and it is what makes the field a
-     * diagnosis rather than a restatement of the outcome: a participant held at the barrier and then
-     * rejected by a timeout or by its sibling's disposal provably reached the pre-write window, and
-     * reporting it as `false` would point the reader at the wrong participant.
+     * Whether this participant **registered** at the rendezvous — recorded the moment it does so, before the release
+     * is awaited.
      */
     arrived: boolean;
     /**
-     * Whether this participant was **released from the rendezvous before its write phase began** —
-     * the property a race claim actually rests on, and the one {@link runBarrieredPair} certifies for
-     * both participants before it returns anything.
-     *
-     * It can only be `true` because the driver itself awaited the release between the two phases, so
-     * no caller can weaken it: there is no `arrive()` to forget to await. It is `false` where the
-     * participant never registered, and where it registered but the rendezvous was abandoned or timed
-     * out instead of releasing — in which case its write never ran at all.
+     * Whether this participant was **released from the rendezvous before its write phase began** — the property a
+     * race claim actually rests on, and the one {@link runBarrieredPair} certifies for both participants before it
+     * returns anything.
      */
     releasedBeforeWrite: boolean;
     /**
@@ -867,11 +652,7 @@ export interface BarrierResult<A, B> {
      */
     winner: BarrierOutcome<A | B> | undefined;
     /**
-     * The single rejected outcome under the same one-fulfilled/one-rejected condition; otherwise
-     * `undefined`. Asserting on this is not optional for a race claim: the final stored state and
-     * **the result the losing caller received** are two different assertions, because an
-     * implementation that reports success for a write which affected nothing passes a count-only
-     * assertion.
+     * The single rejected outcome under the same one-fulfilled/one-rejected condition; otherwise `undefined`.
      */
     loser: BarrierOutcome<A | B> | undefined;
     /**
@@ -880,7 +661,6 @@ export interface BarrierResult<A, B> {
      * an accumulation ends with two successful callers and one row.
      */
     fulfilled: Array<BarrierOutcome<A | B>>;
-    /** Every rejected outcome, always populated. */
     rejected: Array<BarrierOutcome<A | B>>;
 }
 
@@ -902,7 +682,6 @@ export type BarrierParticipantSpec<T, P = undefined> = BarrierParticipantPhases<
  * participant that declares no precheck — and `undefined` is then precisely what its write receives.
  */
 export interface BarrierParticipantPhases<T, P> {
-    /** A name for this participant. Must differ from its sibling's. */
     label?: string;
     /**
      * The read or precheck the race is about, run before the rendezvous. Omit it where the race has no
@@ -927,7 +706,6 @@ export interface BarrierParticipantPhases<T, P> {
 export type BarrierPrecheckRequirement<P> = undefined extends P
     ? unknown
     : {
-          /** Required, because this participant's write has been promised a precheck result. */
           precheck: BarrierPrecheck<P>;
       };
 
@@ -945,11 +723,9 @@ export interface BarrierParticipants<A, B, PA = undefined, PB = undefined> {
 
 export interface RunBarrieredPairOptions {
     /**
-     * The isolation level to open **both** transactions at. Chosen by the caller and never
-     * defaulted here: MySQL and MariaDB default to `REPEATABLE READ` while PostgreSQL defaults to
-     * `READ COMMITTED`, and the observable outcome of a lost-update probe can differ between them,
-     * so a suite that cares must say which level it asked for. Omit it to accept each engine's own
-     * default — which is a legitimate choice, and is then the thing the test is asserting against.
+     * The isolation level to open **both** transactions at. Chosen by the caller and never defaulted here: MySQL and
+     * MariaDB default to `REPEATABLE READ` while PostgreSQL defaults to `READ COMMITTED`, and the observable outcome
+     * of a lost-update probe can differ between them, so a suite that cares must say which level it asked for.
      */
     isolationLevel?: BarrierIsolationLevel;
     /**
@@ -978,15 +754,10 @@ export interface RunSequentialPairOptions {
 }
 
 /**
- * @description
- * Runs two participants on **two independent connections**, each in its own transaction, each
- * advanced through its own precheck, then held at a rendezvous and released together before either
- * writes. This is the canonical way to evidence a race in this package, and the only one of the two
- * drivers here that evidences an interleaving.
- *
- * Gate it with {@link supportsForcedInterleaving}: it is evidence on `e2e-mariadb`, `e2e-mysql`
- * and `e2e-postgres` only, and {@link runSequentialPair} carries the same contract on the rest.
- * Nothing here weakens the migration and constraint obligations, which stay on all four engines.
+ * @description Runs two participants on **two independent connections**, each in its own transaction, each advanced
+ * through its own precheck, then held at a rendezvous and released together before either writes. This is the
+ * canonical way to evidence a race in this package, and the only one of the two drivers here that evidences an
+ * interleaving.
  */
 export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     dataSource: DataSource,
@@ -999,13 +770,9 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
         expectedLabels: labels,
     });
     const commitOnSuccess = options.commitOnSuccess !== false;
-    // Validated before a single connection is taken, deliberately. A bad deadline discovered after the
-    // runners exist would have to unwind them, and the failure a caller sees should be about their
-    // configuration rather than about cleanup.
     const pairTimeoutMs = resolvePairTimeout(options.pairTimeoutMs);
     const state: ChainState = { settled: 0, teardownErrors: [] };
     const token: CancellationToken = { cancelled: false, listeners: [] };
-    // One claim per runner, so a chain's own teardown and the watchdog's reclaim can never both run.
     const claims: CleanupClaim[] = [
         {
             claimed: false,
@@ -1026,8 +793,6 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     ];
     const runners = await createDistinctRunners(dataSource);
 
-    // ★★ Both chains are started here, back to back, with no `await` between them, and each one
-    // commits as soon as its own write returns. Do NOT "simplify" this into awaiting both writes
     // and committing afterwards: on MySQL, MariaDB and PostgreSQL the second writer blocks on the
     // first writer's row lock until that transaction commits, so a harness that holds both
     // commits back deadlocks — and the symptom is an opaque test timeout, not a harness error.
@@ -1056,24 +821,13 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
         claims[1],
     );
 
-    // Settle-collection is done by hand rather than with `Promise.all` (which short-circuits on
-    // the first rejection and would abandon the other runner) or `Promise.allSettled` (which is
-    // outside the es2015 lib surface this project type-checks e2e code against). Neither chain
-    // ever rejects: each maps its own failure into a rejected outcome, so tracking them individually
-    // collects both regardless of which finished first — and, unlike awaiting them in sequence, it
-    // records *which* one is still running when the deadline arrives.
     const tracked = [trackChain(chainA, labels[0]), trackChain(chainB, labels[1])];
     const abandoned = await raceAgainstDeadline(tracked, pairTimeoutMs);
 
     if (abandoned) {
-        // ★ The pair is over, and the three things that must happen now are independent of each other.
-        //
-        // First every participant waiting on something this harness cannot reach is told to give up. Then
         // the rendezvous is disposed, so a participant still waiting there fails immediately instead of
-        // running out its own timer. Then every unsettled participant's connection is reclaimed *from
         // here*, because its chain is blocked and will never reach its own `finally` — and a released
         // connection is also what unblocks a body stuck inside the driver, which is the only cancellation
-        // mechanism TypeORM offers portably. Because that reclaim takes each runner's cleanup claim, it
         // cannot tear down concurrently with a chain that did reach its own teardown.
         cancelToken(token, state);
         barrier.dispose(
@@ -1086,7 +840,6 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
         throw harnessError(buildAbandonedPairMessage(tracked, pairTimeoutMs, state, barrier));
     }
 
-    // Nothing is waiting by now; this exists to guarantee the timeout cannot outlive the test. On a
     // barrier that released normally this only clears the timer, so it cannot invalidate a
     // rendezvous a caller still holds — see ConcurrencyBarrier.dispose.
     barrier.dispose(harnessError('The barriered pair has finished; its rendezvous is no longer in use.'));
@@ -1097,28 +850,17 @@ export async function runBarrieredPair<A, B, PA = undefined, PB = undefined>(
     );
     // `true`: this driver's whole claim is the interleaving, so a run in which either participant was
     // not held at the rendezvous and released from it before writing is refused rather than returned.
-    // The chains already refuse to *commit* such a participant; this refuses to hand the caller a
-    // *result* built from a pair that was never inside the window together, however that came about.
     assertHarnessIntegrity(state, result, true);
     // A completed run whose teardown reported anything is not usable as evidence: a leaked connection or
-    // an unclosed level is a failure at the point it happened rather than an unexplained hang two tests
-    // later.
     assertNoTeardownFailure(state, result);
     return result;
 }
 
 /**
- * @description
- * Runs the **same two participant specs** one after the other — `a`'s precheck and write to
- * completion, its transaction committed or rolled back and its connection released, and only then `b` —
- * returning the **same result shape** as {@link runBarrieredPair}, so a suite can share its
- * participants between the barrier case and the sequential case instead of writing them twice.
- *
- * **What this evidences:** single-connection correctness, replay idempotency, accumulation
- * arithmetic, and constraint shape — including a duplicate written straight through the repository
- * so that no service pre-check can intercept it. That is a real assertion about the same contract,
- * and it is what keeps the sql.js job meaningful rather than skipped: a skipped job is not
- * evidence, whereas a sequential run is.
+ * @description Runs the **same two participant specs** one after the other — `a`'s precheck and write to completion,
+ * its transaction committed or rolled back and its connection released, and only then `b` — returning the **same
+ * result shape** as {@link runBarrieredPair}, so a suite can share its participants between the barrier case and the
+ * sequential case instead of writing them twice.
  */
 export async function runSequentialPair<A, B, PA = undefined, PB = undefined>(
     dataSource: DataSource,
@@ -1128,16 +870,11 @@ export async function runSequentialPair<A, B, PA = undefined, PB = undefined>(
     const labels = resolveDistinctLabels(participants);
     const commitOnSuccess = options.commitOnSuccess !== false;
     const state: ChainState = { settled: 0, teardownErrors: [] };
-    // Never cancelled in this mode: there is no whole-pair watchdog because there is no pair running
     // concurrently to abandon. The token exists so that a phase written for either driver can consult
-    // `ctx.cancelled()` unconditionally rather than guarding on which one is running it.
     const token: CancellationToken = { cancelled: false, listeners: [] };
 
     // No barrier is created at all in this mode, so there is no timer to clear because there was
-    // never anything to wait for. Each runner is created immediately before its own chain rather
     // than both up front, so that on an engine whose driver caches one runner the second participant
-    // legitimately reuses it once the first has finished with it and returned it to its baseline —
-    // which is exactly what "one after the other" means here.
     const outcomeA = await runParticipantChain(
         dataSource.createQueryRunner(),
         labels[0],
@@ -1163,7 +900,6 @@ export async function runSequentialPair<A, B, PA = undefined, PB = undefined>(
 
     const result = assembleBarrierResult(outcomeA, outcomeB);
     // `false`: there is no rendezvous in this mode, so being held at one is not a precondition of
-    // anything and both participants running unheld is exactly what was asked for. Teardown failures
     // are still reported, because a leaked connection is a leaked connection in either mode.
     assertHarnessIntegrity(state, result, false);
     return result;
@@ -1213,8 +949,6 @@ function trackChain<T>(chain: Promise<BarrierOutcome<T>>, label: string): Tracke
             mutable.outcome = outcome as BarrierOutcome<unknown>;
         },
         reason => {
-            // Defensive: a chain is written never to reject, so reaching here means the harness itself
-            // is broken. Recording it as a rejected outcome keeps the pair reportable either way.
             mutable.settled = true;
             mutable.outcome = {
                 label,
@@ -1268,15 +1002,8 @@ function resolvePairTimeout(pairTimeoutMs: number | undefined): number {
 }
 
 /**
- * Settles `action` within `budgetMs`, returning what happened rather than throwing: `'settled'`,
- * `'failed'` with the reason, or `'unsettled'` when the budget ran out.
- *
- * ★ The unsettled case is the one that matters and is not hypothetical. Abandonment is usually caused by
- * a stalled statement, and a stalled statement is precisely what leaves `rollbackTransaction()` queued
- * behind it forever. Awaiting that without a bound moves the hang from the participant into the
- * watchdog's own teardown, where it is worse: the release never happens, the sibling is never reclaimed,
- * and the named diagnosis is never thrown. Abandoning the *attempt* keeps teardown moving; the abandoned
- * promise is left to settle or not on its own, and is reported as unsettled either way.
+ * Settles `action` within `budgetMs`, returning what happened rather than throwing: `'settled'`, `'failed'` with the
+ * reason, or `'unsettled'` when the budget ran out.
  */
 async function attemptWithinBudget(
     action: () => Promise<unknown>,
@@ -1293,7 +1020,6 @@ async function attemptWithinBudget(
             (reason: unknown) => ({ outcome: 'failed' as const, reason }),
         );
     } catch (reason) {
-        // A synchronous throw from the action itself, which a driver double can produce.
         if (timer !== undefined) {
             clearTimeout(timer);
         }
@@ -1325,13 +1051,6 @@ function readRunnerFlag(read: () => boolean, fallback: boolean): boolean {
 
 /**
  * Single-owner token deciding which side performs one runner's teardown.
- *
- * ★ Two sides can want to tear the same runner down at the same moment: the participant's own chain, in
- * its `catch`/`finally`, and the pair watchdog, once the deadline has abandoned the pair. Letting both
- * proceed means two concurrent `rollbackTransaction()` or `release()` calls on one connection, whose
- * outcome is driver-specific and includes releasing a connection out from under an in-flight rollback —
- * which is precisely the pool contamination this file goes to some length to avoid. So the teardown has
- * exactly one owner: whoever claims first does it, and the other side does nothing at all.
  */
 interface CleanupClaim {
     claimed: boolean;
@@ -1352,20 +1071,9 @@ interface CleanupClaim {
      * `release()` hands the connection back without ending anything open on it.
      */
     ownsRunner: boolean;
-    /**
-     * Whether the chain got as far as `connect()`, so a watchdog can tell a runner that is holding a pool
-     * connection from one that never took one. The two need opposite handling when the runner's state
-     * cannot be read: the first must be quarantined, the second must be left alone.
-     */
     connectionAcquired: boolean;
     /**
      * The cleanup the claim's owner is running, once it has started.
-     *
-     * ★ Assigned synchronously in the same turn as the claim, so a watchdog that finds the claim taken
-     * always finds this too and can **await** it. Skipping a claimed runner without waiting is the other
-     * half of the problem: the pair could throw its abandonment error while the chain's rollback, release
-     * or `DataSource.destroy()` was still in flight, losing every diagnostic appended after the message
-     * was built and leaving the next test to race a pending teardown.
      */
     completion: Promise<void> | undefined;
 }
@@ -1390,12 +1098,6 @@ function claimCleanup(claim: CleanupClaim | undefined): boolean {
 
 /**
  * Waits, within a bound, for the cleanup the claim's owner is already running.
- *
- * The wait is bounded because the thing being waited on is: the owner's cleanup is a small number of
- * bounded actions, so a multiple of one action's budget covers it, and exceeding that is itself
- * reportable rather than something to sit on. A claim taken with no completion published cannot happen —
- * the owner assigns it in the same synchronous step — but it is treated as nothing to wait for rather
- * than as an error, since the alternative would be to block on a promise that will never exist.
  */
 async function awaitClaimedCleanup(
     claim: CleanupClaim | undefined,
@@ -1417,17 +1119,9 @@ async function awaitClaimedCleanup(
 }
 
 /**
- * @description
- * **The** cleanup path for a query runner. Every caller uses this one — the participant's own chain, the
- * pair watchdog, the sequential runner, and the pre-chain unwinding that runs before any chain exists —
- * because a second, unbounded path is exactly how a connection escapes the rules below.
- *
- * 1. **Every step is bounded** by {@link DEFAULT_CLEANUP_ACTION_TIMEOUT_MS}. A rollback queued behind the
- *    stalled statement that caused the abandonment does not return, and an unbounded `await` on it hangs
- *    whichever side owns cleanup. If that side is the participant's chain, the watchdog then sees an
- *    unsettled chain, finds the cleanup claim already taken, and correctly declines to race it — so an
- *    unbounded owner means *nobody* quarantines and *nobody* destroys the pool. A single-owner claim is
- *    only safe because the owner's whole cleanup is bounded.
+ * @description **The** cleanup path for a query runner. Every caller uses this one — the participant's own chain,
+ * the pair watchdog, the sequential runner, and the pre-chain unwinding that runs before any chain exists — because
+ * a second, unbounded path is exactly how a connection escapes the rules below.
  */
 async function settleRunner(
     queryRunner: QueryRunner,
@@ -1439,19 +1133,11 @@ async function settleRunner(
     connectionAcquired: boolean,
 ): Promise<void> {
     if (readRunnerFlag(() => queryRunner.isReleased, false)) {
-        // Already released, by this path or the other side of the claim. Nothing left to do, and
         // "unreadable" resolves to "not released" so a leak is attempted rather than assumed away.
         return;
     }
-    // ★ READ THE STATE BEFORE ACTING ON IT. Rule 7 has to know whether the thing it is about to restore
-    // and certify can be read at all, and it has to know that before rule 3 issues a single rollback
-    // against a state nobody can see. Reading here rather than inside the certification is also what makes
-    // the *transition* case reachable: a flag that was observed at the baseline and has since stopped
-    // reading leaves `baseline.certain` true, so nothing but this reading can notice it.
     const observed = readTransactionState(queryRunner);
     if (!baseline.certain || !observed.certain) {
-        // RULE 7. Uncertifiable, from whichever end. What happens next is decided by what this harness is
-        // actually holding, never by rule 2's substituted value — see the rule's own text above.
         const when = baseline.certain
             ? 'was readable when this participant began and cannot be read now'
             : 'could not be read when this participant began';
@@ -1465,9 +1151,6 @@ async function settleRunner(
             return;
         }
         if (baseline.certain && !ownsRunner) {
-            // Genuinely foreign, and known to be so because the baseline flag was OBSERVED active. Rule 6
-            // governs: releasing would publish live foreign work to the next borrower, and destroying the
-            // pool would end an outer run this harness never started, so it does neither — loudly.
             state.teardownErrors.push(
                 `the runner for '${label}' arrived inside a transaction this harness did not open, and ` +
                     `its transaction state ${when}, so nothing above that outer transaction can be ` +
@@ -1476,9 +1159,6 @@ async function settleRunner(
             );
             return;
         }
-        // Ours — or, where the baseline itself was substituted, not demonstrably anybody else's while a
-        // connection is out. Either way rule 5 applies: reported by name, not released, and the owning pool
-        // destroyed, so a later test fails on a closed connection instead of inheriting this one.
         state.teardownErrors.push(
             `the transaction state of the runner for '${label}' ${when}, so the connection it is holding ` +
                 'cannot be certified as clean, and cannot be shown to belong to anybody else either. It is ' +
@@ -1488,7 +1168,6 @@ async function settleRunner(
         return;
     }
     // Bounded, and only ever the levels above the baseline. `restoreTransactionBaseline` records its own
-    // diagnostics, so a failure inside it is already on the record; what this adds is the guarantee that
     // it cannot sit here forever behind a stalled statement.
     const restored = await attemptWithinBudget(
         () => restoreTransactionBaseline(queryRunner, baseline, label, state),
@@ -1504,14 +1183,9 @@ async function settleRunner(
                 `${String(DEFAULT_CLEANUP_ACTION_TIMEOUT_MS)}ms, so the connection cannot be proven clean`,
         );
     }
-    // Re-read rather than trusting the outcome: a rollback can report success while the driver still
-    // considers a level open, and it is the state the pool will act on that matters.
     const quiescent = restored.outcome === 'settled' && isCertainlyAtBaseline(queryRunner, baseline);
 
     if (!ownsRunner) {
-        // Rule 6. Not ours to return, and not ours to destroy the pool over. Reached only where the
-        // baseline was genuinely OBSERVED to be active, so "belongs to that owner" is a fact rather than a
-        // fallback — the uncertain case is handled above and never lands here.
         if (!quiescent) {
             state.teardownErrors.push(
                 `the runner for '${label}' arrived inside a transaction this harness did not open and ` +
@@ -1576,17 +1250,7 @@ async function quarantineRunner(label: string, errors: string[], dataSource: Dat
 }
 
 /**
- *
  * Rolls back and releases the runner of every chain that has not settled.
- *
- * Three properties make this teardown rather than a second hang, and all three are load-bearing:
- *
- *  - **Every action is bounded** by {@link DEFAULT_CLEANUP_ACTION_TIMEOUT_MS}, so a rollback queued behind
- *    the stalled statement that caused the abandonment cannot stop the release that follows it.
- *  - **Every runner is attempted**, and both are attempted **concurrently**, so neither the failure nor
- *    the stalling of one can prevent the other from being reclaimed.
- *  - **Nothing is discarded.** A failure and an unsettled attempt are equally recorded in
- *    `state.teardownErrors` and reported alongside the abandonment, never in place of it.
  */
 async function reclaimAbandonedRunners(
     runners: QueryRunner[],
@@ -1606,12 +1270,7 @@ async function reclaimAbandonedRunners(
         }
         const claim = claims[index];
         if (!claimCleanup(claim)) {
-            // The participant's own chain reached its teardown first and owns this runner's cleanup.
             // Doing it here as well would race it — two concurrent rollbacks or releases on one
-            // connection — so the claim decides, once, which side is responsible. But declining is only
-            // half of it: the pair must also WAIT for that owner, or it throws its abandonment error
-            // while a rollback, release or pool teardown is still running, and every diagnostic the
-            // owner appends afterwards is lost. The wait is bounded like everything else here.
             reclaims.push(awaitClaimedCleanup(claim, tracked[index].label, state.teardownErrors));
             continue;
         }
@@ -1621,20 +1280,14 @@ async function reclaimAbandonedRunners(
                 tracked[index].label,
                 state,
                 dataSource,
-                // The real facts, published by the chain, rather than assumptions. A runner still stalled
-                // in `connect()` reaches here with its recorded baseline and with `ownsRunner` false if it
                 // arrived carrying a foreign transaction, so nothing of its owner's is touched — and with
-                // `connectionAcquired` telling this side whether a pool connection is actually out, which
-                // is what decides between quarantining an uncertain runner and leaving it alone.
                 claim === undefined ? { active: false, depth: undefined, certain: false } : claim.baseline,
                 claim === undefined ? true : claim.ownsRunner,
                 claim === undefined ? false : claim.connectionAcquired,
             ),
         );
     }
-    // `Promise.all` is safe here precisely because `settleRunner` never rejects: it converts every
     // outcome into a recorded diagnostic. Running the two concurrently is what stops a stalled rollback
-    // on one connection from delaying the other's release by its whole budget.
     await Promise.all(reclaims);
 }
 
@@ -1651,11 +1304,6 @@ interface CancellationToken {
 
 /**
  * Marks a token cancelled and runs every listener once.
- *
- * A listener that throws does not stop its siblings from running — teardown must not be derailed by one
- * hook — but its failure is **recorded**, not discarded. A cancellation listener typically exists to
- * settle the promise its participant is blocked on, so one that throws is the reason that participant
- * stays stuck; swallowing it would delete the explanation for the very hang being reported.
  */
 function cancelToken(token: CancellationToken, state: ChainState): void {
     if (token.cancelled) {
@@ -1751,9 +1399,6 @@ async function runParticipantChain<T>(
 ): Promise<BarrierOutcome<T>> {
     let arrived = false;
     let releasedBeforeWrite = false;
-    // Claims this runner's teardown once and remembers it, so the failure path and the `finally` are one
-    // indivisible responsibility rather than two separately-claimable steps. `undefined` means there is
-    // no watchdog to contend with — sequential mode — so this chain owns it by default.
     let cleanupOwned = false;
     const ownCleanup = (): boolean => {
         if (!cleanupOwned) {
@@ -1762,27 +1407,17 @@ async function runParticipantChain<T>(
         return cleanupOwned;
     };
     // The transaction state of the runner as this participant found it. Everything this chain closes
-    // is measured against it, so a level that was already open is never this participant's to end.
     let baseline: TransactionState = { active: false, depth: undefined, certain: false };
-    // Whether the CONNECTION is this participant's to give back, which is a different question from
     // whether a transaction level is its to close. A runner that arrived already inside a transaction
-    // belongs to an outer owner: releasing it would return a connection to the pool with somebody
     // else's transaction (and its locks) still open on it, and would leave that owner holding a
-    // runner it can no longer use. Such a runner is restored to its baseline and then left alone.
     let ownsRunner = false;
     // Whether this chain got as far as taking a pool connection. Distinct from every ownership question
-    // above: a runner that was never connected has nothing to release and nothing to quarantine, while one
-    // that was connected must reach exactly one of those two outcomes.
     let connectionAcquired = false;
     // Whether this chain still has a transaction level of its own open. Derived from OBSERVED runner
     // state rather than from whether startTransaction() resolved — see the inner catch — and cleared
-    // the moment everything this chain added has been closed, so the teardown can never reinterpret
-    // a level that was never ours as ours.
     let ownsTransaction = false;
     let baselineRestorationAttempted = false;
     // Returns the runner to the transaction state it arrived in, once, from whichever of the failure
-    // path and the `finally` is reached first. The failure path calls it so that the settle counter
-    // is taken only after this participant has genuinely finished, its rollback included, which is
     // what BarrierOutcomeBase.settledOrder promises; the `finally` calls it so that a path which
     // never reaches the failure branch still cannot release a connection with a transaction on it.
     const restoreBaseline = async (): Promise<void> => {
@@ -1793,16 +1428,10 @@ async function runParticipantChain<T>(
         if (!ownsTransaction) {
             return;
         }
-        // ★ BOUNDED, on the same budget and for the same reason as every step inside
         // {@link settleRunner}. `restoreTransactionBaseline` ends with `rollbackTransaction()`, and a
         // rollback queued behind a stalled statement never settles. Awaiting that here without a bound is
         // the one failure a single-owner {@link CleanupClaim} cannot survive: this chain either never
-        // reaches its `finally` at all, or reaches it and stalls while holding the claim — and either way
         // the whole-pair watchdog finds a cleanup it must not race, so the connection is NEITHER released
-        // NOR quarantined and the pool is never destroyed. Abandoning the *attempt* at the budget keeps
-        // the participant's own cleanup moving and hands `settleRunner` a runner it can still prove, or
-        // fail to prove, is back at its baseline. That is rule 1 of the teardown contract, and it applies
-        // to the failure path exactly as it applies to the `finally`.
         const restored = await attemptWithinBudget(
             () => restoreTransactionBaseline(queryRunner, baseline, label, state),
             DEFAULT_CLEANUP_ACTION_TIMEOUT_MS,
@@ -1830,35 +1459,16 @@ async function runParticipantChain<T>(
     };
     try {
         // Read the transaction state FIRST, inside this `try` and before anything else touches the
-        // runner. A level that is already open belongs to somebody else, and every close below is
-        // measured against this reading. Two properties make this the right position for it. It is
-        // still "before anything was opened", because `connect()` takes a pool connection and opens no
         // transaction — so the baseline means exactly what the closes below assume. And it is inside
-        // the protected lifecycle, so a `connect()` that throws now reaches the teardown carrying REAL
-        // facts rather than assumed ones, which is what lets that path give a connection back instead
-        // of stranding it.
         baseline = readTransactionState(queryRunner);
         // An already-open transaction makes the CONNECTION foreign too, not just the level. This is
-        // decided here, before anything is opened on the runner and before any path can release it,
-        // so the refusals below are genuinely refusals to touch it.
         ownsRunner = !baseline.active;
-        // Published to the shared record in the same synchronous step as the reading, so the watchdog
         // measures against the same baseline and the same connection ownership this chain would, rather
-        // than assuming either. A deadline that fires while this chain is still stalled — in `connect()`
-        // as much as anywhere later — would otherwise have to guess, and guessing here means rolling
-        // back or releasing work that was never this harness's.
         if (claim !== undefined) {
             claim.baseline = baseline;
             claim.ownsRunner = ownsRunner;
         }
         if (!baseline.certain) {
-            // ★ REFUSED BEFORE A CONNECTION IS TAKEN, because an unreadable flag is not evidence of
-            // anything. The fail-closed value says `active: true` so that no later step can release live
-            // work, but that value is a substitution rather than an observation — and proceeding on it
-            // would mean classifying this runner as somebody else's on the strength of a fact nobody
-            // established. That classification is what rule 6 then acts on: a "foreign" runner is
-            // deliberately neither released nor quarantined, so a runner this harness had connected would
-            // be left holding a pool connection that no side would ever give back.
             throw harnessError(
                 `Participant '${label}' was handed a query runner whose transaction flag could not be ` +
                     'read at all, so nothing about its state can be certified: this harness cannot tell a ' +
@@ -1870,27 +1480,15 @@ async function runParticipantChain<T>(
                     'connection behind it has already gone.',
             );
         }
-        // connect() is called explicitly so that this participant is holding a pool connection of
         // its own before its transaction opens. Two participants must never share one connection:
         // a single connection cannot hold two open transactions, so it cannot interleave, and a
-        // test built on it would prove serialisation.
         await queryRunner.connect();
-        // Recorded the moment the connection is genuinely this chain's, and published for the watchdog in
-        // the same step. It is what lets the teardown distinguish "nothing was ever acquired" from "a
-        // connection is out and its state can no longer be read", which are the same `ownsRunner` and
-        // demand opposite treatment: report and leave alone, versus quarantine.
         connectionAcquired = true;
         if (claim !== undefined) {
             claim.connectionAcquired = true;
         }
         if (baseline.active && baseline.depth === undefined) {
-            // ★ Refused in BOTH modes, including the sequential nesting this module otherwise
-            // supports. A level opened on this runner could never be shown to have been closed
             // again: with a transaction already open, the public `isTransactionActive` flag reads
-            // `true` before and after, so it cannot distinguish this participant's level from the
-            // one it found, and the nesting counter that could is not observable here. Nesting
-            // anyway would let a participant be reported fulfilled over a level it never closed —
-            // and under `commitOnSuccess: false`, over work it was asked to discard and did not.
             throw harnessError(
                 `Participant '${label}' was handed a query runner that is already inside a ` +
                     'transaction and does not expose a nesting depth, so a level opened on it could ' +
@@ -1904,11 +1502,7 @@ async function runParticipantChain<T>(
         if (barrier !== undefined && baseline.active) {
             // Refused rather than nested. A transaction opened on this runner now would be a
             // SAVEPOINT inside somebody else's transaction — sharing its connection and its locks,
-            // invisible to it, and impossible to commit independently — so it could not evidence an
             // interleaving whatever the test then asserted. Failing here also keeps the teardown
-            // honest: nothing this chain does can reach a level it did not open, and — because
-            // `ownsRunner` is already false — nothing releases the runner out from under its owner
-            // either. The refusal leaves it exactly as it was found.
             throw harnessError(
                 `Participant '${label}' was handed a query runner that is already inside a ` +
                     'transaction, so it cannot evidence an interleaving: anything it opened now would ' +
@@ -1922,16 +1516,14 @@ async function runParticipantChain<T>(
         try {
             // The isolation level is whatever the caller asked for. Omitted means the engine's own
             // default, which differs between engines and is then part of what the test asserts.
-            // Published before the await, for the same reason the local flag is set after it is not
             // enough: every installed driver marks the runner transactional before it issues BEGIN, so a
-            // watchdog reading this record mid-start must already know the level may be ours.
             if (claim !== undefined) {
                 claim.ownsTransaction = true;
             }
             await queryRunner.startTransaction(isolationLevel);
             ownsTransaction = true;
         } catch (startError) {
-            // ★ A rejection here does NOT mean no transaction exists. TypeORM flips
+            // A rejection here does NOT mean no transaction exists. TypeORM flips
             // `isTransactionActive` to true and only then issues the statements that open the
             // transaction — `driver/mysql/MysqlQueryRunner.js:L83` ahead of the isolation statement
             // at L93 and START TRANSACTION at L95, `driver/postgres/PostgresQueryRunner.js:L113`
@@ -1940,27 +1532,16 @@ async function runParticipantChain<T>(
             // carrying a half-started transaction whose flag is set while its depth was never
             // incremented. On PostgreSQL that half-start is a genuinely open server-side transaction
             // (START TRANSACTION is issued before the isolation statement), which is exactly why it
-            // has to be closed rather than merely noted. Claiming it here, only where it is above
-            // the baseline this participant found, is what lets the teardown close it.
             ownsTransaction = hasStateAboveBaseline(queryRunner, baseline);
             throw startError;
         }
-        // ★ Post-start certification, run before any caller phase. `startTransaction` resolving is not
-        // by itself proof that this chain now holds a level it will be able to account for, and every
-        // guarantee below it — that a fulfilled participant's work completed, that teardown restores
-        // what it found, that nothing foreign is ended — rests on that accounting. So the state is read
-        // once, here, while the situation is still unambiguous, and anything short of certifiable is
-        // refused rather than carried into a caller's precheck and write.
+        // Post-start certification, run before any caller phase. `startTransaction` resolving is not
         const opened = readTransactionState(queryRunner);
         const lostDepthReporting = baseline.depth !== undefined && opened.depth === undefined;
         if (lostDepthReporting) {
-            // The counter was readable when this chain read its baseline and is gone now that its own
             // level is open: a driver that stopped publishing it across `startTransaction`. Nothing
-            // afterwards could distinguish this chain's level from any other, on a clean runner or a
-            // nested one, so it refuses either way. It closes the level it just opened first, because
             // this is the one moment when doing so is unambiguous — `startTransaction` has returned and
             // no caller code has run, so the innermost level is certainly this chain's. Ownership is
-            // dropped before the attempt so no later blind close can follow it onto somebody else's
             // transaction, and a close that fails is reported and not retried.
             ownsTransaction = false;
             let closedTheLevel = true;
@@ -1988,11 +1569,7 @@ async function runParticipantChain<T>(
         }
         if (!hasStateAboveBaseline(queryRunner, baseline)) {
             // `startTransaction` resolved and yet the runner looks exactly as it did beforehand: no
-            // level this chain could later commit, roll back or account for. Proceeding would run the
             // caller's write outside any transaction this chain controls and then report it committed,
-            // which is the false fulfilment this module exists to make impossible. Nothing observable
-            // was opened, so nothing is closed here — closes are aimed by observed state, never by the
-            // assumption that a resolved call must have done something.
             ownsTransaction = false;
             throw harnessError(
                 `Participant '${label}' called startTransaction successfully and the runner is ` +
@@ -2010,17 +1587,10 @@ async function runParticipantChain<T>(
             cancelled: () => token.cancelled,
             onCancelled: (listener: () => void) => {
                 if (token.cancelled) {
-                    // Registered after the pair was already abandoned, so it is invoked at once — the
-                    // participant asked to be told, and it is already true.
                     try {
                         listener();
                     } catch (listenerError) {
-                        // ★ Recorded AND rethrown, because by this point recording alone would be
-                        // indistinguishable from swallowing it: the abandonment error has already been
-                        // built and thrown, so anything appended to the teardown diagnostics now can
-                        // never reach it. Rethrowing puts the failure where it can still be seen — in
                         // the phase that called `onCancelled`. A broken unblock hook is why the
-                        // participant will not come back, which is precisely what must not be hidden.
                         state.teardownErrors.push(
                             `a cancellation listener registered by '${label}' after abandonment threw: ` +
                                 describeReason(listenerError),
@@ -2034,12 +1604,7 @@ async function runParticipantChain<T>(
         };
         const precheckResult = spec.precheck === undefined ? undefined : await spec.precheck(context);
         if (barrier !== undefined) {
-            // ★ The rendezvous, entered by the harness. Registration is recorded from the barrier's
-            // own record before the release is awaited, so a participant held here and then rejected
-            // by a timeout or by a sibling's disposal still reports the arrival it made — while
-            // `releasedBeforeWrite`, which is what certifies the run, can only become true on the
-            // line after the release has actually been awaited. Nothing a caller writes sits between
-            // the two, which is the whole point of splitting the phases.
+            // The rendezvous, entered by the harness. Registration is recorded from the barrier's
             const released = barrier.arrive(label);
             arrived = barrier.arrivedLabels.indexOf(label) !== -1;
             await released;
@@ -2049,18 +1614,9 @@ async function runParticipantChain<T>(
         // End the transaction here, in this participant's own chain, the moment its write returns.
         // See the note in runBarrieredPair: waiting for the sibling before committing deadlocks on
         // every engine that blocks a second writer on a row lock. A failure raised by COMMIT is
-        // this participant's own outcome and not a harness fault — under SERIALIZABLE that is
         // exactly where a serialization failure surfaces, and it is a genuine race result. Only the
-        // levels this chain added are closed, so a write phase that opened a nested level and left it
-        // open is unwound too, and a level that predates this participant never is.
         if (ownsTransaction) {
             await endTransactionLevels(queryRunner, baseline, commitOnSuccess ? 'commit' : 'rollback');
-            // ★ The post-condition that keeps `fulfilled` honest. A fulfilled outcome asserts that this
-            // participant's work completed as asked — committed under `commitOnSuccess`, deliberately
-            // discarded otherwise — so it may not be constructed while anything this chain opened is
-            // still open. Anything left here would be rolled back by the `finally` moments later, which
-            // would make a reported commit into a silent discard. Raising instead routes the run through
-            // the catch below, so the participant is reported rejected and its state is cleaned up.
             if (!isCertainlyAtBaseline(queryRunner, baseline)) {
                 throw harnessError(
                     `Participant '${label}' could not complete its transaction: the runner is not ` +
@@ -2073,7 +1629,6 @@ async function runParticipantChain<T>(
                 );
             }
             // Ownership is discharged the instant everything this chain opened is closed, so the
-            // teardown below cannot mistake a foreign outer level for this participant's work.
             ownsTransaction = false;
         }
         const settledOrder = state.settled++;
@@ -2085,12 +1640,7 @@ async function runParticipantChain<T>(
     } finally {
         // Teardown on every path — a sibling that threw, a rendezvous that timed out, a transaction that
         // never opened — because a leaked query runner holds a pool connection and the next test then
-        // hangs rather than failing.
-        //
         if (ownCleanup()) {
-            // The promise is published on the shared claim BEFORE it is awaited, with no `await` in
-            // between, so a watchdog that finds this claim taken can wait for this exact cleanup rather
-            // than returning while it is still in flight and losing every diagnostic appended after.
             const cleanup = (async (): Promise<void> => {
                 await restoreBaseline();
                 await settleRunner(
@@ -2109,9 +1659,6 @@ async function runParticipantChain<T>(
             await cleanup;
         }
         // A participant that finished without reaching the rendezvous leaves its sibling waiting
-        // for a partner that is never coming. Disposing turns that into an immediate named failure
-        // on both sides instead of a wait that runs out the timeout. Note that the sibling's wait is
-        // FAILED here, never satisfied: releasing it would let a half-populated pair look like a
         // completed interleaving.
         if (barrier !== undefined && !arrived && !barrier.released) {
             barrier.dispose(
@@ -2137,25 +1684,14 @@ function normaliseParticipantSpec<T, P>(spec: BarrierParticipantSpec<T, P>): Nor
 }
 
 /**
- * The transaction state this module measures a participant against: TypeORM's public
- * `isTransactionActive` flag, and its nesting depth where the driver exposes one.
- *
- * Both halves are needed, because neither alone describes the state a runner can be left in. The
- * flag says whether a transaction is open but not how many nested levels are; the depth says how
- * many levels the driver believes it has but is also the counter that a rollback issued for a level
- * the driver never counted drives *below* where it started.
+ * The transaction state this module measures a participant against: TypeORM's public `isTransactionActive` flag, and
+ * its nesting depth where the driver exposes one.
  */
 interface TransactionState {
     active: boolean;
     depth: number | undefined;
     /**
      * Whether `active` was **observed** rather than substituted.
-     *
-     * It is read on **every** state reading and not only on the baseline one, because a getter can start
-     * throwing at any point: a runner whose connection object is torn out mid-chain was readable when the
-     * participant began and is not readable when its teardown runs. Both {@link isCertainlyAtBaseline} and
-     * rule 7 of {@link settleRunner} therefore consult the reading in front of them rather than trusting
-     * that the first one still holds.
      */
     certain: boolean;
 }
@@ -2179,15 +1715,8 @@ interface TransactionDepthCarrier {
 const MAX_TRANSACTION_UNWIND_STEPS = 8;
 
 /**
- * Reads the state a participant is measured against. Total: never throws, and never assumes the
- * depth counter exists.
- *
- * ★ BOTH READS ARE GUARDED, and total is a promise this function has to keep rather than a description of
- * a happy path. Every decision in the teardown is taken from what this returns, and it is called from
- * inside `finally` blocks and from the pair watchdog — so an accessor that throws here does not produce a
- * wrong answer, it produces no answer at all, and a connection is then neither released nor quarantined.
- * A driver double, a runner whose connection object has been torn out from under it, or a getter that
- * consults a closed pool can all throw.
+ * Reads the state a participant is measured against. Total: never throws, and never assumes the depth counter
+ * exists.
  */
 function readTransactionState(queryRunner: QueryRunner): TransactionState {
     let depth: unknown;
@@ -2202,9 +1731,7 @@ function readTransactionState(queryRunner: QueryRunner): TransactionState {
         active = queryRunner.isTransactionActive;
         certain = true;
     } catch {
-        // Fail closed on the VALUE, and say so in the same breath: `certain: false` is what stops a caller
         // treating this substitution as an observation. {@link readRunnerFlag} states the same rule for the
-        // reads that only need the value.
         active = true;
         certain = false;
     }
@@ -2250,19 +1777,9 @@ function isCertainlyAtBaseline(queryRunner: QueryRunner, baseline: TransactionSt
 }
 
 /**
- * Closes every transaction level above the baseline, innermost first, committing or rolling back as
- * asked, and **raises unless it finishes the job**. Failures propagate: on the success path a failed
- * COMMIT is the participant's own outcome, and on the teardown path the caller catches and reports.
- *
- * ★ Not finishing is a failure, not a stopping condition. The bound and the progress check exist
- * because this loop is driven by driver state rather than by a count of its own — a driver that
- * resolves a close without unwinding anything would otherwise spin here, and a silent spin inside
- * teardown is the hang this module refuses to ship — but *returning quietly* when either trips would
- * be worse than the spin. On the success path the caller would then construct a fulfilled outcome
- * over work that is still open, and the participant's own `finally` would roll that work back
- * afterwards: a test told its write committed when the database threw it away. So both conditions
- * raise, the success path turns into a rejected outcome, and cleanup goes back to being cleanup
- * instead of a silent substitute for COMMIT.
+ * Closes every transaction level above the baseline, innermost first, committing or rolling back as asked, and
+ * **raises unless it finishes the job**. Failures propagate: on the success path a failed COMMIT is the
+ * participant's own outcome, and on the teardown path the caller catches and reports.
  */
 async function endTransactionLevels(
     queryRunner: QueryRunner,
@@ -2304,15 +1821,8 @@ async function endTransactionLevels(
 }
 
 /**
- * Returns a runner to the transaction state it arrived in, and reports rather than hides anything that
- * goes wrong doing so. Called once per participant from whichever of the failure path and the `finally`
- * is reached first, so it covers every way a chain can end — the precheck threw, the rendezvous timed
- * out, the write threw, COMMIT failed, or `startTransaction` itself failed after the driver had already
- * flipped its transaction flag.
- *
- * It closes only what sits above the baseline, so a level that was open before this participant started
- * is never touched: where a driver hands the same runner to two participants, ending the first one's
- * transaction from the second one's teardown would destroy work that is not its own.
+ * Returns a runner to the transaction state it arrived in, and reports rather than hides anything that goes wrong
+ * doing so.
  */
 async function restoreTransactionBaseline(
     queryRunner: QueryRunner,
@@ -2340,12 +1850,8 @@ async function restoreTransactionBaseline(
         return;
     }
     if (baseline.active && !readTransactionState(queryRunner).active) {
-        // ★ The transaction that was ALREADY OPEN when this participant arrived is gone. Whatever ended
-        // it — the participant's own phases, or a close that reached further than the level it aimed at —
-        // this is the loss of work that was never this harness's to end, and it is reported before any
-        // bookkeeping repair is attempted. Repairing the counter here would put it back to a value
+        // The transaction that was ALREADY OPEN when this participant arrived is gone. Whatever ended
         // describing a transaction that no longer exists, which reads as a clean restoration and would
-        // leave the runner internally inconsistent as well: exactly the masking this reports instead.
         state.teardownErrors.push(
             `the transaction that was already open on the runner for '${label}' is no longer active, ` +
                 "so work that was not this participant's to end has been ended — its owner cannot " +
@@ -2366,9 +1872,6 @@ async function restoreTransactionBaseline(
         return;
     }
     if (!isCertainlyAtBaseline(queryRunner, baseline)) {
-        // The counter and the flag are certified together, after any repair rather than instead of it.
-        // A repair that leaves either one disagreeing with the baseline has restored bookkeeping and not
-        // state, and this participant's runner goes no further without that being said out loud.
         state.teardownErrors.push(
             `the runner for '${label}' could not be certified as back at the state it started in, so ` +
                 'it is not safe to hand on: a transaction flag or nesting depth that disagrees with ' +
@@ -2381,16 +1884,8 @@ async function restoreTransactionBaseline(
 }
 
 /**
- * Puts TypeORM's nesting counter back to the baseline after an unwind that drove it below, and reports
- * whether the state now matches.
- *
- * The undershoot is a real and reachable case rather than a hypothetical: `rollbackTransaction()`
- * decrements the counter unconditionally (`driver/mysql/MysqlQueryRunner.js:L136`, and identically in
- * the PostgreSQL and SQLite runners), so rolling back a half-started transaction — one whose flag the
- * driver set before the statement that would have incremented the counter failed — leaves the counter
- * one below where it started. Rolling back is still the right cleanup, because on PostgreSQL that
- * half-start is an open server-side transaction; what must not survive it is the corrupted counter, so
- * it is repaired here and verified afterwards.
+ * Puts TypeORM's nesting counter back to the baseline after an unwind that drove it below, and reports whether the
+ * state now matches.
  */
 function normaliseTransactionDepth(queryRunner: QueryRunner, baseline: TransactionState): boolean {
     if (baseline.depth === undefined) {
@@ -2401,7 +1896,6 @@ function normaliseTransactionDepth(queryRunner: QueryRunner, baseline: Transacti
         return false;
     }
     if (current.active !== baseline.active) {
-        // ★ Not a counter problem, and so not this function's to paper over. A flag that disagrees with
         // the baseline means a transaction was opened or ended rather than miscounted, and writing a
         // number over it would describe a transaction that is not there — which is how the loss of an
         // outer transaction came to be reported as a clean restoration. The caller reports it instead.
@@ -2424,19 +1918,7 @@ function describeTransactionState(state: TransactionState): string {
 }
 
 /**
- * Takes two query runners for a barriered pair and refuses to proceed unless they are genuinely
- * distinct objects.
- *
- * This is the exclusion in {@link SINGLE_CONNECTION_ENGINES} enforced rather than merely
- * documented. TypeORM's SQLite-family drivers cache one query runner and hand the same instance
- * back on every call — `node_modules/typeorm/driver/sqljs/SqljsDriver.js:L46-L50`,
- * `driver/sqlite/SqliteDriver.js:L42-L46` and `driver/better-sqlite3/BetterSqlite3Driver.js:L40-L44`
- * all read `if (!this.queryRunner) this.queryRunner = new ...; return this.queryRunner` — whereas
- * the server drivers construct a new one each time (`driver/postgres/PostgresDriver.js:L425-L427`,
- * `driver/mysql/MysqlDriver.js:L358-L360`). Two participants sharing one runner share one
- * transaction, so the second's `startTransaction` fails against the first's and no interleaving is
- * possible. Failing here, by name, is far better than letting that surface as an obscure
- * "transaction already started" from inside a participant body.
+ * Takes two query runners for a barriered pair and refuses to proceed unless they are genuinely distinct objects.
  */
 async function createDistinctRunners(dataSource: DataSource): Promise<[QueryRunner, QueryRunner]> {
     const first = dataSource.createQueryRunner();
@@ -2467,16 +1949,10 @@ async function createDistinctRunners(dataSource: DataSource): Promise<[QueryRunn
 }
 
 /**
- * Releases a runner that is being abandoned before any participant used it, and **describes** whatever
- * happened instead of discarding it — returning `undefined` when there is nothing to report.
- *
- * The reason this returns rather than swallows is that a runner which could not be released is a held
- * pool connection, which is the one failure this module treats as too consequential to hide anywhere
- * else. Its caller is already throwing, so the description is attached to that error by
- * {@link attachTeardownNote}: the primary diagnosis stays primary, and the leak is still on the record.
+ * Releases a runner that is being abandoned before any participant used it, and **describes** whatever happened
+ * instead of discarding it — returning `undefined` when there is nothing to report.
  */
 async function releaseAbandonedRunner(queryRunner: QueryRunner): Promise<string | undefined> {
-    // Both flags are read fail-closed: an unreadable `isReleased` reads as NOT released so a release is
     // attempted rather than a leak assumed away, and an unreadable `isTransactionActive` reads as ACTIVE
     // so live work is never returned to the pool. See {@link readRunnerFlag}.
     if (readRunnerFlag(() => queryRunner.isReleased, false)) {
@@ -2489,8 +1965,6 @@ async function releaseAbandonedRunner(queryRunner: QueryRunner): Promise<string 
             "carrying somebody else's transaction and its locks"
         );
     }
-    // Bounded like every other teardown action. This runs while its caller is already throwing, so a
-    // release that never settles here would replace a named creation failure with an unexplained hang.
     const released = await attemptWithinBudget(
         () => queryRunner.release(),
         DEFAULT_CLEANUP_ACTION_TIMEOUT_MS,
@@ -2511,15 +1985,8 @@ async function releaseAbandonedRunner(queryRunner: QueryRunner): Promise<string 
 }
 
 /**
- * Combines a primary failure with something observed during the teardown that followed it, without
- * letting either hide the other.
- *
- * When there is nothing to add the primary error is returned **exactly as it arrived** — same object,
- * same type, same stack — because that error is the diagnosis and re-wrapping it would cost the reader
- * the frame where it came from. When there is, it is appended to that same error's message for the same
- * reason: the alternative is either to throw the teardown observation instead (which loses why the
- * runner was being abandoned at all) or to discard it (which loses a leaked connection, or the fact
- * that a runner was deliberately left to its owner).
+ * Combines a primary failure with something observed during the teardown that followed it, without letting either
+ * hide the other.
  */
 function attachTeardownNote(primary: Error, note: string | undefined): Error {
     if (note === undefined) {
@@ -2556,22 +2023,8 @@ function assembleBarrierResult<A, B>(
 }
 
 /**
- *
- * The single gate a run passes before its result is handed to the caller. It refuses two classes of
- * outcome, and it refuses them together rather than one at a time, so that neither can mask the
- * other:
- *
- * 1. **A rendezvous that did not happen**, when `requireArrival` is set — which it is for
- *    {@link runBarrieredPair} and is not for {@link runSequentialPair}. A pair in which either
- *    participant never reached the barrier was never inside the same window, so the run is not race
- *    evidence and must not be returned as though it were. This is the check that stops a suite whose
- *    bodies forgot to arrive from reporting a clean one-winner race.
- * 2. **A participant that could not be torn down cleanly.** A leaked query runner holds a pool
- *    connection, and the next test then hangs instead of failing, which is why this is raised rather
- *    than hidden.
- *
- * Both participant outcomes are carried in the message either way, so raising cannot lose what the two
- * callers actually observed.
+ * The single gate a run passes before its result is handed to the caller. It refuses two classes of outcome, and it
+ * refuses them together rather than one at a time, so that neither can mask the other:
  */
 function assertHarnessIntegrity<A, B>(
     state: ChainState,
@@ -2618,8 +2071,6 @@ function summariseOutcome(outcome: BarrierOutcome<unknown>): string {
     const arrival = `arrived: ${String(outcome.arrived)}, releasedBeforeWrite: ${String(
         outcome.releasedBeforeWrite,
     )}`;
-    // The label was guarded at intake by `resolveDistinctLabels`, so it is this module's own text by the
-    // time it reaches here.
     const label = outcome.label;
     if (outcome.status === 'fulfilled') {
         return `'${label}' fulfilled (${arrival})`;
@@ -2635,23 +2086,11 @@ function summariseOutcome(outcome: BarrierOutcome<unknown>): string {
 function resolveDistinctLabels<A, B, PA, PB>(
     participants: BarrierParticipants<A, B, PA, PB>,
 ): [string, string] {
-    // ★ GUARDED HERE, AT INTAKE, RATHER THAN AT EVERY PLACE A LABEL IS RENDERED. A label is caller-supplied
-    // and it is interpolated into roughly thirty-five diagnostics in this file — every teardown note, every
-    // refusal, the abandonment message and the outcome summary. Every one of those is thrown, printed by the
     // runner and read in a build log, so a label carrying a value leaks from all of them at once; and the
-    // natural way to make a per-item participant readable is to interpolate the item, which is exactly how
-    // such a label appears. Refusing the shapes a value arrives in ONCE, where the caller's label becomes
-    // the harness's, makes every render site safe — including the ones added after this comment, which is
-    // the half that reviewing each render site cannot deliver. See `describeTeardownStage`.
     const rawA = participants.a.label === undefined ? 'a' : participants.a.label;
     const rawB = participants.b.label === undefined ? 'b' : participants.b.label;
     const labelA = safeParticipantLabel(rawA, 1);
-    // ★ THE REFUSAL IS KEYED ON THE RAW LABELS, AND THE COLLISION AVOIDANCE ON THE RENDERED ONES. Those are
-    // two different questions and conflating them gets one of them wrong whichever way it is conflated.
-    //
-    // Two participants the caller named IDENTICALLY are a caller mistake and stay refused: a label
     // identifies an outcome and names a missing participant when the rendezvous times out, so a pair that
-    // cannot be told apart is unusable as evidence.
     if (rawA === rawB) {
         throw harnessError(
             `Both participants are labelled '${labelA}', but the two must be distinguishable: a ` +
@@ -2659,15 +2098,6 @@ function resolveDistinctLabels<A, B, PA, PB>(
                 'times out.',
         );
     }
-    // Two DISTINCT raw labels, on the other hand, must never end up sharing one rendered identity — and
-    // that is possible in BOTH directions, because the ordinal substitute is itself a string a caller can
-    // pass, so the substitute set and the accepted set overlap. Either the accepted label is A's and the
-    // refused one is B's, or the refused one is A's and the accepted one is B's. An earlier revision
-    // advanced B only when B ITSELF had been refused, which covered the first direction and left the
-    // second: a refused A renders `<participant-1>`, an accepted B literally equal to `<participant-1>`
-    // passes the character allowlist untouched, and the pair was rejected as indistinguishable when it was
-    // nothing of the kind. So the advance below is unconditional on provenance and looks only at the
-    // rendered value. It terminates because each turn tries a fresh ordinal and only one value is excluded.
     let ordinalForB = 2;
     let labelB = safeParticipantLabel(rawB, ordinalForB);
     while (labelB === labelA) {
@@ -2690,40 +2120,21 @@ function isPositiveInteger(value: unknown): boolean {
  * so that a caller's own stack survives.
  */
 function asHarnessFailure(reason: unknown, fallbackMessage: string): Error {
-    // An error THIS MODULE authored is its own text and travels intact, identity included, so a caller
-    // that compares against a harness error still can.
     if (isHarnessAuthored(reason)) {
         return reason;
     }
     if (reason === undefined) {
         return harnessError(fallbackMessage);
     }
-    // ★ A FOREIGN REASON IS CONVERTED BEFORE IT IS STORED OR REJECTED WITH, NOT WHEN IT IS PRINTED.
-    // Returning it unchanged — which this did — is what let a caller's `QueryFailedError` become the
     // barrier's stored `failure`, be handed to every waiting participant, and have its `.message`
     // replayed verbatim by every later arrival. A driver error carries the statement and its bound
-    // parameters as enumerable own properties, so each of those was a place they reached a build log.
-    // Converting here means no downstream site has to remember: what is stored is already safe.
     return harnessError(`${fallbackMessage} Reason: ${redactTeardownDiagnostic(reason)}`);
 }
 
 /**
- * Describes a CALLER-SUPPLIED ARGUMENT for an argument-validation message. Total by construction: a value
- * that cannot be serialised or stringified still produces a string rather than throwing from inside an
- * error path, which would replace a real diagnosis with a secondary failure.
- *
- * ★ **NOT FOR A CAUGHT FAILURE OR A REJECTION REASON — USE `redactTeardownDiagnostic` FOR THOSE.** This
- * function reproduces the value it is given, and that is correct for the three things that still call it:
- * a participant count and two timeouts, each a number this package's own test passed in, where
- * `but received "abc"` is the whole diagnosis. It was also being used for every caught failure in this
- * file, and there it was wrong for two compounding reasons. A participant of this harness writes straight
- * through the repository, so its rejection is a TypeORM `QueryFailedError` — and TypeORM copies the driver's
- * error ONTO it, making `query` and `parameters` its own enumerable properties. So the `value.message`
- * branch published the driver's sentence, and the `JSON.stringify` branch published the statement and every
- * bound value with it, into a build log.
- *
- * The split is deliberate rather than incidental: the two jobs read alike and are opposites. One describes a
- * value the test chose, the other describes a value the database produced.
+ * Describes a CALLER-SUPPLIED ARGUMENT for an argument-validation message. Total by construction: a value that
+ * cannot be serialised or stringified still produces a string rather than throwing from inside an error path, which
+ * would replace a real diagnosis with a secondary failure.
  */
 function describeUnknown(value: unknown): string {
     if (typeof value === 'string') {
@@ -2754,14 +2165,8 @@ export interface PreWriteHold {
     /** The statement the hold fired on, for a diagnostic that names what was about to run. */
     readonly heldBefore: () => string | undefined;
     /**
-     * `'arrival'` when this hold was let go because every required participant had arrived AND every
-     * participant that arrived earlier was still waiting at that moment; `undefined` otherwise.
-     *
-     * THIS IS THE ONLY THING THAT CERTIFIES A HOLD, and a whole-rendezvous flag is not a substitute for
-     * it. A rendezvous that timed out one participant and then received the other's arrival later has
-     * seen every participant arrive without any two of them ever overlapping, so a count of arrivals
-     * cannot tell the two runs apart. This value can only be `'arrival'` for a hold that was still
-     * waiting when the set completed.
+     * `'arrival'` when this hold was let go because every required participant had arrived AND every participant
+     * that arrived earlier was still waiting at that moment; `undefined` otherwise.
      */
     readonly releasedBy: () => 'arrival' | undefined;
     /** Puts the runner's own `query` back. Call it in a `finally`. */
@@ -2801,14 +2206,6 @@ export interface PreWriteRendezvous {
     readonly failureReason: () => Error | undefined;
     /**
      * Counts an arrival made from OUTSIDE a held participant, releasing the pair once the threshold is met.
-     *
-     * This is what lets a rendezvous hold ONE real operation while the test itself supplies the conflicting
-     * state the operation is about to collide with. Some operations cannot be held two at a time and the
-     * reason is a property of the operation rather than of this harness: `createReorderList` takes a
-     * pessimistic write lock on the owning customer row as its FIRST statement, so a second caller for the
-     * same customer blocks there and can never reach its own write while the first is held. Holding one
-     * caller and introducing the conflict from the test is the only way to put a real operation inside the
-     * window between its own duplicate lookup and its own insert.
      */
     readonly arriveExternally: () => void;
     /**
@@ -2830,21 +2227,8 @@ interface PreWriteHoldState {
 }
 
 /**
- * @description
- * Holds every participant immediately before its FIRST WRITE, so that two real service operations are
+ * @description Holds every participant immediately before its FIRST WRITE, so that two real service operations are
  * simultaneously past their own reads and short of their own writes.
- *
- * WHY THE OUTER RENDEZVOUS IS NOT ENOUGH, WHICH IS THE WHOLE REASON THIS EXISTS. {@link runBarrieredPair}
- * holds both participants between their precheck and their write phase, so both service calls *start*
- * together. That is necessary and not sufficient: the operation's own duplicate lookup, quantity read or
- * capacity claim happens after the release, so the two operations may still run one after the other. A
- * service that counted and then inserted without a constraint, or read-computed-and-saved a quantity, would
- * then have the second caller observe the first caller's commit and produce a correct-looking final state —
- * the exact defect the race is supposed to catch, passing.
- *
- * @param options - `participants` is how many arrivals must occur before any hold is released; `tables`
- * restricts the hold to writes naming one of them, so a platform write elsewhere in the transaction cannot
- * trip it; `timeoutMs` bounds how long one hold may wait before the rendezvous is failed.
  */
 export function createPreWriteRendezvous(options: {
     participants: number;
@@ -2961,8 +2345,6 @@ export function createPreWriteRendezvous(options: {
 
     const arrive = async (ctx: BarrierParticipantContext, state: PreWriteHoldState): Promise<void> => {
         if (countArrival(true)) {
-            // This arrival completed the set, so it is released by arrival exactly as its siblings are —
-            // including the one-participant case, where it never joins the waiting set at all.
             state.releasedBy = 'arrival';
             releaseAllByArrival();
             return;
@@ -2970,15 +2352,11 @@ export function createPreWriteRendezvous(options: {
         await new Promise<void>((resolve, reject) => {
             state.resolve = resolve;
             state.reject = reject;
-            // ★ IN THE WAITING SET BEFORE ANYTHING THAT CAN FAIL THE RENDEZVOUS, AND THE ORDER IS THE WHOLE
-            // POINT. `onCancelled` invokes its listener SYNCHRONOUSLY when the pair has already been
+            // IN THE WAITING SET BEFORE ANYTHING THAT CAN FAIL THE RENDEZVOUS, AND THE ORDER IS THE WHOLE
             // abandoned, so registering before joining the set would run `failRendezvous` over an empty set,
-            // latch the failure, and then add this state to a set nothing will ever visit again — leaving the
             // intercepted statement pending for ever and hanging the suite's teardown rather than failing it.
             waiting.add(state);
             try {
-                // Two ways this hold can be FAILED — never satisfied: its own bound, and the whole-pair
-                // deadline this harness already owns. Both reject, so the intercepted write does not run.
                 state.timer = setTimeout(() => {
                     failRendezvous(
                         harnessError(
@@ -2999,8 +2377,6 @@ export function createPreWriteRendezvous(options: {
                     );
                 });
             } catch (registrationFailure: unknown) {
-                // A context that cannot register a timer or a cancellation listener leaves this hold with no
-                // way to ever be woken, so it is refused here rather than left to hang. Deterministic, and it
                 // takes the rendezvous with it: a participant this harness cannot supervise must not write.
                 failRendezvous(
                     asHarnessFailure(
@@ -3011,9 +2387,6 @@ export function createPreWriteRendezvous(options: {
                 );
             }
             if (failure !== undefined) {
-                // Already failed — by a synchronous cancellation above, by the registration failure above, or
-                // by a sibling between this hold's arrival and its registration. Refused now rather than left
-                // waiting for an event that has already happened.
                 discardHold(state, failure);
             }
         });
@@ -3039,16 +2412,7 @@ export function createPreWriteRendezvous(options: {
                 return Promise.resolve(true);
             }
             return new Promise<boolean>(resolve => {
-                // ONE-SHOT, AND IT RELEASES BOTH ESCAPES ON WHICHEVER PATH ANSWERS FIRST.
-                //
-                // A wait installs two of them — a watcher in `arrivalWatchers` and a bounded timer — and
-                // exactly one is ever going to fire. Resolving the promise and leaving the other one alive
-                // would keep a timer pending for the whole of `waitMs` after an ARRIVAL answered the wait,
                 // holding this closure and the rendezvous state it captures reachable, and then firing inside
-                // whichever LATER test happened to be running by the time it elapsed. It would be harmless to
-                // this wait, which had already settled, and that is exactly what makes it worth guarding: an
-                // escape that outlives the thing it was guarding is invisible until it fires somewhere it was
-                // never meant to.
                 let settled = false;
                 let expiry: ReturnType<typeof setTimeout> | undefined;
                 let watcher:
@@ -3071,8 +2435,6 @@ export function createPreWriteRendezvous(options: {
                 };
                 watcher = { count, notify: settle };
                 arrivalWatchers.add(watcher);
-                // Bounded, so a run in which the held operation never reaches its write reports a failed
-                // wait rather than hanging the suite until its whole-file timeout.
                 expiry = setTimeout(
                     () => settle(failure === undefined && arrived >= count),
                     waitMs ?? timeoutMs,
@@ -3098,7 +2460,6 @@ export function createPreWriteRendezvous(options: {
                 if (heldBefore === undefined && isTargetedWrite(statement)) {
                     heldBefore = statement;
                     // Throws when the rendezvous fails, so the statement below is NOT reached. That is the
-                    // whole point: a hold that was not released by arrival must not write.
                     await arrive(ctx, state);
                 }
                 return original(statement, parameters as never, useStructuredResult as never);
@@ -3109,8 +2470,6 @@ export function createPreWriteRendezvous(options: {
                 heldBefore: () => heldBefore,
                 releasedBy: () => state.releasedBy,
                 restore: () => {
-                    // The hold has already settled by the time a `finally` runs it, so this is the cleanup
-                    // of last resort: it clears any timer that outlived its hold and takes the state out of
                     // the waiting set, so nothing this rendezvous created survives the test that made it.
                     if (state.timer !== undefined) {
                         clearTimeout(state.timer);
@@ -3124,4 +2483,292 @@ export function createPreWriteRendezvous(options: {
             return hold;
         },
     };
+}
+
+// Diagnostic redaction — the one implementation every end-to-end suite in this package shares.
+// What it decides is a security property: whether a failing assertion publishes a session token, a buyer's
+// module makes "every suite redacts identically" a fact about the code rather than about the discipline of
+// callers pass a redacted string, a count or a boolean as the actual and use these helpers for the message.
+
+/**
+ * A stage label, rendered so that a label someone interpolated a VALUE into cannot publish it.
+ */
+export const TEARDOWN_STAGE_LABEL_BUDGET = 80;
+
+/**
+ * The characters a label may NOT contain, as an allowlist expressed by its complement.
+ */
+const SAFE_STAGE_LABEL = /^[A-Za-z0-9 ,.:;()'"?!+=<>[\]{}#%&*_-]*$/;
+
+/**
+ * Renders a stage or participant label, replacing it wholesale when it carries a value.
+ */
+export function describeTeardownStage(what: string): string {
+    const carriesAValue =
+        /[/\\@]/.test(what) || !SAFE_STAGE_LABEL.test(what) || what.length > TEARDOWN_STAGE_LABEL_BUDGET;
+    return carriesAValue ? '<unrenderable-stage-label>' : what;
+}
+
+/**
+ * The error classes a teardown diagnostic may NAME, as a fixed set.
+ */
+export const TEARDOWN_DIAGNOSTIC_ERROR_CLASSES = new Set<string>([
+    'Error',
+    'AggregateError',
+    'AssertionError',
+    'EvalError',
+    'RangeError',
+    'ReferenceError',
+    'SyntaxError',
+    'TypeError',
+    'URIError',
+    // TypeORM's own, which is what a raw statement against a core table fails with.
+    'CannotConnectAlreadyConnectedError',
+    'CannotExecuteNotConnectedError',
+    'ColumnTypeUndefinedError',
+    'ConnectionIsNotSetError',
+    'EntityMetadataNotFoundError',
+    'EntityNotFoundError',
+    'OptimisticLockVersionMismatchError',
+    'QueryFailedError',
+    'QueryRunnerAlreadyReleasedError',
+    'TransactionAlreadyStartedError',
+    'TransactionNotStartedError',
+    'TypeORMError',
+    'ForbiddenError',
+    'IllegalOperationError',
+    'InternalServerError',
+    'UnauthorizedError',
+    'UserInputError',
+    'bigint',
+    'boolean',
+    'function',
+    'number',
+    'object',
+    'string',
+    'symbol',
+    'undefined',
+]);
+
+/**
+ * What a failure IS, expressed only in labels this file owns.
+ *
+ * Each entry pairs a label with the shapes the four drivers phrase that failure in. The label is what
+ * reaches the log; the pattern only decides whether it does. Adding an engine means adding a pattern, and
+ * a phrasing nobody anticipated simply produces no label — which is the fail-closed direction.
+ */
+export const TEARDOWN_DIAGNOSTIC_CLASSES: ReadonlyArray<readonly [string, RegExp]> = [
+    ['unique-violation', /duplicate (entry|key)|unique constraint/],
+    ['check-violation', /check constraint/],
+    ['not-null-violation', /not[- ]null constraint|cannot be null/],
+    ['foreign-key-violation', /foreign key/],
+    ['missing-table', /no such table|unknown table|relation .* does not exist/],
+    ['missing-column', /no such column|unknown column|column .* does not exist/],
+    ['missing-object', /does not exist|doesn't exist/],
+    ['deadlock', /deadlock/],
+    ['lock-unavailable', /lock wait timeout|database is locked|could not obtain lock/],
+    ['timeout', /statement timeout|query timeout|timed out|etimedout/],
+    ['connection', /econnrefused|econnreset|epipe|not connected|connection (is )?(closed|lost|refused)/],
+    ['transaction-state', /transaction is aborted|transaction already started|transaction not started/],
+    ['syntax', /syntax error|sql syntax/],
+    ['authorization', /permission denied|access denied|forbidden|unauthori[sz]ed/],
+    ['filesystem', /enoent|eacces|no such file|illegal operation on a directory/],
+    ['programming-error', /is not a function|cannot read propert|of undefined|of null/],
+];
+
+/**
+ * The schema names a teardown diagnostic may report as MENTIONED, as a fixed list.
+ */
+export const TEARDOWN_DIAGNOSTIC_SCHEMA_NAMES: readonly string[] = [
+    'administrator',
+    'channel',
+    'customer',
+    'product_variant',
+    'product_variant_price',
+    'reorder_list',
+    'reorder_list_line',
+    'session',
+    'user',
+    'CHK_reorder_list_line_count_non_negative',
+    'CHK_reorder_list_line_quantity_positive',
+    'IDX_reorder_list_customer_channel',
+    'UQ_reorder_list_customer_channel_name_key',
+    'UQ_reorder_list_line_list_variant',
+];
+
+/**
+ * One failure from a teardown stage, rendered so it can be read in a build log without carrying any part of the
+ * message that produced it.
+ */
+export function redactTeardownDiagnostic(err: unknown): string {
+    const raw = err instanceof Error ? err.message : String(err);
+    const rawClass = err instanceof Error ? err.name : typeof err;
+    const errorClass = TEARDOWN_DIAGNOSTIC_ERROR_CLASSES.has(rawClass)
+        ? rawClass
+        : '<unrecognised-error-class>';
+    // A driver code is an enumerated constant the driver owns — MySQL's `ER_DUP_ENTRY`, SQLite's
+    // `SQLITE_CONSTRAINT`, PostgreSQL's five-character SQLSTATE — and it is the most precise thing a log
+    const rawCode: unknown = err instanceof Error ? (err as { code?: unknown }).code : undefined;
+    const code =
+        typeof rawCode === 'string' && /^(ER_[A-Z_]{1,40}|SQLITE_[A-Z_]{1,40}|[0-9A-Z]{5})$/.test(rawCode)
+            ? `/${rawCode}`
+            : '';
+    // MySQL 8 reports 3572 for a refused `NOWAIT`, MariaDB 1205. Admitted only as a non-negative integer
+    // that lets a new engine spelling be added deliberately rather than guessed at.
+    const rawErrno: unknown = err instanceof Error ? (err as { errno?: unknown }).errno : undefined;
+    const errno =
+        typeof rawErrno === 'number' && Number.isSafeInteger(rawErrno) && rawErrno >= 0 && rawErrno <= 99999
+            ? `#${String(rawErrno)}`
+            : '';
+    const lowered = raw.toLowerCase();
+    const labels = TEARDOWN_DIAGNOSTIC_CLASSES.filter(([, pattern]) => pattern.test(lowered)).map(
+        ([label]) => label,
+    );
+    const mentioned = TEARDOWN_DIAGNOSTIC_SCHEMA_NAMES.filter(name =>
+        new RegExp(`\\b${name}\\b`, 'i').test(raw),
+    );
+    return (
+        `${errorClass}${code}${errno} [${labels.length === 0 ? 'unclassified' : labels.join('+')}] ` +
+        `mentioning ${mentioned.length === 0 ? 'nothing recognised' : mentioned.join('+')} ` +
+        `(message withheld, ${String(raw.length)} chars)`
+    );
+}
+
+/**
+ * Runs EVERY teardown stage, in order, whatever any of them does, and reports the failures afterwards.
+ */
+export async function runAllTeardownStages(
+    stages: Array<{ what: string; run: () => Promise<void> }>,
+): Promise<void> {
+    const failures: string[] = [];
+    for (const stage of stages) {
+        try {
+            await stage.run();
+        } catch (err: unknown) {
+            // thrown, printed by the runner and read in a build log, and a stage runs raw statements
+            // {@link redactTeardownDiagnostic} for why measuring the message beats redacting it.
+            failures.push(`${describeTeardownStage(stage.what)}: ${redactTeardownDiagnostic(err)}`);
+        }
+    }
+    if (failures.length > 0) {
+        throw new Error(`Teardown did not complete cleanly — ${failures.join(' | ')}`);
+    }
+}
+
+/**
+ * One settled participant of the two-connection harness, as the harnesses in this package shape them.
+ */
+export interface SettledOutcomeLike {
+    label?: string;
+    status: string;
+    reason?: unknown;
+}
+
+/**
+ * Settled participants rendered for a diagnostic WITHOUT reproducing why any of them rejected.
+ */
+export function describeSettledOutcomes<T extends SettledOutcomeLike>(
+    outcomes: readonly T[],
+    describeFulfilledValue?: (outcome: T) => string,
+): string {
+    return outcomes
+        .map(outcome => {
+            const label = outcome.label === undefined ? '' : describeTeardownStage(outcome.label);
+            if (outcome.status === 'fulfilled') {
+                const described = describeFulfilledValue ? describeFulfilledValue(outcome) : 'fulfilled';
+                return label === '' ? described : `${label}=${described}`;
+            }
+            const rejection = `REJECTED: ${redactTeardownDiagnostic(outcome.reason)}`;
+            return label === '' ? rejection : `${label} ${rejection}`;
+        })
+        .join(' | ');
+}
+
+/**
+ * Re-raises a caught failure as a REDACTED one, and is the only sanctioned way to let a caught failure out.
+ */
+export function rethrowRedacted(what: string, err: unknown): never {
+    throw new Error(`${describeTeardownStage(what)} failed — ${redactTeardownDiagnostic(err)}`);
+}
+
+/**
+ * One cell rendered so that two reads of the same stored value compare equal.
+ */
+export function canonicaliseCell(value: unknown): string {
+    if (value === null || value === undefined) {
+        return 'null';
+    }
+    if (value instanceof Date) {
+        return `date:${value.getTime()}`;
+    }
+    if (Buffer.isBuffer(value)) {
+        return `buffer:${value.toString('hex')}`;
+    }
+    if (typeof value === 'boolean') {
+        return `number:${value ? 1 : 0}`;
+    }
+    if (typeof value === 'number') {
+        return `number:${value}`;
+    }
+    return `string:${String(value)}`;
+}
+
+/**
+ * Describes ONE cell for a diagnostic WITHOUT disclosing it: its kind, and for a sized value its size.
+ */
+export function describeCellForDiagnostic(value: unknown): string {
+    if (value === null || value === undefined) {
+        return 'null';
+    }
+    if (value instanceof Date) {
+        return 'date';
+    }
+    if (Buffer.isBuffer(value)) {
+        return `buffer(${String(value.length)})`;
+    }
+    if (typeof value === 'boolean' || typeof value === 'number' || typeof value === 'bigint') {
+        return String(value);
+    }
+    if (typeof value === 'string') {
+        return `string(${String(value.length)})`;
+    }
+    return typeof value;
+}
+
+/** What {@link describeRowDifferences} says when the rows match the capture in every cell. */
+export const NO_ROW_DIFFERENCE = 'no cell differs';
+
+/**
+ * Names every cell that differs between a capture and the rows as they stand now — by ROW IDENTIFIER and COLUMN
+ * NAME, and by the SHAPE of each side rather than by either value.
+ */
+export function describeRowDifferences(
+    captured: ReadonlyArray<Record<string, unknown>>,
+    now: ReadonlyArray<Record<string, unknown>>,
+): string {
+    const nowById = new Map(now.map(row => [String(row.id), row]));
+    const capturedIds = new Set(captured.map(row => String(row.id)));
+    const differences: string[] = [];
+    for (const row of captured) {
+        const current = nowById.get(String(row.id));
+        if (current === undefined) {
+            differences.push(`row ${String(row.id)} is missing`);
+            continue;
+        }
+        for (const column of Object.keys(row).sort()) {
+            if (canonicaliseCell(row[column]) !== canonicaliseCell(current[column])) {
+                differences.push(
+                    `row ${String(row.id)}.${column} moved ` +
+                        `(${describeCellForDiagnostic(row[column])} -> ` +
+                        `${describeCellForDiagnostic(current[column])})`,
+                );
+            }
+        }
+    }
+    for (const row of now) {
+        if (!capturedIds.has(String(row.id))) {
+            differences.push(`row ${String(row.id)} was added`);
+        }
+    }
+    return differences.length === 0 ? NO_ROW_DIFFERENCE : differences.join('; ');
 }

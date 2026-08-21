@@ -5,9 +5,9 @@
  * yields the five declared defaults.
  *
  * `@since 3.8.0` on each member is a derivation rather than a quotation: the contribution guide requires a
- * new public API to name the next minor version, and this checkout declares 3.7.0 — in `lerna.json` and in
- * every workspace manifest — so 3.8.0 is the next minor and is named here on that basis. No released
- * version of this platform carries it, and nothing outside this package's own `@since` tags asserts it.
+ * new public API to name the next minor version but its own example names a different one, and this checkout
+ * declares 3.7.0 — in `lerna.json` and in every workspace manifest — so 3.8.0 is the next minor and is named
+ * here on that basis. No released version of this platform carries it yet.
  *
  * There is no sixth key, and the absences are deliberate rather than pending. The list-name bound is not
  * configurable: it is the fixed constant `MAX_LIST_NAME_LENGTH` in `constants.ts`, equal to the `name`

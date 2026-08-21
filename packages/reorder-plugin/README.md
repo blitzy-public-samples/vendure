@@ -460,8 +460,13 @@ purge behaviour of its own to remove them.
 
 ## Package scripts
 
-Beyond the conventional `build`, `watch`, `lint`, `test`, `e2e`, `bench` and `ci`, this package
-declares two scripts that behave unlike the rest and are documented here so their exit status is not
+This package declares the conventional `build`, `watch`, `lint`, `test`, `e2e`, `bench` and `ci`. Of
+those, `bench` is deliberately an empty target: this feature asserts no service-level, latency or
+throughput figure anywhere, so there is nothing for a benchmark to hold to and the plugin ships no
+`*.bench.ts`. The script therefore passes `--passWithNoTests`, so the workspace aggregate that runs
+it reports a clean status rather than failing on an empty file set.
+
+Two further scripts behave unlike the rest and are documented here so their exit status is not
 misread:
 
 | Script                            | What it asserts                                                                          |

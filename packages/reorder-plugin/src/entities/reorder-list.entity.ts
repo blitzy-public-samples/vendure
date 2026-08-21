@@ -126,13 +126,13 @@ const NAME_KEY_COLUMN_OPTIONS: ColumnOptions = {
  * addition.** The feature contract enumerates five named objects across the two plugin tables —
  * three here and two on {@link ReorderListLine} — and requires the count itself to be asserted "so
  * an addition is visible rather than absorbed"
- * [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.4, §5]. An earlier revision also
- * declared a channel-only index for the cascade that fires when a channel is deleted; it was
- * withdrawn because it is a sixth object the contract does not authorise, and because nothing
- * depends on it: no operation issues a predicate led by `channelId` alone, the MySQL family creates
- * an index for a foreign key of its own accord, and a channel deletion is a single administrative
- * act rather than a request path. An index this feature genuinely needs belongs in the contract
- * first, so that the entity, the migration and the tests all move together.
+ * [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.4, §5]. A channel-only index for the
+ * cascade that fires when a channel is deleted is the obvious candidate for a fourth, and it is
+ * deliberately absent: it would be a sixth object across the two tables that the contract does not
+ * authorise, and nothing depends on it. No operation issues a predicate led by `channelId` alone,
+ * the MySQL family creates an index for a foreign key of its own accord, and a channel deletion is a
+ * single administrative act rather than a request path. An index this feature genuinely needs belongs
+ * in the contract first, so that the entity, the migration and the tests all move together.
  *
  * `id`, `createdAt` and `updatedAt` are inherited from {@link VendureEntity} and are deliberately not
  * re-declared here, though all three are part of this entity's published contract.

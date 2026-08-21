@@ -397,9 +397,9 @@ function isExcludedByDirective(selection: SelectionNode, variableValues: Record<
  * that stopped at the first match would hand the caller of this function a filtered window, the pre-parent
  * reconciliation would decline it — correctly, since a filtered total counts the caller's own subset — and the
  * *unfiltered* alias would then reach the field resolver's fallback, repairing the row only after the executor
- * had already taken the sibling `lineCount` scalar. That is precisely the stale-first-response defect the
- * pre-parent reconciliation exists to remove, reintroduced through an alias. So the whole selection set is
- * walked and {@link selectedUnfilteredLinesPageOptions} picks from what it finds.
+ * had already taken the sibling `lineCount` scalar — which is the stale-first-response the pre-parent
+ * reconciliation exists to prevent, reached through an alias instead of directly. So the whole selection set
+ * is walked and {@link selectedUnfilteredLinesPageOptions} picks from what it finds.
  *
  * A field reached through two spreads of the same fragment is collected twice. That is harmless: the caller
  * only ever uses the first window it accepts, and two spreads of one fragment describe the identical window.
@@ -672,7 +672,7 @@ export async function reconcileSingleReorderListRead(
         }
     }
     if (!page) {
-        // ★ UNREACHABLE AGAINST THE SERVICE'S CONTRACT — WHICH IS WHY IT FAILS CLOSED RATHER THAN RETURNING.
+        // UNREACHABLE AGAINST THE SERVICE'S CONTRACT — WHICH IS WHY IT FAILS CLOSED RATHER THAN RETURNING.
         // `getLinesForLists` seeds an entry for every identifier it is given, so a missing entry means that
         // contract has been broken inside this plugin. Returning here would answer the request with the
         // stored counter and no reconciliation, which is indistinguishable from the ordinary
@@ -1006,7 +1006,7 @@ export class ReorderListEntityResolver {
         const pages = await batch.loaded;
         const page = pages.get(parentId);
         if (!page) {
-            // ★ UNREACHABLE AGAINST THE SERVICE'S CONTRACT, AND IT FAILS CLOSED. `getLinesForLists` seeds an
+            // UNREACHABLE AGAINST THE SERVICE'S CONTRACT, AND IT FAILS CLOSED. `getLinesForLists` seeds an
             // entry for every identifier registered in the batch, so a missing partition means that contract
             // has been broken inside this plugin. Returning `{ items: [], totalItems: 0 }` would publish
             // "this list has no lines" — a statement about the buyer's own data that this request has no

@@ -1,62 +1,5 @@
 /*
  * STORY-001-01-04 — "Read reorder lists through the Shop API".
- *
- * The two published reads — `activeCustomerReorderLists` and `activeCustomerReorderList` — and every claim
- * STORY-001-01-04 makes about them. Its eight acceptance criteria run first, then the schema-delta
- * comparison, then the statement-count contracts, then the five scenarios of its section 7, then the one
- * empty-generation assertion this suite owns. Every criterion and every scenario is a NAMED test, so a red
- * result names the requirement rather than a helper.
- *
- * THE ISOLATION CONTRACT (EPIC-001 section 11.6.1), stated here because every exact count below rests on it.
- * One `TestServer`, initialised in `beforeAll` under the long setup timeout; `afterAll` calls
- * `await server.destroy()` UNCONDITIONALLY; `beforeEach` resets the capture instrument, empties both plugin
- * tables and authenticates the acting session; `afterEach` deletes every plugin-owned row addressing
- * `reorder_list_line` BEFORE `reorder_list` so a foreign key is never what fails the cleanup, and restores
- * every core row a test mutated but did not create. The harness's wholesale table clear is NEVER used
- * between tests: it synchronises the schema
- * (`packages/testing/src/data-population/clear-all-tables.ts`) and would drop the populated catalogue every
- * later case depends on. No test consumes the state a sibling criterion left behind — each builds its own
- * precondition by CALLING a fixture helper — which is what lets any test here run alone and the file run in
- * reverse order with the same result.
- *
- * DETERMINISM. An ordering assertion below NAMES the tie-break column the query it sent declares, and a
- * paginated assertion NAMES the page arguments it sent. Nothing here asserts an ordering the query does not
- * make total: the collection default is `createdAt` DESC then `id` DESC and the nested lines default is
- * `createdAt` ASC then `id` ASC, and the identifier half of each is what makes a page boundary stable when
- * rows share a timestamp — which they routinely do, the column having one-second resolution on the SQLite
- * family.
- *
- * STATEMENT-COUNT DISCIPLINE (EPIC-001 sections 7.7.1a and 11.6.2; FEATURE-001-01 sections 2.6.1.1, 2.6.2
- * and 2.6.3). Three observation boundaries are kept apart, and every assertion below says which one it is
- * making:
- *
- *   - PLUGIN-STATEMENT boundary — statements against this plugin's own two tables. This is the ONLY boundary
- *     at which an exact number is asserted, and every such assertion is an EQUALITY: never "at least", never
- *     "no more than".
- *   - SERVICE-CALL boundary — the named service method is spied and its CALLS are asserted. Never statements.
- *   - WHOLE-REQUEST boundary — NON-GROWTH ONLY across two input sizes, and never an exact total. A page of
- *     three lists and a page of six must issue the same number of statements against the two plugin tables;
- *     equality across the two sizes is the whole assertion.
- *
- * The instrument is the canonical one: a TypeORM logger OBJECT supplied on `dbConnectionOptions` through
- * `queryCaptureConfig`, reset in `beforeEach`, opened immediately before the operation under test and closed
- * the moment it returns, and filtered by table name with the filter NAMED at the assertion site. The boolean
- * `logging` flag and a spy on the repository accessor are both refused by that contract and neither appears
- * in this file. The counted form runs on sql.js, where statement text and count are deterministic; the
- * BEHAVIOUR each count evidences is asserted ungated and therefore runs on all four engine jobs.
- *
- * "Zero statements" is asserted only where zero is REACHABLE: against `reorder_list_line` on a read that
- * selects no nested collection, and against `reorder_list` on the over-limit refusal, which the platform
- * raises while building the query and therefore before any row is read. It is NEVER asserted against
- * `reorder_list` for an inaccessible single read — the server cannot discover a row's absence without
- * asking, so a zero-statement claim there is unpassable for a correct implementation and passable only by
- * one that answers without looking. That case asserts EXACTLY ONE scoped statement instead.
- *
- * The two compiler-project criteria below generate their shared types module from the live introspection of
- * the server this suite booted, run the two declared package scripts inside that window, and then run them
- * again with the module absent. The exhaustive project emits TS2322 for the missing branch AND TS2307 for a
- * missing import, so the criterion requires TS2322 WITHOUT TS2307 inside the window and TS2307 outside it —
- * otherwise an unresolved import would pass as evidence of exhaustiveness.
  */
 import { generate } from '@graphql-codegen/cli';
 import { LanguageCode, SortOrder } from '@vendure/common/lib/generated-shop-types';
@@ -91,10 +34,10 @@ import {
     NO_ROW_DIFFERENCE,
     rethrowRedacted,
     runAllTeardownStages,
-} from './fixtures/diagnostic-redaction';
-import { committedMigrationApplies } from './fixtures/migration-state';
+} from './fixtures/concurrency-barrier';
 import {
     CapturedStatement,
+    committedMigrationApplies,
     CorrelatedOwnershipRequirement,
     isStatementCountEngine,
     queryCaptureConfig,
@@ -272,13 +215,6 @@ const COMPILER_INVOCATION_TIMEOUT_MS = 240_000;
 
 /**
  * Where the plugin-aware types AC-8 generates are written: the package root, not this directory.
- *
- * It is inside the package because both compiler fixtures import it by a RELATIVE specifier — that is what
- * makes the enum they compile against unambiguously the generated one, with no ambient path mapping able to
- * substitute another. It is a build product of this run rather than a checked-in artefact: git-ignores it
- * (`packages/reorder-plugin/.gitignore`), AC-8 writes it before compiling and removes it afterwards, and a
- * copy of it committed beside the fixtures would defeat the whole point, since the PROVENANCE of the enum is
- * the evidence.
  */
 const GENERATED_TYPES_DIRECTORY = path.join('..', '.generated');
 const GENERATED_SHOP_TYPES_FILE = 'shop-error-codes.ts';
@@ -453,13 +389,8 @@ const GET_ACTIVE_CUSTOMER_FOR_REORDER_READ = gql`
 `;
 
 /**
- * The introspection of the booted Shop API, shaped so that ONE code path can read both it and the untouched
- * `schema-shop.json` snapshot.
- *
- * The root types are reached through `types` by name rather than through `queryType { fields }`, because the
- * standard introspection query the snapshot was produced with selects only `queryType { name }` and puts
- * every field under `types`. Reading both sides the same way is what makes the comparison a comparison
- * rather than two different readings that happen to agree.
+ * The introspection of the booted Shop API, shaped so that ONE code path can read both it and the untouched `schema-
+ * shop.json` snapshot.
  */
 const SHOP_SCHEMA_SHAPE = gql`
     query ReorderReadShopSchemaShape {
@@ -560,7 +491,6 @@ interface AdminProductVariant {
     sku: string;
     enabled: boolean;
     price: number;
-    /** The variant's OWNING product, whose identifier is a `product` row's and not a `product_variant` row's. */
     product: { id: ReorderApiId };
 }
 
@@ -675,19 +605,10 @@ interface SeededList {
     lineIds: string[];
 }
 
-// Introspection helpers
-//
 // Every one of them is a pure function over an {@link IntrospectedSchema}, so the SAME code reads the live
-// schema and the checked-in snapshot. That is the whole reason they exist: a comparison written twice is two
-// readings that can disagree about what "the same signature" means.
 
 /**
  * Renders a type reference to its SDL spelling — `String!`, `[ReorderList!]!`, `ID`.
- *
- * One string carries the return type AND its nullability AND its list depth, which is exactly what
- * "byte-identical in return type and nullability" has to compare. Comparing the nested objects instead would
- * also compare `description` and `isDeprecated`, which the snapshot carries and this suite's introspection
- * does not select — so a documentation edit that changed no contract would fail the comparison.
  */
 function renderTypeRef(ref: IntrospectedTypeRef | null | undefined): string {
     if (!ref) {
@@ -776,19 +697,10 @@ function sortedErrorResultImplementors(schema: IntrospectedSchema): string[] {
 
 const capture = new QueryCaptureLogger();
 
-// THE SQL.JS SNAPSHOT DIRECTORY, CREATED IDEMPOTENTLY AND AT MODULE SCOPE, FOR TWO SEPARATE REASONS.
-//
 // The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
 // guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
 // which is a check-then-act race: this package's e2e suites start together, so when the directory is absent —
-// as it is on a fresh checkout, and after the operational reset a schema change requires — two of them can
 // both observe it missing and the loser fails its `beforeAll` with `EEXIST`. The three server engines use no
-// snapshot directory and are unaffected.
-//
-// The second is ordering. The directory has to exist before `testConfig()` reads the `e2e/` directory index
-// it derives this file's port from, which is why the call sits at module scope rather than in `beforeAll`.
-// Recursive creation is idempotent, so a directory another suite already made is not an error, and an empty
-// directory is not a cached snapshot file — the initializer still synchronises a fresh schema.
 fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
 
 const serverConfig = mergeConfig(testConfig(), {
@@ -845,11 +757,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     let defaultChannelDbId: number;
     /**
      * The stored identifier of the second channel THIS SUITE created.
-     *
-     * Kept because a channel-scope assertion has to name the channel the request actually acted in. Requiring
-     * only that the predicate carry something other than the default channel's identifier is satisfied by any
-     * value at all — including one belonging to no channel — so the exact identifier is what makes the claim
-     * about scoping rather than about inequality.
      */
     let secondChannelDbId: number;
 
@@ -1017,16 +924,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
     /**
      * Replaces the two plugin tables with THE CHECKED-IN MIGRATION'S OWN OUTPUT, on the live connection.
-     *
-     * **It is available on the generation engine alone**, because the shipped artefact is the migration
-     * generator's PostgreSQL output and an emitted migration is bound to the engine it was generated against
-     * ({@link committedMigrationApplies} carries the reasoning and the citations). Elsewhere the rebuild is
-     * skipped and the caller says what its assertion then rests on, which is what the case below asserts
-     * rather than assumes. Where a migration-created schema IS exercised on every engine is
-     * `e2e/reorder-list-migration.e2e-spec.ts`: it applies the checked-in artefact where the dialect matches
-     * and this engine's own lifecycle emission otherwise, and runs its whole data-bearing cycle against that.
-     *
-     * @returns Whether the schema underneath is now the migration's own.
      */
     async function rebuildPluginSchemaFromCheckedInMigration(): Promise<boolean> {
         if (!committedMigrationApplies(String(dataSource.options.type))) {
@@ -1044,15 +941,8 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     }
 
     /**
-     * The configuration the platform generator runs against, resolved so that the plugin tables in the
-     * database it opens are the ones the checked-in migration created.
-     *
-     * On the server engines the generator's own connection reaches the live database, so the live options are
-     * handed over unchanged. On sql.js they do NOT: the initializer points `location` at a snapshot file and
-     * disables auto-save once populating is finished, so a second connection loads the SYNCHRONISED snapshot
-     * from disk and never observes the live in-memory schema at all. The live database is therefore exported
-     * to a scratch file first and the generator pointed at that, so the diff is against the migration's own
-     * output on all four engines rather than on three of them.
+     * The configuration the platform generator runs against, resolved so that the plugin tables in the database it
+     * opens are the ones the checked-in migration created.
      */
     async function generatorConfigAgainstMigratedSchema(
         scratchDirectory: string,
@@ -1075,24 +965,12 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     /**
      * Captures EVERY COLUMN of one variant's row and queues its exact restoration, with the assertion that it
      * happened, before the caller changes anything.
-     *
-     * Two weaker forms are ruled out rather than untried. Restoring the whole catalogue in `afterEach` —
-     * `UPDATE product_variant SET enabled = true, deletedAt = NULL WHERE 1 = 1` — reaches every row in the
-     * database rather than the two the catalogue-moved scenario touches: a variant the seed had legitimately
-     * disabled would be silently enabled, and a defect elsewhere that disabled or soft-deleted a variant it
-     * should not have would be quietly repaired between tests instead of failing something. Capturing only
-     * `enabled` and `deletedAt` fares no better: the compensating write puts those two back and advances the
-     * row's `updatedAt` on its way — restoring the columns under test while changing one that was not, and
-     * reporting success either way.
      */
     async function captureVariantAvailability(externalVariantId: ReorderApiId): Promise<void> {
         const variantId = decodeId(externalVariantId);
         const captured = await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
             variantId,
         });
-        // A COUNT rather than the array, for the same reason the soft-delete capture is counted: `toHaveLength`
-        // prints the received rows on failure, and a captured core row is a value-bearing capture whatever
-        // table it came from.
         expect(captured.rows.length, `No product_variant row with id ${String(variantId)} to capture`).toBe(
             1,
         );
@@ -1102,18 +980,8 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     const VARIANT_TRANSLATION_TABLE = 'product_variant_translation';
 
     /**
-     * Captures the exact `(baseId, languageCode)` translation row — or the fact that there is none — and
-     * queues its exact restoration before the caller writes.
-     *
-     * BOTH HALVES OF THAT MATTER. The registration has to happen before
-     * the mutation: a write that commits and then throws — or anything throwing between the write and a later
-     * registration — leaves the row changed with nothing queued to put it back, and every following test in
-     * the file then runs against a catalogue this one modified. And the restoration has to branch on what was
-     * there: deleting the pair unconditionally is correct only if this suite created it, so a fixture that
-     * already carried a translation for that language would have it removed rather than restored, silently,
-     * with the test reporting success either way. The general capture does both — it re-writes a captured row
-     * column for column and DELETES a row that appeared where the capture found none — and then asserts which
-     * of the two it did.
+     * Captures the exact `(baseId, languageCode)` translation row — or the fact that there is none — and queues its
+     * exact restoration before the caller writes.
      */
     async function captureVariantTranslation(
         externalVariantId: ReorderApiId,
@@ -1134,13 +1002,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         return { row: captured.rows.length === 1 ? { ...captured.rows[0] } : undefined };
     }
 
-    // Exact restoration of the core rows a test changes
-    //
-    // A core row this suite touches is put back COLUMN FOR COLUMN, and the restoration is then ASSERTED
-    // against what was captured. Two mechanisms make that stricter than it first sounds: the compensating
-    // write goes through the RAW TABLE rather than the entity manager, so restoring a captured value cannot
-    // itself move an entity-managed audit column, and it covers an inserted row and a deleted row alike by
-    // deleting or re-inserting as the capture requires. The restoration is then read back and compared for
     // equality, so a column the compensating write missed fails the test rather than leaking into the next.
 
     /**
@@ -1176,23 +1037,11 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         try {
             await dataSource.query(query, bound);
         } catch (err: unknown) {
-            // ★ THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
-            // HERE.
-            //
+            // THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
             // Every statement this helper runs binds CAPTURED CELLS: the values a restoration is putting
-            // back, which on the soft-delete path are a live buyer's `customer`, `user` and `session` rows —
             // an address, a password hash, an authentication token. TypeORM raises a failure from
-            // `dataSource.query` as a `QueryFailedError` that has copied the driver's error ONTO ITSELF, so
-            // `query` and `parameters` are its own ENUMERABLE properties: `String(err)` and
             // `JSON.stringify(err)` both publish the statement and every bound value, and so does the runner
-            // when it prints an unhandled rejection.
-            //
-            // A QUEUED restoration runs inside `runAllTeardownStages`, which already measures a failure
-            // rather than reproducing it. What that cannot cover is a restoration driven DIRECTLY from a test
-            // body, so the functional half can be asserted while the server is still up — those calls sit
             // outside the aggregator and travel straight to the runner. Sanitising HERE covers both, and
-            // covers a call added later by someone who never read this comment, which is the only version of
-            // this fix that stays true.
             rethrowRedacted('a captured-row restoration statement', err);
         }
     }
@@ -1271,12 +1120,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 continue;
             }
             // AND THE UPDATE-DATE COLUMN IS ALWAYS RE-STATED, even when it did not move. On the MySQL family
-            // the column is declared `datetime(6) on update CURRENT_TIMESTAMP(6)` — read out of
-            // `information_schema.COLUMNS` on the live e2e schema, not inferred — so ANY update that omits it
             // from its SET list is re-timestamped BY THE ENGINE, below TypeORM and below this helper. That was
-            // observed: a compensating write that restored only `deletedAt` left `user.updatedAt` moved by
-            // 865 milliseconds, because the captured value happened to equal the current one and so was not
-            // in `moved` at all.
             if (UPDATE_DATE_COLUMN in captured && !moved.some(([column]) => column === UPDATE_DATE_COLUMN)) {
                 moved.push([UPDATE_DATE_COLUMN, captured[UPDATE_DATE_COLUMN]]);
             }
@@ -1309,15 +1153,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
     /**
      * Requires the rows the predicate names to equal the capture cell for cell, so restoration is proved.
-     *
-     * ★ THE COMPARISON IS OVER FULL VALUES; THE ASSERTION IS OVER A REDACTED DESCRIPTION OF THE RESULT. Those
-     * are two separate things and an earlier revision conflated them: it rendered every cell of every row
-     * into two arrays and handed both to `toEqual`, so a failure printed the arrays — and on the soft-delete
-     * path those arrays hold a real `session.token` and the buyer's own contact fields. Comparing here
-     * instead, and asserting on the difference DESCRIPTION, keeps the check exactly as strict — every column
-     * of every captured row is compared through {@link canonicaliseCell}, a captured row that has gone is
-     * reported missing and a row that appeared is reported added — while leaving the assertion's own actual
-     * and expected values two short redacted strings that Vitest cannot expand into cell values.
      */
     async function expectCoreRowsRestored(rowsCapture: CoreRowsCapture): Promise<void> {
         const now = await readCoreRows(rowsCapture.table, rowsCapture.where, rowsCapture.parameters);
@@ -1328,14 +1163,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 'reported by row id, column name and value SHAPE only, deliberately — see ' +
                 'describeCellForDiagnostic',
         ).toBe(NO_ROW_DIFFERENCE);
-        // AND THE ROW COUNT, which the description above already covers through its missing/added entries and
-        // which is restated here so a future edit to that description cannot quietly weaken this to a
-        // per-column check over a shorter table.
-        //
-        // Two NUMBERS compared by hand rather than `expect(now).toHaveLength(n)`, because that matcher prints
-        // the RECEIVED ARRAY on failure — and on the soft-delete path that array is the buyer's `customer`,
         // `user` and `session` rows, `session.token` included. The numbers say exactly the same thing and
-        // cannot be expanded into a cell value.
         if (now.length !== rowsCapture.rows.length) {
             throw new Error(
                 `${rowsCapture.table} holds ${String(now.length)} rows for ${rowsCapture.where} where the ` +
@@ -1347,23 +1175,8 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
     /**
      * Creates one bare catalogue variant directly through the repository, and returns its stored identifier.
-     *
-     * The `lineCount` repair has to be provoked by removing line rows UNDERNEATH the plugin, which the
-     * cascade from `product_variant` does — `ReorderListLine.productVariantId` declares `onDelete: 'CASCADE'`.
-     * A seeded variant cannot be hard-deleted: other core tables reference it without cascading, so the
-     * statement is refused by a foreign key. A variant created here has no such references, so deleting it
-     * removes exactly the line rows that point at it. EPIC-001 section 11.6.1's alternative is explicit —
-     * either restore the core row or structure the test so the deleted row is one it created — and this is
-     * that second form, which is also the only one that leaves the shared catalogue untouched.
      */
     async function createBareVariant(index: number): Promise<number> {
-        /*
-         * The OWNING PRODUCT'S identifier, read from the catalogue rather than derived from a variant's.
-         * `ProductVariant.productId` is a foreign key into `product`, so passing a `product_variant`
-         * identifier there is only ever right by coincidence — it succeeds exactly when the two sequences
-         * happen to overlap, and it silently attaches the fixture to the wrong product (or is refused by the
-         * foreign key) the moment they do not.
-         */
         const owningProductId = decodeId(catalogueVariants[0].product.id);
         expect(
             Number.isInteger(owningProductId),
@@ -1463,12 +1276,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     /**
      * Generates plugin-aware Shop types from the LIVE schema of the server this file booted, and returns the
      * `ErrorCode` members the generator derived.
-     *
-     * The INTROSPECTION is the repository's own: `getIntrospectionQuery({ inputValueDeprecation: true })`,
-     * the same call the repository's download step makes
-     * (`scripts/codegen/download-introspection-schema.ts`), issued against this server's Shop API and written
-     * out in the same whole-result shape the checked-in snapshot uses, so the generator receives exactly the
-     * kind of input it receives in a real codegen run.
      */
     async function generatePluginAwareShopTypes(): Promise<{ members: string[]; modulePath: string }> {
         const directory = path.join(__dirname, GENERATED_TYPES_DIRECTORY);
@@ -1543,9 +1350,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             'The generated directory did not hold the module and its introspection input',
         ).toEqual([GENERATED_INTROSPECTION_FILE, GENERATED_SHOP_TYPES_FILE].sort());
         fs.removeSync(directory);
-        // A FIXED LABEL, not the path. The directory is named by `GENERATED_TYPES_DIRECTORY` a few lines
-        // above, so interpolating its absolute form adds nothing a reader needs and publishes the checkout
-        // location of whatever machine ran the suite.
         expect(
             fs.existsSync(directory),
             `the ${GENERATED_TYPES_DIRECTORY} directory survived being detached`,
@@ -1583,28 +1387,8 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     }
 
     /**
-     * Runs the command a package script declares, exactly as declared.
-     */
-    /**
-     * Compiler output with every host path folded to a stable marker, so a diagnostic can be read in a build
-     * log without describing the machine that produced it.
-     *
-     * ★ THE DIAGNOSTIC IS THE EVIDENCE, SO IT IS NORMALISED RATHER THAN WITHHELD. The assertions below are
-     * about what the compiler SAID — that it named all four added `ErrorCode` members, that it refused for
-     * exhaustiveness rather than an unresolved import — and a failure that reported only "the output did not
-     * contain it" would be unactionable. What the reader does not need is the absolute prefix `tsc` prints in
-     * front of every file it names, which is the checkout location on whatever machine ran the suite. Folding
-     * the package directory, the repository root and the OS temporary directory to fixed markers keeps every
-     * line number, error code and identifier and removes the layout.
-     *
-     * ★ IT IS APPLIED ONCE, INSIDE {@link runDeclaredCompilerScript}, AND THAT PLACEMENT IS THE POINT.
-     * Applying it at each use site is not equivalent: a custom assertion message is only one of the two things
-     * a failing matcher prints, and the other is the ACTUAL. `expect(output, normalised).toContain('TS2322')`
-     * publishes the raw string through the actual while the message beside it is clean. Normalising at the
-     * source means callers never hold the raw text, so the safe form is the only form available to them.
-     *
-     * Longest prefix first, because the package directory is a child of the repository root and folding the
-     * parent first would leave the child's remainder spelled out.
+     * Compiler output with every host path folded to a stable marker, so a diagnostic can be read in a build log
+     * without describing the machine that produced it.
      */
     function withoutHostPaths(output: string): string {
         const packageDir = path.join(__dirname, '..');
@@ -1630,10 +1414,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 encoding: 'utf-8',
                 timeout: COMPILER_INVOCATION_TIMEOUT_MS,
             });
-            // ★ NORMALISED HERE, AT THE SOURCE, so no caller can obtain the raw text at all. Folding it at
-            // each use site is what the previous revision did, and it left the raw string available as a
-            // MATCHER ACTUAL — which Vitest prints on a failed `toContain`, custom message or not. A matcher
-            // actual is a sink exactly as a message is. Doing it once here makes the safe form the only form.
             return { status: 0, output: withoutHostPaths(stdout) };
         } catch (err: unknown) {
             const failure = err as {
@@ -1643,8 +1423,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             };
             return {
                 status: failure.status ?? null,
-                // Normalised on this path too — and it is the one that matters most, since the half of the
-                // pair that must FAIL is the half whose diagnostic gets read.
                 output: withoutHostPaths(`${String(failure.stdout ?? '')}${String(failure.stderr ?? '')}`),
             };
         }
@@ -1659,9 +1437,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
         dataSource = server.app.get(TransactionalConnection).rawConnection;
         reorderListService = server.app.get(ReorderListService);
-        // Read from metadata rather than written out: a repository read's default alias is the entity
         // metadata's own name, and the capture predicates below must name the alias the statement actually
-        // uses. Hard-coding it would make a rename of the entity class look like a scoping failure.
         listAlias = dataSource.getMetadata(ReorderList).name;
 
         await adminClient.asSuperAdmin();
@@ -1696,8 +1472,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 input: {
                     code: SECOND_CHANNEL_CODE,
                     token: SECOND_CHANNEL_TOKEN,
-                    // Every value below is READ OFF the default channel rather than chosen here, so the second
-                    // channel differs from the first along exactly one dimension: its identity.
                     defaultLanguageCode: resolvedDefaultChannel.defaultLanguageCode,
                     defaultCurrencyCode: resolvedDefaultChannel.defaultCurrencyCode,
                     availableCurrencyCodes: resolvedDefaultChannel.availableCurrencyCodes,
@@ -1722,9 +1496,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
         secondShopClient = new SimpleGraphQLClient(serverConfig, shopApiUrl);
 
-        // Introspected ONCE, from the booted server carrying the plugin. Comparing a runtime schema against
-        // the untouched snapshot is the only correct way to evidence the delta: the introspection that
-        // produces `schema-shop.json` declares its own configuration and never reads a plugin's, so the
         // snapshot cannot move and must be neither edited nor regenerated (AAP section 0.4.1.5).
         liveSchema = await introspectLiveSchema();
 
@@ -1736,14 +1507,11 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     }, TEST_SETUP_TIMEOUT_MS);
 
     afterAll(async () => {
-        // UNCONDITIONALLY, per EPIC-001 section 11.6.1: a suite that destroys its server only on the success
         // path leaks a listening port into the next file.
         await server.destroy();
     });
 
     beforeEach(async () => {
-        // Each test's own scope, established here and never inherited: the restore queue and the temporary
-        // directory list start empty, the capture window starts closed and empty, both plugin tables start
         // empty, and the acting session is freshly authenticated on the default channel token.
         restoreActions = [];
         temporaryDirectories = [];
@@ -1754,12 +1522,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     });
 
     afterEach(async () => {
-        // EVERY STAGE RUNS, whatever any of them does, and the failures are reported once at the end.
-        //
-        // Core rows this test mutated are restored FIRST and in reverse order, so a later mutation layered on
-        // an earlier one unwinds in the order it was applied. The bare variants this test created are removed
-        // BEFORE the plugin rows, because removing them cascades whatever lines still point at them and a later
-        // foreign key failure would be reported as a cleanup error rather than as the deliberate cascade it is.
         const queued = restoreActions.slice().reverse();
         restoreActions = [];
         const directories = temporaryDirectories.slice();
@@ -1771,12 +1533,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             })),
             { what: 'bare variants', run: deleteBareVariants },
             { what: 'plugin rows', run: deleteAllPluginRows },
-            // ★ AN INDEX, NEVER THE PATH. `stage.what` is reproduced VERBATIM by the teardown aggregator —
-            // that is deliberate, because the stage name is this file's own text and is what identifies the
-            // step that failed — so anything interpolated into it is published as-is. An absolute temporary
             // directory discloses the layout of whatever machine ran the suite, developer or CI worker, and
-            // nothing about the assertion needs it: the path stays in the closure below, where the removal
-            // uses it and no log reads it.
             ...directories.map((directory, index) => ({
                 what: `temporary directory ${String(index + 1)} of ${String(directories.length)}`,
                 run: () => fs.remove(directory),
@@ -1820,15 +1577,11 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 GET_ACTIVE_CUSTOMER_REORDER_LISTS,
             );
 
-            // The call SUCCEEDS. The session holds only `Permission.Authenticated`; the gate marks the request
             // context and the service-layer ownership predicate is what actually scopes the answer.
             expect(activeCustomerReorderLists.totalItems).toBe(2);
             expect(activeCustomerReorderLists.items).toHaveLength(2);
 
-            // The declared default sort is `createdAt` DESC and then `id` DESC — and the identifier half is
-            // named here because it is what decides this very assertion: the two lists were created within one
             // clock second, and `createdAt` has one-second resolution on the SQLite family, so the timestamps
-            // are equal and the appended `id DESC` tie-break is the whole of the ordering.
             expect(activeCustomerReorderLists.items[0].name).toBe(SECOND_LIST_NAME);
             expect(activeCustomerReorderLists.items[1].name).toBe(FIRST_LIST_NAME);
             expect(String(activeCustomerReorderLists.items[0].id)).toBe(second.id);
@@ -1839,8 +1592,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
             expect(activeCustomerReorderLists.items.map(entry => String(entry.id))).not.toContain(foreign.id);
 
-            // Every entry reports its viewer access through the NESTED object, and the capability list is
-            // empty because no grant row can exist until list sharing ships.
             for (const entry of activeCustomerReorderLists.items) {
                 expect(entry.viewerAccess.access).toBe('OWNED');
                 expect(entry.viewerAccess.grantedCapabilities).toEqual([]);
@@ -1873,7 +1624,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
 
         it('pages deterministically across a boundary when more rows than one page share a createdAt', async () => {
-            // SIX rows carrying ONE timestamp, read in pages of FOUR — deliberately more equal-timestamp rows
             // than fit one page, because a tie-break can only be observed failing at a page boundary.
             const seeded = await seedLists('Equal timestamp', 6);
             const sharedTimestamp = new Date('2025-03-04T05:06:07.000Z');
@@ -1882,10 +1632,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 sharedTimestamp,
             );
 
-            // THE PAGE ARGUMENTS THIS ASSERTION SENT, named: take 4 / skip 0, then take 4 / skip 4, with the
-            // total order stated explicitly as `createdAt` DESC then `id` DESC — the same order the read
-            // applies by default, asked for by name so the assertion cannot be about an ordering the query
-            // never declared.
             const pageOne = await shopClient.query<
                 GetActiveCustomerReorderListsPaginatedQuery,
                 GetActiveCustomerReorderListsPaginatedQueryVariables
@@ -1916,13 +1662,11 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             ].map(entry => decodeId(entry.id));
 
             // Each row EXACTLY ONCE: no row repeated across the boundary and none missed, which is the failure
-            // a partial order produces when equal-timestamp rows are re-ordered between two requests.
             expect(new Set(walked).size).toBe(6);
             expect(walked.slice().sort((a, b) => a - b)).toEqual(
                 seeded.map(entry => decodeId(entry.id)).sort((a, b) => a - b),
             );
             // And strictly descending by identifier THROUGH the boundary, which is the tie-break doing the
-            // ordering: every `createdAt` in this fixture is the same value.
             for (let index = 1; index < walked.length; index++) {
                 expect(walked[index]).toBeLessThan(walked[index - 1]);
             }
@@ -1948,7 +1692,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(activeCustomerReorderList).not.toBeNull();
             const list = activeCustomerReorderList as NonNullable<typeof activeCustomerReorderList>;
             expect(list.name).toBe(FIRST_LIST_NAME);
-            // The STORED counter, arriving with the row. Exactly two, asserted as a number.
             expect(list.lineCount).toBe(2);
             expect(list.viewerAccess.access).toBe('OWNED');
             expect(list.viewerAccess.grantedCapabilities).toEqual([]);
@@ -1966,11 +1709,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
 
         it('publishes no price, currency or stock field on any type this feature declares', () => {
-            // Discharged against the INTROSPECTED SCHEMA rather than by observing a payload that happened not
-            // to carry one: a field absent from a response is absent because it was not selected, which is not
-            // evidence about the contract. `ReorderListLine.productVariant` resolves to the PLATFORM's own
-            // `ProductVariant` type, whose monetary fields are the platform's to publish — so the types checked
-            // here are the ones this feature declares, and the relation field itself carries no such name.
             const pluginTypes = [
                 'ReorderList',
                 'ReorderListLine',
@@ -2022,11 +1760,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 }),
             );
 
-            // The PLATFORM's refusal, not a plugin-local one: `ListQueryBuilder` raises `UserInputError` with
-            // the message key `error.list-query-limit-exceeded`, which the platform's own English catalogue
-            // renders as a sentence naming the breached limit. The key itself never reaches the wire — the
-            // resolved message does — so the assertion names both: the code exactly, and the limit inside the
-            // rendered text.
             expect(envelope.errors, JSON.stringify(envelope)).toBeDefined();
             expect(envelope.errors).toHaveLength(1);
             expect(envelope.errors?.[0].extensions?.code).toBe('USER_INPUT_ERROR');
@@ -2036,11 +1769,8 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(envelope.data).toBeNull();
 
             if (isStatementCountEngine()) {
-                // ZERO is REACHABLE here and is therefore asserted as a number, which is what "before any row
                 // is read" means: the refusal happens while the query is being built, so no statement against
-                // `reorder_list` is ever issued. This is not the inaccessible-single-read case, where a claim
                 // of zero statements would be unpassable for a correct implementation — the filter is named at
-                // the assertion site so the two cannot be confused. The gating reason is reported with every
                 // counted failure through {@link countedDiagnostic}.
                 expect(capture.count(LIST_TABLE), countedDiagnostic()).toBe(0);
                 expect(capture.count(LINE_TABLE), countedDiagnostic()).toBe(0);
@@ -2056,8 +1786,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 GET_ACTIVE_CUSTOMER_REORDER_LISTS,
             );
 
-            // At most the platform's configured limit, and SPECIFICALLY at most the plugin's own stricter
-            // default — asserted as the exact number, since the fixture holds one more row than that default.
             expect(activeCustomerReorderLists.items.length).toBe(DEFAULT_LISTS_PAGE_SIZE);
             expect(activeCustomerReorderLists.items.length).toBeLessThanOrEqual(SHOP_LIST_QUERY_LIMIT);
             expect(activeCustomerReorderLists.totalItems).toBe(DEFAULT_LISTS_PAGE_SIZE + 1);
@@ -2065,11 +1793,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
         it('applies the configured default nested page size of 50 where the caller windows no lines', async () => {
             const seeded = await seedList('Default nested page');
-            // ONE MORE LINE THAN THE NESTED DEFAULT, each on its own variant because a line is unique per
-            // `(list, variant)` and the seeded catalogue ships four. The rows are inserted directly and the
-            // counter is set to match, so the fixture's starting state is stated rather than inferred — and
-            // `lineCount` therefore agrees with reality before the read, which keeps this case about the page
-            // size and not about the repair.
             const lineTotal = DEFAULT_LINES_PAGE_SIZE + 1;
             for (let index = 0; index < lineTotal; index++) {
                 const variantDbId = await createBareVariant(index);
@@ -2130,9 +1853,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             const malformed = await bothArgumentForms(MALFORMED_LIST_ID);
 
             // (iii) the caller's OWN list, read under the SECOND CHANNEL's real token. The token is sent
-            // rather than a variable mutated, and the session is unchanged: the row is inaccessible because it
-            // belongs to another channel, which is a different reason from every other case and must produce
-            // the same answer.
             shopClient.setChannelToken(SECOND_CHANNEL_TOKEN);
             const otherChannel = await bothArgumentForms(own.id);
             shopClient.setChannelToken(E2E_DEFAULT_CHANNEL_TOKEN);
@@ -2140,28 +1860,17 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             const sixNulls = [...unknown, ...otherCustomers, ...otherChannel];
             const expectedEnvelope: GraphQlEnvelope = { data: { activeCustomerReorderList: null } };
 
-            // DEEP EQUALITY BETWEEN THE WHOLE ENVELOPES, and that is the assertion rather than six independent
-            // null checks. A response carrying a warning extension on one path, or an `errors` array on
-            // another, satisfies "each is null" while telling a caller which identifiers exist — so what is
-            // compared here is every observable part of the response: the presence and value of `data`, the
-            // ABSENCE of any `errors` key, and the absence of any `extensions` key.
             for (const envelope of sixNulls) {
                 expect(envelope).toEqual(expectedEnvelope);
                 expect(Object.keys(envelope).sort()).toEqual(['data']);
                 expect(envelope.errors).toBeUndefined();
                 expect(envelope.extensions).toBeUndefined();
             }
-            // Equal to ONE ANOTHER as well as to the unknown-identifier answer, stated as its own assertion so
-            // a future change that made one path differ fails here rather than silently.
             for (const envelope of sixNulls) {
                 expect(envelope).toEqual(sixNulls[0]);
                 expect(envelope).toEqual(unknown[0]);
             }
 
-            // THE MALFORMED IDENTIFIER resolves to exactly `null` INSIDE THE RESOLVER rather than being
-            // refused at schema validation: `ID` accepts a string, so the request is valid and the answer is
-            // the same normalised null. A validation failure would have produced a `GRAPHQL_VALIDATION_FAILED`
-            // entry and no `data` key at all, which is what the absence of `errors` here rules out.
             for (const envelope of malformed) {
                 expect(envelope).toEqual(expectedEnvelope);
                 expect(envelope.errors).toBeUndefined();
@@ -2177,11 +1886,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
     });
 
-    // AC-5 — the unauthenticated and cross-customer collection reads
-    //
-    // A READ answers with an empty collection or a null and NEVER with an error (ruling R14, the shipped read
     // convention). A WRITE is the opposite case and propagates `FORBIDDEN`; that is asserted by the create,
-    // add-item and mutate suites, which own the six mutations, and deliberately not here.
 
     describe('AC-5: a caller with no resolvable scope receives an empty page rather than an error', () => {
         it('returns totalItems 0 and an empty items collection with no error entry for an unauthenticated call', async () => {
@@ -2197,20 +1902,14 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(envelope.data).toEqual({ activeCustomerReorderLists: { totalItems: 0, items: [] } });
 
             /*
-             * THE SINGLE-LIST READ ADDRESSES THE EXISTING, OWNED ROW — not an identifier nothing was ever
-             * stored under. An implementation that leaks any row it can find to a caller with no session
-             * answers an unknown identifier with null just as correctly as a scoped one does, so an unknown
-             * identifier evidences nothing about scoping at all: the null it produces is indistinguishable
-             * from the null a total absence of authorization would produce. Reading the row that exists is
-             * the only form of this assertion an unscoped implementation fails.
+             * THE SINGLE-LIST READ ADDRESSES THE EXISTING, OWNED ROW — not an identifier nothing was ever stored
+             * under.
              */
             const single = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: owned.id });
             expect(single.errors, JSON.stringify(single)).toBeUndefined();
             expect(single.data).toEqual({ activeCustomerReorderList: null });
 
-            // And the same convention holds for an identifier nothing was stored under, so the two cases are
             // INDISTINGUISHABLE to an anonymous caller — which is the point: the API discloses neither the
-            // existence nor the absence of another party's row.
             const unknown = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: UNKNOWN_LIST_ID });
             expect(unknown.errors).toBeUndefined();
             expect(unknown).toEqual(single);
@@ -2306,7 +2005,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(activeCustomer).not.toBeNull();
             const customer = activeCustomer as ActiveCustomerShape;
             expect(String(customer.id)).toBe(String(actingCustomer.id));
-            // Compared as a BOOLEAN so a failure does not print the buyer's address on both sides of a diff.
             expect(
                 customer.emailAddress === actingCustomer.emailAddress,
                 "activeCustomer returned a different customer's identifying field",
@@ -2325,31 +2023,10 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 ].sort(),
             );
             /*
-             * THE CUSTOM FIELDS VALUE IS UNCHANGED, and "unchanged" is asserted as the COMPLETE shape rather
-             * than as the absence of reorder-shaped keys. This feature registers ZERO custom fields on any
-             * core entity (ruling R1) and declares no `configuration` hook, so the value carries no registered
-             * field at all — not merely no field whose name happens to mention this feature. A filter for
-             * reorder-shaped names is passed by an arbitrary new custom field registered by anything at all,
-             * which is exactly the regression this criterion exists to catch: a plugin that widened a core
-             * entity under a name of its own choosing would be invisible to it.
-             */
-            /*
              * The one key the value does carry is the PLATFORM'S OWN and is not a custom field: the generated
-             * custom-field resolver spreads the entity's `customFields` and then attaches `__entityId__` set to
-             * the entity's identifier, so that a relation-typed custom field could be resolved from it
-             * (`packages/core/src/api/config/generate-resolvers.ts`). It is present on every entity the platform
-             * generates that resolver for, plugin or no plugin, so the exact expected shape is that marker and
-             * nothing besides — asserted as an equality over the WHOLE key set.
-             */
-            /*
-             * ★ THE DIAGNOSTIC NAMES THE UNEXPECTED KEYS AND SERIALISES NO VALUE. The actual and expected of
-             * this assertion are already key sets rather than the object, but an earlier revision put
-             * `JSON.stringify(customer.customFields)` in the MESSAGE — and the exact regression this
-             * assertion exists to catch is "something registered a custom field on `Customer`", so the one
-             * failure that prints it is the one where the value holds whatever that field stores. On a
-             * deployment that is arbitrary customer extension data: a tax identifier, an internal note, an
-             * integration's API key. A key NAME is what identifies the plugin that widened the entity, and
-             * it is the whole diagnosis; the value contributes nothing to it.
+             * custom-field resolver spreads the entity's `customFields` and then attaches `__entityId__` set to the
+             * entity's identifier, so that a relation-typed custom field could be resolved from it
+             * (`packages/core/src/api/config/generate-resolvers.ts`).
              */
             const unexpectedCustomFieldKeys = Object.keys(customer.customFields ?? {})
                 .filter(key => key !== '__entityId__')
@@ -2366,14 +2043,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 actingCustomerDbId,
             );
 
-            /*
-             * AND THE COMPLETE DECLARED SHAPE OF `Customer` MATCHES THE UNTOUCHED BASELINE, field for field
-             * and signature for signature. This is the structural half of the same claim, and it is compared
-             * against `schema-shop.json` — which cannot have moved, because the introspection that produces it
-             * declares its own configuration and never reads the dev-server config. A registered custom field
-             * changes `customFields` from the scalar the baseline publishes into a generated object type
-             * carrying members, so the signature comparison sees it whatever the field is called.
-             */
             expect(fieldSignaturesOf(liveSchema, 'Customer')).toEqual(
                 fieldSignaturesOf(snapshotSchema, 'Customer'),
             );
@@ -2393,23 +2062,9 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
     });
 
-    // AC-8 — the `ErrorCode` growth, evidenced as a number by the two compiler projects
-    //
-    // The read itself returns no error member: its return type is a paginated list and a nullable object, not
-    // a union, which is why the growth cannot be evidenced from a read payload and is evidenced by compilation
-    // instead. Neither fixture module is IMPORTED here — importing the deliberately-failing one would couple
-    // this suite's own transpile to it — so the two spawned compiler runs are the only interaction with them.
-
     describe('AC-8: the four added ErrorCode members are evidenced by the pinned compiler', () => {
         let generatedErrorCodeMembers: string[];
 
-        /*
-         * The generation runs ONCE for the whole criterion, before either project is compiled, because both
-         * projects compile against the same module and the arithmetic asserted below is a property of that one
-         * generation. It is a `beforeAll` scoped to this describe rather than to the file so that no other
-         * criterion pays for it, and its output is removed in the matching `afterAll` — the module is a build
-         * product of this run and a checked-in copy would let the pair compile against a stale enum.
-         */
         beforeAll(async () => {
             const generated = await generatePluginAwareShopTypes();
             generatedErrorCodeMembers = generated.members;
@@ -2421,18 +2076,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
 
         it('generates the ErrorCode enum from the live schema, 32 baseline members widening to 36', () => {
-            /*
-             * THE PROVENANCE ASSERTION, and the reason the two compile statuses below mean anything. The enum
-             * the fixtures switch over was derived by the repository's own generator from the LIVE schema of
-             * the server this file booted, so its membership is a measurement of what the running server
-             * publishes. Nothing in either fixture declares a member and nothing in this file supplies one to
-             * the generator.
-             *
-             * Stated as a transition (ruling R15): the baseline width, this feature's own four additions, and
-             * the total — with the four named individually, and with every baseline member read off the
-             * UNTOUCHED checked-in snapshot and required to still be present, so the widening is proved
-             * additive rather than merely larger.
-             */
             const baseline = sortedEnumValues(snapshotSchema, 'ErrorCode');
             expect(baseline.length).toBe(BASELINE_ERROR_CODE_COUNT);
 
@@ -2453,7 +2096,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                     `${code} was already in the baseline, so it is not this feature's`,
                 ).not.toContain(code);
             }
-            // And the additions are EXACTLY those four — no fifth member arrived from anywhere.
             expect(generated.filter(member => !baseline.includes(member))).toEqual(
                 [...FEATURE_ERROR_CODES].sort(),
             );
@@ -2461,14 +2103,9 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
         it('declares each compiler project as its own package script, pinned and identical but for the project', () => {
             /*
-             * THE INVOCATION SURFACE, ASSERTED RATHER THAN ASSUMED. STORY-001-01-04's AC-8 asks for two
-             * compiler PROJECTS driven by two package SCRIPTS; a suite that shelled out to its own command
-             * line would satisfy the compiler half while leaving the declared half absent, and nothing would
-             * say so. Each script is therefore read out of the manifest and required to be a DIRECT
-             * invocation of the workspace-pinned compiler on its own project with `--noEmit`: nothing stands
-             * between the script and `tsc`, and `npx` appears nowhere, because it may resolve or fetch a
-             * compiler other than the pinned one and would decide this criterion by whatever happened to be
-             * available.
+             * THE INVOCATION SURFACE, ASSERTED RATHER THAN ASSUMED. STORY-001-01-04's AC-8 asks for two compiler
+             * PROJECTS driven by two package SCRIPTS; a suite that shelled out to its own command line would satisfy
+             * the compiler half while leaving the declared half absent, and nothing would say so.
              */
             const pinnedCompiler = path.join('..', '..', 'node_modules', 'typescript', 'bin', 'tsc');
             const blanked: string[][] = [];
@@ -2514,13 +2151,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                     'statuses are not attributable to the projects',
             ).toEqual(blanked[1]);
 
-            /*
-             * AND EACH PROJECT IS A SINGLE-FILE PROJECT NAMING ITS OWN HALF OF THE PAIR, extending the
-             * repository root configuration so that `strict` is inherited rather than redeclared. Without
-             * this a project could quietly widen to a directory and compile files nobody is asserting
-             * anything about, or both projects could name the same fixture — which would make the two
-             * statuses impossible rather than merely uninformative.
-             */
             for (const declaration of [
                 { project: EXHAUSTIVE_TSCONFIG, fixture: './error-code-exhaustive.fixture.ts' },
                 { project: DEFAULTED_TSCONFIG, fixture: './error-code-defaulted.fixture.ts' },
@@ -2550,8 +2180,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             'resolves the workspace-pinned TypeScript compiler and not a floating one',
             () => {
                 const compiler = path.join(__dirname, '../../../node_modules/typescript/bin/tsc');
-                // A FIXED LABEL rather than the resolved path. Where the compiler is expected is a property of
-                // the workspace layout, which this message can state without naming the machine it is on.
                 expect(
                     fs.existsSync(compiler),
                     'The workspace compiler is absent from node_modules/typescript/bin/tsc; run the ' +
@@ -2579,11 +2207,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                     `The diagnostic named none of the four added members:\n${output}`,
                 ).toBeGreaterThan(0);
                 expect(output, output).toContain('TS2322');
-                // AND NOT AN UNRESOLVED IMPORT. This is the load-bearing half: with the generated module
-                // absent the compiler emits TS2307 AND this same TS2322, because an unresolved import still
-                // leaves `code` typed by name rather than as `never`. A TS2322 on its own would therefore be
-                // satisfied by a checkout in which nothing generated the module at all. The criterion below
-                // drives that absent case deliberately and requires the TS2307 there.
                 expect(
                     output,
                     `The refusal was an unresolved module rather than exhaustiveness:\n${output}`,
@@ -2597,14 +2220,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             () => {
                 const { status, output } = runDeclaredCompilerScript(DEFAULTED_SCRIPT);
 
-                // ZERO, and the same generated enum — the same four added members and all 32 baseline ones — is
-                // in scope in this project as in the one above: the pair differs only in the presence of a
-                // default branch, so a clean exit here is what makes the failure above attributable to
-                // exhaustiveness rather than to the fixture, or the generated module, being unbuildable.
                 expect(status, `Expected a zero exit; output was:\n${output}`).toBe(0);
-                // AND NO DIAGNOSTIC OF ANY KIND. The driver reports its own success on this path, so the
-                // property that matters is not silence but the absence of a compiler diagnostic — a clean
-                // exit accompanied by an `error TS…` line would mean the status had been decided elsewhere.
                 expect(output, output).not.toContain('error TS');
             },
             COMPILER_INVOCATION_TIMEOUT_MS,
@@ -2613,16 +2229,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         it(
             'is checkable only inside the generation window, and proves it by failing with TS2307 outside it',
             () => {
-                /*
-                 * WHY THE TWO STATUSES ABOVE ARE ATTRIBUTABLE TO EXHAUSTIVENESS AND NOTHING ELSE.
-                 *
-                 * Each fixture imports the module the `beforeAll` of this criterion generated from the live
-                 * schema of the server this suite booted, and that module is a build product that is never
-                 * committed — a committed copy would let the pair compile against a stale enum, which is the
-                 * failure mode the generation exists to remove. So on a clean checkout, where nothing has
-                 * booted a server, neither declared script can resolve it. That is intended rather than a
-                 * defect, and it is exactly why the generation window belongs to this file.
-                 */
                 const directory = path.join(__dirname, GENERATED_TYPES_DIRECTORY);
                 const detached = detachGeneratedShopTypes();
                 try {
@@ -2655,12 +2261,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     });
 
     // The schema delta, by runtime introspection of the booted server (AAP section 0.7.3, ruling R15)
-    //
-    // The comparison is between the LIVE schema of a server carrying this plugin and the UNTOUCHED checked-in
-    // snapshot, read from disk read-only. The snapshot is never edited and never regenerated, and it cannot
-    // move: the introspection that produces it declares its own configuration with `plugins: [AdminUiPlugin]`
-    // and never reads a plugin's. Every number below is therefore stated as a TRANSITION — the baseline and
-    // this feature's own addition — and never as a bare post-plugin total.
 
     describe('the published Shop surface widens by exactly this feature\u2019s own additions', () => {
         it('transitions 19\u219221 queries, 32\u219238 mutations, 32\u219236 error codes, 31\u219235 implementors and 97\u219297 permissions', () => {
@@ -2682,8 +2282,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             );
 
             // THE RUNTIME WIDTH, as baseline PLUS this feature's own additions. These are F-101's figures and
-            // not EPIC-001 section 6.5's cumulative ledger for all eight features, which would be 23 / 42 / 38
-            // / 101 and is what ruling R15 exists to keep out of an assertion like this one.
             const liveQueries = sortedFieldNames(liveSchema, liveSchema.queryType.name);
             const liveMutations = sortedFieldNames(
                 liveSchema,
@@ -2704,17 +2302,11 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             );
             expect(sortedErrorResultImplementors(liveSchema)).toHaveLength(35);
 
-            // THE ZERO DELTA, ASSERTED RATHER THAN OMITTED. This feature registers no `PermissionDefinition`,
-            // so the published enum is exactly as wide as it was — and a zero delta that is not asserted is
-            // indistinguishable from one that was never checked.
             expect(sortedEnumValues(liveSchema, 'Permission')).toHaveLength(BASELINE_PERMISSION_MEMBER_COUNT);
             expect(sortedEnumValues(liveSchema, 'Permission')).toEqual(
                 sortedEnumValues(snapshotSchema, 'Permission'),
             );
 
-            // The additions are exactly the named ones, and nothing else appeared. A root field that appeared
-            // and is not one of these is a platform widening, which EPIC-001 asks to be reported rather than
-            // absorbed into this feature's delta.
             expect(liveQueries.filter(name => !baselineQueries.includes(name)).sort()).toEqual(
                 [...FEATURE_ROOT_QUERIES].sort(),
             );
@@ -2733,15 +2325,10 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                     signature,
                 );
             }
-            // And no baseline field was REMOVED or renamed, which the loop above cannot see on its own: a
-            // renamed field would simply be absent from `live` under its old name and present under a new one,
-            // and the membership comparison is what catches the second half.
             for (const name of baseline.keys()) {
                 expect(live.has(name)).toBe(true);
             }
 
-            // The two shipped order mutations gain NO argument: a custom field on `Order` or `OrderLine` would
-            // widen them as a side effect, and this feature registers none.
             const baselineMutations = fieldSignaturesOf(
                 snapshotSchema,
                 (snapshotSchema.mutationType as { name: string }).name,
@@ -2792,14 +2379,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
 
         it('leaves the two paginated options inputs to the generator, this plugin naming neither', () => {
-            /*
-             * THE GENERATOR'S OWN INPUTS ARE READ FIRST, from the introspected schema, and their names are
-             * never spelled in this file. The generator derives one options input per paginated row type — the
-             * row type with a trailing `List` stripped, plus `ListOptions` — and the derived name is taken off
-             * the argument it generated rather than restated as a literal. That is the requirement as well as
-             * the technique: the two derived identifiers may not be declared or even NAMED anywhere, so a test
-             * that typed them out to assert their absence would itself be the thing it was checking for.
-             */
             const rootField = findField(
                 liveSchema,
                 liveSchema.queryType.name,
@@ -2827,14 +2406,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             );
             expect(nestedOptionsTypeName).not.toBe(rootOptionsTypeName);
 
-            /*
-             * THE PLUGIN'S OWN DOCUMENT NAMES NEITHER OF THEM, and that is the load-bearing half: the plugin
-             * document is merged BEFORE the generator runs, so naming a type the document does not declare is
-             * an unknown-type merge failure and the server does not start. The assertion is made against the
-             * document's own source text — the thing that actually gets merged — and against the names the
-             * generator just produced, so it is stronger than a literal pair as well as free of them: whatever
-             * the generator derives is what the document is checked for.
-             */
             const documentSource = shopApiExtensions.loc?.source.body ?? '';
             expect(documentSource.length, 'The plugin SDL document carried no source text').toBeGreaterThan(
                 0,
@@ -2863,10 +2434,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
     });
 
     // Statement-count discipline (EPIC-001 sections 7.7.1a and 11.6.2; FEATURE-001-01 sections 2.6.1.1,
-    // 2.6.2 and 2.6.3)
-    //
     // Each test below states WHICH observation boundary it is making its claim at, because conflating them is
-    // what produces a brittle assertion that fails on an unrelated platform change. The counted form is gated
     // to sql.js, where statement text and count are deterministic; the BEHAVIOUR each count evidences is
     // asserted ungated in the same test and therefore runs on all four engine jobs.
 
@@ -2891,14 +2459,10 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             if (isStatementCountEngine()) {
                 // EXACTLY ONE statement against `reorder_list` — never zero. The server cannot discover a
                 // row's absence without asking, so a zero-statement claim here is unpassable for a correct
-                // implementation and passable only by one that answers without looking. The filter is named:
-                // `reorder_list`, and the gating reason travels with any failure.
                 expect(capture.count(LIST_TABLE), countedDiagnostic()).toBe(1);
                 expect(capture.selectsFor(LIST_TABLE).length, countedDiagnostic()).toBe(1);
                 expect(capture.writesFor(LIST_TABLE).length, countedDiagnostic()).toBe(0);
                 expect(capture.writesFor(LINE_TABLE).length, countedDiagnostic()).toBe(0);
-                // No nested collection is reachable for a row that was not found, so zero against the child
-                // table is the reachable number here.
                 expect(capture.count(LINE_TABLE), countedDiagnostic()).toBe(0);
                 const [statement] = capture.selectsFor(LIST_TABLE);
                 expect(
@@ -2942,12 +2506,10 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 expect(capture.writesFor(LIST_TABLE).length, countedDiagnostic()).toBe(0);
                 const [statement] = capture.selectsFor(LIST_TABLE);
                 /*
-                 * The channel conjunct carries THE SECOND CHANNEL'S OWN IDENTIFIER — the channel the
-                 * `vendure-token` header selected — and not merely some value that differs from the default's.
-                 * "Not the default" is satisfied by any value whatsoever, including one belonging to no
-                 * channel at all, so it evidences inequality rather than scoping. Naming the exact identifier
-                 * is what makes this an assertion that the read was scoped to the channel the request acted
-                 * in, which is the reason the row is unreachable.
+                 * The channel conjunct carries THE SECOND CHANNEL'S OWN IDENTIFIER — the channel the `vendure-token`
+                 * header selected — and not merely some value that differs from the default's. "Not the default" is
+                 * satisfied by any value whatsoever, including one belonging to no channel at all, so it evidences
+                 * inequality rather than scoping.
                  */
                 expect(
                     whereRequiresScopedPredicates(statement, [
@@ -3011,10 +2573,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
             if (isStatementCountEngine()) {
                 // THE EXACT NUMBER, and its composition, named: one statement resolving the page of lists —
-                // the platform computes the total locally when the page is not saturated — plus exactly two
-                // resolving every entry's lines, one for the rows and one for the per-parent totals. Four
-                // entries cost the same three as three entries, which is what distinguishes a counter that
-                // ARRIVES WITH THE ROW from one counted per entry: a per-entry count would have grown by one
                 // statement, and a grouped count alongside the page would have added a fourth.
                 expect(statementsForThree, captureForThree).toBe(3);
                 expect(lineStatementsForThree, captureForThree).toBe(2);
@@ -3059,12 +2617,9 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(seeded).toHaveLength(6);
 
             /*
-             * ONE WARM-UP REQUEST, OUTSIDE BOTH WINDOWS. The comparison below counts every statement the
-             * request issued, including the platform's own session and channel resolution, and some of that is
-             * memoised per process on first use. Without a warm-up the first measured window would carry those
-             * one-off statements and the second would not, so the two numbers would differ for a reason that
-             * has nothing to do with the page size. Warming first makes the difference between the two windows
-             * attributable to the only thing that differs between them.
+             * ONE WARM-UP REQUEST, OUTSIDE BOTH WINDOWS. The comparison below counts every statement the request
+             * issued, including the platform's own session and channel resolution, and some of that is memoised per
+             * process on first use.
              */
             await shopClient.query<
                 GetActiveCustomerReorderListsWithLinePagesQuery,
@@ -3079,8 +2634,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 >(GET_ACTIVE_CUSTOMER_REORDER_LISTS_WITH_LINE_PAGES, { take: 3, linesTake: 5 }),
             );
             // UNFILTERED, because this is the WHOLE-REQUEST boundary — see `allDatabaseStatements`. Counting
-            // only the plugin's two tables would leave an N+1 against `product_variant`, `customer` or any
-            // other core table entirely invisible to the comparison.
             const statementsForThree = allDatabaseStatements().length;
             const captureForThree = wholeRequestDiagnostic('page of three');
             const pluginStatementsForThree = capture.count(LIST_TABLE, LINE_TABLE);
@@ -3096,7 +2649,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             const pluginStatementsForSix = capture.count(LIST_TABLE, LINE_TABLE);
 
             // The BEHAVIOUR, ungated so it runs on all four engines: both requests answered the same field set
-            // over their own page, and the larger page really is larger.
             expect(pageOfThree.activeCustomerReorderLists.items).toHaveLength(3);
             expect(pageOfSix.activeCustomerReorderLists.items).toHaveLength(6);
             for (const entry of [
@@ -3110,17 +2662,13 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
             if (isStatementCountEngine()) {
                 /*
-                 * EQUALITY ACROSS THE TWO PAGE SIZES IS THE WHOLE ASSERTION, and no exact total is asserted at
-                 * this boundary. Doubling the page must not add a statement ANYWHERE in the request: `lines`,
-                 * `lineCount` and `viewerAccess` are resolved once per page rather than once per entry, so a
-                 * per-entry resolution introduced anywhere in that chain — including one that touches only
-                 * core tables — makes these two numbers diverge.
+                 * EQUALITY ACROSS THE TWO PAGE SIZES IS THE WHOLE ASSERTION, and no exact total is asserted at this
+                 * boundary.
                  */
                 expect(
                     statementsForSix,
                     `${captureForThree}\n---\n${wholeRequestDiagnostic('page of six')}`,
                 ).toBe(statementsForThree);
-                // A guard against the assertion passing because nothing was captured at all, stated at both
                 // the whole-request and the plugin-statement boundary so a silent window is caught either way.
                 expect(statementsForThree).toBeGreaterThan(0);
                 expect(pluginStatementsForThree).toBeGreaterThan(0);
@@ -3162,18 +2710,14 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
             if (isStatementCountEngine()) {
                 /*
-                 * ZERO COST, EXPRESSED AS A ZERO DELTA OVER EVERY STATEMENT THE TWO REQUESTS ISSUED. Selecting
-                 * the field added nothing, anywhere — not one statement against the plugin's tables and not one
-                 * against `customer`, `channel`, `session` or any other core table. The comparison is made over
-                 * the WHOLE non-transaction statement set rather than over a table-filtered count, because a
-                 * per-entry lookup against any core table adds statements a plugin-table filter cannot see. A
-                 * delta over the unfiltered set is the only shape of this claim such an implementation fails.
+                 * ZERO COST, EXPRESSED AS A ZERO DELTA OVER EVERY STATEMENT THE TWO REQUESTS ISSUED. Selecting the
+                 * field added nothing, anywhere — not one statement against the plugin's tables and not one against
+                 * `customer`, `channel`, `session` or any other core table.
                  */
                 expect(
                     statementsWith,
                     `${captureWithout}\n---\n${wholeRequestDiagnostic('with viewerAccess')}`,
                 ).toBe(statementsWithout);
-                // And the request that carries the field is still the shape this feature promises: one page
                 // statement, no nested read for a selection that names no lines, and no write.
                 expect(capture.count(LIST_TABLE), countedDiagnostic()).toBe(1);
                 expect(capture.count(LINE_TABLE), countedDiagnostic()).toBe(0);
@@ -3200,7 +2744,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(linesSpy).toHaveBeenCalledTimes(1);
             expect(singleSpy).toHaveBeenCalledTimes(0);
             expect(repairSpy).toHaveBeenCalledTimes(0);
-            // And the batched call was handed EVERY identifier on the page at once, which is what "once per
             // page" means at this boundary.
             expect((linesSpy.mock.calls[0][1] as unknown[]).length).toBe(3);
         });
@@ -3267,14 +2810,10 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
             if (isStatementCountEngine()) {
                 // Counted rather than matched on the array: a captured statement carries its raw bound
-                // parameters, so handing the array to `toHaveLength` would print them on failure. The
                 // redacted capture description is the message, which is where the detail belongs.
                 expect(firstWrites.length, firstCapture).toBe(1);
                 expect(firstWrites[0].kind, firstCapture).toBe('update');
                 // ALL FOUR CONJUNCTS, on the live statement. The two ownership conjuncts are not redundant with
-                // the read that produced the row: this is the one production write whose target row is chosen
-                // from a caller-supplied object, and identifiers are sequential under the default id strategy,
-                // so a predicate naming only the row and the stale counter would be a write scoped by the
                 // caller having been careful rather than by the database [FEATURE-001-01:§2.6.1.1].
                 expect(
                     whereRequiresScopedPredicates(firstWrites[0], [
@@ -3410,8 +2949,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             expect(disabledLine?.quantity).toBe(2);
             expect(deletedLine?.quantity).toBe(3);
 
-            // A DISABLED variant is still resolvable in the active channel, so its object arrives populated —
-            // asserting `null` here would be asserting the opposite of the requirement.
             expect(disabledLine?.productVariant).not.toBeNull();
             expect(disabledLine?.productVariant?.name).toBe(disabledVariant.name);
             expect(deletedLine?.productVariant).toBeNull();
@@ -3432,16 +2969,7 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 GetActiveCustomerReorderListQueryVariables
             >(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: seeded.id });
 
-            // A CORE ROW THIS TEST DID NOT CREATE. Two ordering requirements below prevent a stale or
             // half-applied restoration, and neither is visible in the statements themselves.
-            //
-            // FIRST, THE PRICE IS READ NOW RATHER THAN TAKEN FROM THE FIXTURE. `catalogueVariants` was captured
-            // in `beforeAll`; restoring to a value read then would write back a figure that need not still be
-            // current, which is a contamination dressed as a cleanup.
-            //
-            // SECOND, THE EXACT RESTORATION IS QUEUED BEFORE THE WRITE IS ISSUED, not after it succeeds. A
-            // failure between the two would otherwise leave the catalogue altered with no undo action
-            // registered, so every later test in the file would run against a price this one changed.
             const [{ price: originalPrice }] = (
                 await adminClient.query<GetVariantsQuery>(GET_VARIANTS_FOR_REORDER_READ)
             ).productVariants.items.filter(candidate => candidate.id === variant.id);
@@ -3449,10 +2977,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 'number',
             );
             const changedPrice = originalPrice + 4321;
-            // EVERY COLUMN of both core rows this holds — the variant row, and the `product_variant_price`
-            // rows that are where a price actually lives — captured before the write. Restoring by issuing the
-            // inverse Admin mutation would put the NUMBER back and advance the `updatedAt` of both rows while
-            // doing so, leaving the next test reading rows that are not the rows that were there.
             const pricedVariantDbId = decodeId(variant.id);
             await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
                 variantId: pricedVariantDbId,
@@ -3525,13 +3049,9 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 GetActiveCustomerReorderListQueryVariables
             >(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: seeded.id });
 
-            // The RECORDED response is unchanged — it is a value the client already holds, and nothing about a
-            // later write reaches back into it.
             expect(recorded).toEqual(recordedSnapshot);
             expect(recorded.activeCustomerReorderList?.lines.items).toHaveLength(2);
 
-            // The SECOND response reflects the write: the counter is 1 and the page holds the line the other
-            // session did not remove, identified BY IDENTIFIER rather than by position.
             expect(reread.activeCustomerReorderList?.lineCount).toBe(1);
             expect(reread.activeCustomerReorderList?.lines.totalItems).toBe(1);
             expect(reread.activeCustomerReorderList?.lines.items).toHaveLength(1);
@@ -3574,13 +3094,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             const listName = 'Sprachunabh\u00e4ngiger Name';
             const seeded = await seedList(listName, [{ productVariantId: variant.id, quantity: 6 }]);
 
-            // THE PRIOR STATE, READ AND ITS RESTORATION QUEUED BEFORE ANYTHING IS WRITTEN. Both halves are
-            // load-bearing. Registering after the mutation would leave the row changed with nothing queued to
-            // put it back if the write committed and then something threw — and every following test in this
-            // file would run against a catalogue this one had modified. Reading first is what lets the
-            // restoration branch correctly: this fixture ships English alone, so the expectation is that there
-            // is no German row and the restoration is a delete, but a fixture that already carried one would
-            // have it PUT BACK rather than deleted. Which of the two happened is asserted rather than assumed.
             const priorGerman = await captureVariantTranslation(variant.id, LanguageCode.de);
             expect(
                 priorGerman.row,
@@ -3598,10 +3111,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                 ],
             });
 
-            // AND THE SECOND LANGUAGE REALLY IS THERE NOW, established by an independent read rather than by
-            // the mutation's own reply: a scenario named "two languages" whose second language was not written
-            // would assert nothing, and the writing operation is the one witness that cannot establish that it
-            // wrote.
             const writtenGerman = await dataSource
                 .createQueryBuilder()
                 .select('translation.name', 'name')
@@ -3645,41 +3154,27 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
         });
     });
 
-    // The empty-generation assertion this suite owns
-    //
     // STORY-001-01-04 owns NO MIGRATION: every table, column, index and constraint its two reads rely on ships
     // in the single additive migration STORY-001-01-01 generates. A generated file appearing here is the signal
-    // that this story has altered a mapping it does not own.
 
     describe('this story owns no migration', () => {
         it('emits no migration file against a schema the checked-in migration created', async () => {
             const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-read-migration-'));
-            // Queued BEFORE the call, so the directory is removed even if the assertion below fails.
             temporaryDirectories.push(outputDir);
             const snapshotDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-read-schema-'));
             temporaryDirectories.push(snapshotDir);
 
-            // WHAT THE GENERATOR IS POINTED AT IS THE MIGRATION'S OWN OUTPUT, which is the whole point of this
-            // assertion rather than a refinement of it. `generateMigration` forces `synchronize: false` and
             // `migrationsRun: false` on the connection it opens (`packages/core/src/migrate.ts`), so it diffs
-            // the entity declarations against whatever schema is already in the database — and under every
-            // initializer this suite can run, that schema was built by SYNCHRONISING those same declarations.
             const schemaIsTheMigrations = await rebuildPluginSchemaFromCheckedInMigration();
 
             // WHAT THE ASSERTION RESTS ON, which differs by engine and is recorded rather than glossed. On the
             // generation engine the diff is taken against a schema the shipped artefact built, so an empty
-            // result means the artefact and the entities agree. Elsewhere it is taken against the synchronised
-            // schema, where an empty result means the entities carry no pending change — weaker, but still the
-            // claim this story owns, which is that it adds no column and needs no migration of its own.
             expect(
                 schemaIsTheMigrations,
                 'the rebuild must run on exactly the engine the shipped artefact was generated against',
             ).toBe(committedMigrationApplies(String(dataSource.options.type)));
 
-            // THE GENERATOR'S OWN DECISION INPUT, read from the running server's connection, because that is
-            // where the diagnostic lives: `generateMigration` writes a file if and only if this log's
             // `upQueries` is non-empty, so naming the offending statements turns a bare `undefined`
-            // expectation into a failure a reader can act on.
             const log = await dataSource.driver.createSchemaBuilder().log();
             const namesPluginTable = (query: string) =>
                 /reorder_list(_line)?/i.test(query.replace(/["`[\]]/g, ''));
@@ -3693,8 +3188,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             ).toHaveLength(0);
             expect(offendingDownQueries).toHaveLength(0);
 
-            // AND THE PLATFORM ENTRY POINT ITSELF, against that same migration-created schema. It returns
-            // `undefined` and writes NO FILE; the platform logs "No changes in database schema were found -
             // cannot generate a migration." on this path (`packages/core/src/migrate.ts`).
             const generated = await generateMigration(
                 await generatorConfigAgainstMigratedSchema(snapshotDir),
@@ -3703,10 +3196,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
                     outputDir,
                 },
             );
-            // The file's own contents are the diagnostic when it does write one, and reading them also
-            // catches the way this assertion could otherwise go quietly wrong: a generator pointed at an
-            // EMPTY database emits the entire schema rather than nothing, so a broken snapshot fails here
-            // loudly instead of passing vacuously.
             expect(
                 generated,
                 `generateMigration emitted a migration against the migration-created schema: ${
@@ -3715,16 +3204,9 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             ).toBeUndefined();
             expect(await fs.readdir(outputDir)).toEqual([]);
 
-            // The output directory is a temporary one OUTSIDE the repository, so nothing is ever written under
-            // this package's own migrations directory and `git status --porcelain` is clean after a run
-            // whatever this assertion finds.
             expect(path.isAbsolute(outputDir)).toBe(true);
             expect(outputDir.startsWith(path.join(__dirname, '..'))).toBe(false);
 
-            // The running server is unaffected by the generation pass, asserted rather than assumed because
-            // that pass loads and then RESETS the platform's module-level configuration. The two tables are
-            // empty at this point, the rebuild having dropped and recreated them, so this also proves the
-            // migration's own output accepts the writes this story reads back.
             const stillWorking = await seedList('After the generation pass', [
                 { productVariantId: catalogueVariants[0].id, quantity: 2 },
             ]);
@@ -3739,15 +3221,6 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
 
 /*
  * The correlated-ownership verifier, tested as the load-bearing instrument it is.
- *
- * ★ WHY THIS SPEC EXISTS. Every assertion that a `reorder_list_line` write is scoped to its owner is
- * decided by `whereRequiresCorrelatedOwnership`: a line row stores its parent's identifier, a variant
- * reference and a quantity, so the acting customer and the active channel can only reach the statement
- * through a sub-query over the parent table (FEATURE-001-01 §2.11). If this parser certifies a statement
- * that does not really scope the row, every suite that trusts it passes while the write reaches rows nobody
- * owns — and it passes silently, because nothing else in the suite is looking. A verifier is therefore only
- * worth what its own negative cases prove, and those cases have to be COMMITTED to prove anything twice: a
- * check performed once by hand cannot fail when a later edit weakens the parser.
  */
 describe('the query-capture instrument this suite measures with', () => {
     /** The decoded identifiers a fixture would hold, standing in for rows it created. */
@@ -3827,10 +3300,7 @@ describe('the query-capture instrument this suite measures with', () => {
             });
 
             it('certifies the MySQL accumulate, whose placeholders are positional', () => {
-                // The `SET` clause binds ahead of the predicate, so the customer and channel are the fourth and
                 // fifth parameters of the statement rather than the first two of the sub-query. Resolving them
-                // requires the offset arithmetic the parser performs; a verifier that numbered the sub-query's
-                // own placeholders from zero would read the quantity and the line id as the tenant.
                 const statement = captureOne(
                     'UPDATE `reorder_list_line` SET `quantity` = `quantity` + ? ' +
                         `WHERE \`id\` = ? AND \`reorderListId\` = ? AND ${MYSQL_EXISTS}`,
@@ -3863,15 +3333,8 @@ describe('the query-capture instrument this suite measures with', () => {
             });
 
             it('certifies the same sub-query under a configured schema, which qualifies the relation', () => {
-                // ★ THE FORM A DEPLOYMENT WITH `dbConnectionOptions.schema` ACTUALLY RECEIVES. The service
-                // builds the sub-query's relation from `metadata.tablePath` rather than from `tableName`, so
-                // under a configured schema it arrives qualified — which is a tenant-isolation requirement
-                // rather than a spelling choice, because the driver never issues `SET search_path` from that
                 // option (`node_modules/typeorm/driver/postgres/PostgresDriver.js:L266-L281`) and a bare
-                // relation would resolve through the session's own path into another schema. This instrument
                 // decides every line-write ownership assertion in this package, so it has to certify the
-                // qualified form: were it to refuse it, those assertions would fail closed on precisely the
-                // deployment whose isolation matters most, and the failure would look like a scope defect.
                 const statement = postgresAdjust(
                     'EXISTS (SELECT 1 FROM "tenant_schema"."reorder_list" "owned_list_scope" ' +
                         'WHERE "owned_list_scope"."id" = "reorderListId" ' +
@@ -3920,11 +3383,6 @@ describe('the query-capture instrument this suite measures with', () => {
 
         describe('refuses a requirement whose scope values it cannot decide', () => {
             it('refuses a scope predicate with no expected value, rather than checking the column alone', () => {
-                // The type forbids this, which is the first line of defence; the cast is the point of the test.
-                // A suite compiled against an earlier shape, a plain-JavaScript caller, or a fixture identifier
-                // that was never assigned can all present a predicate with no value — and the general predicate
-                // helper reads an absent value as "require only that this column is compared", which certifies a
-                // sub-query whose tenant parameters are bound the wrong way round.
                 const requirement = {
                     table: 'reorder_list',
                     correlation: { column: 'id', outerColumn: 'reorderListId' },
@@ -4000,10 +3458,6 @@ describe('the query-capture instrument this suite measures with', () => {
 
         describe('refuses a sub-query whose row count does not follow its predicate', () => {
             it('refuses an ungrouped aggregate projection, which is satisfied for every row', () => {
-                // Every other part of the requirement is met: the right table, a real correlation, and both
-                // scope comparisons bound to the right values. `COUNT(*)` without a `GROUP BY` still returns one
-                // row — `0` — when nothing matched, so the `EXISTS` is true for a line nobody owns and the write
-                // it guards reaches the whole table.
                 const statement = postgresAdjust(POSTGRES_EXISTS.replace('SELECT 1', 'SELECT COUNT(*)'));
 
                 expect(whereRequiresCorrelatedOwnership(statement, ownedLineScope())).toBe(false);
@@ -4159,10 +3613,6 @@ describe('the query-capture instrument this suite measures with', () => {
             it('is the only one of the three that can read the sub-query', () => {
                 const statement = postgresAdjust(POSTGRES_EXISTS);
 
-                // Both of the others refuse the sub-query, deliberately and correctly for what each claims: one
-                // recognises only `column <op> operand` as a comparison, and the other blanks any parenthesised
-                // SELECT before it looks for a column name. Neither can state the claim a line write makes, which
-                // is why the correlated helper exists — and why a suite must not fall back to them.
                 expect(
                     whereRequiresScopedPredicates(statement, [
                         { column: 'customerId', value: CUSTOMER_ID },
@@ -4197,18 +3647,13 @@ describe('the query-capture instrument this suite measures with', () => {
             // ...and INLINE, as the SQLite family receives it, which is this package's default engine.
             logger.logQuery(`SELECT "id" FROM "session" WHERE "token" = '${TOKEN}'`, [], runner);
             // A COUNT: this logger deliberately holds a statement whose parameter IS the token under
-            // test, so the array is the one thing in this file that must never reach a matcher.
             expect(logger.statements.length).toBe(2);
             return logger;
         }
 
         it('describes a bound value and an inline literal instead of rendering either', () => {
-            // ★ WHY THIS IS A SECURITY PROPERTY AND NOT A FORMATTING PREFERENCE. The instrument is attached
             // to the whole connection, so it captures the platform's statements as well as the plugin's —
-            // including the session look-up an authenticated request performs, whose value is the caller's
             // credential. Dozens of assertion sites in this package pass `capture.format()` as their
-            // failure message, and a failure message goes into the run's log: on continuous integration that
-            // log is readable by everyone who can see the build. A dump that renders values therefore turns
             // any flaky count assertion into a credential disclosure.
             const dump = captureTokenBearingStatement().format();
 
@@ -4248,9 +3693,7 @@ describe('the query-capture instrument this suite measures with', () => {
 
         it('redacts the value a driver quotes into its own failure message', () => {
             // The other way a captured value reaches the dump. A constraint violation on the MySQL family
-            // quotes the offending value into the error text, and the create suite deliberately provokes one,
             // so an unredacted error line would publish what the parameter list no longer does. The
-            // constraint NAME survives, which is what the suites that assert on a violation actually read.
             const logger = new QueryCaptureLogger();
             logger.enable();
             const runner = {
@@ -4269,14 +3712,11 @@ describe('the query-capture instrument this suite measures with', () => {
             const dump = logger.format();
             expect(dump).not.toContain(TOKEN);
             expect(dump).toContain('UQ_reorder_list_customer_channel_name_key');
-            // And the error is still the driver's own text under the opt-in, so an investigation loses
-            // nothing.
             expect(logger.format(undefined, { revealValues: true })).toContain(`Duplicate entry '${TOKEN}'`);
         });
 
         it('consumes an escaped quote inside a literal rather than ending the literal early', () => {
             // Both conventions the target engines use, so a value containing a quote is still consumed whole:
-            // a scanner that ended the literal at the escape would render the rest of the value as SQL.
             const logger = new QueryCaptureLogger();
             logger.enable();
             const runner = {

@@ -1,36 +1,5 @@
 /*
  * End-to-end specification for `addItemToReorderList` — STORY-001-01-02.
- *
- * The AAP settles it. §0.1.2.4 supplies `maxQuantityPerLine = 999` as a value the ticket set is forbidden
- * from inventing, directs that the supplied values "be used as the declared defaults without substitution",
- * and names this operation and `adjustReorderListLine` as its enforcement points, applied to the RESULTING
- * quantity. The AAP is the frozen authority over a story-level test-deployment figure, exactly as it is for
- * the two page-size keys in its own conflict C-C, so this suite deploys **999**.
- *
- * `e2e-common/test-config.ts` maps a package name to a base port and falls back to 3250 for anything it
- * does not name; `reorder-plugin` is not named, so every suite in this package indexes off that shared
- * fallback. `testConfig()` is therefore called rather than a port being hard-coded — the per-file index it
- * derives is what keeps this file from colliding with its siblings inside this package.
- *
- * `./graphql/reorder-definitions` is the single authority for the plugin's own eight operations and no
- * suite may inline a copy of anything it declares — so every reorder document below is imported from it.
- * It declares no PLATFORM document (no sign-in, no catalogue read, no channel administration, no
- * `activeOrder`, no introspection), and this package's `e2e/` file set is closed, so the platform
- * documents this suite needs are declared here with `graphql-tag` rather than in a new shared module.
- *
- *  - A **counted** statement assertion is an equality and runs on the sql.js job only, gated with
- *    `isStatementCountEngine()` (epic §11.6.2). The behaviour each count evidences — the response, the
- *    persisted rows, the refusal — runs on all four engine jobs and is never gated.
- *  - A **forced interleaving** runs on `e2e-mariadb`, `e2e-mysql` and `e2e-postgres` only, gated with
- *    `supportsForcedInterleaving()`. sql.js is excluded from every concurrency claim (epic §11.6.3) and
- *    carries the sequential form of the same contract instead, which runs everywhere.
- */
-/*
- * The non-null assertion rule is disabled for this file, as the shipped plugin e2e precedent
- * `packages/asset-server-plugin/e2e/asset-server-plugin.e2e-spec.ts:L1` does. A specification reads
- * fixture identifiers it has just asserted the existence of, and a narrowing dance around each one would
- * add noise without adding a single assertion. Every use below is preceded by an assertion that the value
- * is present, so a missing fixture fails on that assertion rather than on a type error.
  */
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 import {
@@ -54,7 +23,7 @@ import fs from 'fs';
 import gql from 'graphql-tag';
 import os from 'os';
 import path from 'path';
-import { DataSource } from 'typeorm';
+import { DataSource, EntityManager, QueryRunner } from 'typeorm';
 import type { SqljsConnectionOptions } from 'typeorm/driver/sqljs/SqljsConnectionOptions';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -72,10 +41,19 @@ import {
     asShopApiContext,
     BarrierParticipantContext,
     BarrierParticipantSpec,
+    canonicaliseCell,
+    ConcurrencyBarrier,
     createPreWriteRendezvous,
     createTransactionBinder,
+    describeRowDifferences,
+    describeSettledOutcomes,
+    describeTeardownStage,
     EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES,
+    NO_ROW_DIFFERENCE,
     PreWriteRendezvous,
+    redactTeardownDiagnostic,
+    rethrowRedacted,
+    runAllTeardownStages,
     runBarrieredPair,
     runSequentialPair,
     SQLJS_EXCLUSION_REASON,
@@ -83,17 +61,8 @@ import {
     TransactionBinder,
 } from './fixtures/concurrency-barrier';
 import {
-    canonicaliseCell,
-    describeRowDifferences,
-    describeSettledOutcomes,
-    NO_ROW_DIFFERENCE,
-    redactTeardownDiagnostic,
-    rethrowRedacted,
-    runAllTeardownStages,
-} from './fixtures/diagnostic-redaction';
-import { committedMigrationApplies } from './fixtures/migration-state';
-import {
     CapturedStatement,
+    committedMigrationApplies,
     isStatementCountEngine,
     queryCaptureConfig,
     QueryCaptureLogger,
@@ -120,14 +89,7 @@ import {
     ReorderListSuccessShape,
 } from './graphql/reorder-definitions';
 
-// The configured deployment
-//
-// Configuring a value for a test deployment is NOT choosing a product default. The shipped defaults —
-// 200 lines per list and 999 units per line — are the plugin's own, and they are asserted by
-// `src/reorder.plugin.spec.ts`. Only the LINE bound below is reduced — to 2, so that a third distinct
-// variant breaches it inside one test, exactly as AC-6's Given clause requires. The quantity bound keeps
 // the supplied 999, and its result boundary is reached arithmetically instead: an increment onto a line
-// already holding enough that the SUM crosses the maximum while each figure alone is legal.
 
 /** AC-6's configured line bound. Small enough that a third distinct variant breaches it. */
 const MAX_LINES_PER_LIST = 2;
@@ -194,11 +156,6 @@ const FORBIDDEN_PAYLOAD_FIELD_PATTERN = /price|currenc|money|amount|tax|stock|sa
 const ABSENT_LIST_ID = 'T_9999999';
 
 const ABSENT_VARIANT_ID = 'T_9999999';
-
-// Platform documents
-//
-// Declared here for the reason the header records: `./graphql/reorder-definitions` owns the plugin's
-// eight operations and declares no platform operation, and this package's `e2e/` file set is closed.
 
 /** Reads the seeded customers' e-mail addresses. The seed's addresses are generated, so they are read. */
 const GET_CUSTOMER_LIST = gql`
@@ -500,11 +457,6 @@ const INTROSPECT_ROOT_FIELDS = gql`
     }
 `;
 
-// Result shapes of the platform documents above
-//
-// Hand-written for the same reason `./graphql/reorder-definitions` hand-writes its own: the checked-in
-// introspection snapshot is never regenerated for this feature, so no generator runs over this suite.
-
 interface SeededCustomer {
     id: ReorderApiId;
     emailAddress: string;
@@ -561,30 +513,13 @@ interface ActiveOrderShape {
  */
 interface TrackedFixtureOrder {
     readonly orderId: number;
-    /**
-     * The decoded database identifiers of every `OrderLine` the fixture put on it.
-     *
-     * Mutable, and filled in AFTER the entry joins the ledger, because the order is already committed by
-     * the time the fixture can look at it: registering the parent first and the children second is what
-     * keeps a failure between the two from leaving teardown knowing about neither. Where it is still empty
-     * at teardown, the children are re-queried from the parent.
-     */
     lineIds: number[];
 }
 
-// THE SQL.JS SNAPSHOT DIRECTORY, CREATED IDEMPOTENTLY AND AT MODULE SCOPE, FOR TWO SEPARATE REASONS.
-//
 // The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
 // guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
 // which is a check-then-act race: this package's e2e suites start together, so when the directory is absent —
-// as it is on a fresh checkout, and after the operational reset a schema change requires — two of them can
 // both observe it missing and the loser fails its `beforeAll` with `EEXIST`. The three server engines use no
-// snapshot directory and are unaffected.
-//
-// The second is ordering. The directory has to exist before `testConfig()` reads the `e2e/` directory index
-// it derives this file's port from, which is why the call sits at module scope rather than in `beforeAll`.
-// Recursive creation is idempotent, so a directory another suite already made is not an error, and an empty
-// directory is not a cached snapshot file — the initializer still synchronises a fresh schema.
 fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
 
 describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
@@ -619,11 +554,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 defaultReorderListLinesPageSize: DEFAULT_LINES_PAGE_SIZE,
             }),
         ],
-        /*
-         * The shared harness points this at `<package>/e2e/fixtures/assets`, which this package does
-         * not have. The shipped cross-package precedent is `packages/dashboard/e2e/global-setup.ts`,
-         * which borrows core's own fixture assets for exactly this reason.
-         */
         importExportOptions: {
             importAssetsDir: path.join(__dirname, '../../core/e2e/fixtures/assets'),
         },
@@ -679,11 +609,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     beforeAll(async () => {
         await server.init({
             initialData,
-            /*
-             * The minimal catalogue seeds one product with FOUR distinct enabled variants, which is what
-             * the three-distinct-variant line-bound case needs. The path is the shipped cross-package
-             * precedent's (`packages/dashboard/e2e/global-setup.ts`).
-             */
             productsCsvPath: path.join(__dirname, '../../core/e2e/fixtures/e2e-products-minimal.csv'),
             customerCount: 2,
         });
@@ -744,7 +669,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     beforeEach(() => {
         // Epic §11.6.2: the captured array is emptied per test, so a count is scoped to one test and
-        // never to a file. Capture itself stays disabled until a test enables it around one operation.
         capture.disable();
         capture.reset();
     });
@@ -752,15 +676,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     afterEach(async () => {
         /*
          * EVERY STAGE RUNS, whatever any of them does, and the failures are reported once at the end. A linear
-         * teardown stops at the first failure and strands the rest, which is how one broken test leaves the
-         * next running against state it never established.
-         *
-         * Plugin-owned rows go first, child table before parent and each named explicitly, so a foreign key is
-         * never what fails the cleanup. The harness's wholesale table clear is never used between tests: it
-         * synchronises the schema and drops the populated catalogue every later test reads. Then the orders
-         * this file's own fixture created; then the core rows a test mutated but did not create, newest first;
-         * then the temporary directories; then the client's own session and channel token, so no test inherits
-         * a sibling's.
+         * teardown stops at the first failure and strands the rest, which is how one broken test leaves the next
+         * running against state it never established.
          */
         const queued = coreRowRestorations.splice(0, coreRowRestorations.length).reverse();
         const directories = temporaryDirectories.splice(0, temporaryDirectories.length);
@@ -771,12 +688,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 what: `core row restoration ${String(queued.length - index)}`,
                 run: restore,
             })),
-            // ★ AN INDEX, NEVER THE PATH. `stage.what` is reproduced VERBATIM by the teardown aggregator —
-            // that is deliberate, because the stage name is this file's own text and is what identifies the
-            // step that failed — so anything interpolated into it is published as-is. An absolute temporary
             // directory discloses the layout of whatever machine ran the suite, developer or CI worker, and
-            // nothing about the assertion needs it: the path stays in the closure below, where the removal
-            // uses it and no log reads it.
             ...directories.map((directory, index) => ({
                 what: `temporary directory ${String(index + 1)} of ${String(directories.length)}`,
                 run: () => {
@@ -816,19 +728,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         expect(customer).toBeDefined();
         await shopClient.asUserWithCredentials(customer.emailAddress, SEEDED_CUSTOMER_PASSWORD);
         // `asUserWithCredentials` adopts the token of the single channel the login result reports, so the
-        // channel this suite means to act in is set explicitly afterwards rather than assumed.
         shopClient.setChannelToken(defaultChannelToken);
         return customer;
     }
 
     /**
      * Runs a fixture step that may commit `reorder_list` rows, and registers every row it committed.
-     *
-     * The same window the order ledger closes, closed for the plugin's own rows: `createReorderList` COMMITS
-     * before its response is read, so an assertion on `__typename` or a decode of the identifier standing
-     * between the commit and the ledger would lose a row that exists. `afterEach` in this file deletes by
-     * identifier rather than emptying the table, so a lost identifier is a row that outlives the test and
-     * shifts the counts a later test asserts. Discovery is a DELTA taken in a `finally`.
      */
     async function trackListsCommittedBy<T>(run: () => Promise<T>): Promise<T> {
         const before = (await dataSource.getRepository(ReorderList).find({ select: { id: true } })).map(row =>
@@ -913,15 +818,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     }
 
     /**
-     * Runs a fixture step that may commit an order, and registers every order it committed — whatever the
-     * step, or anything the caller does with its response, then does.
-     *
-     * THE WINDOW THIS CLOSES. A Shop mutation COMMITS before its response is read, so every step between the
-     * commit and the ledger is a place the identifier can be lost: an assertion on `__typename`, a decode of
-     * the identifier, a guard on the response shape. A ledger populated from the response therefore cannot
-     * see the one case that matters — a committed row whose response the caller rejects — and the order, its
-     * lines and the session link pointing at it survive into the next test, where they become that test's
-     * baseline. Discovery is a DELTA taken in a `finally`, so no assertion, decode or throw can skip it.
+     * Runs a fixture step that may commit an order, and registers every order it committed — whatever the step, or
+     * anything the caller does with its response, then does.
      */
     async function trackOrdersCommittedBy<T>(run: () => Promise<T>): Promise<T> {
         const before = (await dataSource.getRepository(Order).find({ select: { id: true } })).map(row =>
@@ -952,11 +850,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         if (alreadyTracked !== undefined && alreadyTracked.lineIds.length > 0) {
             return;
         }
-        // THE EXACT CHILD ROWS, READ BACK RATHER THAN INFERRED. The order was created by the call
-        // immediately above, so every line on it now is one this fixture caused; reading them through the
-        // declared `lines` relation records their real identifiers instead of trusting a cascade to find
-        // them later. The count is asserted, because a capture that silently recorded nothing would let a
-        // teardown that deletes nothing report success.
         const ledgerEntry = registerOrderInLedger(orderId, []);
 
         const order = await dataSource
@@ -973,32 +866,15 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * Removes every order this test's fixture created, CHILD ROWS BEFORE PARENT.
-     *
-     * THE EXACT ROWS, IN THE EXACT ORDER, AND NOT BY CASCADE. `OrderLine.order` does declare
-     * `onDelete: 'CASCADE'`, so deleting the parent would take the lines with it — which is precisely why
-     * leaning on it proves nothing: a relation later reconfigured to `SET NULL`, or a child this fixture
-     * created under a table the cascade does not reach, would leave rows behind and every run would still
-     * report a clean teardown. So the tracked line identifiers are deleted FIRST, by identifier, then the
-     * session link is cleared — `Session.activeOrder` declares no delete action, so a session still
-     * pointing at the order would make the parent delete fail on a foreign key — and only then the exact
-     * parent. Each step is then VERIFIED: neither the tracked lines nor the tracked order may survive, and
-     * a survivor is raised rather than ignored, which is what makes this cleanup falsifiable.
      */
     async function removeTrackedOrders(): Promise<void> {
         const tracked = ordersToRemove.splice(0, ordersToRemove.length);
-        // EACH ENTRY IS ATTEMPTED WHATEVER THE OTHERS DO. One order whose removal throws must not strand the
-        // orders queued behind it: the failures are collected and reported once, which is the same discipline
-        // the outer teardown runner applies to its stages, applied here to the entries within one stage.
         const failures: string[] = [];
         for (const entry of tracked) {
             try {
                 await removeOneTrackedOrder(entry);
             } catch (err: unknown) {
-                // MEASURED, NOT REPRODUCED. Removing an order writes across `order`, `order_line` and the
-                // buyer's `session` rows, so a driver failure here is a `QueryFailedError` carrying the
                 // statement and its bound values — and this aggregate is thrown and printed by the runner.
-                // The order identifier is kept, on the same footing as a row id: it is what locates the
-                // entry that would not go, and it describes nobody.
                 failures.push(`order ${entry.orderId}: ${redactTeardownDiagnostic(err)}`);
             }
         }
@@ -1011,10 +887,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     async function removeOneTrackedOrder(entry: TrackedFixtureOrder): Promise<void> {
         {
             const orderId = entry.orderId;
-            // WHERE THE LEDGER CARRIES NO CHILDREN, THEY ARE RE-QUERIED FROM THE PARENT. An entry reaches
-            // teardown with an empty list only when the fixture's own inspection did not complete, which is
-            // exactly the case cleanup must still handle: the identifiers are recovered here rather than
-            // assumed, so a failed setup cannot leave a child row behind.
             const lineIds =
                 entry.lineIds.length > 0
                     ? [...entry.lineIds]
@@ -1053,14 +925,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         }
     }
 
-    // Exact restoration of the core rows a test changes
-    //
-    // A core row this suite touches is put back COLUMN FOR COLUMN, and the restoration is then ASSERTED
-    // against what was captured. Two mechanisms make that stricter than it first sounds, and a restoration
-    // that names only the column it is undoing satisfies neither: the compensating write goes through the
-    // RAW TABLE rather than the entity manager, so restoring a captured value cannot itself move an
-    // entity-managed audit column, and it covers an inserted row and a deleted row alike by deleting or
-    // re-inserting as the capture requires. The restoration is then read back and compared for equality, so
     // a column the compensating write missed fails the test rather than leaking into the next.
 
     /**
@@ -1096,23 +960,11 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         try {
             await dataSource.query(query, bound);
         } catch (err: unknown) {
-            // ★ THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
-            // HERE.
-            //
+            // THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
             // Every statement this helper runs binds CAPTURED CELLS: the values a restoration is putting
-            // back, which on the soft-delete path are a live buyer's `customer`, `user` and `session` rows —
             // an address, a password hash, an authentication token. TypeORM raises a failure from
-            // `dataSource.query` as a `QueryFailedError` that has copied the driver's error ONTO ITSELF, so
-            // `query` and `parameters` are its own ENUMERABLE properties: `String(err)` and
             // `JSON.stringify(err)` both publish the statement and every bound value, and so does the runner
-            // when it prints an unhandled rejection.
-            //
-            // A QUEUED restoration runs inside `runAllTeardownStages`, which already measures a failure
-            // rather than reproducing it. What that cannot cover is a restoration driven DIRECTLY from a test
-            // body, so the functional half can be asserted while the server is still up — those calls sit
             // outside the aggregator and travel straight to the runner. Sanitising HERE covers both, and
-            // covers a call added later by someone who never read this comment, which is the only version of
-            // this fix that stays true.
             rethrowRedacted('a captured-row restoration statement', err);
         }
     }
@@ -1191,12 +1043,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 continue;
             }
             // AND THE UPDATE-DATE COLUMN IS ALWAYS RE-STATED, even when it did not move. On the MySQL family
-            // the column is declared `datetime(6) on update CURRENT_TIMESTAMP(6)` — read out of
-            // `information_schema.COLUMNS` on the live e2e schema, not inferred — so ANY update that omits it
             // from its SET list is re-timestamped BY THE ENGINE, below TypeORM and below this helper. That was
-            // observed: a compensating write that restored only `deletedAt` left `user.updatedAt` moved by
-            // 865 milliseconds, because the captured value happened to equal the current one and so was not
-            // in `moved` at all.
             if (UPDATE_DATE_COLUMN in captured && !moved.some(([column]) => column === UPDATE_DATE_COLUMN)) {
                 moved.push([UPDATE_DATE_COLUMN, captured[UPDATE_DATE_COLUMN]]);
             }
@@ -1229,15 +1076,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * Requires the rows the predicate names to equal the capture cell for cell, so restoration is proved.
-     *
-     * ★ THE COMPARISON IS OVER FULL VALUES; THE ASSERTION IS OVER A REDACTED DESCRIPTION OF THE RESULT. Those
-     * are two separate things and an earlier revision conflated them: it rendered every cell of every row
-     * into two arrays and handed both to `toEqual`, so a failure printed the arrays — and on the soft-delete
-     * path those arrays hold a real `session.token` and the buyer's own contact fields. Comparing here
-     * instead, and asserting on the difference DESCRIPTION, keeps the check exactly as strict — every column
-     * of every captured row is compared through {@link canonicaliseCell}, a captured row that has gone is
-     * reported missing and a row that appeared is reported added — while leaving the assertion's own actual
-     * and expected values two short redacted strings that Vitest cannot expand into cell values.
      */
     async function expectCoreRowsRestored(rowsCapture: CoreRowsCapture): Promise<void> {
         const now = await readCoreRows(rowsCapture.table, rowsCapture.where, rowsCapture.parameters);
@@ -1248,14 +1086,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 'reported by row id, column name and value SHAPE only, deliberately — see ' +
                 'describeCellForDiagnostic',
         ).toBe(NO_ROW_DIFFERENCE);
-        // AND THE ROW COUNT, which the description above already covers through its missing/added entries and
-        // which is restated here so a future edit to that description cannot quietly weaken this to a
-        // per-column check over a shorter table.
-        //
-        // Two NUMBERS compared by hand rather than `expect(now).toHaveLength(n)`, because that matcher prints
-        // the RECEIVED ARRAY on failure — and on the soft-delete path that array is the buyer's `customer`,
         // `user` and `session` rows, `session.token` included. The numbers say exactly the same thing and
-        // cannot be expanded into a cell value.
         if (now.length !== rowsCapture.rows.length) {
             throw new Error(
                 `${rowsCapture.table} holds ${String(now.length)} rows for ${rowsCapture.where} where the ` +
@@ -1288,16 +1119,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     /**
      * Replaces the two plugin tables with THE CHECKED-IN MIGRATION'S OWN OUTPUT, on the live connection.
-     *
-     * **It is available on the generation engine alone**, because the shipped artefact is the migration
-     * generator's PostgreSQL output and an emitted migration is bound to the engine it was generated against
-     * ({@link committedMigrationApplies} carries the reasoning and the citations). Elsewhere the rebuild is
-     * skipped and the caller says what its assertion then rests on, which is what the case below asserts
-     * rather than assumes. Where a migration-created schema IS exercised on every engine is
-     * `e2e/reorder-list-migration.e2e-spec.ts`: it applies the checked-in artefact where the dialect matches
-     * and this engine's own lifecycle emission otherwise, and runs its whole data-bearing cycle against that.
-     *
-     * @returns Whether the schema underneath is now the migration's own.
      */
     async function rebuildPluginSchemaFromCheckedInMigration(): Promise<boolean> {
         if (!committedMigrationApplies(String(dataSource.options.type))) {
@@ -1315,15 +1136,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     }
 
     /**
-     * The configuration the platform generator runs against, resolved so that the plugin tables in the
-     * database it opens are the ones the checked-in migration created.
-     *
-     * On the server engines the generator's own connection reaches the live database, so the live options are
-     * handed over unchanged. On sql.js they do NOT: the initializer points `location` at a snapshot file and
-     * disables auto-save once populating is finished, so a second connection loads the SYNCHRONISED snapshot
-     * from disk and never observes the live in-memory schema at all. The live database is therefore exported
-     * to a scratch file first and the generator pointed at that, so the diff is against the migration's own
-     * output on all four engines rather than on three of them.
+     * The configuration the platform generator runs against, resolved so that the plugin tables in the database it
+     * opens are the ones the checked-in migration created.
      */
     async function generatorConfigAgainstMigratedSchema(
         scratchDirectory: string,
@@ -1380,14 +1194,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     }
 
     /**
-     * Asserts one top-level `USER_INPUT_ERROR` carrying exactly the given resolved message, on an envelope
-     * whose `data` is exactly null.
-     *
-     * `data` is asserted to be exactly `null` rather than "either `data` or its union member", because the
-     * published field is `addItemToReorderList(...): AddItemToReorderListResult!`: a thrown error nullifies
-     * that non-null field and propagates to the root, so `null` is the only envelope a genuine refusal can
-     * produce. Accepting `data: { addItemToReorderList: null }` would additionally admit a resolver that
-     * executed and returned null — a different outcome wearing the same assertion.
+     * Asserts one top-level `USER_INPUT_ERROR` carrying exactly the given resolved message, on an envelope whose
+     * `data` is exactly null.
      */
     function expectSingleUserInputError(
         refusal: TopLevelRefusal,
@@ -1468,7 +1276,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const variant = seededVariants[0];
             expect(variant.enabled).toBe(true);
 
-            // The precondition this test built itself: the list holds exactly zero lines.
             expect(list.lineCount).toBe(0);
             expect(list.lines.totalItems).toBe(0);
             expect(await readLineRows(listId)).toHaveLength(0);
@@ -1497,7 +1304,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 .columns.map(column => column.databaseName)
                 .sort();
 
-            // Three inherited from the base entity, three declared by this feature, and nothing else.
             expect(columns).toEqual(
                 ['createdAt', 'id', 'productVariantId', 'quantity', 'reorderListId', 'updatedAt'].sort(),
             );
@@ -1572,12 +1378,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
     });
 
     describe('AC-2: a second add for the same variant resolves to the existing line and accumulates', () => {
-        /*
-         * AC-2's own literal arithmetic: the same quantity of 6 submitted twice, leaving exactly 12. The
-         * criterion and the story's runnable demonstration both name 12, and the configured maximum of 999
-         * admits it — see the reported deviation in this file's header for why the maximum is not AC-6's
-         * stated 10, under which this total was not storable at all.
-         */
         const FIRST_ADD_QUANTITY = 6;
         const SECOND_ADD_QUANTITY = 6;
         const ACCUMULATED_QUANTITY = FIRST_ADD_QUANTITY + SECOND_ADD_QUANTITY;
@@ -1626,13 +1426,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(accumulated.lines.items[0].quantity).toBe(ACCUMULATED_QUANTITY);
 
             /*
-             * Shape half, also on all four engine jobs, and it opens with the POSITIVE requirement because
-             * without one the whole assertion is vacuous. Counting only the shapes the contract refuses — a
-             * computed-value UPDATE, an INSERT, a DELETE — and requiring each to be none is satisfied by an
-             * implementation that writes NOTHING AT ALL, and equally by a capture window that never saw the
-             * write. So the accumulating statement itself is required to be present, exactly once, on every
-             * dialect: the accumulation is a single self-referential UPDATE and this path has no concurrency
-             * for the service's retry to double it.
+             * Shape half, also on all four engine jobs, and it opens with the POSITIVE requirement because without
+             * one the whole assertion is vacuous.
              */
             const lineWrites = capture.writesFor('reorder_list_line');
             expect(
@@ -1640,9 +1435,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     .length,
                 `Expected exactly one self-referential increment, filtered to reorder_list_line:\n${capture.format()}`,
             ).toBe(1);
-            // ★ COUNTS, NEVER THE ARRAYS. `CapturedStatement` carries its raw bound `parameters` by design
-            // — that is what makes the predicate assertions in this file possible — so handing one of these
-            // arrays to a matcher makes a count regression print those parameters into a build log.
+            // COUNTS, NEVER THE ARRAYS. `CapturedStatement` carries its raw bound `parameters` by design
             // `capture.format()` is the redacted rendering and is what the messages here carry.
             expect(
                 lineWrites.filter(
@@ -1758,11 +1551,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 expect(result.addItemToReorderList.__typename).toBe('ReorderListNotFoundError');
 
                 /*
-                 * FEATURE-001-01 §2.6.1.1, asserted rather than paraphrased: exactly one scoped statement
-                 * against the addressed plugin table, its `WHERE` carrying the acting customer and the
-                 * active channel as conjuncts beside the row's own identifier, and no INSERT, UPDATE or
-                 * DELETE at all. Never "zero statements" for a lookup — a correct implementation has to
-                 * ask the database, and this asserts that it asked exactly once.
+                 * FEATURE-001-01 §2.6.1.1, asserted rather than paraphrased: exactly one scoped statement against
+                 * the addressed plugin table, its `WHERE` carrying the acting customer and the active channel as
+                 * conjuncts beside the row's own identifier, and no INSERT, UPDATE or DELETE at all.
                  */
                 const listStatements = capture.forTables('reorder_list');
                 expect(listStatements.length).toBe(1);
@@ -1839,13 +1630,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         async function trackVariantWithFourOnHand(
             variant: AdminProductVariant,
         ): Promise<AdminProductVariant> {
-            // EVERY COLUMN of every core row this change disturbs, captured before the write and queued for
-            // exact restoration with the assertion that it happened. Three tables move, and the third is the
-            // one an inverse Admin mutation cannot undo: setting a `stockOnHand` INSERTS a `stock_movement`
             // [packages/core/src/service/services/stock-movement.service.ts:L113-L119], so restoring by
-            // issuing the inverse mutation would put the numbers back, advance three `updatedAt` values and
-            // leave a SECOND movement row behind. The capture over `stock_movement` removes whatever the
-            // window inserted and leaves whatever was there before it.
             const variantDbId = decodeId(variant.id);
             await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
                 variantId: variantDbId,
@@ -1925,13 +1710,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const list = await createList('AC-5 availability service silence');
 
             /*
-             * The SERVICE-CALL boundary, which is a different observation from a statement count and is
-             * therefore asserted separately and on all four engines: the platform's own availability entry
-             * points are spied on their singleton instances and the assertion is on CALLS, never on
-             * statements. A statement count cannot see a call that was answered from a cache, from an
-             * already-loaded relation, or by a method that computed its answer without querying — and a
-             * discarded availability read is still an availability read, which is exactly what this criterion
-             * forbids. The spies call through, so the operation under test runs unaltered.
+             * The SERVICE-CALL boundary, which is a different observation from a statement count and is therefore
+             * asserted separately and on all four engines: the platform's own availability entry points are spied on
+             * their singleton instances and the assertion is on CALLS, never on statements.
              */
             const productVariantService = server.app.get(ProductVariantService);
             const stockLevelService = server.app.get(StockLevelService);
@@ -1976,14 +1757,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 const result = await addItemCaptured(list.id, tracked.id, 6);
                 expect(result.addItemToReorderList.__typename).toBe('ReorderList');
 
-                /*
-                 * The filters are named in the assertion, and all five are named rather than one. Zero is
-                 * claimed because this write reaches no availability path at all, which is the one condition
-                 * under which a zero count is an honest claim. Asserting the unchanged columns instead would
-                 * hold just as firmly for an implementation that read the saleable level, discarded it and
-                 * wrote the line anyway — a discarded read is still a read, and it is the thing this
-                 * criterion says is not done.
-                 */
                 for (const table of FORBIDDEN_AVAILABILITY_TABLES) {
                     expect(
                         capture.forTables(table).length,
@@ -2050,12 +1823,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const listId = decodeId(list.id);
             const variant = seededVariants[0];
 
-            /*
-             * Both figures are legal ON THEIR OWN, which is what makes this criterion falsifiable: the seeded
-             * quantity is below the configured maximum and so is the increment. Only their SUM exceeds it, by
-             * exactly one. An implementation that bounds the increment admits this second add; one that bounds
-             * the result refuses it.
-             */
             expect(SEEDED_BEFORE_OVER_MAXIMUM).toBeLessThanOrEqual(MAX_QUANTITY_PER_LINE);
             expect(OVER_MAXIMUM_INCREMENT).toBeLessThanOrEqual(MAX_QUANTITY_PER_LINE);
             expect(SEEDED_BEFORE_OVER_MAXIMUM + OVER_MAXIMUM_INCREMENT).toBe(MAX_QUANTITY_PER_LINE + 1);
@@ -2186,12 +1953,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(members).toEqual(
                 ['ReorderList', 'ReorderListLimitError', 'ReorderListNotFoundError'].sort(),
             );
-            /*
-             * The platform's negative-quantity error result describes setting a negative quantity on an
-             * ORDER line and is silent on zero, so reporting a malformed list-line quantity with it would be
-             * reporting one condition under another condition's name. It is not a member here, which is
-             * precisely why this feature declares four error results rather than five.
-             */
             expect(members).not.toContain('NegativeQuantityError');
         });
     });
@@ -2214,13 +1975,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(login.channels).toBeDefined();
             expect(login.channels!.length).toBeGreaterThanOrEqual(1);
             for (const channel of login.channels!) {
-                /*
-                 * The POSITIVE assertion this criterion exists for: the session holds the single permission
-                 * the Customer Role is created with and no plugin-registered permission of any name. It is
-                 * never asserted to hold `Permission.Owner` — that is declared unassignable and internal, so
-                 * no session can be in that state; admission comes from the request context being marked
-                 * owner-only, and the service-layer predicate is the whole of the control.
-                 */
                 expect(channel.permissions).toEqual(['Authenticated']);
                 expect(channel.permissions).not.toContain('Owner');
             }
@@ -2393,10 +2147,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             ]);
             expect(runtimeErrorCodes).toHaveLength(36);
 
-            /*
-             * The zero delta is ASSERTED rather than omitted: this feature registers no permission
-             * definition, so the published enum stays at 97 members — 97 → 97.
-             */
             expect(snapshot.permissions).toHaveLength(97);
             expect(runtimePermissions.slice().sort()).toEqual(snapshot.permissions.slice().sort());
             expect(runtimePermissions).toHaveLength(97);
@@ -2422,11 +2172,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(__type!.inputFields).toHaveLength(3);
 
             /*
-             * There is no fourth field and there is no request-deduplication key of any name. The delivery
-             * guarantee this operation makes is at-least-once — two deliveries of one add accumulate, as the
-             * duplicated-delivery scenario below asserts — and the deterministic remedy is
-             * `adjustReorderListLine`, which sets an absolute quantity. The forbidden name is described
-             * rather than spelled so that a search for it over this file returns nothing.
+             * There is no fourth field and there is no request-deduplication key of any name. The delivery guarantee
+             * this operation makes is at-least-once — two deliveries of one add accumulate, as the duplicated-
+             * delivery scenario below asserts — and the deterministic remedy is `adjustReorderListLine`, which sets
+             * an absolute quantity.
              */
             for (const field of __type!.inputFields) {
                 expect(/idempot|dedup|fingerprint|requestid|clientid/i.test(field.name)).toBe(false);
@@ -2439,10 +2188,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         /*
          * Three of the four keys are reachable through `addItemToReorderList` and are asserted at their own
          * criteria: the positive-integer and above-maximum keys at AC-6, and the variant-not-found key in the
-         * incomplete-request scenario below. The fourth belongs to the name-canonicalisation path, which this
-         * story's operation cannot reach — so it is exercised here through the list-creation helper this
-         * suite already uses for its own fixtures. The claim is about the CATALOGUE, not about that
-         * operation's behaviour, which STORY-001-01-01 and STORY-001-01-03 own.
+         * incomplete-request scenario below.
          */
         it('resolves the name-rejection key to English text, not to the key itself', async () => {
             await signInAsCustomer(0);
@@ -2570,9 +2316,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
             const { addItemToReorderList } = await addItem(list.id, variant.id, 6);
 
-            // Proceed, with no warning and no audit record. The disabled state is surfaced at preview time
             // and resolved at commit time by later features; this feature neither blocks on it nor reports
-            // it, and it does not null the variant either — a disabled variant is still resolvable.
             expect(addItemToReorderList.__typename).toBe('ReorderList');
             const updated = addItemToReorderList as ReorderListSuccessShape;
             expect(updated.lineCount).toBe(1);
@@ -2590,11 +2334,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         it('proceeds with no warning, because the line stores no price for a change to invalidate', async () => {
             const variant = seededVariants[1];
             await adminClient.asSuperAdmin();
-            // CAPTURED FIRST, before anything is written — including the no-op update below, which reads the
-            // current price and, being a save, advances the variant's `updatedAt` on its way past. Two tables
-            // hold this state: the variant row, and the `product_variant_price` rows that are where a price
-            // actually lives. Both go back column for column, so restoring does not itself re-timestamp the
-            // rows it restores.
             const priceVariantDbId = decodeId(variant.id);
             await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
                 variantId: priceVariantDbId,
@@ -2631,13 +2370,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     describe('Scenario: the same add is delivered twice and this operation cannot tell the difference', () => {
         it('accumulates on the retry and offers the absolute set as the deterministic remedy', async () => {
-            /*
-             * The ticket's own figures, now that the configured maximum admits them: a line already holding 6,
-             * a call of 6 that the server committed before the client's transport timed out, and an identical
-             * retry of 6 leaving exactly 18 — not 12, because nothing replays and no claim is stored. The
-             * remedy is the absolute set that brings it to the buyer's intended 12, and repeating that set
-             * leaves 12: a set is idempotent where an add is not.
-             */
             const PRE_EXISTING_QUANTITY = 6;
             const DELIVERED_QUANTITY = 6;
             const ACCUMULATED_AFTER_RETRY = PRE_EXISTING_QUANTITY + DELIVERED_QUANTITY * 2;
@@ -2648,7 +2380,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const listId = decodeId(list.id);
             const variant = seededVariants[0];
 
-            // The Given: the list already holds one line for this variant at a quantity of 6.
             const seeded = await addItem(list.id, variant.id, PRE_EXISTING_QUANTITY);
             expect(seeded.addItemToReorderList.__typename).toBe('ReorderList');
             const lineId = (seeded.addItemToReorderList as ReorderListSuccessShape).lines.items[0].id;
@@ -2707,15 +2438,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         /**
          * One side of a race, expressed as THE REAL `addItemToReorderList` SERVICE OPERATION executed on this
          * participant's own connection inside its own held transaction.
-         *
-         * WHY THE WRITE IS NOT THE HTTP CALL. An HTTP request opens a transaction of the server's own choosing
-         * on a connection this barrier has never touched, so the rendezvous would sit entirely outside the
-         * operation under test: the two requests could be serialised end to end and the run would still look
-         * green. That is exactly the run in which a read-compute-save accumulation, or a count-then-insert
-         * capacity check, survives a race test — each request sees the other's committed effect because they
-         * never overlapped. Binding the context puts the whole operation on the held connection, so the
-         * accumulation, the deduplication constraint and the conditional counter update are all exercised
-         * inside the window the assertion claims.
          */
         function addItemParticipant(
             label: string,
@@ -2732,9 +2454,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     // ON THE SHARED CONNECTION, NOT THIS PARTICIPANT'S TRANSACTION. Under the MySQL family's
                     // default REPEATABLE READ a transaction's snapshot is fixed by its first CONSISTENT read,
                     // so a precheck issued inside the participant's own transaction would fix it before the
-                    // service ran and every read the service then took would answer from a snapshot older
-                    // than its sibling's commit — the harness manufacturing the lost update it set out to
-                    // detect. The observation is of the same shared state at the same moment either way.
                     const rows: unknown[] = await dataSource.query(
                         `SELECT ${escapeName('id')} FROM ${escapeName('reorder_list_line')} ` +
                             `WHERE ${escapeName('reorderListId')} = ${listRowId}`,
@@ -2754,21 +2473,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     ).toBe(ctx.manager);
                     // THE SECOND, INNER RENDEZVOUS, AND IT IS WHERE THIS RACE ACTUALLY LIVES. The outer
                     // barrier releases both participants together, which starts both service calls at the
-                    // same moment and is not the same thing as overlapping their writes: this operation
-                    // resolves the list, resolves the variant and looks up the existing line before it writes
-                    // anything, so two callers released together can still run one wholly after the other and
-                    // the second would then observe the first's committed effect. This hold fires immediately
                     // before this caller's FIRST statement against a plugin table and waits for its sibling,
-                    // so both callers are provably past their own reads and short of their own writes when
-                    // they are let go — which is the window the accumulation, the deduplication constraint
-                    // and the conditional counter update all exist to survive.
                     const hold = preWrite.install(ctx);
                     try {
-                        // INTERNAL identifiers, not the `T_n` forms a client sends. The platform decodes
-                        // every `id` argument in an interceptor above the resolver
                         // (`packages/core/src/api/middleware/id-interceptor.ts`), so a service invoked
-                        // directly is below that layer and receives decoded values — passing an external
-                        // identifier here would reach the database as a non-numeric literal.
                         return await reorderListService.addItemToReorderList(boundContext, {
                             reorderListId: listRowId,
                             productVariantId: variantRowId,
@@ -2782,17 +2490,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         }
 
         /**
-         * Whether this engine holds the parent list row EXCLUSIVELY for a line write, in which case the two
-         * inner-rendezvous cases below cannot certify an interleaving and are skipped here.
-         *
-         * On the MySQL family a transaction that will write only a line takes the parent exclusively, because
-         * two transactions holding it shared were measured to deadlock at the line row once that row is removed
-         * beneath them — and an InnoDB deadlock inside a mutation's savepoint scope surfaces as an
-         * unrecoverable savepoint error rather than as the retriable deadlock it is. Two accumulations against
-         * ONE list therefore serialise at the parent by design, which is exactly what an inner rendezvous
-         * requiring both participants to arrive at their own first write cannot observe: the second participant
-         * is still waiting for the parent when the hold's budget expires. That is the design being honoured,
-         * not a defect being hidden.
+         * Whether this engine holds the parent list row EXCLUSIVELY for a line write, in which case the two inner-
+         * rendezvous cases below cannot certify an interleaving and are skipped here.
          */
         function holdsParentExclusivelyForLineWrites(): boolean {
             return EXCLUSIVE_PARENT_FOR_LINE_WRITE_ENGINES.includes(resolveConfiguredEngine());
@@ -2854,11 +2553,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
         /**
          * Every outcome of a pair rendered for a diagnostic, through the shared describer.
-         *
-         * A rejected participant here is a service call over a real connection, so its reason is a TypeORM
-         * `QueryFailedError` carrying the statement and its bound values. The shared describer names the error
-         * class, the driver code and the failure classification without reproducing any of it; the FULFILLED
-         * side is this suite's own domain object, so this file decides what about it is worth saying.
          */
         function describeOutcomes(
             outcomes: Array<{
@@ -2910,11 +2604,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
          */
         async function shopContextFor(client: SimpleGraphQLClient): Promise<RequestContext> {
             const session = await server.app.get(SessionService).getSessionFromToken(client.getAuthToken());
-            // A SCALAR, uniformly with every other session assertion in this package. This one asserts the
-            // session EXISTS, so it can only fail with `undefined` as the actual and cannot render a
-            // `CachedSession` today — but the direction of an assertion is one edit away from reversing, and
             // the value on the other side of it carries the session token. Comparing here removes the
-            // question rather than answering it.
             expect(
                 session !== undefined,
                 'The client holds no session, so no authenticated context can be built',
@@ -2928,11 +2618,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             expect(ctx.authorizedAsOwnerOnly).toBe(true);
             expect(ctx.channel.token).toBe(defaultChannelToken);
             expect(ctx.activeUserId).toBeDefined();
-            // AND IT IDENTIFIES AS THE SHOP API, which a direct service call does not get for free: the
-            // platform reads the api type off the resolver's `info` argument, which no direct call
             // has, so `fromRequest` alone yields `custom` and a race would then be exercising a
-            // branch no buyer's request reaches. `asShopApiContext` self-checks both the result and
-            // that this context is left unchanged.
             const shopCtx = asShopApiContext(ctx);
             expect(shopCtx.apiType).toBe('shop');
             return shopCtx;
@@ -3005,9 +2691,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                     ),
                 });
 
-                // Both were provably inside the pre-write window together — released together by the outer
                 // barrier, and then held together INSIDE their own operations until each had resolved the
-                // list, the variant and the absent line and was about to issue its first write.
                 expect(result.a.releasedBeforeWrite).toBe(true);
                 expect(result.b.releasedBeforeWrite).toBe(true);
                 expectHeldBeforeTheirOwnWrites(preWrite);
@@ -3069,10 +2753,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
                 expect(result.a.releasedBeforeWrite).toBe(true);
                 expect(result.b.releasedBeforeWrite).toBe(true);
-                // BOTH CALLERS HAD ALREADY READ THE LINE'S CURRENT QUANTITY WHEN THEY WERE RELEASED, which is
-                // the precondition a lost update needs and the reason 12 rather than 18 is a reachable wrong
-                // answer here at all. Without this hold the two operations could run end to end and the
-                // second would read the first's committed 12, reaching 18 by serialisation rather than by
                 // atomicity and evidencing nothing.
                 expectHeldBeforeTheirOwnWrites(preWrite);
                 expect(
@@ -3091,11 +2771,9 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 const rows = await readLineRows(listId);
                 expect(rows).toHaveLength(1);
                 /*
-                 * 6 + 6 + 6 = 18, which is the scenario's own discriminator: "two concurrent six-unit adds
-                 * against a line already holding six leave eighteen and not twelve". A read-compute-save
-                 * implementation leaves 12 — both requests read 6, both compute 12, both store 12, and one
-                 * buyer's six units are gone. Only an increment evaluated by the engine against the row's
-                 * current value reaches 18.
+                 * 6 + 6 + 6 = 18, which is the scenario's own discriminator: "two concurrent six-unit adds against a
+                 * line already holding six leave eighteen and not twelve". A read-compute-save implementation leaves
+                 * 12 — both requests read 6, both compute 12, both store 12, and one buyer's six units are gone.
                  */
                 expect(rows[0].quantity).toBe(RACE_ADD_QUANTITY * 3);
             },
@@ -3136,17 +2814,8 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
                 expect(result.a.releasedBeforeWrite).toBe(true);
                 expect(result.b.releasedBeforeWrite).toBe(true);
-                // Both callers reached their capacity claim before either had made one, so both were about to
-                // write against a list holding one below the bound. That is the state a count-then-insert
-                // check answers wrongly for both, and the state the conditional counter update has to settle.
                 expectHeldBeforeTheirOwnWrites(preWrite);
 
-                /*
-                 * Exactly one returns the list and the other returns the limit error — the assertion that
-                 * fails against a count-then-insert check, and the one the conditional counter update exists
-                 * to satisfy. Both callers are FULFILLED because a limit error is a payload rather than a
-                 * request failure, so the outcome each received is read off its value.
-                 */
                 expect(
                     fulfilledServiceTypenames([result.a, result.b]),
                     describeOutcomes([result.a, result.b]),
@@ -3219,17 +2888,12 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 b: repositoryInsertParticipant('duplicate-insert', listId, variantRowId, 1),
             });
 
-            // COUNTS, not the outcome arrays: each entry carries its raw rejection reason.
             expect(result.fulfilled.length, describeSettledOutcomes([result.a, result.b])).toBe(1);
             expect(result.rejected.length, describeSettledOutcomes([result.a, result.b])).toBe(1);
             expect(result.loser?.label).toBe('duplicate-insert');
             const rejection: unknown = (result.rejected[0] as { reason?: unknown }).reason;
             const reason = String(rejection instanceof Error ? (rejection.message ?? '') : (rejection ?? ''));
-            // Every one of the four drivers names the offending relation in its own message, whether it
             // reports a constraint or the unique index the MySQL family stores under the same name.
-            //
-            // THE PREDICATE READS THE RAW MESSAGE; THE ASSERTION DOES NOT. `expect(reason).toContain(...)`
-            // would make the driver's own text the matcher ACTUAL, which Vitest prints on failure — and on
             // MySQL that text is `Duplicate entry '<the value>' for key '<the name>'`. The boolean says the
             // same thing, and the redacted description beside it names the relation the driver mentioned.
             expect(
@@ -3251,18 +2915,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
     describe('This story generates no migration', () => {
         /*
-         * ★ HOW THIS IS EVIDENCED, AND WHAT MAKES THE EMPTY RESULT MEAN SOMETHING.
-         *
-         * `generateMigration` decides between writing a file and logging
-         * "No changes in database schema were found - cannot generate a migration." from exactly one input:
-         * the schema builder's own log, `connection.driver.createSchemaBuilder().log()`. It writes a file if
-         * and only if that log's `upQueries` is non-empty, and returns `undefined` otherwise. It forces
-         * `synchronize: false` and `migrationsRun: false` on the connection it opens, so the schema it diffs
-         * is whatever is already in the database (`packages/core/src/migrate.ts`).
+         * HOW THIS IS EVIDENCED, AND WHAT MAKES THE EMPTY RESULT MEAN SOMETHING.
          */
         it('leaves the platform generator with nothing to emit against the migration-created schema', async () => {
             const outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reorder-add-item-generated-'));
-            // Queued BEFORE the call, so the directory is removed even if an assertion below fails.
             temporaryDirectories.push(outputDirectory);
             const snapshotDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reorder-add-item-schema-'));
             temporaryDirectories.push(snapshotDirectory);
@@ -3271,9 +2927,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
             // WHAT THE ASSERTION RESTS ON, which differs by engine and is recorded rather than glossed. On the
             // generation engine the diff is taken against a schema the shipped artefact built, so an empty
-            // result means the artefact and the entities agree. Elsewhere it is taken against the synchronised
-            // schema, where an empty result means the entities carry no pending change — weaker, but still the
-            // claim this story owns, which is that it adds no column and needs no migration of its own.
             expect(
                 schemaIsTheMigrations,
                 'the rebuild must run on exactly the engine the shipped artefact was generated against',
@@ -3291,15 +2944,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             ).toHaveLength(0);
             expect(offendingDownQueries).toHaveLength(0);
 
-            // SECOND HALF — the platform entry point, against that same migration-created schema.
             const generated = await generateMigration(
                 await generatorConfigAgainstMigratedSchema(snapshotDirectory),
                 { name: 'storyOneOhOneOhTwoShouldEmitNothing', outputDir: outputDirectory },
             );
-            // The file's own contents are the diagnostic when it does write one, and reading them also
-            // catches the way this assertion could otherwise go quietly wrong: a generator pointed at an
-            // EMPTY database emits the entire schema rather than nothing, so a broken snapshot fails here
-            // loudly instead of passing vacuously.
             expect(
                 generated,
                 `generateMigration emitted a migration against the migration-created schema: ${
@@ -3308,10 +2956,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             ).toBeUndefined();
             expect(fs.readdirSync(outputDirectory)).toEqual([]);
 
-            // The running server is unaffected by the generation pass, which is asserted rather than assumed
-            // because that pass loads and then RESETS the platform's module-level configuration. The two
-            // tables are empty at this point — the rebuild dropped and recreated them — so this also proves
-            // the migration's own output accepts the writes this story makes.
             const stillWorking = await createList('After the generation pass');
             const added = await addItem(stillWorking.id, seededVariants[0].id, 3);
             expect(added.addItemToReorderList.__typename).toBe('ReorderList');
@@ -3319,8 +2963,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
 
         it('writes no migration file into a generator output directory and leaves the package untouched', () => {
-            // A real directory, created here and removed in `afterEach`, so "nothing was written to it" is
-            // an observation rather than a figure of speech.
             const outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reorder-plugin-migration-'));
             temporaryDirectories.push(outputDirectory);
 
@@ -3339,39 +2981,13 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
         });
     });
 
-    // ─────────────────────────────────────────────────────────────────────────────────────────────────────
-    // CORRUPT PERSISTED STATE IS NOT COMPOUNDED — the portable half of conflict C-E, exercised live.
-    //
-    // `CHK_reorder_list_line_count_non_negative` and `CHK_reorder_list_line_quantity_positive` are declared
     // on the entities and do materialise on PostgreSQL and the SQLite family, but TypeORM 0.3.28 discards
     // them on MySQL and MariaDB. On those two engines a row violating either invariant is therefore storable
-    // by anything writing outside this service — a repair script, a second application sharing the schema,
-    // direct SQL. That much this plugin cannot prevent. What must not follow is this service COMPOUNDING the
-    // violation: handing out capacity that a negative counter merely appears to permit, or adding to a
-    // quantity the column may not hold and storing the result.
-    //
-    // Each case below seeds the violation through raw SQL exactly as such a writer would, then drives the
-    // published mutation. The seeding is expected to SUCCEED where the constraint is absent and to be
     // REFUSED where it is present, so one case is meaningful on all four engines: it evidences the database
     // constraint on the engines that have it, and the service-level floor on the engines that do not.
     describe('corrupt persisted state is refused rather than compounded', () => {
         /**
          * True when a caught failure is a CHECK violation **naming the constraint the caller expected**.
-         *
-         * BOTH halves are required, and requiring only one is the bug this replaced. The engine's own code
-         * establishes the CLASS of failure; the constraint name establishes that it was THIS invariant and
-         * not another. A unique-constraint violation, a syntax error, a missing table, a denied privilege and
-         * a dropped connection all fail the first half; a violation of some other check fails the second.
-         *
-         * The codes are the engines' own and were measured rather than assumed: PostgreSQL raises SQLSTATE
-         * `23514` and puts the name in `constraint`; the SQLite family renders `CHECK constraint failed:
-         * <name>`; MySQL 8 raises errno 3819 and MariaDB 4025, which this predicate accepts for completeness
-         * even though neither engine creates these constraints in the first place. TypeORM copies the driver
-         * error onto its own `QueryFailedError`, but a driver that nests it instead is read through
-         * `driverError` so the predicate does not depend on which.
-         *
-         * Nothing read here is ever emitted. The message is tested, never printed — the caller either turns
-         * this into a discriminated outcome or hands the failure to the redactor.
          */
         function isRefusalByCheckConstraint(err: unknown, constraintName: string): boolean {
             const layers = [err, (err as { driverError?: unknown })?.driverError];
@@ -3400,22 +3016,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
         /**
          * Attempts one invariant-violating write and says which of exactly two things happened.
-         *
-         * **It is fail-closed, and that is the entire design.** An earlier version returned a boolean and
-         * treated every failure as "the check refused it", so a syntax error, a missing column, a denied
-         * privilege, a dropped connection or a violation of some OTHER constraint would all have been read as
-         * proof that a security invariant exists — a broken test certifying an absent guard. Worse, it
-         * classified AFTER {@link executeRawStatement}, which has already replaced the driver error with a
-         * redacted one, so the evidence needed to classify correctly was gone by the time it looked.
-         *
-         * So the classification happens HERE, at the raw boundary, before anything is redacted, and only a
-         * CHECK violation naming {@link expectedCheckConstraint} is admitted. Everything else goes to the
-         * redactor and fails the test, which is the only safe direction for a helper whose output is read as
-         * evidence.
-         *
-         * @param expectedCheckConstraint - The exact named object whose refusal is the only acceptable
-         * failure. Passing a name the statement cannot violate makes every refusal rethrow, which is
-         * deliberate: this parameter is the assertion.
          */
         async function seedInvariantViolation(
             sql: string,
@@ -3430,7 +3030,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
                 if (isRefusalByCheckConstraint(err, expectedCheckConstraint)) {
                     return 'refused-by-expected-check';
                 }
-                // Not the refusal this seed was written to provoke, so it is a broken test rather than
                 // evidence of anything. It travels through the redactor because the raw failure carries the
                 // statement and every bound value on its own enumerable properties.
                 rethrowRedacted('an invariant-violation seed statement', err);
@@ -3452,19 +3051,14 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             );
             if (seeded === 'refused-by-expected-check') {
                 // That named constraint exists on this engine and refused the write — which is this case's
-                // assertion here, reached only because the failure identified itself as a violation of that
-                // exact object. The counter therefore still reads as the service left it, and there is
                 // nothing for the service-level floor to defend against on this engine.
                 expect(await readListRow(listRowId)).toMatchObject({ lineCount: 1 });
                 return;
             }
 
-            // The constraint is absent, the row is now invalid, and this is the state the exploit needs.
             const linesBefore = await countAllLineRows();
             await expectRefusal(() => addItem(list.id, seededVariants[1].id, 1));
 
-            // NOTHING WAS BUILT ON IT. Without the claim's floor the counter would have satisfied
-            // `< maxLinesPerList`, the claim would have been granted and a line would exist here.
             expect(await countAllLineRows()).toBe(linesBefore);
             expect(await readLineRows(listRowId)).toHaveLength(1);
         });
@@ -3476,9 +3070,7 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             const variant = seededVariants[0];
             await addItem(list.id, variant.id, 5);
 
-            // Zero is the sharper violation than a negative, because the total the request would produce is
             // legal arithmetic (0 + 2 = 2): request validation passes, so only the statement's own floor
-            // stands between a row the column may not hold and a total computed from it.
             const seeded = await seedInvariantViolation(
                 `UPDATE ${quotedIdentifier('reorder_list_line')} SET ${quotedIdentifier('quantity')} = 0 ` +
                     `WHERE ${quotedIdentifier('reorderListId')} = :listRowId`,
@@ -3492,20 +3084,10 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 
             await expectRefusal(() => addItem(list.id, variant.id, 2));
 
-            // THE VIOLATION WAS NOT COMPOUNDED. Without the accumulate floor this row would now read 2 — a
-            // quantity computed from a base the column forbids, and indistinguishable thereafter from one the
-            // buyer actually asked for.
             expect(await readLineRows(listRowId)).toMatchObject([{ quantity: 0 }]);
         });
 
-        // ─────────────────────────────────────────────────────────────────────────────────────────────────
-        // THE SEEDER ITSELF IS FAIL-CLOSED, asserted rather than assumed.
-        //
-        // The two cases above branch on what the seeder returns, so the seeder IS part of the evidence: if it
-        // reported "the check refused it" for any failure other than that exact check, a green run would
         // certify a guard that was never exercised — on the very engines where the constraint is absent. Each
-        // case below fails for a DIFFERENT reason that is not the expected check, and each must rethrow
-        // rather than return the refusal outcome.
         describe('the invariant seeder admits only the refusal it was asked about', () => {
             it('rethrows a syntactically broken statement instead of calling it a check refusal', async () => {
                 await expect(
@@ -3529,9 +3111,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             });
 
             it('rethrows a violation of a different named constraint', async () => {
-                // A genuine constraint violation, but of the per-variant uniqueness object rather than either
-                // check. This is the case a class-only test would wave through, and the reason the constraint
-                // NAME is required alongside the failure class.
                 await signInAsCustomer(0);
                 const list = await createList('C-E seeder rejects a foreign constraint');
                 const listRowId = decodeId(list.id);
@@ -3557,8 +3136,6 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
             });
 
             it('reports the accepted case as accepted rather than as a refusal', async () => {
-                // The positive control. Without it the three cases above would also pass against a seeder
-                // that rethrew unconditionally and could never return either outcome.
                 await signInAsCustomer(0);
                 const list = await createList('C-E seeder accepts a legal write');
                 const listRowId = decodeId(list.id);
@@ -3577,21 +3154,11 @@ describe('ReorderPlugin addItemToReorderList (STORY-001-01-02)', () => {
 });
 
 // THE PRE-WRITE RENDEZVOUS, CERTIFIED AGAINST ITS OWN FALSE-PASS.
-//
 // The three races above rest entirely on one claim: that both callers were between their own reads and their
-// own writes at the same moment. The instrument that makes that claim has a failure mode that would certify
-// the exact serialisation it exists to detect, and it is not hypothetical — it is what happens when one
 // caller is blocked on a lock the other holds:
-//
-//   1. A reaches its hold and waits.
 //   2. B cannot reach its hold at all, because it is blocked in the database.
-//   3. A's wait ends.
 //   4. B unblocks, reads A's committed state, and reaches its hold.
-//
-// If step 3 RELEASED A's write, then by step 4 every aggregate reads perfectly — two installs, two arrivals,
-// a release "by arrival" — while the two callers never overlapped, and a read-compute-save accumulation would
 // leave the correct total purely by serialisation. So step 3 must FAIL the rendezvous instead, and that
-// behaviour is asserted here rather than assumed of the fixture.
 
 describe('the pre-write rendezvous refuses to certify a sequential run', () => {
     /** A write against a plugin table, which is what the rendezvous is told to intercept. */
@@ -3679,10 +3246,7 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
         const firstHold = rendezvous.install(first.ctx);
         const secondHold = rendezvous.install(second.ctx);
 
-        // A WAIT INSTALLS TWO ESCAPES AND EXACTLY ONE OF THEM FIRES. Here the ARRIVAL fires, so the bounded
-        // timer never does — and the defect this guards against is that timer being left pending for the rest
         // of its bound afterwards, holding the wait's closure and the rendezvous state it captures reachable,
-        // and then elapsing inside whichever LATER test is running by then.
         const realSetTimeout = globalThis.setTimeout;
         const realClearTimeout = globalThis.clearTimeout;
         const mutableGlobal = globalThis as unknown as {
@@ -3696,8 +3260,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
             realClearTimeout(handle);
         }) as unknown as typeof globalThis.clearTimeout;
         try {
-            // Observed across the SYNCHRONOUS call only, so the single timer captured is the wait's own
-            // rather than a per-hold timer or anything the runtime installs elsewhere.
             mutableGlobal.setTimeout = ((handler: () => void, ms?: number) => {
                 const handle = realSetTimeout(handler, ms);
                 installed.push(handle);
@@ -3720,7 +3282,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
                     'later test',
             ).toContain(installed[0]);
             // And nothing is left holding the rendezvous either, so a further arrival has no stale observer
-            // to notify and no hold is still parked in the waiting set.
             expect(rendezvous.waitingCount(), 'a released hold was left in the waiting set').toBe(0);
         } finally {
             mutableGlobal.setTimeout = realSetTimeout;
@@ -3736,7 +3297,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
         const hold = rendezvous.install(lonely.ctx);
 
         // THE STEP-3 BEHAVIOUR. The wait ends without the sibling arriving, and the intercepted statement is
-        // refused rather than run.
         await expect(lonely.ctx.queryRunner.query(TARGETED_WRITE)).rejects.toThrow(
             /waited 150ms without every participant arriving/,
         );
@@ -3747,8 +3307,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
         );
         expect(rendezvous.failureReason()?.message).toMatch(/failed rather than released/);
         expect(rendezvous.releasedByArrival()).toBe(false);
-        // Nothing retained: the refused hold left the waiting set and its timer was cleared with it, so no
-        // timer outlives the test that created it.
         expect(rendezvous.waitingCount(), 'a refused hold was left in the waiting set').toBe(0);
         hold.restore();
     });
@@ -3764,8 +3322,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
             /without every participant/,
         );
 
-        // STEP 4, AND THE LATCH. The sibling now arrives, completing the count — the run the aggregates could
-        // not tell apart from a genuine overlap. It is refused, and the release cause stays false.
         await expect(late.ctx.queryRunner.query(TARGETED_WRITE)).rejects.toThrow(
             /failed rather than released/,
         );
@@ -3787,9 +3343,6 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
 
         const attempt = abandoned.ctx.queryRunner.query(TARGETED_WRITE);
         // WAITED ON A RENDEZVOUS EVENT, NOT ON A TIMER. Yielding a fixed number of event-loop turns and
-        // ASSUMING the interceptor has registered by then is not an observation, and it would let this case
-        // pass on a build where the hold was never registered at all. The arrival is the event that says the
-        // hold exists, so it is the thing waited on.
         expect(
             await rendezvous.waitForArrivals(1),
             'the participant never reached its write, so there was no hold to cancel',
@@ -3805,10 +3358,7 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
     });
 
     it('refuses a hold whose pair was already abandoned before it reached its write', async () => {
-        // THE HARDEST PATH, AND THE ONE THAT ACTUALLY STRANDED A PARTICIPANT. The real context invokes a
-        // cancellation listener synchronously when the pair is already abandoned, so the failure happens
         // DURING the hold's own registration. A rendezvous that registered before joining its waiting set
-        // would fail over an empty set and then add this hold to a set nothing revisits: the intercepted
         // statement would never settle, and the suite would hang in teardown instead of reporting a failure.
         const rendezvous = fabricateRendezvous(2);
         const preCancelled = fabricateParticipant('pre-cancelled', { alreadyCancelled: true });
@@ -3847,14 +3397,1127 @@ describe('the pre-write rendezvous refuses to certify a sequential run', () => {
         const hold = rendezvous.install(participant.ctx);
 
         // A one-participant rendezvous is complete on the first arrival, so this delegates immediately and
-        // is still certified as released by arrival.
         await participant.ctx.queryRunner.query(TARGETED_WRITE);
         expect(hold.releasedBy()).toBe('arrival');
         hold.restore();
 
-        // After restoration a second targeted write is not intercepted at all — no second arrival is counted.
         await participant.ctx.queryRunner.query(TARGETED_WRITE);
         expect(rendezvous.arrivedCount()).toBe(1);
         expect(participant.executed).toEqual([TARGETED_WRITE, TARGETED_WRITE]);
+    });
+});
+
+// The concurrency evidence in this suite is only worth what the barrier that produces it is worth: a harness
+// that silently releases a connection early, or reports a foreign failure verbatim, turns a race proof into a
+// coincidence. These cases drive the barrier directly, with fake runners, so they need no server.
+
+/**
+ * The two-connection harness's TEARDOWN CONTRACT, tested where it is hardest to reach: on a query runner whose own
+ * state accessors misbehave.
+ */
+
+/** Every lifecycle call a fake runner received, in order, so teardown is asserted rather than assumed. */
+interface RunnerJournal {
+    calls: string[];
+}
+
+/** How a fake runner should misbehave. Everything not selected here behaves like a healthy driver. */
+interface FakeRunnerFaults {
+    /** `isTransactionActive` throws on every read, as a driver double or a torn-down connection can. */
+    throwOnTransactionFlag?: boolean;
+    /** `transactionDepth` throws on every read, leaving the harness with no counter to compare. */
+    throwOnTransactionDepth?: boolean;
+    /**
+     * The lifecycle call after which `isTransactionActive` STOPS reading — the transition case.
+     */
+    flagFailsAfter?: 'connect' | 'startTransaction' | 'commitTransaction';
+    /**
+     * The runner arrives already inside a transaction at depth 1, as one drawn from a caller's outer
+     * transaction does. This is a SUPPORTED situation for {@link runSequentialPair}, and it is what makes
+     * the harness's `ownsRunner` false — so it is how the "genuinely foreign" branch is reached.
+     */
+    initiallyInTransaction?: boolean;
+    releaseFailsWith?: unknown;
+}
+
+/**
+ * A query runner that records what was done to it, with the two state accessors optionally throwing.
+ */
+function createFakeRunner(
+    journal: RunnerJournal,
+    faults: FakeRunnerFaults = {},
+): QueryRunner & { readonly journal: RunnerJournal } {
+    let transactionActive = faults.initiallyInTransaction === true;
+    let depth = faults.initiallyInTransaction === true ? 1 : 0;
+    let released = false;
+    let flagBroken = false;
+    const breakFlagAfter = (call: FakeRunnerFaults['flagFailsAfter']): void => {
+        if (faults.flagFailsAfter === call) {
+            flagBroken = true;
+        }
+    };
+    const runner = {
+        journal,
+        get isReleased(): boolean {
+            return released;
+        },
+        get isTransactionActive(): boolean {
+            if (faults.throwOnTransactionFlag || flagBroken) {
+                throw new Error('isTransactionActive is unreadable on this runner');
+            }
+            return transactionActive;
+        },
+        get transactionDepth(): number {
+            if (faults.throwOnTransactionDepth) {
+                throw new Error('transactionDepth is unreadable on this runner');
+            }
+            return depth;
+        },
+        set transactionDepth(value: number) {
+            depth = value;
+        },
+        manager: {} as EntityManager,
+        connect: () => {
+            journal.calls.push('connect');
+            breakFlagAfter('connect');
+            return Promise.resolve();
+        },
+        startTransaction: () => {
+            journal.calls.push('startTransaction');
+            transactionActive = true;
+            depth += 1;
+            breakFlagAfter('startTransaction');
+            return Promise.resolve();
+        },
+        commitTransaction: () => {
+            journal.calls.push('commitTransaction');
+            depth -= 1;
+            // Closing a NESTED level leaves the outer transaction open, which is what TypeORM's own
+            // runners do: they release a savepoint and decrement while the depth is still above zero, and
+            // inside somebody else's transaction would appear to lose it here.
+            transactionActive = depth > 0;
+            breakFlagAfter('commitTransaction');
+            return Promise.resolve();
+        },
+        rollbackTransaction: () => {
+            journal.calls.push('rollbackTransaction');
+            depth -= 1;
+            transactionActive = depth > 0;
+            return Promise.resolve();
+        },
+        release: () => {
+            journal.calls.push('release');
+            if ('releaseFailsWith' in faults) {
+                return Promise.reject(faults.releaseFailsWith);
+            }
+            released = true;
+            return Promise.resolve();
+        },
+        query: () => {
+            journal.calls.push('query');
+            return Promise.resolve([]);
+        },
+    };
+    return runner as unknown as QueryRunner & { readonly journal: RunnerJournal };
+}
+
+/**
+ * A data source that hands out the given runners in order and records a pool teardown if one happens.
+ */
+function createFakeDataSource(runners: QueryRunner[], journal: RunnerJournal): DataSource {
+    let handedOut = 0;
+    return {
+        options: { type: 'postgres' },
+        isInitialized: true,
+        createQueryRunner: () => {
+            const runner = runners[handedOut];
+            handedOut += 1;
+            if (runner === undefined) {
+                throw new Error('the fake data source was asked for more runners than it was given');
+            }
+            return runner;
+        },
+        destroy: () => {
+            journal.calls.push('dataSource.destroy');
+            return Promise.resolve();
+        },
+    } as unknown as DataSource;
+}
+
+/** A participant that writes nothing. The subject is the lifecycle around it, not the work inside it. */
+const inertParticipant = (label: string) => ({
+    label,
+    write: () => Promise.resolve(`${label} wrote nothing`),
+});
+
+describe('the two-connection harness, when a runner cannot be read', () => {
+    it('refuses before taking a pool connection, when neither accessor can be read', async () => {
+        const journal: RunnerJournal = { calls: [] };
+        const faults: FakeRunnerFaults = { throwOnTransactionFlag: true, throwOnTransactionDepth: true };
+        const first = createFakeRunner(journal, faults);
+        const second = createFakeRunner(journal, faults);
+        const dataSource = createFakeDataSource([first, second], journal);
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant('reads-nothing-a'),
+            b: inertParticipant('reads-nothing-b'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        // ownership existed, no diagnostic was produced and the runner was simply dropped.
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toContain('The concurrency harness cannot certify this run');
+
+        expect(message).toContain('transaction flag could not be read');
+        expect(message).toContain('refused before it took a pool connection');
+
+        // AND NOTHING WAS TAKEN OUT OF THE POOL. This is the property that closes the leak: `connect()` is
+        expect(journal.calls).not.toContain('connect');
+        expect(journal.calls).not.toContain('startTransaction');
+        expect(journal.calls).not.toContain('rollbackTransaction');
+        expect(journal.calls).not.toContain('release');
+        expect(journal.calls).not.toContain('dataSource.destroy');
+        expect(message).toContain('Nothing was acquired');
+    });
+
+    it('refuses on an unreadable flag even when the depth counter reads perfectly', async () => {
+        const journal: RunnerJournal = { calls: [] };
+        const first = createFakeRunner(journal, { throwOnTransactionFlag: true });
+        const second = createFakeRunner(journal, { throwOnTransactionFlag: true });
+        const dataSource = createFakeDataSource([first, second], journal);
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant('flagless-a'),
+            b: inertParticipant('flagless-b'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toContain('transaction flag could not be read');
+
+        // No connection, no transaction, no release, no quarantine, and both fakes still unreleased because
+        expect(journal.calls).not.toContain('connect');
+        expect(journal.calls).not.toContain('startTransaction');
+        expect(journal.calls).not.toContain('commitTransaction');
+        expect(journal.calls).not.toContain('release');
+        expect(journal.calls).not.toContain('dataSource.destroy');
+        expect(first.isReleased).toBe(false);
+        expect(second.isReleased).toBe(false);
+    });
+
+    it('completes the pair and releases both connections exactly once, when only the depth counter throws', async () => {
+        const journal: RunnerJournal = { calls: [] };
+        const first = createFakeRunner(journal, { throwOnTransactionDepth: true });
+        const second = createFakeRunner(journal, { throwOnTransactionDepth: true });
+        const dataSource = createFakeDataSource([first, second], journal);
+
+        const result = await runSequentialPair(dataSource, {
+            a: inertParticipant('depthless-a'),
+            b: inertParticipant('depthless-b'),
+        });
+
+        expect(result.fulfilled).toHaveLength(2);
+        expect(result.rejected).toHaveLength(0);
+
+        expect(journal.calls.filter(call => call === 'commitTransaction')).toHaveLength(2);
+        expect(journal.calls.filter(call => call === 'release')).toHaveLength(2);
+        expect(journal.calls).not.toContain('rollbackTransaction');
+        expect(journal.calls).not.toContain('dataSource.destroy');
+        expect(first.isReleased).toBe(true);
+        expect(second.isReleased).toBe(true);
+    });
+});
+
+describe('the two-connection harness, when a runner STOPS being readable mid-chain', () => {
+    /*
+     * WHY THIS GROUP IS SEPARATE FROM THE ONE ABOVE, AND WHY IT IS THE DANGEROUS HALF.
+     */
+
+    it('reports and holds a genuinely foreign connection whose flag dies after connect', async () => {
+        const journal: RunnerJournal = { calls: [] };
+        // Observed active at depth 1 when the participant begins — a real outer transaction, so ownership
+        const first = createFakeRunner(journal, { initiallyInTransaction: true, flagFailsAfter: 'connect' });
+        const second = createFakeRunner(journal, {
+            initiallyInTransaction: true,
+            flagFailsAfter: 'connect',
+        });
+        const dataSource = createFakeDataSource([first, second], journal);
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant('foreign-then-blind-a'),
+            b: inertParticipant('foreign-then-blind-b'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toContain('cannot certify this run');
+        expect(message).toContain('foreign-then-blind-a');
+        expect(message).toContain('arrived inside a transaction this harness did not open');
+        expect(message).toContain('this harness only lost sight of it');
+
+        expect(message).toContain("'foreign-then-blind-a' rejected with");
+        expect(message).toContain('could not complete its transaction');
+
+        // publish a live foreign transaction and its locks to the next borrower, and destroying the pool
+        expect(journal.calls).toContain('connect');
+        expect(journal.calls).not.toContain('release');
+        expect(journal.calls).not.toContain('dataSource.destroy');
+        expect(first.isReleased).toBe(false);
+        expect(second.isReleased).toBe(false);
+    });
+
+    it('quarantines a connection the harness borrowed itself whose flag dies after the commit', async () => {
+        const journal: RunnerJournal = { calls: [] };
+        // harness's. The flag survives the whole transaction and dies once the commit has returned, which
+        const first = createFakeRunner(journal, { flagFailsAfter: 'commitTransaction' });
+        const second = createFakeRunner(journal, { flagFailsAfter: 'commitTransaction' });
+        const dataSource = createFakeDataSource([first, second], journal);
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant('ours-then-blind-a'),
+            b: inertParticipant('ours-then-blind-b'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toContain('cannot certify this run');
+        expect(message).toContain('ours-then-blind-a');
+        expect(message).toContain('cannot be certified as clean');
+        expect(message).toContain('quarantined rather than released');
+
+        expect(journal.calls).toContain('commitTransaction');
+        expect(journal.calls).toContain('dataSource.destroy');
+        expect(journal.calls).not.toContain('release');
+        expect(first.isReleased).toBe(false);
+
+        // MAX_TRANSACTION_UNWIND_STEPS, so the closes per participant stay within one commit plus that
+        expect(message).toContain('within 8 closes');
+        expect(journal.calls.filter(call => call === 'commitTransaction').length).toBeLessThanOrEqual(18);
+
+        // WHICH OF THESE TWO CASES FALSIFIES WHICH CHANGE.
+        // The foreign case above is the one that fails without the certainty check, because
+        // there a substituted value produced a positive certification. Here the baseline was inactive, so
+        // the value comparison already disagreed and the runner was already quarantined; what this case
+        // pins down is the OWNERSHIP SPLIT — that the same unreadable state disposes of a borrowed
+        // connection by quarantine and a foreign one by report alone, and that the borrowed one is never
+        // released on the way.
+    });
+});
+
+describe('the two-connection harness, when a teardown failure has to be reported', () => {
+    /**
+     * A rejection shaped exactly as TypeORM raises one, driver fields and all.
+     */
+    function driverRejection(email: string): Error {
+        return Object.assign(
+            new Error(`Duplicate entry '${email}' for key 'UQ_reorder_list_line_list_variant'`),
+            {
+                name: 'QueryFailedError',
+                code: 'ER_DUP_ENTRY',
+                errno: 1062,
+                query: 'INSERT INTO `customer` (`emailAddress`) VALUES (?)',
+                parameters: [email],
+                driverError: { sqlMessage: `Duplicate entry '${email}'`, sqlState: '23000' },
+            },
+        );
+    }
+
+    it('measures the failure rather than reproducing it, and still names what a reader needs', async () => {
+        // WHY THIS CASE MATTERS HERE RATHER THAN ONLY IN THE REDACTION FIXTURE'S OWN SPEC. A participant of
+        // build. This asserts the delegation to the shared redactor, not the redactor itself.
+        const email = 'someone.real@example.invalid';
+        const journal: RunnerJournal = { calls: [] };
+        const faults: FakeRunnerFaults = { releaseFailsWith: driverRejection(email) };
+        const dataSource = createFakeDataSource(
+            [createFakeRunner(journal, faults), createFakeRunner(journal, faults)],
+            journal,
+        );
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant('writes-first'),
+            b: inertParticipant('writes-second'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+
+        // enumerated driver code and errno, and how the failure classifies.
+        expect(message).toContain('writes-first');
+        expect(message).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+        expect(message).toContain('[unique-violation]');
+
+        // WHAT IT MUST NOT CARRY: the statement, its bound values, the driver's own sentence, the SQLSTATE.
+        for (const secret of [email, 'INSERT', 'VALUES', '23000', 'Duplicate']) {
+            expect(message.includes(secret), `the harness diagnostic disclosed "${secret.slice(0, 3)}"`).toBe(
+                false,
+            );
+        }
+    });
+
+    it('refuses a participant label that carries a value', async () => {
+        const email = 'someone.real@example.invalid';
+        const journal: RunnerJournal = { calls: [] };
+        const faults: FakeRunnerFaults = { releaseFailsWith: new Error('the pool refused it') };
+        const dataSource = createFakeDataSource(
+            [createFakeRunner(journal, faults), createFakeRunner(journal, faults)],
+            journal,
+        );
+
+        const failure = await runSequentialPair(dataSource, {
+            a: inertParticipant(`writes-for-${email}`),
+            b: inertParticipant('writes-second'),
+        }).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect((failure as Error).message.includes(email)).toBe(false);
+    });
+});
+
+describe('the exported barrier primitive, driven directly rather than through a pair driver', () => {
+    // WHY THE PRIMITIVE NEEDS ITS OWN CASES. `runBarrieredPair` and `runSequentialPair` resolve their
+    // suite may construct `ConcurrencyBarrier` itself — it is exported — and then this class's own
+    // constructor, `arrive()` and `dispose()` are the only boundary a caller's label or failure crosses.
+
+    const EMAIL = 'someone.real@example.invalid';
+    const TOKEN = ['s3cr3t', 'session', 'token', '4f2c81b9'].join('-');
+    const HOST_PATH = '/var/folders/T/reorder-plugin-a1b2c3/migrations';
+    const CONTROL = 'writes\u0007\u200b\nfake-log-line: OK';
+
+    /** A rejection shaped exactly as TypeORM raises one: driver fields as enumerable own properties. */
+    function driverRejection(): Error {
+        return Object.assign(
+            new Error(`Duplicate entry '${EMAIL}' for key 'UQ_reorder_list_line_list_variant'`),
+            {
+                name: 'QueryFailedError',
+                code: 'ER_DUP_ENTRY',
+                errno: 1062,
+                query: 'INSERT INTO `customer` (`emailAddress`) VALUES (?)',
+                parameters: [EMAIL],
+                driverError: { sqlMessage: `Duplicate entry '${EMAIL}'`, sqlState: '23000' },
+            },
+        );
+    }
+
+    /** Fails naming which value leaked, without putting the value itself in the message. */
+    function expectNoValueIn(text: string, values: readonly string[]): void {
+        for (const value of values) {
+            expect(text.includes(value), `the diagnostic disclosed "${value.slice(0, 3)}"`).toBe(false);
+        }
+    }
+
+    it('publishes no part of a value-bearing label through the timeout diagnostic', async () => {
+        // The timeout message is the one a hung rendezvous produces and therefore the one most likely to be
+        const barrier = new ConcurrencyBarrier(2, {
+            timeoutMs: 20,
+            expectedLabels: [`expects-${EMAIL}`, `expects-${HOST_PATH}`],
+        });
+
+        const failure = await barrier.arrive(`writes-for-${EMAIL}`).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toContain('Concurrency barrier timed out');
+        expectNoValueIn(message, [EMAIL, HOST_PATH]);
+    });
+
+    it('publishes no part of a control-character label, so a log line cannot be forged', async () => {
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 20, expectedLabels: [CONTROL] });
+
+        const failure = await barrier.arrive(CONTROL).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        const message = (failure as Error).message;
+        expect(message.includes('fake-log-line')).toBe(false);
+        expect(message.includes('\u0007')).toBe(false);
+        expect(message.includes('\u200b')).toBe(false);
+    });
+
+    it('converts a foreign disposal reason before storing it or rejecting anyone with it', async () => {
+        // the statement and its bound parameters as enumerable own properties, so all three published them.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+        const waiting = barrier.arrive('writes-first').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        barrier.dispose(driverRejection());
+
+        const rejected = await waiting;
+        expect(rejected).toBeInstanceOf(Error);
+        const rejectedMessage = (rejected as Error).message;
+        expect(rejectedMessage).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+        expect(rejectedMessage).toContain('[unique-violation]');
+        expectNoValueIn(rejectedMessage, [EMAIL, 'INSERT', 'VALUES', '23000', 'Duplicate']);
+        expect(JSON.stringify(rejected)).toBe('{}');
+        expect((rejected as { cause?: unknown }).cause).toBeUndefined();
+
+        const late = await barrier.arrive('arrives-late').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+        const lateMessage = (late as Error).message;
+        expect(lateMessage).toContain('no longer');
+        expectNoValueIn(lateMessage, [EMAIL, 'INSERT', 'VALUES', '23000', 'Duplicate']);
+    });
+
+    it('refuses a token-bearing disposal reason that is not an Error at all', async () => {
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+        const waiting = barrier.arrive('writes-first').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        barrier.dispose([TOKEN, EMAIL]);
+
+        expectNoValueIn(((await waiting) as Error).message, [TOKEN, EMAIL]);
+    });
+
+    it('keeps two refused labels DISTINCT, so refusing one cannot turn a leak into a hang', async () => {
+        // the distinct-arrival count below the release threshold and hang the rendezvous. Both labels here
+        // are refused and the barrier must still release on the second arrival.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+        const first = barrier.arrive(`writes-for-${EMAIL}`);
+        const second = barrier.arrive(`writes-for-${HOST_PATH}`);
+
+        await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+        expect(barrier.released, 'two refused labels were merged into one participant').toBe(true);
+        expect(new Set(barrier.arrivedLabels).size).toBe(2);
+        expectNoValueIn(barrier.arrivedLabels.join(' '), [EMAIL, HOST_PATH]);
+    });
+
+    it('still counts a REPEAT arrival of the same refused label exactly once', async () => {
+        // must not satisfy a two-participant barrier, or a test would read a rendezvous that never happened
+        // as evidence of an interleaving.
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 40 });
+        const firstArrival = barrier.arrive(`writes-for-${EMAIL}`).then(
+            () => undefined,
+            () => undefined,
+        );
+        const failure = await barrier.arrive(`writes-for-${EMAIL}`).then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        expect(failure, 'a repeated refused label was counted as two participants').toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain('Concurrency barrier timed out');
+        expect(new Set(barrier.arrivedLabels).size).toBe(1);
+        await firstArrival;
+    });
+
+    it('keeps a safe label intact, because the diagnostic has to stay readable', async () => {
+        const barrier = new ConcurrencyBarrier(2, { timeoutMs: 20, expectedLabels: ['adjust', 'remove'] });
+
+        const failure = await barrier.arrive('adjust').then(
+            () => undefined,
+            (reason: unknown) => reason,
+        );
+
+        const message = (failure as Error).message;
+        expect(message).toContain('Arrived: adjust');
+        expect(message).toContain('Did not arrive: remove');
+    });
+
+    // RENDERED-IDENTITY OWNERSHIP. The ordinal that makes a refused label safe is itself a string a
+    // caller could pass, so the substitute and the accepted set overlap — and the identity a barrier
+    // therefore do not leak anything; they HANG, which is a worse failure than the one the guard prevents.
+    describe('the identity a barrier deduplicates by is never shared by two participants', () => {
+        it('keeps them distinct when the REFUSED label arrives first and claims the ordinal', async () => {
+            const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+            const refused = barrier.arrive(`writes-for-${EMAIL}`);
+            const collides = barrier.arrive('<participant-1>');
+
+            await expect(Promise.all([refused, collides])).resolves.toEqual([undefined, undefined]);
+            expect(barrier.released, 'two participants were merged into one identity').toBe(true);
+            expect(new Set(barrier.arrivedLabels).size).toBe(2);
+            expect(barrier.arrivedLabels.join(' ').includes(EMAIL)).toBe(false);
+        });
+
+        it('keeps them distinct when the ORDINAL-SHAPED label arrives first', async () => {
+            const barrier = new ConcurrencyBarrier(2, { timeoutMs: 5_000 });
+            const accepted = barrier.arrive('<participant-1>');
+            const refused = barrier.arrive(`writes-for-${EMAIL}`);
+
+            await expect(Promise.all([accepted, refused])).resolves.toEqual([undefined, undefined]);
+            expect(barrier.released).toBe(true);
+            expect(new Set(barrier.arrivedLabels).size).toBe(2);
+        });
+
+        it('keeps them distinct when the ordinal-shaped label came from expectedLabels', async () => {
+            const barrier = new ConcurrencyBarrier(2, {
+                timeoutMs: 5_000,
+                expectedLabels: ['<participant-1>', '<participant-2>'],
+            });
+            const first = barrier.arrive(`writes-for-${EMAIL}`);
+            const second = barrier.arrive(`reads-for-${EMAIL}`);
+
+            await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+            expect(barrier.released).toBe(true);
+            expect(new Set(barrier.arrivedLabels).size).toBe(2);
+            expect(barrier.arrivedLabels.join(' ').includes(EMAIL)).toBe(false);
+        });
+
+        it('still counts a repeat arrival once when its identity was ordinalised twice over', async () => {
+            // Stability has to survive the ownership stepping: the same raw label must resolve to the same
+            const barrier = new ConcurrencyBarrier(3, { timeoutMs: 60, expectedLabels: ['<participant-1>'] });
+            const first = barrier.arrive(`writes-for-${EMAIL}`).then(
+                () => undefined,
+                () => undefined,
+            );
+            const repeat = await barrier.arrive(`writes-for-${EMAIL}`).then(
+                () => undefined,
+                (reason: unknown) => reason,
+            );
+
+            expect(repeat, 'a repeated label was counted twice').toBeInstanceOf(Error);
+            expect(new Set(barrier.arrivedLabels).size).toBe(1);
+            await first;
+        });
+
+        it('lets a pair driver run when the REFUSED label is A and the ordinal-shaped one is B', async () => {
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            const result = await runSequentialPair(dataSource, {
+                a: inertParticipant(`writes-for-${EMAIL}`),
+                b: inertParticipant('<participant-1>'),
+            });
+
+            expect(result.a.status).toBe('fulfilled');
+            expect(result.b.status).toBe('fulfilled');
+            expect(result.a.label).not.toBe(result.b.label);
+            expect(`${String(result.a.label)} ${String(result.b.label)}`.includes(EMAIL)).toBe(false);
+        });
+
+        it('still refuses a pair the caller named IDENTICALLY, which is a different question', async () => {
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            await expect(
+                runSequentialPair(dataSource, {
+                    a: inertParticipant('writes-twice'),
+                    b: inertParticipant('writes-twice'),
+                }),
+            ).rejects.toThrow(/must be distinguishable/);
+        });
+
+        it('refuses an identically-named pair even when both labels were themselves refused', async () => {
+            // The same rule under redaction: two equal refused labels are still one caller mistake, and the
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            const attempt = runSequentialPair(dataSource, {
+                a: inertParticipant(`writes-for-${EMAIL}`),
+                b: inertParticipant(`writes-for-${EMAIL}`),
+            });
+
+            await expect(attempt).rejects.toThrow(/must be distinguishable/);
+            await expect(attempt).rejects.not.toThrow(new RegExp(EMAIL.replace('.', '\\.')));
+        });
+
+        it('lets a pair driver run when one label is ordinal-shaped and the other is refused', async () => {
+            const journal: RunnerJournal = { calls: [] };
+            const dataSource = createFakeDataSource(
+                [createFakeRunner(journal), createFakeRunner(journal)],
+                journal,
+            );
+
+            const result = await runSequentialPair(dataSource, {
+                a: inertParticipant('<participant-2>'),
+                b: inertParticipant(`writes-for-${EMAIL}`),
+            });
+
+            expect(result.a.status).toBe('fulfilled');
+            expect(result.b.status).toBe('fulfilled');
+            expect(result.a.label).not.toBe(result.b.label);
+            expect(`${String(result.a.label)} ${String(result.b.label)}`.includes(EMAIL)).toBe(false);
+        });
+    });
+});
+
+// The diagnostic-secrecy contract of the redaction every suite in this package shares.
+// A redaction that stops redacting still produces a string, so the failure mode is silent: the first
+// divergence would surface as a session token, a bound parameter or a filesystem path in a build log. These
+
+/**
+ * The DIAGNOSTIC-SECRECY CONTRACT of `concurrency-barrier.ts`, tested where the real thing is tested: against the
+ * actual driver and runtime messages it will be handed.
+ */
+describe('the diagnostic redaction every e2e suite shares', () => {
+    const TOKEN = ['s3cr3t', 'session', 'token', '4f2c81b9'].join('-');
+    const EMAIL = 'someone.real@example.invalid';
+    /** A constraint name a driver would quote back at the caller, beside the value it refused. */
+    const DUPLICATE_KEY_NAME = 'customer.UQ_email';
+    const SECRETS = [TOKEN, EMAIL, 'Hayden', 'Zieme'];
+
+    /**
+     * A rejection shaped exactly as TypeORM raises one, driver fields and all.
+     */
+    function driverRejection(): Error {
+        return Object.assign(
+            new Error(`Duplicate entry '${EMAIL}' for key 'UQ_reorder_list_line_list_variant'`),
+            {
+                name: 'QueryFailedError',
+                code: 'ER_DUP_ENTRY',
+                errno: 1062,
+                query: 'INSERT INTO `reorder_list_line` (`reorderListId`, `productVariantId`) VALUES (?, ?)',
+                parameters: [7, 300],
+                driverError: { sqlMessage: `Duplicate entry '${EMAIL}'`, sqlState: '23000' },
+            },
+        );
+    }
+
+    /** Fails naming which secret leaked, without putting the secret itself in the message. */
+    function expectNoSecretIn(text: string): void {
+        for (const secret of SECRETS) {
+            expect(
+                text.includes(secret),
+                `the diagnostic disclosed a value beginning "${secret.slice(0, 3)}"`,
+            ).toBe(false);
+        }
+    }
+
+    // that redacted quoted runs and let the rest through would have published verbatim. What is asserted
+    it('reproduces no part of a MySQL failure that quoted the value it refused', () => {
+        const redacted = redactTeardownDiagnostic(
+            new Error(`Duplicate entry '${EMAIL}' for key '${DUPLICATE_KEY_NAME}'`),
+        );
+
+        expect(redacted).toContain('[unique-violation]');
+        expect(redacted).toContain('mentioning customer');
+        expect(redacted).toContain('message withheld');
+        expectNoSecretIn(redacted);
+        expect(redacted).not.toContain('Duplicate');
+    });
+
+    it('reproduces no part of a PostgreSQL detail, whose value is in PARENTHESES and never quoted', () => {
+        // redaction published the buyer's address unchanged.
+        const redacted = redactTeardownDiagnostic(
+            new Error(
+                'duplicate key value violates unique constraint "customer_email_key" ' +
+                    `Key (emailAddress)=(${EMAIL}) already exists.`,
+            ),
+        );
+
+        expect(redacted).toContain('[unique-violation]');
+        expectNoSecretIn(redacted);
+        expect(redacted).not.toContain('@');
+        expect(redacted).not.toContain('emailAddress');
+    });
+
+    it('reproduces no part of an unquoted, undelimited token', () => {
+        // THE SECOND CASE THAT DEFEATED IT: nothing to quote, nothing to parenthesise, and the token is
+        const redacted = redactTeardownDiagnostic(new Error(`failed to invalidate session token ${TOKEN}`));
+
+        expectNoSecretIn(redacted);
+        expect(redacted).toContain('mentioning session');
+        expect(redacted).toContain('message withheld');
+    });
+
+    it('reproduces no part of an absolute filesystem path', () => {
+        // THE THIRD: a path is a disclosure about the host, and it carries no delimiter either.
+        const redacted = redactTeardownDiagnostic(
+            new Error("ENOENT: no such file or directory, open '/home/runner/work/secrets/db.sqlite'"),
+        );
+
+        expect(redacted).toContain('[filesystem]');
+        expect(redacted).not.toContain('/');
+        expect(redacted).not.toContain('runner');
+        expect(redacted).not.toContain('secrets');
+    });
+
+    it('names the driver code, because it is an enumerated constant rather than a value', () => {
+        const err = Object.assign(new Error(`Duplicate entry '${EMAIL}' for key 'x'`), {
+            name: 'QueryFailedError',
+            code: 'ER_DUP_ENTRY',
+        });
+
+        const redacted = redactTeardownDiagnostic(err);
+
+        expect(redacted).toContain('QueryFailedError/ER_DUP_ENTRY');
+        expectNoSecretIn(redacted);
+    });
+
+    it('refuses a driver code that is not one of the three enumerated shapes', () => {
+        // A `code` carrying anything other than an ER_/SQLITE_ constant or a five-character SQLSTATE is
+        const err = Object.assign(new Error('failed'), { code: TOKEN });
+
+        const redacted = redactTeardownDiagnostic(err);
+
+        expect(redacted).not.toContain(TOKEN);
+        expect(redacted).toContain('Error [unclassified]');
+    });
+
+    it('does not name an error class it does not recognise', () => {
+        const err = Object.assign(new Error('failed'), { name: `LeakedFrom-${TOKEN}` });
+
+        const redacted = redactTeardownDiagnostic(err);
+
+        expect(redacted).toContain('<unrecognised-error-class>');
+        expectNoSecretIn(redacted);
+    });
+
+    it('fails CLOSED on a phrasing nobody anticipated, reporting it by length alone', () => {
+        // THE PROPERTY THE WHOLE DESIGN RESTS ON. An engine, a library or a future platform version
+        // slipped through unredacted — it is a length. The exact-string assertion is deliberate: a future
+        const opaque = 'q7vn41xk';
+        const message = `an engine nobody has written a pattern for refused ${opaque}`;
+
+        const redacted = redactTeardownDiagnostic(new Error(message));
+
+        expect(redacted).toBe(
+            `Error [unclassified] mentioning nothing recognised (message withheld, ${String(
+                message.length,
+            )} chars)`,
+        );
+        expect(redacted).not.toContain(opaque);
+    });
+
+    it('renders a rejection that is not an Error, and reproduces none of it either', () => {
+        const redacted = redactTeardownDiagnostic(`failed on '${TOKEN}'`);
+
+        expect(redacted).toContain('string [unclassified]');
+        expectNoSecretIn(redacted);
+    });
+
+    it('keeps an ordinary stage label verbatim, because that is what identifies the step', () => {
+        expect(describeTeardownStage('plugin rows')).toBe('plugin rows');
+        expect(describeTeardownStage('core row restoration 3')).toBe('core row restoration 3');
+        expect(describeTeardownStage('temporary directory 1 of 2')).toBe('temporary directory 1 of 2');
+    });
+
+    it('refuses a label carrying a filesystem path, forward or back slashed', () => {
+        expect(describeTeardownStage('temporary directory /tmp/reorder-abc123')).toBe(
+            '<unrenderable-stage-label>',
+        );
+        expect(describeTeardownStage('temporary directory C:\\Users\\runner\\reorder')).toBe(
+            '<unrenderable-stage-label>',
+        );
+        expect(describeTeardownStage('/home/runner/work/secrets')).not.toContain('runner');
+    });
+
+    it('refuses a label carrying an address', () => {
+        expect(describeTeardownStage(`restore ${EMAIL}`)).toBe('<unrenderable-stage-label>');
+        expectNoSecretIn(describeTeardownStage(`restore ${EMAIL}`));
+    });
+
+    it('refuses a label that is merely too long, since every real one here is a few words', () => {
+        const overBudget = `restore ${'x'.repeat(90)}`;
+
+        expect(describeTeardownStage(overBudget)).toBe('<unrenderable-stage-label>');
+    });
+
+    it('refuses a label carrying a control character, so a log record cannot be forged', () => {
+        // spelled to read like a step that passed — so a label is a log-injection vector and not only a
+        // disclosure one. None of the three original rules caught it: a newline is not a path separator, not
+        const forged = 'writes\nfake-log-line: every teardown stage passed';
+        const bell = 'writes\u0007then';
+        const carriageReturn = 'writes\rthen';
+
+        expect(describeTeardownStage(forged)).toBe('<unrenderable-stage-label>');
+        expect(describeTeardownStage(bell)).toBe('<unrenderable-stage-label>');
+        expect(describeTeardownStage(carriageReturn)).toBe('<unrenderable-stage-label>');
+        expect(describeTeardownStage(forged).includes('fake-log-line')).toBe(false);
+    });
+
+    it('refuses a label carrying an invisible or non-ASCII character', () => {
+        expect(describeTeardownStage('writes\u200bthen')).toBe('<unrenderable-stage-label>');
+        expect(describeTeardownStage('writes\u202ethen')).toBe('<unrenderable-stage-label>');
+        expect(describeTeardownStage('restore Café')).toBe('<unrenderable-stage-label>');
+    });
+
+    it('accepts both substitute forms, so a guarded label cannot be guarded twice into a different one', () => {
+        expect(describeTeardownStage('<unrenderable-stage-label>')).toBe('<unrenderable-stage-label>');
+        expect(describeTeardownStage('<participant-1>')).toBe('<participant-1>');
+        expect(describeTeardownStage('<participant-12>')).toBe('<participant-12>');
+    });
+
+    /**
+     * THE END-TO-END PROPERTY, ASSERTED THROUGH THE AGGREGATOR RATHER THAN THROUGH ITS PARTS.
+     */
+    it('routes both the label and the failure through their guards when it aggregates', async () => {
+        const hostPath = '/tmp/reorder-abc123';
+        let aggregated = '';
+
+        try {
+            await runAllTeardownStages([
+                {
+                    what: `temporary directory ${hostPath}`,
+                    run: () => Promise.reject(new Error(`ENOENT, no such file or directory '${hostPath}'`)),
+                },
+            ]);
+        } catch (err: unknown) {
+            aggregated = err instanceof Error ? err.message : String(err);
+        }
+
+        expect(aggregated).toContain('Teardown did not complete cleanly');
+        expect(aggregated).toContain('<unrenderable-stage-label>');
+        expect(aggregated).toContain('[filesystem]');
+        expect(aggregated).toContain('message withheld');
+        // stronger statement: it holds for a path this test never thought of.
+        expect(aggregated).not.toContain(hostPath);
+        expect(aggregated).not.toContain('/');
+    });
+
+    it('is bounded by construction, so no budget has to cut a literal in half', () => {
+        const redacted = redactTeardownDiagnostic(new Error(`${'padding '.repeat(600)}${TOKEN}`));
+
+        expect(redacted.length).toBeLessThan(200);
+        expect(redacted).not.toContain('<truncated>');
+        expectNoSecretIn(redacted);
+    });
+
+    // only the message, the class and an enumerated code, whatever else the object is carrying.
+    it('reads nothing but the message, class and code from a driver error carrying query and parameters', () => {
+        const driverFailure = Object.assign(
+            new Error(`Duplicate entry '${EMAIL}' for key '${DUPLICATE_KEY_NAME}'`),
+            {
+                name: 'QueryFailedError',
+                code: 'ER_DUP_ENTRY',
+                query: 'INSERT INTO `customer` (`emailAddress`, `phoneNumber`) VALUES (?, ?)',
+                parameters: [EMAIL, '+44 7700 900000'],
+                driverError: { sqlMessage: `Duplicate entry '${EMAIL}'`, sqlState: '23000' },
+            },
+        );
+
+        const redacted = redactTeardownDiagnostic(driverFailure);
+
+        expect(redacted).toContain('QueryFailedError/ER_DUP_ENTRY');
+        expect(redacted).toContain('[unique-violation]');
+        expectNoSecretIn(redacted);
+        expect(redacted).not.toContain('INSERT');
+        expect(redacted).not.toContain('VALUES');
+        expect(redacted).not.toContain('phoneNumber');
+        expect(redacted).not.toContain('7700');
+        expect(redacted).not.toContain('23000');
+    });
+
+    it('reproduces no part of a statement fragment, even one with no value in it at all', () => {
+        // A statement is a disclosure in its own right — it names columns and the shape of a write — and the
+        const redacted = redactTeardownDiagnostic(
+            new Error(
+                'error: syntax error at or near "SELCT" — ' +
+                    'SELECT "id", "emailAddress", "passwordHash" FROM "user" WHERE "identifier" = $1',
+            ),
+        );
+
+        expect(redacted).toContain('[syntax]');
+        expect(redacted).not.toContain('SELECT');
+        expect(redacted).not.toContain('passwordHash');
+        expect(redacted).not.toContain('$1');
+        expect(redacted).toContain('mentioning user');
+    });
+
+    it('reproduces no part of a bound parameter that arrived as the whole rejection', () => {
+        const redacted = redactTeardownDiagnostic([TOKEN, EMAIL]);
+
+        expect(redacted).toContain('object [unclassified]');
+        expectNoSecretIn(redacted);
+    });
+    // THE OUTCOME DESCRIBER, WHICH IS THE HELPER THE RACE CASES REACH FOR. Every barriered pair in this
+    // helper boundary itself rather than the redactor beneath it, because that boundary is where four separate
+    describe('the settled-outcome describer the race cases report through', () => {
+        it('describes a rejected participant by class, code and errno and reproduces none of its message', () => {
+            const described = describeSettledOutcomes([
+                { label: 'writes-first', status: 'fulfilled' },
+                { label: 'writes-the-duplicate', status: 'rejected', reason: driverRejection() },
+            ]);
+
+            expect(described).toContain('writes-first=fulfilled');
+            expect(described).toContain('writes-the-duplicate REJECTED:');
+            expect(described).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+            expect(described).toContain('[unique-violation]');
+            expect(described).toContain('UQ_reorder_list_line_list_variant');
+            expectNoSecretIn(described);
+            expect(described).not.toContain('INSERT');
+            expect(described).not.toContain('VALUES');
+            expect(described).not.toContain('23000');
+            expect(described).not.toContain('Duplicate');
+        });
+
+        it("describes a fulfilled participant through the caller's own value describer", () => {
+            const described = describeSettledOutcomes(
+                [
+                    { label: 'a', status: 'fulfilled', value: 'ReorderList' },
+                    { label: 'b', status: 'rejected', reason: driverRejection() },
+                ],
+                outcome => String((outcome as { value?: unknown }).value ?? 'unknown'),
+            );
+
+            expect(described).toContain('a=ReorderList');
+            expect(described).toContain('b REJECTED:');
+            expectNoSecretIn(described);
+        });
+
+        it('refuses a participant label that carries a value', () => {
+            const described = describeSettledOutcomes([
+                { label: `restores ${EMAIL}`, status: 'rejected', reason: new Error('failed') },
+            ]);
+
+            expect(described).toContain('<unrenderable-stage-label>');
+            expectNoSecretIn(described);
+        });
+
+        it('describes a participant with no label at all', () => {
+            const described = describeSettledOutcomes([{ status: 'rejected', reason: driverRejection() }]);
+
+            expect(described.startsWith('REJECTED:')).toBe(true);
+            expectNoSecretIn(described);
+        });
+
+        it('reports a numeric driver errno and refuses one outside the enumerated range', () => {
+            const inRange = redactTeardownDiagnostic(Object.assign(new Error('lock'), { errno: 3572 }));
+            const outOfRange = redactTeardownDiagnostic(
+                Object.assign(new Error('lock'), { errno: 1_700_000_000_000 }),
+            );
+
+            expect(inRange).toContain('#3572');
+            expect(outOfRange).not.toContain('1700000000000');
+            expect(outOfRange).not.toContain('#');
+        });
+    });
+
+    // THE THROWING BOUNDARY. `runAllTeardownStages` covers a QUEUED restoration; what it cannot cover is a
+    // still up. Those calls are outside the aggregator, and the statements they run bind CAPTURED CELLS — so a
+    // was putting back. These cases assert the boundary refuses to pass any of it on.
+    describe('the redacting rethrow every raw restoration statement passes through', () => {
+        it('raises a failure that reproduces no part of the statement, its parameters or its message', () => {
+            let thrown: unknown;
+            try {
+                rethrowRedacted('a captured-row restoration statement', driverRejection());
+            } catch (err: unknown) {
+                thrown = err;
+            }
+
+            expect(thrown).toBeInstanceOf(Error);
+            const message = (thrown as Error).message;
+            // What a reader NEEDS: which step, which error class, which enumerated driver code and errno, how
+            expect(message).toContain('a captured-row restoration statement failed');
+            expect(message).toContain('QueryFailedError/ER_DUP_ENTRY#1062');
+            expect(message).toContain('[unique-violation]');
+            // What it must NOT carry: the statement, the bound values, the driver's sentence, the SQLSTATE.
+            expect(message).not.toContain('INSERT');
+            expect(message).not.toContain('reorder_list_line` (`reorderListId');
+            expect(message).not.toContain('VALUES');
+            expect(message).not.toContain('23000');
+            expect(message).not.toContain('Duplicate');
+            expectNoSecretIn(message);
+        });
+
+        it('does not chain the original, because a cause is walked and printed by the runner', () => {
+            let thrown: unknown;
+            try {
+                rethrowRedacted('a captured-row restoration statement', driverRejection());
+            } catch (err: unknown) {
+                thrown = err;
+            }
+
+            expect((thrown as { cause?: unknown }).cause).toBeUndefined();
+            expect(JSON.stringify(thrown)).toBe('{}');
+        });
+
+        it('refuses a step label that carries a value, so the boundary cannot be talked into leaking one', () => {
+            let thrown: unknown;
+            try {
+                rethrowRedacted(`restoring ${EMAIL}`, new Error('nope'));
+            } catch (err: unknown) {
+                thrown = err;
+            }
+
+            expectNoSecretIn((thrown as Error).message);
+        });
+
+        it('measures a rejection that is a bare bound value rather than an Error', () => {
+            let thrown: unknown;
+            try {
+                rethrowRedacted('a captured-row restoration statement', [TOKEN, EMAIL]);
+            } catch (err: unknown) {
+                thrown = err;
+            }
+
+            expectNoSecretIn((thrown as Error).message);
+        });
+    });
+
+    describe('the row-difference description the restoration assertions report', () => {
+        it('names the row and the column of a moved cell, and neither of its values', () => {
+            const captured = [
+                { id: 7, token: TOKEN, invalidated: false, expires: new Date(1_700_000_000_000) },
+            ];
+            const now = [{ id: 7, token: `${TOKEN}xx`, invalidated: true, expires: null }];
+
+            const described = describeRowDifferences(captured, now);
+
+            expect(described).toContain(
+                `row 7.token moved (string(${String(TOKEN.length)}) -> string(${String(TOKEN.length + 2)}))`,
+            );
+            // carry a credential, so those are rendered as themselves.
+            expect(described).toContain('row 7.invalidated moved (false -> true)');
+            expect(described).toContain('row 7.expires moved (date -> null)');
+            expectNoSecretIn(described);
+        });
+
+        it('still detects a change the shape alone cannot distinguish', () => {
+            const captured = [{ id: 5, emailAddress: EMAIL }];
+            const now = [{ id: 5, emailAddress: 'X'.repeat(EMAIL.length) }];
+
+            expect(describeRowDifferences(captured, now)).toBe(
+                `row 5.emailAddress moved (string(${String(EMAIL.length)}) -> string(${String(EMAIL.length)}))`,
+            );
+        });
+
+        it('reports a vanished row and an arrived row by identifier alone', () => {
+            const described = describeRowDifferences([{ id: 7, token: TOKEN }], [{ id: 9, token: TOKEN }]);
+
+            expect(described).toContain('row 7 is missing');
+            expect(described).toContain('row 9 was added');
+            expectNoSecretIn(described);
+        });
+
+        it('says nothing when every cell matches, which is what the restoration assertion requires', () => {
+            const captured = [{ id: 7, token: TOKEN, expires: new Date(1_700_000_000_000) }];
+
+            expect(describeRowDifferences(captured, [{ ...captured[0] }])).toBe(NO_ROW_DIFFERENCE);
+        });
+
+        it('compares through the same canonicalisation two drivers are folded onto', () => {
+            // A boolean column arrives as `true` from PostgreSQL and as `1` from the MySQL family, and the
+            // same stored value read twice must not read as a difference. This is what keeps a cross-engine
+            expect(canonicaliseCell(true)).toBe(canonicaliseCell(1));
+            expect(canonicaliseCell(false)).toBe(canonicaliseCell(0));
+            expect(describeRowDifferences([{ id: 1, enabled: true }], [{ id: 1, enabled: 1 }])).toBe(
+                NO_ROW_DIFFERENCE,
+            );
+        });
     });
 });

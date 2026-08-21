@@ -306,7 +306,7 @@ function countCodePoints(value: string): number {
 /**
  * Describes a rejected option value **by its type and category, never by its content.**
  *
- * ★ **The rejected value is untrusted input, and this message is written to a log.** An option arrives from
+ * **The rejected value is untrusted input, and this message is written to a log.** An option arrives from
  * whatever the deployment's configuration produced — an environment variable, a JSON file, a secret manager
  * lookup, a mis-wired expression — so a rejected *string* may be a credential, a connection URL or a token
  * that happened to be assigned to the wrong key. Interpolating it verbatim would write it into the startup
@@ -590,11 +590,14 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  *
  * **The shipped migration is PostgreSQL DDL, and that is a property of how it is produced rather than a
  * choice.** It is the output of Vendure's own migration generator, which serialises the statements one
- * configured engine emits, so the artefact is bound to that engine. Deploying on PostgreSQL applies the
- * shipped file as it stands. Deploying on MySQL, MariaDB or SQLite means generating the equivalent file for
- * that engine from these same two entity classes, by the invocation the migration's own header records; the
- * entities, the tables and the column names are the same either way. A server with `synchronize` enabled
- * needs no migration at all, which is the path the test harnesses take.
+ * configured connection emits, so the artefact is bound to more than the engine: the identifier columns are
+ * `SERIAL` and `integer` because that is what the generating connection's `EntityIdStrategy` produced, and
+ * `down()` names the `public` schema that connection was configured with. The shipped file is therefore
+ * directly usable by a PostgreSQL deployment whose identifier strategy and schema match those
+ * generation-time assumptions. Any other engine, any other `EntityIdStrategy` and any other schema
+ * regenerates the equivalent file from these same two entity classes, by the invocation the migration's own
+ * header records; the entities, the tables and the column names are the same either way. A server with
+ * `synchronize` enabled needs no migration at all, which is the path the test harnesses take.
  *
  * **What a generated file actually creates differs by engine, and the difference is declared rather than
  * hidden.** The two entity classes declare five named database objects. A file generated for PostgreSQL or
@@ -689,7 +692,7 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
     // `packages/telemetry-plugin/src/telemetry.plugin.ts` L121. Kept as a plain string literal so that a
     // test can read it from the plugin metadata and substitute an unsatisfiable one.
     //
-    // ‼ IT IS A COMPATIBILITY STATEMENT AND NOT A SECURITY ENDORSEMENT, and the difference is worth stating
+    // It is a compatibility statement and not a security endorsement, and the difference is worth stating
     // here because the two are easy to read as one. What this range asserts is which platform versions this
     // plugin's own code is built against and will boot on. It asserts nothing about whether a given version
     // in that range carries current security fixes, and it cannot: the mechanism only refuses versions BELOW

@@ -47,9 +47,10 @@ import { ReorderList } from './reorder-list.entity';
  * The feature contract enumerates five named objects across the two plugin tables — two here and
  * three on {@link ReorderList} — and requires the count itself to be asserted "so an addition is
  * visible rather than absorbed" [tickets/EPIC-001/FEATURE-001-01-named-reorder-lists.md:§2.4, §5].
- * An earlier revision also declared a variant-only index for the cascade that fires when a variant is
- * hard-deleted; it was withdrawn because it is a sixth object the contract does not authorise, and
- * because nothing this plugin does needs it: `UQ_reorder_list_line_list_variant` leads with
+ * A variant-only index for the cascade that fires when a variant is hard-deleted is the obvious
+ * candidate for a third, and it is deliberately absent: it would be a sixth object across the two
+ * tables that the contract does not authorise, and nothing this plugin does needs it.
+ * `UQ_reorder_list_line_list_variant` leads with
  * `reorderListId` and therefore already serves every lookup the service performs — a list's own
  * lines, and the one line a list holds for a variant — no operation issues a predicate led by
  * `productVariantId` alone, the MySQL family creates an index for a foreign key of its own accord,

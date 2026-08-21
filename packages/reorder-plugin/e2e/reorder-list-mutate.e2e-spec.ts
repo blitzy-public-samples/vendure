@@ -1,24 +1,6 @@
 /*
- * End-to-end specification for STORY-001-01-03 — the four mutations that keep a saved set current in
- * place: `adjustReorderListLine`, `removeReorderListLine`, `updateReorderList` and `deleteReorderList`.
- *
- * WHAT THIS FILE ASSERTS, AND THE TWO STRUCTURAL CLAIMS IT EXISTS FOR.
- *
- * Beyond the eight criteria and the four scenarios, two claims run through every one of the four
- * operations and are asserted rather than assumed (FEATURE-001-01 §2.11):
- *
- * 1. **Affected-row-count authority.** Each operation is a single conditional statement whose `WHERE`
- *    carries the row's own identifier together with the acting customer and the active channel, and its
- *    affected-row count is the authority on what happened — 1 means applied, 0 means the row was not
- *    there and yields the operation's own not-found member rather than a success. A read-then-write with
- *    no affected-row check is not acceptable, so the assertions below are made against the CAPTURED
- *    STATEMENT TEXT and not only against the response: an implementation that read the row, decided in
- *    TypeScript and then wrote unconditionally fails them.
- * 2. **The same-transaction counter decrement.** `removeReorderListLine` decrements
- *    `reorder_list.lineCount` in the same transaction as the `DELETE`, so the counter and the rows are
- *    never observable disagreeing. Asserted by locating both statements in one capture window, on one
- *    query runner, with no transaction-control statement between them — an assertion that fails if the
- *    decrement is moved outside the transaction.
+ * End-to-end specification for STORY-001-01-03 — the four mutations that keep a saved set current in place:
+ * `adjustReorderListLine`, `removeReorderListLine`, `updateReorderList` and `deleteReorderList`.
  */
 import { LanguageCode } from '@vendure/common/lib/generated-shop-types';
 import {
@@ -41,7 +23,7 @@ import fs from 'fs-extra';
 import gql from 'graphql-tag';
 import os from 'os';
 import path from 'path';
-import { DataSource, EntityManager, QueryRunner } from 'typeorm';
+import { DataSource, EntityManager } from 'typeorm';
 import type { SqljsConnectionOptions } from 'typeorm/driver/sqljs/SqljsConnectionOptions';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -59,9 +41,16 @@ import {
 import {
     asShopApiContext,
     BarrierParticipantSpec,
+    canonicaliseCell,
     createTransactionBinder,
+    describeRowDifferences,
+    describeSettledOutcomes,
     FORCED_INTERLEAVING_ENGINES,
+    NO_ROW_DIFFERENCE,
+    redactTeardownDiagnostic,
     resolveConfiguredEngine,
+    rethrowRedacted,
+    runAllTeardownStages,
     runBarrieredPair,
     runSequentialPair,
     SINGLE_CONNECTION_ENGINES,
@@ -70,18 +59,7 @@ import {
     TransactionBinder,
 } from './fixtures/concurrency-barrier';
 import {
-    canonicaliseCell,
-    describeRowDifferences,
-    describeSettledOutcomes,
-    NO_ROW_DIFFERENCE,
-    redactTeardownDiagnostic,
-    rethrowRedacted,
-    runAllTeardownStages,
-} from './fixtures/diagnostic-redaction';
-import { committedMigrationApplies } from './fixtures/migration-state';
-import {
-    CapturedStatement,
-    CorrelatedOwnershipRequirement,
+    committedMigrationApplies,
     isStatementCountEngine,
     queryCaptureConfig,
     QueryCaptureLogger,
@@ -118,11 +96,6 @@ import {
 
 /**
  * The quantity ceiling this test deployment is configured with.
- *
- * It is deliberately far below the plugin's declared default of 999 so that AC-2's above-maximum case is
- * reachable with a small, readable number. **Configuring a value for a test deployment is not choosing a
- * product default**: the declared defaults live with the options themselves
- * [packages/reorder-plugin/src/types.ts] and STORY-001-01-01 owns them.
  */
 const MAX_QUANTITY_PER_LINE = 10;
 
@@ -132,12 +105,6 @@ const MAX_LISTS_PER_CUSTOMER = 25;
 
 /**
  * The suffix that marks the counted form of a claim in a test title, naming the engine it is counted on.
- *
- * ★ The engine named is the one the counted form RUNS ON, taken from the gate's own list, and never the engine
- * the current run happens to use. Interpolating `resolveConfiguredEngine()` here would make the label state the
- * opposite of the truth on every job except the one it is counted on: a MySQL run would print
- * `[counted form, mysql only]` against tests it had just SKIPPED. Reading the label off
- * `STATEMENT_COUNT_ENGINES` also means it cannot drift from the gate it describes.
  */
 const COUNTED_FORM = `[counted form, ${STATEMENT_COUNT_ENGINES.join(' / ')} only]`;
 
@@ -160,11 +127,6 @@ const QUANTITY_ABOVE_MAXIMUM_MESSAGE =
 
 /**
  * The resolved English message for a name whose canonical form cannot be stored.
- *
- * Restated here rather than imported from `i18n/en.json`, so that a change to the published wording has to
- * be made deliberately in both places. It names the refused characters individually because the message
- * does: a category ("control or zero-width") described a wider set than the code refuses, which told a
- * buyer the wrong rule.
  */
 const NAME_EMPTY_MESSAGE =
     'The reorder list name must be between 1 and 191 characters once surrounding whitespace is removed ' +
@@ -176,14 +138,6 @@ const MONETARY_OR_STOCK_FIELD_NAME = /price|currenc|stock|money|amount|saleable|
 
 /** The resolved English message the platform's own `ForbiddenError` carries. */
 const FORBIDDEN_MESSAGE = 'You are not currently authorized to perform this action';
-
-// Local documents
-//
-// Every reorder document comes from `./graphql/reorder-definitions`, which is their single authority — no
-// copy of one is inlined here. The documents below address the PLATFORM's own operations, which that
-// module does not declare and must not grow to: the customer roster and the second channel this suite
-// needs as fixtures, the active order AC-7 and AC-8 assert is untouched, and the runtime introspection
-// AC-8 compares against the checked-in snapshot.
 
 /** The seeded customer roster, read once so this suite never hard-codes a generated email address. */
 const GET_CUSTOMER_LIST = gql`
@@ -335,12 +289,6 @@ const INTROSPECT_ENUM = gql`
     }
 `;
 
-// Local result shapes for the platform documents above
-//
-// Written out rather than generated, for the reason `./graphql/reorder-definitions` records: this
-// plugin's types can never appear in the checked-in introspection snapshot, so no generated artefact
-// covers a suite that mixes the two. These cover the platform half only.
-
 interface SeededCustomer {
     id: string;
     emailAddress: string;
@@ -412,11 +360,6 @@ interface IntrospectTypeFieldsQuery {
 /** The shape a GraphQL response carrying top-level errors arrives in, as the shipped client exposes it. */
 interface TopLevelErrorResponse {
     errors: Array<{ message: string; path?: readonly string[]; extensions?: { code?: string } }>;
-    /**
-     * Optional because the three envelopes a refusal can produce are materially different and each assertion
-     * names the one it requires: an execution-time refusal of a Non-Null field carries `data` exactly null,
-     * whereas a document rejected BEFORE execution begins carries no `data` entry at all.
-     */
     data?: Record<string, unknown> | null;
     status: number;
 }
@@ -442,30 +385,12 @@ interface SeededList {
     lineIds: string[];
 }
 
-// The server, the instrument, and the configuration that installs it
-//
-// `testConfig()` is called HERE, at the top level of this spec file, and never from a helper module: it
-// derives its port from the calling file's own index within its own directory listing
-// [e2e-common/test-config.ts], so a call made from anywhere else indexes against the wrong directory and
-// can collide two suites on one port. `reorder-plugin` carries no base-port entry in that file's own table,
-// so the base is the shared fallback of 3250 and the per-file index is what separates the suites in this
-// package from one another.
-
 const capture = new QueryCaptureLogger();
 
-// THE SQL.JS SNAPSHOT DIRECTORY, CREATED IDEMPOTENTLY AND AT MODULE SCOPE, FOR TWO SEPARATE REASONS.
-//
 // The first is a race. The platform's own initializer creates it with a bare, non-recursive `mkdirSync`
 // guarded by a preceding `existsSync` (`packages/testing/src/initializers/sqljs-initializer.ts` L31-L35),
 // which is a check-then-act race: this package's e2e suites start together, so when the directory is absent —
-// as it is on a fresh checkout, and after the operational reset a schema change requires — two of them can
 // both observe it missing and the loser fails its `beforeAll` with `EEXIST`. The three server engines use no
-// snapshot directory and are unaffected.
-//
-// The second is ordering. The directory has to exist before `testConfig()` reads the `e2e/` directory index
-// it derives this file's port from, which is why the call sits at module scope rather than in `beforeAll`.
-// Recursive creation is idempotent, so a directory another suite already made is not an error, and an empty
-// directory is not a cached snapshot file — the initializer still synchronises a fresh schema.
 fs.mkdirSync(path.join(__dirname, '__data__'), { recursive: true });
 
 const serverConfig = mergeConfig(testConfig(), {
@@ -479,10 +404,6 @@ const serverConfig = mergeConfig(testConfig(), {
         }),
     ],
     importExportOptions: {
-        // The four enabled variants this story's fixtures reference come from core's own minimal product
-        // source, and its assets come from beside it — the shipped precedent being
-        // `packages/dashboard/e2e/global-setup.ts`. The harness's own default asset directory points inside
-        // this package, where no asset fixture exists or may be added.
         importAssetsDir: path.join(__dirname, '../../core/e2e/fixtures/assets'),
     },
     ...queryCaptureConfig(capture),
@@ -496,14 +417,6 @@ const serverConfig = mergeConfig(testConfig(), {
  */
 interface TrackedFixtureOrder {
     readonly orderId: number;
-    /**
-     * The decoded database identifiers of every `OrderLine` the fixture put on it.
-     *
-     * Mutable, and filled in AFTER the entry joins the ledger, because the order is already committed by
-     * the time the fixture can look at it: registering the parent first and the children second is what
-     * keeps a failure between the two from leaving teardown knowing about neither. Where it is still empty
-     * at teardown, the children are re-queried from the parent.
-     */
     lineIds: number[];
 }
 
@@ -549,8 +462,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         await server.init({
             initialData,
             productsCsvPath: path.join(__dirname, '../../core/e2e/fixtures/e2e-products-minimal.csv'),
-            // Two is the minimum this story needs and therefore the number it asks for: AC-3 requires a
-            // SECOND customer owning a list in the same channel.
             customerCount: 2,
         });
         await adminClient.asSuperAdmin();
@@ -594,21 +505,12 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
 
     beforeEach(() => {
         // EPIC-001 §11.6.2's first rule: the captured array is emptied per test, so a count is scoped to
-        // one test rather than to a file. Capture itself stays CLOSED here and is opened only immediately
-        // around the operation under test, so fixture writes, authentication and cleanup fall outside every
-        // number this file asserts.
         capture.reset();
         capture.disable();
     });
 
     afterEach(async () => {
-        // EVERY STAGE RUNS, whatever any of them does, and the failures are reported once at the end.
-        //
-        // Plugin-owned rows go first, CHILD TABLE BEFORE PARENT so a foreign key is never what fails the
         // cleanup (EPIC-001 §11.6.1, §7.8). Only this suite writes those two tables in this database, so
-        // emptying them deletes exactly this test's rows and nothing else. The harness's wholesale table clear
-        // is deliberately NOT used: it synchronises the schema and drops the populated catalogue every later
-        // test reads.
         const queued = coreRowRestorers.slice().reverse();
         coreRowRestorers = [];
         const directories = temporaryDirectories.slice();
@@ -620,12 +522,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 what: `core row restorer ${String(queued.length - index)}`,
                 run: restore,
             })),
-            // ★ AN INDEX, NEVER THE PATH. `stage.what` is reproduced VERBATIM by the teardown aggregator —
-            // that is deliberate, because the stage name is this file's own text and is what identifies the
-            // step that failed — so anything interpolated into it is published as-is. An absolute temporary
             // directory discloses the layout of whatever machine ran the suite, developer or CI worker, and
-            // nothing about the assertion needs it: the path stays in the closure below, where the removal
-            // uses it and no log reads it.
             ...directories.map((directory, index) => ({
                 what: `temporary directory ${String(index + 1)} of ${String(directories.length)}`,
                 run: () => fs.remove(directory),
@@ -641,17 +538,10 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         ]);
     });
 
-    // Fixture helpers. Every one of them is a FUNCTION each test calls from its own body — never a
-    // leftover a sibling criterion built, which is what lets any test here run alone and the file run in
     // reverse order with the same result (EPIC-001 §11.6.1).
 
     /**
      * Decodes the platform's external `T_n` identifier to the value the database column actually holds.
-     *
-     * The e2e harness configures an id strategy that prefixes every identifier with `T_`, so a predicate
-     * assertion made against the external form would never match a captured statement. Numeric decoding is
-     * what the statement carries — inlined as a literal by the SQLite family and bound as a parameter by the
-     * others, both of which the capture helpers resolve.
      */
     function decodeId(externalId: ReorderApiId): number {
         const decoded = Number(String(externalId).replace(/^T_/, ''));
@@ -759,16 +649,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
 
     /**
      * Replaces the two plugin tables with THE CHECKED-IN MIGRATION'S OWN OUTPUT, on the live connection.
-     *
-     * **It is available on the generation engine alone**, because the shipped artefact is the migration
-     * generator's PostgreSQL output and an emitted migration is bound to the engine it was generated against
-     * ({@link committedMigrationApplies} carries the reasoning and the citations). Elsewhere the rebuild is
-     * skipped and the caller says what its assertion then rests on, which is what the case below asserts
-     * rather than assumes. Where a migration-created schema IS exercised on every engine is
-     * `e2e/reorder-list-migration.e2e-spec.ts`: it applies the checked-in artefact where the dialect matches
-     * and this engine's own lifecycle emission otherwise, and runs its whole data-bearing cycle against that.
-     *
-     * @returns Whether the schema underneath is now the migration's own.
      */
     async function rebuildPluginSchemaFromCheckedInMigration(): Promise<boolean> {
         if (!committedMigrationApplies(String(dataSource.options.type))) {
@@ -786,15 +666,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     }
 
     /**
-     * The configuration the platform generator runs against, resolved so that the plugin tables in the
-     * database it opens are the ones the checked-in migration created.
-     *
-     * On the server engines the generator's own connection reaches the live database, so the live options are
-     * handed over unchanged. On sql.js they do NOT: the initializer points `location` at a snapshot file and
-     * disables auto-save once populating is finished, so a second connection loads the SYNCHRONISED snapshot
-     * from disk and never observes the live in-memory schema at all. The live database is therefore exported
-     * to a scratch file first and the generator pointed at that, so the diff is against the migration's own
-     * output on all four engines rather than on three of them.
+     * The configuration the platform generator runs against, resolved so that the plugin tables in the database it
+     * opens are the ones the checked-in migration created.
      */
     async function generatorConfigAgainstMigratedSchema(
         scratchDirectory: string,
@@ -817,24 +690,12 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     /**
      * Captures EVERY COLUMN of one variant's row and queues its exact restoration, with the assertion that it
      * happened, before the caller changes anything.
-     *
-     * Two weaker forms are ruled out rather than untried. Restoring the whole catalogue in `afterEach` —
-     * `UPDATE product_variant SET enabled = true, deletedAt = NULL WHERE 1 = 1` — reaches every row in the
-     * database rather than the ones section 7's second scenario touches: a variant the seed had legitimately
-     * disabled would be silently enabled, and a defect elsewhere that disabled or soft-deleted a variant it
-     * should not have would be quietly repaired between tests instead of failing something. Capturing only
-     * `enabled` and `deletedAt` fares no better: the compensating write puts those two back and advances the
-     * row's `updatedAt` on its way — restoring the columns under test while changing one that was not, and
-     * reporting success either way.
      */
     async function captureVariantAvailability(externalVariantId: string): Promise<void> {
         const variantId = decodeId(externalVariantId);
         const captured = await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
             variantId,
         });
-        // A COUNT rather than the array, for the same reason the soft-delete capture is counted: `toHaveLength`
-        // prints the received rows on failure, and a captured core row is a value-bearing capture whatever
-        // table it came from.
         expect(captured.rows.length, `No product_variant row with id ${String(variantId)} to capture`).toBe(
             1,
         );
@@ -912,15 +773,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     }
 
     /**
-     * Runs a fixture step that may commit an order, and registers every order it committed — whatever the
-     * step, or anything the caller does with its response, then does.
-     *
-     * THE WINDOW THIS COVERS. A Shop mutation COMMITS before its response is read, so every step between the
-     * commit and the ledger is a place the identifier can be lost: an assertion on `__typename`, a decode of
-     * the identifier, a guard on the response shape. A ledger populated from the response therefore cannot
-     * see the one case that matters — a committed row whose response the caller rejects — and the order, its
-     * lines and the session link pointing at it survive into the next test, where they become that test's
-     * baseline. Discovery is a DELTA taken in a `finally`, so no assertion, decode or throw can skip it.
+     * Runs a fixture step that may commit an order, and registers every order it committed — whatever the step, or
+     * anything the caller does with its response, then does.
      */
     async function trackOrdersCommittedBy<T>(run: () => Promise<T>): Promise<T> {
         const before = (await dataSource.getRepository(Order).find({ select: { id: true } })).map(row =>
@@ -951,11 +805,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         if (alreadyTracked !== undefined && alreadyTracked.lineIds.length > 0) {
             return;
         }
-        // THE EXACT CHILD ROWS, READ BACK RATHER THAN INFERRED. This fixture is the only thing in the file
-        // that creates an order, so every line on the order it just created or reused is one it caused;
-        // reading them through the declared `lines` relation records their real identifiers instead of
-        // trusting a cascade to find them later. The count is asserted, because a capture that silently
-        // recorded nothing would let a teardown that deletes nothing report success.
         const ledgerEntry = registerOrderInLedger(orderId, []);
 
         const order = await dataSource
@@ -972,33 +821,16 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
 
     /**
      * Removes every order this test's fixture created, CHILD ROWS BEFORE PARENT.
-     *
-     * THE EXACT ROWS, IN THE EXACT ORDER, AND NOT BY CASCADE. `OrderLine.order` does declare
-     * `onDelete: 'CASCADE'`, so deleting the parent would take the lines with it — which is precisely why
-     * leaning on it proves nothing: a relation later reconfigured to `SET NULL`, or a child this fixture
-     * created under a table the cascade does not reach, would leave rows behind and every run would still
-     * report a clean teardown. So the tracked line identifiers are deleted FIRST, by identifier, then the
-     * session link is cleared — `Session.activeOrder` declares no delete action, so a session still
-     * pointing at the order would make the parent delete fail on a foreign key — and only then the exact
-     * parent. Each step is then VERIFIED: neither the tracked lines nor the tracked order may survive, and
-     * a survivor is raised rather than ignored, which is what makes this cleanup falsifiable.
      */
     async function removeTrackedOrders(): Promise<void> {
         const tracked = ordersToRemove.slice();
         ordersToRemove = [];
-        // EACH ENTRY IS ATTEMPTED WHATEVER THE OTHERS DO. One order whose removal throws must not strand the
-        // orders queued behind it: the failures are collected and reported once, which is the same discipline
-        // the outer teardown runner applies to its stages, applied here to the entries within one stage.
         const failures: string[] = [];
         for (const entry of tracked) {
             try {
                 await removeOneTrackedOrder(entry);
             } catch (err: unknown) {
-                // MEASURED, NOT REPRODUCED. Removing an order writes across `order`, `order_line` and the
-                // buyer's `session` rows, so a driver failure here is a `QueryFailedError` carrying the
                 // statement and its bound values — and this aggregate is thrown and printed by the runner.
-                // The order identifier is kept, on the same footing as a row id: it is what locates the
-                // entry that would not go, and it describes nobody.
                 failures.push(`order ${entry.orderId}: ${redactTeardownDiagnostic(err)}`);
             }
         }
@@ -1011,10 +843,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     async function removeOneTrackedOrder(entry: TrackedFixtureOrder): Promise<void> {
         {
             const orderId = entry.orderId;
-            // WHERE THE LEDGER CARRIES NO CHILDREN, THEY ARE RE-QUERIED FROM THE PARENT. An entry reaches
-            // teardown with an empty list only when the fixture's own inspection did not complete, which is
-            // exactly the case cleanup must still handle: the identifiers are recovered here rather than
-            // assumed, so a failed setup cannot leave a child row behind.
             const lineIds =
                 entry.lineIds.length > 0
                     ? [...entry.lineIds]
@@ -1053,13 +881,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         }
     }
 
-    // Exact restoration of the core rows a test changes
-    //
-    // A core row this suite touches is put back COLUMN FOR COLUMN, and the restoration is then ASSERTED
-    // against what was captured. Two mechanisms make that stricter than it first sounds: the compensating
-    // write goes through the RAW TABLE rather than the entity manager, so restoring a captured value cannot
-    // itself move an entity-managed audit column, and it covers an inserted row and a deleted row alike by
-    // deleting or re-inserting as the capture requires. The restoration is then read back and compared for
     // equality, so a column the compensating write missed fails the test rather than leaking into the next.
 
     /**
@@ -1095,23 +916,11 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         try {
             await dataSource.query(query, bound);
         } catch (err: unknown) {
-            // ★ THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
-            // HERE.
-            //
+            // THE ONE DIAGNOSTIC SINK THAT REDACTING AT THE CALLER CANNOT CLOSE, WHICH IS WHY IT IS CLOSED
             // Every statement this helper runs binds CAPTURED CELLS: the values a restoration is putting
-            // back, which on the soft-delete path are a live buyer's `customer`, `user` and `session` rows —
             // an address, a password hash, an authentication token. TypeORM raises a failure from
-            // `dataSource.query` as a `QueryFailedError` that has copied the driver's error ONTO ITSELF, so
-            // `query` and `parameters` are its own ENUMERABLE properties: `String(err)` and
             // `JSON.stringify(err)` both publish the statement and every bound value, and so does the runner
-            // when it prints an unhandled rejection.
-            //
-            // A QUEUED restoration runs inside `runAllTeardownStages`, which already measures a failure
-            // rather than reproducing it. What that cannot cover is a restoration driven DIRECTLY from a test
-            // body, so the functional half can be asserted while the server is still up — those calls sit
             // outside the aggregator and travel straight to the runner. Sanitising HERE covers both, and
-            // covers a call added later by someone who never read this comment, which is the only version of
-            // this fix that stays true.
             rethrowRedacted('a captured-row restoration statement', err);
         }
     }
@@ -1190,12 +999,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 continue;
             }
             // AND THE UPDATE-DATE COLUMN IS ALWAYS RE-STATED, even when it did not move. On the MySQL family
-            // the column is declared `datetime(6) on update CURRENT_TIMESTAMP(6)` — read out of
-            // `information_schema.COLUMNS` on the live e2e schema, not inferred — so ANY update that omits it
             // from its SET list is re-timestamped BY THE ENGINE, below TypeORM and below this helper. That was
-            // observed: a compensating write that restored only `deletedAt` left `user.updatedAt` moved by
-            // 865 milliseconds, because the captured value happened to equal the current one and so was not
-            // in `moved` at all.
             if (UPDATE_DATE_COLUMN in captured && !moved.some(([column]) => column === UPDATE_DATE_COLUMN)) {
                 moved.push([UPDATE_DATE_COLUMN, captured[UPDATE_DATE_COLUMN]]);
             }
@@ -1228,15 +1032,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
 
     /**
      * Requires the rows the predicate names to equal the capture cell for cell, so restoration is proved.
-     *
-     * ★ THE COMPARISON IS OVER FULL VALUES; THE ASSERTION IS OVER A REDACTED DESCRIPTION OF THE RESULT. Those
-     * are two separate things and an earlier revision conflated them: it rendered every cell of every row
-     * into two arrays and handed both to `toEqual`, so a failure printed the arrays — and on the soft-delete
-     * path those arrays hold a real `session.token` and the buyer's own contact fields. Comparing here
-     * instead, and asserting on the difference DESCRIPTION, keeps the check exactly as strict — every column
-     * of every captured row is compared through {@link canonicaliseCell}, a captured row that has gone is
-     * reported missing and a row that appeared is reported added — while leaving the assertion's own actual
-     * and expected values two short redacted strings that Vitest cannot expand into cell values.
      */
     async function expectCoreRowsRestored(rowsCapture: CoreRowsCapture): Promise<void> {
         const now = await readCoreRows(rowsCapture.table, rowsCapture.where, rowsCapture.parameters);
@@ -1247,14 +1042,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 'reported by row id, column name and value SHAPE only, deliberately — see ' +
                 'describeCellForDiagnostic',
         ).toBe(NO_ROW_DIFFERENCE);
-        // AND THE ROW COUNT, which the description above already covers through its missing/added entries and
-        // which is restated here so a future edit to that description cannot quietly weaken this to a
-        // per-column check over a shorter table.
-        //
-        // Two NUMBERS compared by hand rather than `expect(now).toHaveLength(n)`, because that matcher prints
-        // the RECEIVED ARRAY on failure — and on the soft-delete path that array is the buyer's `customer`,
         // `user` and `session` rows, `session.token` included. The numbers say exactly the same thing and
-        // cannot be expanded into a cell value.
         if (now.length !== rowsCapture.rows.length) {
             throw new Error(
                 `${rowsCapture.table} holds ${String(now.length)} rows for ${rowsCapture.where} where the ` +
@@ -1287,13 +1075,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     }
 
     /**
-     * Asserts FEATURE-001-01 §2.6.1.1's refused-write contract over the statements just captured, for a
-     * write refused because the addressed LIST is not the caller's in the active channel.
-     *
-     * `relation` is given as the lower-cased alias and matched case-insensitively, which is what makes ONE
-     * assertion correct on every engine: the service reads through a locking query builder aliased
-     * `reorderlist` where the engine has a row lock and through the repository's own `ReorderList` alias
-     * where it does not.
+     * Asserts FEATURE-001-01 §2.6.1.1's refused-write contract over the statements just captured, for a write
+     * refused because the addressed LIST is not the caller's in the active channel.
      */
     function assertRefusedWriteReadOneScopedListRow(addressedListId: ReorderApiId, actingCustomerId: string) {
         const scopedSelects = capture.selectsFor('reorder_list');
@@ -1328,11 +1111,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 input: { reorderListId: seeded.listId, lineId: lineIdBeforeCall, quantity: 6 },
             });
 
-            // The call SUCCEEDS. The session holds only the single permission the Customer Role is created
-            // with and holds `Permission.Owner` under no circumstances — that member is unassignable and
-            // internal, so the gate admits on the request context's owner-only marking and the service
-            // predicate is the whole of the control. This positive assertion is what would fail if the gate
-            // were mistaken for the control.
             expect(adjustReorderListLine.__typename).toBe('ReorderList');
             if (adjustReorderListLine.__typename !== 'ReorderList') {
                 throw new Error('adjustReorderListLine did not return a ReorderList');
@@ -1433,13 +1211,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         );
     });
 
-    // AC-2 — A zero or negative quantity is refused as a request-level input error
-    //
-    // The line-count bound is DELIBERATELY not evaluated by this operation: `maxLinesPerList` is
-    // evaluated by the add path and explicitly not by an adjustment, because changing the quantity of a
-    // line that already exists creates no line and so cannot breach a bound on the NUMBER of lines
     // (FEATURE-001-01 §2.11). No criterion in this story therefore returns `ReorderListLimitError`, and
-    // that absence is deliberate rather than an omission.
 
     describe('AC-2: adjustReorderListLine refuses a quantity it cannot store', () => {
         function expectSingleUserInputError(response: TopLevelErrorResponse, message: string) {
@@ -1555,12 +1327,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     });
 
     // AC-3 — A line the caller does not hold returns a not-found result that discloses nothing
-    //
-    // The two error types are NOT interchangeable and the split is contractual: a line absent from a list
-    // the caller DOES own is a different fact from a list the caller does not own, and a client can act on
-    // the first by refreshing while the second means the list is not theirs to refresh. What must be
-    // indistinguishable is the three ways a LIST can fail to resolve — absent, another customer's, another
-    // channel's — because identifiers are sequential under the default strategy and a distinguishable
     // refusal would be an enumeration channel rather than a courtesy.
 
     describe('AC-3: adjustReorderListLine discloses nothing about a row the caller does not hold', () => {
@@ -1669,12 +1435,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         );
     });
 
-    // AC-4 — A named line is removed and the line that remains is the one not named
-    //
-    // The ordering is STATED rather than assumed: the published default sort for lines is ascending by the
-    // creation timestamp the base entity supplies, with the identifier appended as the tie-break, so "the
-    // first of those two lines" is a fact a test can assert rather than a coincidence of insertion order.
-
     describe('AC-4: removeReorderListLine removes exactly the line it was given', () => {
         async function seedTwoLineList(): Promise<SeededList> {
             const seeded = await seedList(customers[0], 'Two line list', [
@@ -1767,13 +1527,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         );
     });
 
-    // AC-5 — An unauthenticated remove writes nothing, and a second remove of the same line is refused
-    //
-    // The end state is idempotent while the RESPONSE is not, and the distinction is the point: a caller
-    // retrying a removal reaches the same zero-line list either way, so no data is at risk, but a caller
-    // who never removed anything and receives a success has been misinformed about a row that was never
-    // theirs. That is why a repeated remove is refused rather than reported as a success.
-
     describe('AC-5: removeReorderListLine refuses an unauthenticated request and a repeat', () => {
         it('refuses the unauthenticated call with exactly one FORBIDDEN entry, no payload and no write', async () => {
             const seeded = await seedList(customers[0], 'Unauthenticated probe', [
@@ -1799,16 +1552,10 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             expect(response.errors[0].extensions?.code).toBe('FORBIDDEN');
             expect(response.errors[0].message).toBe(FORBIDDEN_MESSAGE);
             expect(response.errors[0].path).toEqual(['removeReorderListLine']);
-            // NO PAYLOAD WAS RETURNED. See refinement (R-ii) in this file's header: the field is declared
-            // Non-Null, so the error propagates past it to the root and `data` is null WHOLESALE. That is the
             // only envelope this refusal can produce, and it is asserted on its own — a restatement admitting
-            // `data: { removeReorderListLine: null }` would also admit a resolver that executed and returned
-            // null, which is a different outcome.
             expect(response.data).toBeNull();
-            // And the refusal happened before either plugin table was reached at all, which is the one place
             // in this file a claim of ZERO statements is made — the session guard is evaluated before any
             // statement is issued, so this is a path refused before it reached the table rather than a read
-            // that discovered a row's absence without asking.
             expect(capture.count('reorder_list'), capture.format()).toBe(0);
             expect(capture.count('reorder_list_line'), capture.format()).toBe(0);
 
@@ -1856,15 +1603,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         });
     });
 
-    // AC-6 — A rename is stored, and a rename onto a name the same customer already holds conflicts
-    //
-    // Uniqueness is evaluated on the canonical name column this feature stores rather than on a database
     // column collation, so the comparison behaves identically on every engine. The canonical form is the
-    // input trimmed, its internal whitespace runs collapsed to one space, normalised to NFC and then
-    // lower-cased — so `weekly kitchen restock` collides with `Weekly Kitchen Restock`. Canonicalisation
-    // PRESERVES accents, so an accented spelling and its unaccented counterpart remain distinct; that is
-    // settled by the feature contract and by the canonicalisation unit spec, and is deliberately not
-    // re-asserted numerically here.
 
     describe('AC-6: updateReorderList renames, conflicts on the canonical name, and refuses a blank one', () => {
         /** Seeds the two lists AC-6 is written against: the second holds the single line. */
@@ -1924,7 +1663,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             expect(updateReorderList.errorCode).toBe('REORDER_LIST_NAME_CONFLICT_ERROR');
             expect(updateReorderList.conflictingNameKey).toBe('weekly kitchen restock');
             expect(updateReorderList.message.length).toBeGreaterThan(0);
-            // The API-visible message carries no driver text, no SQL fragment and no constraint name.
             expect(updateReorderList.message).not.toContain('UQ_reorder_list_customer_channel_name_key');
             expect(updateReorderList.message.toUpperCase()).not.toContain('SELECT');
             expect(updateReorderList.message.toUpperCase()).not.toContain('UPDATE');
@@ -1964,14 +1702,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 );
                 expect(updateReorderList.__typename).toBe('ReorderList');
 
-                // REFINEMENT (R-i), stated in full in this file's header. The rename path writes exactly one
-                // row and it is the LIST row; the filter named here is `reorder_list_line`, and the two
-                // equalities below are what "a rename reads and writes no line row" means for a published
-                // payload that carries the list's own `lines` page:
-                //
                 //   - zero WRITE statements whose target is `reorder_list_line`; and
                 //   - every statement against that table being a `SELECT`, so nothing on this path mutated a
-                //     line row under any shape.
                 expect(capture.writesFor('reorder_list_line').length, capture.format()).toBe(0);
                 const lineStatements = capture.forTables('reorder_list_line');
                 expect(
@@ -1986,11 +1718,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     });
 
     // AC-7 — A deleted list takes its lines with it in one transaction, and a repeat delete is refused
-    //
-    // The cascade is asserted by COUNTING ROWS rather than by naming a database clause: a criterion that
-    // asserted the clause would test the migration's text, whereas a row count fails whether the cause is
     // a missing clause, a service that deletes the parent and abandons the children, or a transaction that
-    // commits half the work.
 
     describe('AC-7: deleteReorderList removes the list and its lines, and refuses a repeat', () => {
         it('returns a DeletionResponse, leaves zero lines and zero lists, and refuses the second call', async () => {
@@ -2006,10 +1734,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 DeleteReorderListMutationVariables
             >(DELETE_REORDER_LIST, { id: seeded.listId });
 
-            // The platform's OWN `DeletionResponse`, reused verbatim rather than replaced by a plugin-owned
-            // deletion payload. Its `message` is nullable and is selected under the alias the shared document
-            // applies, because the two union members declare `message` at different nullabilities and
-            // selecting both under one response key would make the document invalid.
             expect(first.deleteReorderList.__typename).toBe('DeletionResponse');
             if (first.deleteReorderList.__typename !== 'DeletionResponse') {
                 throw new Error('deleteReorderList did not return a DeletionResponse');
@@ -2055,7 +1779,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 );
                 expect(deleteReorderList.__typename).toBe('DeletionResponse');
 
-                // ONE conditional `DELETE`, against the PARENT, and nothing loops over the lines: they go
                 // through the declared cascade, which is the engine's work and issues no statement of its own.
                 const listWrites = capture.writesFor('reorder_list');
                 expect(listWrites.length, capture.format()).toBe(1);
@@ -2069,11 +1792,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         );
     });
 
-    // AC-8 — The existing order operations are unchanged and the active order is untouched
-    //
-    // The comparison is made by RUNTIME INTROSPECTION of a booted server carrying the plugin, compared
-    // field-by-field against the checked-in `schema-shop.json`. That snapshot is read READ-ONLY: it is
-    // neither edited nor regenerated, and it cannot move, because the introspection that produces it
     // declares its own configuration and never reads the dev-server config (AAP §0.4.1.5). Editing it to
     // "record" the plugin's operations would be both wrong and a boundary breach.
 
@@ -2141,9 +1859,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             expect(runtimeMutation.__type).not.toBeNull();
 
             const comparisons: Array<{ rootType: 'Query' | 'Mutation'; fieldName: string }> = [
-                // The single operation under test in this criterion.
                 { rootType: 'Query', fieldName: 'activeOrder' },
-                // The three published order operations whose names this story's own operations echo, which is
                 // why a signature comparison is not optional here (STORY-001-01-03 §10).
                 { rootType: 'Mutation', fieldName: 'adjustOrderLine' },
                 { rootType: 'Mutation', fieldName: 'removeOrderLine' },
@@ -2165,9 +1881,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 ).toEqual(normaliseField(snapshotField as IntrospectedField));
             }
 
-            // No order mutation gained a `customFields` argument, because this story declares no custom field
-            // on any core entity — EPIC-001 ruling R1. Stated separately from the comparison above so the
-            // failure names the cause rather than only the difference.
             for (const fieldName of ['addItemToOrder', 'adjustOrderLine', 'removeOrderLine']) {
                 const runtimeField = runtimeMutation.__type?.fields.find(field => field.name === fieldName);
                 expect(runtimeField?.args.map(argument => argument.name)).not.toContain('customFields');
@@ -2196,16 +1909,12 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             const snapshotPermissions =
                 snapshotTypes.find(type => type.name === 'Permission')?.enumValues ?? [];
 
-            // The transition is stated as a transition rather than as a single number, per EPIC-001 ruling
-            // R15, and these are batch B1's widths — never the whole programme's.
             expect(snapshotQueryFields.length).toBe(19);
             expect(runtimeQuery.__type?.fields.length).toBe(21);
             expect(snapshotMutationFields.length).toBe(32);
             expect(runtimeMutation.__type?.fields.length).toBe(38);
             expect(snapshotErrorCodes.length).toBe(32);
             expect(runtimeErrorCode.__type?.enumValues.length).toBe(36);
-            // THE ZERO DELTA IS ASSERTED RATHER THAN OMITTED: this story registers no custom permission
-            // definition, so the published enum keeps exactly the members it had.
             expect(snapshotPermissions.length).toBe(97);
             expect(runtimePermission.__type?.enumValues.length).toBe(97);
 
@@ -2265,13 +1974,10 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     });
 
     // The two structural claims of this story, asserted rather than assumed (FEATURE-001-01 §2.11)
-    //
     // The counted and predicate-shape assertions in this section are gated to the one engine on which
     // statement text and statement count are deterministic, and the fixture's own exported sentence saying
-    // why titles the describe below verbatim rather than being paraphrased here. Every behavioural sibling
     // above runs on all four engine jobs. The capture helpers themselves resolve placeholders on every
     // engine, so these assertions would hold elsewhere too; they are gated only because each shares a
-    // capture window with an exact count.
 
     describe(`Affected-row-count authority and the same-transaction decrement. ${STATEMENT_COUNT_ENGINE_REASON}`, () => {
         /** The correlated-`EXISTS` ownership requirement every statement that writes a LINE must carry. */
@@ -2324,10 +2030,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     capture.format(),
                 ).toBe(true);
                 // AND THE ACTING CUSTOMER AND THE ACTIVE CHANNEL ARE IN THIS SAME STATEMENT. A line row carries
-                // neither column, so the only shape that can scope it is a correlated `EXISTS` over the parent
-                // — verified here for its table, its correlation OUT to the row being written, and each scope
-                // comparison bound to its expected value. A parameter scan or a name search would certify a
-                // sub-query that scopes nothing.
                 expect(
                     whereRequiresCorrelatedOwnership(conditional, ownedLineScope()),
                     capture.format(),
@@ -2378,7 +2080,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 // Both statements ran on ONE query runner, both inside a transaction, and NO transaction-control
                 // statement separates them — so no observer can see the rows and the counter disagreeing. This
                 // assertion fails if the decrement is moved outside the transaction, because a release or a
-                // commit would then appear between the two.
                 expect(decrement.runnerId, capture.format()).toBe(conditional.runnerId);
                 expect(conditional.inTransaction, capture.format()).toBe(true);
                 expect(decrement.inTransaction, capture.format()).toBe(true);
@@ -2518,10 +2219,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 input: { reorderListId: seeded.listId, lineId: seeded.lineIds[0], quantity: 6 },
             });
 
-            // REPEATING THE SAME ABSOLUTE SET LEAVES THE SAME VALUE. There is no idempotency key anywhere in
-            // this feature, and none is needed for this operation: an absolute set is idempotent by
-            // construction, which is exactly why it is the deterministic remedy for the at-least-once delivery
-            // of an add that accumulates.
             expect(first.adjustReorderListLine.__typename).toBe('ReorderList');
             expect(second.adjustReorderListLine.__typename).toBe('ReorderList');
             if (
@@ -2542,11 +2239,9 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     });
 
     // §7's fourth scenario — one request adjusts a line while another removes the same line
-    //
     // BOTH interleavings are FORCED rather than awaited, on the three engine jobs that run a database
     // server two independent connections can be opened against: `e2e-mariadb`, `e2e-mysql` and
     // `e2e-postgres`. `Promise.all` alone does not satisfy the rule, which is why the barrier fixture — not
-    // a bare pair of promises — is the instrument.
 
     describe(`§7 scenario 4: one request adjusts a line while another removes it (engine: ${resolveConfiguredEngine()})`, () => {
         /**
@@ -2555,11 +2250,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
          */
         async function shopContextFor(client: SimpleGraphQLClient): Promise<RequestContext> {
             const session = await server.app.get(SessionService).getSessionFromToken(client.getAuthToken());
-            // A SCALAR, uniformly with every other session assertion in this package. This one asserts the
-            // session EXISTS, so it can only fail with `undefined` as the actual and cannot render a
-            // `CachedSession` today — but the direction of an assertion is one edit away from reversing, and
             // the value on the other side of it carries the session token. Comparing here removes the
-            // question rather than answering it.
             expect(
                 session !== undefined,
                 'The client holds no session, so no authenticated context can be built',
@@ -2573,11 +2264,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             expect(ctx.authorizedAsOwnerOnly).toBe(true);
             expect(ctx.channel.token).toBe(E2E_DEFAULT_CHANNEL_TOKEN);
             expect(ctx.activeUserId).toBeDefined();
-            // AND IT IDENTIFIES AS THE SHOP API, which a direct service call does not get for free: the
-            // platform reads the api type off the resolver's `info` argument, which no direct call
             // has, so `fromRequest` alone yields `custom` and a race would then be exercising a
-            // branch no buyer's request reaches. `asShopApiContext` self-checks both the result and
-            // that this context is left unchanged.
             const shopCtx = asShopApiContext(ctx);
             expect(shopCtx.apiType).toBe('shop');
             return shopCtx;
@@ -2586,12 +2273,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         /**
          * Which row, if any, a barrier participant holds before the rendezvous in order to make the OTHER
          * participant queue behind it. `'none'` is a follower.
-         *
-         * **There is deliberately no `'line'` member.** Both service paths admit through the PARENT row
-         * before touching a line, so the parent is the row a follower reaches first in either pairing and is
-         * therefore the only row a leader can order it on. A line lead would leave the follower holding the
-         * parent while waiting for the line, and the leader holding the line while waiting for the parent —
-         * a cycle rather than an ordering. See {@link takeLeadLock}.
          */
         type LeadLock = 'none' | 'list';
 
@@ -2683,15 +2364,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         }
 
         /**
-         * THE REAL `adjustReorderListLine` OPERATION as a barrier participant, executed on this participant's
-         * own connection inside its own held transaction.
-         *
-         * `leadLock` is what makes the ordering FORCED rather than observed. The participant that holds it
-         * takes a pessimistic write lock on the row its sibling reaches first, in its PRECHECK, which
-         * completes before either write begins; when the pair is released, that participant proceeds while
-         * its sibling blocks on the lock, and the harness commits the holder as soon as its write returns, so
-         * the sibling then runs against the holder's committed effect. Without it, which caller reaches the
-         * row first is whatever the scheduler decided, and the pair could only assert a disjunction.
+         * THE REAL `adjustReorderListLine` OPERATION as a barrier participant, executed on this participant's own
+         * connection inside its own held transaction.
          */
         function serviceAdjust(
             label: string,
@@ -2725,11 +2399,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                         quantity,
                     });
                     // READ BACK INSIDE THIS OPERATION'S OWN TRANSACTION — after its statement, before it
-                    // commits. In the adjust-then-remove ordering this is the ONLY point at which the
-                    // adjusted value is observable at all: the sibling removal deletes the row as soon as
                     // this transaction commits, so once the pair has settled there is nothing left to read
-                    // and no stored-state assertion could tell an adjustment that set 6 from one that set
-                    // nothing. In the opposite ordering the same read reports that the row was already gone.
                     const row = await ctx.manager
                         .getRepository(ReorderListLine)
                         .findOne({ where: { id: lineRowId } });
@@ -2775,48 +2445,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         }
 
         /**
-         *
          * Takes the pessimistic write lock that establishes a forced ordering, or none.
-         *
-         * ★ THE LEADER HOLDS THE PARENT LIST ROW, IN BOTH PAIRINGS, AND THAT FOLLOWS FROM THE PRODUCTION LOCK
-         * ORDER RATHER THAN FROM A PREFERENCE. A leader can only order its sibling on the row that sibling
-         * reaches FIRST, and both service paths reach the parent first:
-         *
-         *   - `removeReorderListLine` opens with a scoped admission read of the parent under a write lock
-         *     (`findOwnedListForUpdate`) and only then deletes the line, so that its counter decrement shares
-         *     the delete's transaction.
-         *   - `adjustReorderListLine` opens with a scoped admission read of the SAME parent row under a lock
-         *     too (`findOwnedListForShare`) — shared where the engine can share it safely, and EXCLUSIVE on the
-         *     MySQL family, which `ENGINES_REQUIRING_EXCLUSIVE_PARENT_FOR_LINE_WRITES` names. Only then does its
-         *     single conditional `UPDATE` address the line.
-         *
-         * So every transaction in the service that touches both rows takes the parent and then the child, and
-         * `'list'` is the only lead lock that can order either pairing. The leader takes it EXCLUSIVELY, which
-         * is what makes a following adjustment queue even on an engine whose own admission read would be
-         * content with a shared lock.
-         *
-         * ‼ A LINE LEAD IS NOT OFFERED, BECAUSE IT WOULD MANUFACTURE A CYCLE THE PRODUCTION ORDER NO LONGER
-         * CONTAINS. An earlier revision of this file had the leading removal hold the LINE, which was correct
-         * against an earlier service in which the adjustment did not lock the parent at all and reached the
-         * line first. Against the parent-first service it inverts: the following adjustment takes the parent
-         * and then waits for the line the leader holds, while the leader waits for the parent the follower
-         * holds. Measured on MariaDB 11.5 rather than reasoned about — InnoDB detected the cycle and rolled a
-         * victim's whole transaction back, which discards its savepoints, so the platform's unwind then
-         * reported `SAVEPOINT typeorm_1 does not exist` and both participants surfaced the plugin's generic
-         * internal error: a symptom three layers from its cause, and a test that could never have evidenced
-         * the ordering it claimed. That is why {@link LeadLock} has no `'line'` member to reach for.
-         *
-         * ✓ AND THE PRODUCTION INVERSION THAT WARNING USED TO DESCRIBE IS GONE. Two genuine concurrent
-         * requests — one adjusting, one removing the same line, with no test lock anywhere — now take the two
-         * rows in the SAME order, because the adjustment's admission read holds the parent before any line
-         * statement is issued. Nothing in either path acquires the child before the parent, so the pair cannot
-         * form a cycle at all; what it does instead is queue, which is what these two cases measure. The cost
-         * of that choice is stated where it is made rather than here: on the MySQL family the exclusive parent
-         * lock serialises two concurrent adjustments of one list, and the service records why that trade is
-         * accepted.
-         *
-         * Only the three server engines run the forced orderings, and each of them honours
-         * `pessimistic_write` — which is exactly why the sql.js job runs the sequential form instead.
          */
         async function takeLeadLock(
             manager: EntityManager,
@@ -2842,11 +2471,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         }
 
         /*
-         * There is deliberately no line-locking counterpart to `lockListRow` above. It existed while a
-         * removal led by holding the child row, and holding the child is precisely what forms the cycle
-         * {@link takeLeadLock} records: against the parent-first service both pairings queue on the parent,
-         * so a line lock is not merely unused here but unsafe, and leaving the helper in place would leave
-         * the hazard one argument away.
+         * There is deliberately no line-locking counterpart to `lockListRow` above.
          */
 
         /**
@@ -2898,11 +2523,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             };
         }
 
-        // ★ ALL THREE READERS BELOW REPORT THROUGH THE SHARED DESCRIBER. Each is reached only when a
-        // participant REJECTED, and a participant here writes straight through the repository — so the reason
         // is a TypeORM `QueryFailedError` carrying the statement, its bound values and the driver's own
-        // fields. `String(reason)` and `reason.message` both published all of it into the failure these
-        // helpers exist to explain. See `e2e/fixtures/diagnostic-redaction.ts`.
+        // helpers exist to explain. See `e2e/fixtures/concurrency-barrier.ts`.
 
         /** Reads an outcome's affected count, failing loudly for a participant that did not fulfil. */
         function affectedRowsOf(outcome: { status: string; value?: number; reason?: unknown }): number {
@@ -2950,21 +2572,16 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         }
 
         describe('Forced interleaving, which only a server engine can evidence', () => {
-            // ★ THE GUARD THAT STOPS A GREEN ENGINE JOB MEANING NOTHING, and it is deliberately NOT skipped
+            // THE GUARD THAT STOPS A GREEN ENGINE JOB MEANING NOTHING, and it is deliberately NOT skipped
             // on any engine.
-            //
             // The two cases below are gated by `supportsForcedInterleaving()`, which reads the configured
             // engine at COLLECTION time. If that gate were ever wrong — an engine name spelled differently,
-            // an environment variable read that returned nothing, a list that lost an entry — both cases
             // would SILENTLY SKIP and this file would still report green. A run of `e2e (mysql)` would then
             // prove nothing about forced interleaving on MySQL while looking exactly like one that did.
-            //
-            // So the gate is asserted against the RUNNING data source, which cannot be gated by itself: on a
             // server engine the pair must be enabled, and on a single-connection engine it must be disabled
             // for the stated reason rather than by accident. A green run on any of the three server engines
             // therefore establishes that the forced-interleaving pair actually executed there, which is the
             // property the three-engine evidence clause rests on and the one a reader cannot otherwise
-            // confirm from the source alone.
             it('runs the forced pair on exactly the engines that can evidence it', () => {
                 const configured = resolveConfiguredEngine();
                 const running = dataSource.options.type;
@@ -2977,11 +2594,9 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                         'engine-conditional gate in this file was decided against the wrong engine',
                 ).toBe(configured);
 
-                // TWO. The gate agrees with itself whether asked by name or handed the data source.
                 expect(supportsForcedInterleaving(dataSource)).toBe(supportsForcedInterleaving());
 
                 // THREE. And it says the right thing for this engine, read from the two published lists
-                // rather than from a second copy of the rule.
                 if (SINGLE_CONNECTION_ENGINES.indexOf(running) !== -1) {
                     expect(
                         supportsForcedInterleaving(),
@@ -3016,11 +2631,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     expect((await readStoredList(seeded.listId))?.lineCount).toBe(1);
                     const sessionContext = await shopContextFor(shopClient);
 
-                    // THE ORDERING IS FORCED, not observed: the adjustment holds the PARENT row exclusively for
-                    // the window, and the parent is the row `removeReorderListLine` reaches first — its scoped
                     // admission read is the transaction's opening statement — so the removal queues there and
-                    // cannot touch the line until the adjustment has committed. The parent is the only row
-                    // that can order this pair, because the adjustment reaches it first as well; see
                     // {@link takeLeadLock}.
                     const adjustObservation = newObservation();
                     const removeObservation = newObservation();
@@ -3044,9 +2655,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     expect(result.rejected.length, describeOutcomeReasons(result)).toBe(0);
 
                     // BOTH REAL RESPONSES. The adjustment applied — its conditional statement affected one
-                    // row, which is what makes its result the list rather than a not-found — and the removal
-                    // that followed it deleted the row it had just adjusted, likewise affecting one row and
-                    // returning the list it had emptied.
                     const adjusted = fulfilledValueOf(result.a);
                     expect(adjusted).not.toBeInstanceOf(ReorderListLineNotFoundError);
                     expect(adjusted).toBeInstanceOf(ReorderList);
@@ -3056,12 +2664,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     expect((removed as ReorderList).lineCount).toBe(0);
 
                     // THE STATEMENT OUTCOMES, WHICH THE RESULT CLASSES ABOVE CANNOT CARRY. Both operations
-                    // return the parent list on their applied path, and by the time this pair has settled the
-                    // line is gone and the stored state is empty — which is exactly what an adjustment that
-                    // matched NOTHING would also leave behind. So a no-op adjust that still returned a list
                     // satisfies every assertion above, and only the driver's own affected-row count separates
-                    // it from one that applied. One each: the adjustment set its row, and the removal then
-                    // deleted that same row.
                     expect(affectedRowsOfLineStatement(adjustObservation, 'UPDATE', 'the adjustment')).toBe(
                         1,
                     );
@@ -3092,9 +2695,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     expect((await readStoredList(seeded.listId))?.lineCount).toBe(1);
                     const sessionContext = await shopContextFor(shopClient);
 
-                    // THE OPPOSITE ORDERING, forced on the SAME row and for the same reason: the removal holds
-                    // the PARENT exclusively, so the adjustment queues on its own admission read of that
-                    // parent and reaches the line only after the removal has committed — by which time the
                     // line is gone and its conditional statement matches nothing. Holding the LINE here
                     // instead would not order the pair, it would deadlock it: the adjustment would already
                     // hold the parent while waiting for the line. See {@link takeLeadLock}.
@@ -3117,11 +2717,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     expect(result.b.releasedBeforeWrite).toBe(true);
                     expect(result.rejected.length, describeOutcomeReasons(result)).toBe(0);
 
-                    // BOTH REAL RESPONSES. The removal deleted its one row and returned the emptied list; the
                     // adjustment's conditional statement then affected ZERO rows, and the affected-row count
-                    // being the authority is precisely what turns that into a not-found result rather than a
-                    // success reported over a row the caller never touched — the defect a read-then-write
-                    // would ship.
                     const removed = fulfilledValueOf(result.a);
                     expect(removed).toBeInstanceOf(ReorderList);
                     expect((removed as ReorderList).lineCount).toBe(0);
@@ -3135,19 +2731,11 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     );
 
                     // THE STATEMENT OUTCOMES: one, then ZERO. The removal deleted its row, and the adjustment
-                    // that followed it matched nothing — and that zero is the authority the service turns into
-                    // the not-found result above, rather than a class chosen from a prior read. Asserting the
-                    // count as well as the class is what distinguishes the published contract being honoured
-                    // from it being reached by accident.
                     expect(affectedRowsOfLineStatement(removeObservation, 'DELETE', 'the removal')).toBe(1);
                     expect(affectedRowsOfLineStatement(adjustObservation, 'UPDATE', 'the adjustment')).toBe(
                         0,
                     );
-                    // AND THE REFUSED ADJUSTMENT CHANGED NOTHING — whether or not its own snapshot could
-                    // still see the row it failed to update.
-                    //
                     // Which of those it sees is the ENGINE'S ISOLATION LEVEL talking rather than anything
-                    // about the operation, so asserting a single visibility outcome here would encode one
                     // engine's snapshot rule as a contract: under the
                     // REPEATABLE READ default of the MySQL family, this transaction's snapshot predates the
                     // sibling's committed removal, so a plain SELECT still returns a row the transaction can
@@ -3172,10 +2760,8 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
 
         // The sequential form, which EVERY engine runs — and the only concurrency-adjacent form the
         // in-process engine can honour. The exclusion is stated verbatim in this title rather than
-        // paraphrased, so no two files in this package word it differently.
         describe(`Sequential form, run on every engine. ${SQLJS_EXCLUSION_REASON}`, () => {
             it('runs remove-then-adjust sequentially on every engine and reports the affected-row count of each conditional statement', async () => {
-                // THE FUNCTIONAL HALF, which is what keeps the sql.js job meaningful rather than skipped. It
                 // evidences single-connection correctness and the affected-row-count rule; it evidences NOTHING
                 // about interleaving, because two participants run in series were never inside the same window.
                 const seeded = await seedList(customers[0], 'Sequential remove then adjust', [
@@ -3190,7 +2776,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 });
 
                 // There is no rendezvous in this mode, so neither participant was held at one and nothing here
-                // claims otherwise.
                 expect(result.a.releasedBeforeWrite).toBe(false);
                 expect(result.b.releasedBeforeWrite).toBe(false);
                 expect(result.a.settledOrder).toBe(0);
@@ -3228,11 +2813,7 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
     });
 
     // §7's first three scenarios. The fourth — concurrent modification — is the describe above.
-    //
     // TWO OF THE THREE REQUIRED CATEGORIES RESOLVE TO *PROCEED* RATHER THAN TO A BLOCK, and that is stated
-    // honestly here rather than force-fitted into a failure these operations cannot have: a saved list
-    // records INTENT rather than availability, so neither a disabled variant nor a changed price is a
-    // precondition of amending a line.
 
     describe('§7 scenario 1: zero, null or empty collection — an empty list and two incomplete requests', () => {
         it('refuses a removal from a list holding no lines with ReorderListLineNotFoundError', async () => {
@@ -3258,10 +2839,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             const seeded = await seedList(customers[0], 'Missing argument');
             const recordedName = (await readStoredList(seeded.listId))?.name;
 
-            // `quantity` is declared non-nullable in the published input object, so a request that omits it
-            // fails the executor's own input coercion. The variables are widened here deliberately: the
-            // hand-written variables type models the PUBLISHED input, in which the field is required, so
-            // sending an incomplete input is only expressible by saying so at the call site.
             const response = await expectTopLevelErrors(() =>
                 shopClient.query<AdjustReorderListLineMutation, AdjustReorderListLineMutationVariables>(
                     ADJUST_REORDER_LIST_LINE,
@@ -3324,8 +2901,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 line => String(line.id) === seeded.lineIds[0],
             );
             expect(adjustedLine?.quantity).toBe(6);
-            // A DISABLED variant is still resolvable in the active channel, so it arrives populated. Nulling it
-            // would hide a variant the contract says to return.
             expect(adjustedLine?.productVariant).not.toBeNull();
             const staleLine = adjustReorderListLine.lines.items.find(
                 line => String(line.id) === seeded.lineIds[1],
@@ -3356,15 +2931,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 { productVariantId: 'T_1', quantity: 2 },
             ]);
 
-            /*
-             * THE PREMISE IS ESTABLISHED, NOT ASSUMED. This scenario is about a price that HAS moved, and the
-             * two assertions it ends with — that neither operation refuses and that neither payload carries a
-             * monetary field — are equally true of a catalogue whose price never moved at all. So a scenario
-             * that took the price change on trust could not tell an implementation which ignores the price
-             * from one which was simply never shown a changed price. Three things are therefore checked before
-             * either reorder mutation is issued: the Admin mutation's own result, an INDEPENDENT re-read of the
-             * variant, and that the re-read value differs from the one recorded first.
-             */
             const readVariantPrice = async (): Promise<number> => {
                 const { product } = await adminClient.query<{
                     product: { id: string; variants: Array<{ id: string; price: number }> } | null;
@@ -3408,12 +2974,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     price,
                 );
             };
-            // The price lives in core rows this test did not create, so EVERY COLUMN of both of them — the
-            // variant row and the `product_variant_price` rows belonging to it — is captured BEFORE the write
-            // and queued for exact restoration, so the prior state goes back even if an assertion below
-            // throws. Restoring by issuing the inverse Admin mutation would put the NUMBER back and advance
-            // the `updatedAt` of both rows while doing so, leaving the next test reading rows that are not
-            // the rows that were there.
             const pricedVariantDbId = decodeId('T_1');
             await captureCoreRows('product_variant', 'captured_row.id = :variantId', {
                 variantId: pricedVariantDbId,
@@ -3470,7 +3030,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         });
 
         it('publishes no monetary, currency or stock field on any of the four operations\u2019 inputs or results', async () => {
-            // The CURRENCY dimension of this story, discharged at the payload level and asserted against the
             // running schema for all four operations rather than for one (STORY-001-01-03 §10).
             const publishedTypes = [
                 'ReorderList',
@@ -3498,8 +3057,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     `${typeName} published a monetary, currency or stock field`,
                 ).toEqual([]);
             }
-            // And the add input still declares exactly three fields and no request-deduplication key, which is
-            // the ruling this story consumes rather than restates.
             const { __type: addInput } = await shopClient.query<IntrospectTypeFieldsQuery>(
                 INTROSPECT_TYPE_FIELDS,
                 { typeName: 'AddItemToReorderListInput' },
@@ -3512,45 +3069,27 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         });
     });
 
-    // The empty-generation assertion this suite owns
-    //
     // STORY-001-01-03 requires NO MIGRATION OF ITS OWN, and the absence is verified rather than asserted:
-    // every table, column, index, constraint and on-delete action it relies on ships in the single additive
     // migration STORY-001-01-01 generates. A generated file appearing at this point is the signal that this
-    // story has altered a mapping it does not own.
 
     describe('This story owns no migration', () => {
         it('emits no migration file against a schema the checked-in migration created', async () => {
             const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-mutate-migration-'));
-            // Queued before the call, so the directory is removed even if the assertion below fails.
             temporaryDirectories.push(outputDir);
             const snapshotDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-mutate-schema-'));
             temporaryDirectories.push(snapshotDir);
 
-            // WHAT THE GENERATOR IS POINTED AT IS THE MIGRATION'S OWN OUTPUT, and that is the whole point of
-            // this assertion rather than a refinement of it. `generateMigration` forces `synchronize: false`
             // and `migrationsRun: false` on the connection it opens (`packages/core/src/migrate.ts`), so it
-            // diffs the entity declarations against whatever schema is already in the database — and under
-            // every initializer this suite can run, that schema was built by SYNCHRONISING those same
-            // declarations. An empty result against it would therefore be reported whether the checked-in
-            // migration is faithful, broken or absent. So the two plugin tables are dropped and recreated by
-            // the artefact first, and the diff is taken against that.
             const schemaIsTheMigrations = await rebuildPluginSchemaFromCheckedInMigration();
 
             // WHAT THE ASSERTION RESTS ON, which differs by engine and is recorded rather than glossed. On the
             // generation engine the diff is taken against a schema the shipped artefact built, so an empty
-            // result means the artefact and the entities agree. Elsewhere it is taken against the synchronised
-            // schema, where an empty result means the entities carry no pending change — weaker, but still the
-            // claim this story owns, which is that it adds no column and needs no migration of its own.
             expect(
                 schemaIsTheMigrations,
                 'the rebuild must run on exactly the engine the shipped artefact was generated against',
             ).toBe(committedMigrationApplies(String(dataSource.options.type)));
 
-            // THE GENERATOR'S OWN DECISION INPUT, read from the running server's connection, because that is
-            // where the diagnostic lives: `generateMigration` writes a file if and only if this log's
             // `upQueries` is non-empty, so naming the offending statements here turns a bare `undefined`
-            // expectation into a failure a reader can act on.
             const log = await dataSource.driver.createSchemaBuilder().log();
             const namesPluginTable = (query: string) =>
                 /reorder_list(_line)?/i.test(query.replace(/["`[\]]/g, ''));
@@ -3564,9 +3103,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             ).toHaveLength(0);
             expect(offendingDownQueries).toHaveLength(0);
 
-            // AND THE PLATFORM ENTRY POINT ITSELF, against that same migration-created schema. It returns
-            // `undefined` and writes no file; the platform logs "No changes in database schema were found -
-            // cannot generate a migration." on this path.
             const generated = await generateMigration(
                 await generatorConfigAgainstMigratedSchema(snapshotDir),
                 {
@@ -3574,10 +3110,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                     outputDir,
                 },
             );
-            // The file's own contents are the diagnostic when it does write one, and reading them also
-            // catches the way this assertion could otherwise go quietly wrong: a generator pointed at an
-            // EMPTY database emits the entire schema rather than nothing, so a broken snapshot fails here
-            // loudly instead of passing vacuously.
             expect(
                 generated,
                 `generateMigration emitted a migration against the migration-created schema: ${
@@ -3586,16 +3118,9 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             ).toBeUndefined();
             expect(await fs.readdir(outputDir)).toEqual([]);
 
-            // The output directory is a temporary one outside the repository, so nothing is ever written under
-            // this package's own migrations directory and `git status --porcelain` is clean after a run
-            // whatever this assertion finds.
             expect(path.isAbsolute(outputDir)).toBe(true);
             expect(outputDir.startsWith(path.join(__dirname, '..'))).toBe(false);
 
-            // The running server is unaffected by the generation pass, which is asserted rather than assumed
-            // because that pass loads and then resets the platform's module-level configuration. The two
-            // tables are empty at this point, the rebuild having dropped and recreated them, so this also
-            // proves the migration's own output accepts the writes this story makes.
             const stillWorking = await seedList(customers[0], 'After the generation pass', [
                 { productVariantId: 'T_1', quantity: 2 },
             ]);
@@ -3603,15 +3128,10 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
         });
     });
 
-    // The four mandatory authorisation cases, carried for EVERY ONE of this story's four mutations
-    //
     // STORY-001-01-03 §10 requires the four authorisation cases as REAL API CALLS for each of the four
-    // mutations — "each of which is a real API call asserting both the returned payload and the stored row
-    // count rather than a unit test of a guard function, and the foreign-channel case sending a second real
     // channel token rather than mutating a variable" — which is four callers × four operations, sixteen
     // cells. §10 also states which four callers: a session holding no custom permission SUCCEEDS, a request
     // authenticated as a DIFFERENT CUSTOMER is refused, a request carrying a FOREIGN CHANNEL TOKEN reaches
-    // nothing, and an UNAUTHENTICATED request writes nothing.
 
     describe('The four mandatory authorisation cases, per operation', () => {
         /** The normalised refusal every inaccessible-row call in this section must be indistinguishable from. */
@@ -3835,8 +3355,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
                 Object.keys(unknown.deleteReorderList).sort(),
             );
 
-            // THE LIST AND ITS LINE ARE BOTH STILL THERE, and the owner still holds exactly one list in the
-            // channel the row belongs to — so no cascade fired either.
             expect((await readStoredList(seeded.listId))?.name).toBe('Foreign channel delete probe');
             expect((await readStoredLines(seeded.listId)).length).toBe(1);
             expect(await countStoredLists(customers[0].id, activeChannelId)).toBe(1);
@@ -3892,415 +3410,6 @@ describe('Reorder list mutations — adjust, remove, rename and delete (STORY-00
             expect((await readStoredList(theirs.listId))?.name).toBe('Second customer delete fixture');
             expect((await readStoredLines(theirs.listId)).length).toBe(1);
             expect(await countStoredLists(customers[1].id, activeChannelId)).toBe(1);
-        });
-    });
-});
-
-// The correlated-ownership verifier this file's line-write claims are decided by
-//
-// ★ WHY THESE CASES ARE HERE. Every assertion above that a `reorder_list_line` write is scoped to its owner
-// is decided by {@link whereRequiresCorrelatedOwnership}: a line row stores its parent's identifier, a
-// variant reference and a quantity, so the acting customer and the active channel can only reach the
-// statement through a sub-query over the parent table (FEATURE-001-01 §2.11). If that parser certifies a
-// statement which does not really scope the row, the claims above pass while the write reaches rows nobody
-// owns — and they pass silently, because nothing else in this file is looking. A verifier is therefore only
-// worth what its own negative cases prove, and those cases have to be COMMITTED to prove anything twice: a
-// check performed once by hand cannot fail when a later edit weakens the parser.
-/** The decoded identifiers a fixture would hold, standing in for rows it created. */
-const VERIFIER_CUSTOMER_ID = 5;
-const VERIFIER_CHANNEL_ID = 1;
-const VERIFIER_LIST_ID = 100;
-const VERIFIER_LINE_ID = 200;
-
-/**
- * The ownership claim a line write must satisfy, built fresh per assertion so that no test can observe a
- * requirement another one mutated.
- */
-function verifierLineScope(): CorrelatedOwnershipRequirement {
-    return {
-        table: 'reorder_list',
-        correlation: { column: 'id', outerColumn: 'reorderListId' },
-        predicates: [
-            { column: 'customerId', value: VERIFIER_CUSTOMER_ID },
-            { column: 'channelId', value: VERIFIER_CHANNEL_ID },
-        ],
-    };
-}
-
-/**
- * Captures one statement the way a real run does: through the logger's own TypeORM hook, with a query
- * runner whose connection reports the engine.
- */
-function captureVerifierStatement(query: string, parameters: unknown[], engine: string): CapturedStatement {
-    // Its own instrument, deliberately not the file-level `capture` the suite above installs on the server:
-    // these cases feed the logger by hand and must not add to, or read from, a window that suite is counting.
-    const verifierCapture = new QueryCaptureLogger();
-    verifierCapture.enable();
-    const runner = {
-        connection: { options: { type: engine } },
-        isTransactionActive: true,
-    } as unknown as QueryRunner;
-    verifierCapture.logQuery(query, parameters, runner);
-    const [statement] = verifierCapture.statements;
-    expect(statement).toBeDefined();
-    expect(statement.dialect).toBe(engine);
-    return statement;
-}
-
-/** The correlated `EXISTS` PostgreSQL receives, with its identifiers double-quoted and its values bound. */
-const POSTGRES_EXISTS =
-    'EXISTS (SELECT 1 FROM "reorder_list" "owned_list_scope" ' +
-    'WHERE "owned_list_scope"."id" = "reorderListId" ' +
-    'AND "owned_list_scope"."customerId" = $4 AND "owned_list_scope"."channelId" = $5)';
-
-/** The same clause as the MySQL family receives it: backticks, and positional placeholders. */
-const MYSQL_EXISTS =
-    'EXISTS (SELECT 1 FROM `reorder_list` `owned_list_scope` ' +
-    'WHERE `owned_list_scope`.`id` = `reorderListId` ' +
-    'AND `owned_list_scope`.`customerId` = ? AND `owned_list_scope`.`channelId` = ?)';
-
-/** The same clause as sql.js receives it: double-quoted identifiers, and the values written inline. */
-const SQLJS_EXISTS =
-    'EXISTS (SELECT 1 FROM "reorder_list" "owned_list_scope" ' +
-    'WHERE "owned_list_scope"."id" = "reorderListId" ' +
-    `AND "owned_list_scope"."customerId" = ${VERIFIER_CUSTOMER_ID} ` +
-    `AND "owned_list_scope"."channelId" = ${VERIFIER_CHANNEL_ID})`;
-
-/** A PostgreSQL adjust whose `EXISTS` clause is supplied, so one shape can be varied at a time. */
-function postgresVerifierAdjust(existsClause: string): CapturedStatement {
-    return captureVerifierStatement(
-        'UPDATE "reorder_list_line" SET "quantity" = $1 ' +
-            `WHERE "id" = $2 AND "reorderListId" = $3 AND ${existsClause}`,
-        [7, VERIFIER_LINE_ID, VERIFIER_LIST_ID, VERIFIER_CUSTOMER_ID, VERIFIER_CHANNEL_ID],
-        'postgres',
-    );
-}
-
-describe('whereRequiresCorrelatedOwnership', () => {
-    describe('certifies the ownership sub-query the service writes', () => {
-        it('certifies the PostgreSQL adjust, resolving both bound values through their placeholders', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS);
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(true);
-        });
-
-        it('certifies the MySQL accumulate, whose placeholders are positional', () => {
-            // The `SET` clause binds ahead of the predicate, so the customer and channel are the fourth and
-            // fifth parameters of the statement rather than the first two of the sub-query. Resolving them
-            // requires the offset arithmetic the parser performs; a verifier that numbered the sub-query's
-            // own placeholders from zero would read the quantity and the line id as the tenant.
-            const statement = captureVerifierStatement(
-                'UPDATE `reorder_list_line` SET `quantity` = `quantity` + ? ' +
-                    `WHERE \`id\` = ? AND \`reorderListId\` = ? AND ${MYSQL_EXISTS}`,
-                [3, VERIFIER_LINE_ID, VERIFIER_LIST_ID, VERIFIER_CUSTOMER_ID, VERIFIER_CHANNEL_ID],
-                'mysql',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(true);
-        });
-
-        it('certifies the MariaDB remove, which is a delete rather than an update', () => {
-            const statement = captureVerifierStatement(
-                `DELETE FROM \`reorder_list_line\` WHERE \`id\` = ? AND \`reorderListId\` = ? AND ${MYSQL_EXISTS}`,
-                [VERIFIER_LINE_ID, VERIFIER_LIST_ID, VERIFIER_CUSTOMER_ID, VERIFIER_CHANNEL_ID],
-                'mariadb',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(true);
-        });
-
-        it('certifies the sql.js adjust, whose values are inline literals rather than parameters', () => {
-            const statement = captureVerifierStatement(
-                `UPDATE "reorder_list_line" SET "quantity" = 7 WHERE "id" = ${VERIFIER_LINE_ID} ` +
-                    `AND "reorderListId" = ${VERIFIER_LIST_ID} AND ${SQLJS_EXISTS}`,
-                [],
-                'sqljs',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(true);
-        });
-
-        it('accepts a caller that names the alias and the outer relation exactly', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS);
-            const requirement = verifierLineScope();
-            requirement.correlation.outerRelation = undefined;
-            requirement.predicates[0].relation = 'owned_list_scope';
-            requirement.predicates[1].relation = 'owned_list_scope';
-
-            expect(whereRequiresCorrelatedOwnership(statement, requirement)).toBe(true);
-        });
-
-        it('refuses a caller that names an alias the sub-query did not use', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS);
-            const requirement = verifierLineScope();
-            requirement.predicates[0].relation = 'reorder_list_line';
-
-            expect(whereRequiresCorrelatedOwnership(statement, requirement)).toBe(false);
-        });
-
-        it('reads a raw statement string, resolving inline literals only', () => {
-            const raw =
-                `UPDATE "reorder_list_line" SET "quantity" = 7 WHERE "id" = ${VERIFIER_LINE_ID} ` +
-                `AND "reorderListId" = ${VERIFIER_LIST_ID} AND ${SQLJS_EXISTS}`;
-
-            expect(whereRequiresCorrelatedOwnership(raw, verifierLineScope(), 'sqljs')).toBe(true);
-        });
-    });
-
-    describe('refuses a requirement whose scope values it cannot decide', () => {
-        it('refuses a scope predicate with no expected value, rather than checking the column alone', () => {
-            // The type forbids this, which is the first line of defence; the cast is the point of the test.
-            // A suite compiled against an earlier shape, a plain-JavaScript caller, or a fixture identifier
-            // that was never assigned can all present a predicate with no value — and the general predicate
-            // helper reads an absent value as "require only that this column is compared", which certifies a
-            // sub-query whose tenant parameters are bound the wrong way round.
-            const requirement = {
-                table: 'reorder_list',
-                correlation: { column: 'id', outerColumn: 'reorderListId' },
-                predicates: [{ column: 'customerId' }, { column: 'channelId', value: VERIFIER_CHANNEL_ID }],
-            } as unknown as CorrelatedOwnershipRequirement;
-
-            expect(
-                whereRequiresCorrelatedOwnership(postgresVerifierAdjust(POSTGRES_EXISTS), requirement),
-            ).toBe(false);
-        });
-
-        it('refuses a scope predicate whose expected value is explicitly undefined', () => {
-            const requirement = {
-                table: 'reorder_list',
-                correlation: { column: 'id', outerColumn: 'reorderListId' },
-                predicates: [
-                    { column: 'customerId', value: undefined },
-                    { column: 'channelId', value: VERIFIER_CHANNEL_ID },
-                ],
-            } as unknown as CorrelatedOwnershipRequirement;
-
-            expect(
-                whereRequiresCorrelatedOwnership(postgresVerifierAdjust(POSTGRES_EXISTS), requirement),
-            ).toBe(false);
-        });
-
-        it('refuses the swapped tenant binding, which has the right shape and the wrong owner', () => {
-            const requirement = verifierLineScope();
-            requirement.predicates[0].value = VERIFIER_CHANNEL_ID;
-            requirement.predicates[1].value = VERIFIER_CUSTOMER_ID;
-
-            expect(
-                whereRequiresCorrelatedOwnership(postgresVerifierAdjust(POSTGRES_EXISTS), requirement),
-            ).toBe(false);
-        });
-
-        it('refuses a value no parameter carries, so a stale fixture identifier fails loudly', () => {
-            const requirement = verifierLineScope();
-            requirement.predicates[0].value = VERIFIER_CUSTOMER_ID + 1;
-
-            expect(
-                whereRequiresCorrelatedOwnership(postgresVerifierAdjust(POSTGRES_EXISTS), requirement),
-            ).toBe(false);
-        });
-
-        it('refuses an empty predicates list, because a correlation alone proves existence not ownership', () => {
-            const requirement = verifierLineScope();
-            requirement.predicates = [];
-
-            expect(
-                whereRequiresCorrelatedOwnership(postgresVerifierAdjust(POSTGRES_EXISTS), requirement),
-            ).toBe(false);
-        });
-
-        it('refuses a malformed requirement instead of throwing', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS);
-
-            expect(
-                whereRequiresCorrelatedOwnership(
-                    statement,
-                    undefined as unknown as CorrelatedOwnershipRequirement,
-                ),
-            ).toBe(false);
-            expect(
-                whereRequiresCorrelatedOwnership(statement, {
-                    table: '',
-                    correlation: { column: 'id', outerColumn: 'reorderListId' },
-                    predicates: [{ column: 'customerId', value: VERIFIER_CUSTOMER_ID }],
-                }),
-            ).toBe(false);
-        });
-    });
-
-    describe('refuses a sub-query whose row count does not follow its predicate', () => {
-        it('refuses an ungrouped aggregate projection, which is satisfied for every row', () => {
-            // Every other part of the requirement is met: the right table, a real correlation, and both
-            // scope comparisons bound to the right values. `COUNT(*)` without a `GROUP BY` still returns one
-            // row — `0` — when nothing matched, so the `EXISTS` is true for a line nobody owns and the write
-            // it guards reaches the whole table.
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS.replace('SELECT 1', 'SELECT COUNT(*)'));
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses an empty grouping set, which synthesises a row from no rows', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace(/\)$/, ' GROUP BY GROUPING SETS (()))'),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a HAVING clause, whose group is not a row of the relation', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace(/\)$/, ' HAVING COUNT(*) >= 0)'),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a row-limiting tail, which decouples the result in the other direction', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS.replace(/\)$/, ' LIMIT 0)'));
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a projection this parser has not modelled, rather than reading through it', () => {
-            for (const projection of ['SELECT *', 'SELECT DISTINCT 1', 'SELECT 1, 1', 'SELECT ol.id']) {
-                const statement = postgresVerifierAdjust(POSTGRES_EXISTS.replace('SELECT 1', projection));
-
-                expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-            }
-        });
-
-        it('refuses a set operator inside the sub-query, which answers for rows it never read', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS.replace(/\)$/, ' UNION SELECT 1)'));
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-    });
-
-    describe('refuses a sub-query that scopes something other than the addressed row', () => {
-        it('refuses a sub-query over the wrong table', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace('"reorder_list" "owned_list_scope"', '"customer" "owned_list_scope"'),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a second relation, which lets the correlation and the scope address different rows', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace(
-                    '"reorder_list" "owned_list_scope"',
-                    '"reorder_list" "owned_list_scope", "reorder_list" "other"',
-                ),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a sub-query with no correlation, which any owned list satisfies', () => {
-            const statement = postgresVerifierAdjust(
-                'EXISTS (SELECT 1 FROM "reorder_list" "owned_list_scope" ' +
-                    'WHERE "owned_list_scope"."customerId" = $4 AND "owned_list_scope"."channelId" = $5)',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a correlation compared to a bound parameter rather than to the outer column', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace(
-                    '"owned_list_scope"."id" = "reorderListId"',
-                    '"owned_list_scope"."id" = $3',
-                ),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a correlation qualified by the sub-query own alias, which compares a row to itself', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace(
-                    '"owned_list_scope"."id" = "reorderListId"',
-                    '"owned_list_scope"."id" = "owned_list_scope"."reorderListId"',
-                ),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a scope comparison that is only a disjunct of the sub-query predicate', () => {
-            const statement = postgresVerifierAdjust(
-                POSTGRES_EXISTS.replace(
-                    'AND "owned_list_scope"."channelId" = $5',
-                    'AND ("owned_list_scope"."channelId" = $5 OR "owned_list_scope"."id" = $3)',
-                ),
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-    });
-
-    describe('refuses an EXISTS that the outer predicate does not require', () => {
-        it('refuses an EXISTS under a disjunction', () => {
-            const statement = captureVerifierStatement(
-                `UPDATE "reorder_list_line" SET "quantity" = $1 WHERE "id" = $2 OR ${POSTGRES_EXISTS}`,
-                [7, VERIFIER_LINE_ID, VERIFIER_LIST_ID, VERIFIER_CUSTOMER_ID, VERIFIER_CHANNEL_ID],
-                'postgres',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a negated EXISTS, which requires the row NOT to be owned', () => {
-            const statement = postgresVerifierAdjust(`NOT ${POSTGRES_EXISTS}`);
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses an EXISTS that is only part of its leaf', () => {
-            const statement = postgresVerifierAdjust(`${POSTGRES_EXISTS} IS NOT NULL`);
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a perfect sub-query standing beside an always-true disjunct', () => {
-            const statement = captureVerifierStatement(
-                'UPDATE "reorder_list_line" SET "quantity" = $1 ' +
-                    `WHERE "id" = $2 AND (1 = 1 OR ${POSTGRES_EXISTS})`,
-                [7, VERIFIER_LINE_ID, VERIFIER_LIST_ID, VERIFIER_CUSTOMER_ID, VERIFIER_CHANNEL_ID],
-                'postgres',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-
-        it('refuses a statement carrying no EXISTS at all', () => {
-            const statement = captureVerifierStatement(
-                'UPDATE "reorder_list_line" SET "quantity" = $1 WHERE "id" = $2 AND "reorderListId" = $3',
-                [7, VERIFIER_LINE_ID, VERIFIER_LIST_ID],
-                'postgres',
-            );
-
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(false);
-        });
-    });
-
-    describe('complements the other two predicate helpers rather than duplicating them', () => {
-        it('is the only one of the three that can read the sub-query', () => {
-            const statement = postgresVerifierAdjust(POSTGRES_EXISTS);
-
-            // Both of the others refuse the sub-query, deliberately and correctly for what each claims: one
-            // recognises only `column <op> operand` as a comparison, and the other blanks any parenthesised
-            // SELECT before it looks for a column name. Neither can state the claim a line write makes, which
-            // is why the correlated helper exists — and why a suite must not fall back to them.
-            expect(
-                whereRequiresScopedPredicates(statement, [
-                    { column: 'customerId', value: VERIFIER_CUSTOMER_ID },
-                    { column: 'channelId', value: VERIFIER_CHANNEL_ID },
-                ]),
-            ).toBe(false);
-            expect(whereMentionsColumns(statement, ['customerId'])).toBe(false);
-
-            expect(whereMentionsColumns(statement, ['id', 'reorderListId'])).toBe(true);
-            expect(whereRequiresCorrelatedOwnership(statement, verifierLineScope())).toBe(true);
         });
     });
 });

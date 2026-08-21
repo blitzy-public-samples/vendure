@@ -174,8 +174,7 @@ const ZERO_WIDTH_SPACE_CODE_POINT = 0x200b;
 const BYTE_ORDER_MARK_CODE_POINT = 0xfeff;
 
 /*
- * WHAT THIS MODULE DELIBERATELY DOES **NOT** REFUSE, recorded because an earlier revision did and the
- * removal is a correction rather than a relaxation.
+ * WHAT THIS MODULE DELIBERATELY DOES **NOT** REFUSE, and why the enumeration is narrow by design.
  *
  * The refusal is exactly the four enumerated ranges declared above — the C0 controls less the three
  * characters the whitespace pipeline has already consumed, U+007F together with the C1 block, U+200B ZERO
@@ -188,15 +187,14 @@ const BYTE_ORDER_MARK_CODE_POINT = 0xfeff;
  * gives: they are content rather than noise, and refusing them refuses a Persian name and every emoji
  * sequence built with one.
  *
- * A general `/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u` class stood here as well, and it refused a
- * great deal the contract never authorised. `Default_Ignorable_Code_Point` covers the variation selectors,
- * so **every emoji written with an explicit presentation selector was refused** — "Favourites ❤️" (U+2764
- * U+FE0F) and "Notes ✏️" among them — and `\p{Cf}` adds U+00AD SOFT HYPHEN, so a hyphenated paste was
- * refused too. Those are plausible, non-hostile list names, and the registered message of the day ("must not
- * contain control or zero-width characters") did not describe them either, so the refusal a buyer saw did not
- * match the rule they had broken. The message has since been rewritten to name the refused characters
- * individually, which is what makes the two halves agree: what the code refuses and what the buyer is told
- * are now the same four grounds.
+ * A general `/[\p{Cc}\p{Cf}\p{Default_Ignorable_Code_Point}]/u` class would be the obvious shorthand for
+ * this, and it is not used because it refuses a great deal the contract never authorises.
+ * `Default_Ignorable_Code_Point` covers the variation selectors, so it refuses **every emoji written with an
+ * explicit presentation selector** — "Favourites ❤️" (U+2764 U+FE0F) and "Notes ✏️" among them — and
+ * `\p{Cf}` adds U+00AD SOFT HYPHEN, so it refuses a hyphenated paste too. Those are plausible, non-hostile
+ * list names. The enumeration also has to agree with what the buyer is told: the registered message names the
+ * refused characters individually, so the code and the message describe the same four grounds, which a
+ * property class covering an open-ended set could not.
  *
  * The characters that class also caught and this one does not — U+034F COMBINING GRAPHEME JOINER, the
  * bidirectional marks, embeddings, overrides and isolates, U+2060 WORD JOINER and the invisible mathematical
@@ -531,7 +529,7 @@ export function toNameKey(displayName: string): string {
  *    zero-width joiner, a soft hyphen, a bidirectional mark and a combining grapheme joiner are all
  *    stored verbatim, because a display name is trim-and-collapse and *nothing else* and the safety of the
  *    RENDERING is the storefront's. See {@link isDisallowedCodePoint} for the set and the note beside it for
- *    what an earlier revision refused here and why that over-reached, and {@link findDisallowedCharacter}
+ *    why the enumeration is narrow rather than a general property class, and {@link findDisallowedCharacter}
  *    for why this test of the *display* value necessarily runs after the two above.
  * 4. **A derived `nameKey` longer than the same maximum is refused, even where the display value fitted.**
  *    Both stored values are bounded because both occupy a `varchar(191)` column, and normalisation is not

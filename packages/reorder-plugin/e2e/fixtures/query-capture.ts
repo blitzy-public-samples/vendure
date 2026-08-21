@@ -1,58 +1,29 @@
 /**
  * The canonical query-capture instrument for the reorder plugin's end-to-end suite.
- *
- *  1. The instrument is guaranteed to receive the statements. TypeORM's query runners call
- *     `logger.logQuery(...)` unconditionally before executing — see
- *     `node_modules/typeorm/driver/sqljs/SqljsQueryRunner.js:L70` — leaving it to the logger, not
- *     the driver, to decide what to do with the call.
- *  2. Once this logger is installed, `dbConnectionOptions.logging` becomes **inert**, because core's
- *     `TypeOrmLogger` is never constructed. That independently confirms the boolean flag is the
- *     wrong instrument.
- *  3. Because core's `TypeOrmLogger` is displaced, its error, warning, schema and migration
- *     diagnostics no longer reach the Vendure logger. That is why this class *records*
- *     `logQueryError`, `logSchemaBuild`, `logMigration` and `log` and exposes a `format()` dump
- *     rather than silently discarding them.
- *
- * A `new QueryCaptureLogger()` therefore survives both paths with its **identity intact**, so
- * `capture.reset()` in `beforeEach` provably affects the very object TypeORM holds. A plain object
- * literal such as `{ logQuery() {} }` has `constructor.name === 'Object'`, so it is deep-merged onto
- * a fresh `{}`: identity is lost, `reset()` silently stops working, and the failure is intermittent
- * and baffling. Do not "simplify" this class into a literal.
- *
- * ENGINE POSTURE — THE INVERSE OF THE SIBLING BARRIER MODULE
- * Epic §11.6.2 rules that "a statement count is asserted on one engine and the behaviour it
- * evidences is asserted on all four", and fixes the counted form to the sql.js job because it is
- * deterministic there while statement text and even statement count differ legitimately between
- * drivers. FEATURE-001-01 §2.6.1.1 restates it: the counted form runs on `e2e-sqljs` and the
- * behavioural form on all four engine jobs.
- *
- * This is the **opposite** of `./concurrency-barrier.ts`, whose forced interleavings run on MariaDB,
- * MySQL and PostgreSQL and are *excluded* from sql.js, because sql.js is the in-process WebAssembly
- * initializer and two transactions there cannot be held past a barrier and released together
- * (epic §11.6.3). Do not transplant one rule onto the other. Use `isStatementCountEngine()` below
- * to gate an exact-equality count; never make a behavioural assertion engine-conditional.
  */
-import { QueryRunner, Logger as TypeOrmLoggerInterface } from 'typeorm';
+import { generateMigration, resetConfig, VendureConfig } from '@vendure/core';
+import { preBootstrapConfig } from '@vendure/core/dist/bootstrap';
+import fs from 'fs-extra';
+import os from 'os';
+import path from 'path';
+import {
+    DataSource,
+    DataSourceOptions,
+    MigrationInterface,
+    QueryRunner,
+    Logger as TypeOrmLoggerInterface,
+} from 'typeorm';
+import * as ts from 'typescript';
+
+import { describeTeardownStage, redactTeardownDiagnostic } from './concurrency-barrier';
 
 /**
  * The leading-keyword classification of a captured statement.
- *
- * `transaction` covers the transaction-control statements — `START TRANSACTION`, `BEGIN`,
- * `BEGIN TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE SAVEPOINT` and
- * `SET TRANSACTION ...`. They are **captured rather than dropped**, because they are what lets a
- * suite prove that two writes happened inside the *same* transaction: both statements appear
- * between one `START TRANSACTION`/`BEGIN` and the following `COMMIT`, on the same `runnerId`, with
- * no intervening commit. They are excluded from every table-filtered result because they name no
- * table.
- *
- * `other` covers everything else: DDL, `PRAGMA ...`, `SET ...` and table-less probes such as
- * `SELECT VERSION()` (see {@link classifyStatement} for why a table-less `SELECT` is `other`).
  */
 export type CapturedStatementKind = 'select' | 'insert' | 'update' | 'delete' | 'transaction' | 'other';
 
 export interface CapturedStatement {
     query: string;
-    /** Copied, so a later driver mutation cannot rewrite history. Always an array, never undefined. */
     parameters: unknown[];
     /** Leading-keyword classification. See {@link CapturedStatementKind}. */
     kind: CapturedStatementKind;
@@ -62,15 +33,8 @@ export interface CapturedStatement {
      */
     dialect?: string;
     /**
-     * The table tokens extracted from table *positions* only — after `FROM`, `INTO`, `UPDATE` and
-     * every `JOIN` form — lower-cased and de-duplicated in first-seen order. Never a substring scan
-     * of the statement text; see {@link extractStatementTables} for the two traps that makes
-     * unavoidable — a quoted literal or a comment whose text looks like a table name, and a table
-     * reached only inside a nested query.
-     *
-     * This is the "which tables does this statement touch" answer, and it includes a table reached
-     * only inside a sub-query. For "which table does this statement change", see
-     * {@link CapturedStatement.targetTables}.
+     * The table tokens extracted from table *positions* only — after `FROM`, `INTO`, `UPDATE` and every `JOIN` form
+     * — lower-cased and de-duplicated in first-seen order.
      */
     tables: string[];
     /**
@@ -79,7 +43,6 @@ export interface CapturedStatement {
      * row-level write.
      */
     targetTables: string[];
-    /** Monotonic index within the current capture window, starting at 0 and contiguous. */
     sequence: number;
     /**
      * A stable identifier for the `QueryRunner` that issued the statement, so statements can be
@@ -103,9 +66,7 @@ export interface CapturedStatement {
  * One message observed through TypeORM's general-purpose `log` hook.
  */
 export interface CapturedLogMessage {
-    /** The level TypeORM reported. */
     level: 'log' | 'info' | 'warn';
-    /** The message, rendered to a string so a suite can assert on it without a type guard. */
     message: string;
 }
 
@@ -138,13 +99,8 @@ const IDENTIFIER_QUOTE_CHARACTERS = /["`[\]]/g;
 const SKIPPABLE_PRE_TABLE_WORDS = ['if', 'not', 'exists', 'only'];
 
 /**
- * Words which, standing **immediately** before `UPDATE`, mean that `UPDATE` introduces no table:
- * `SELECT ... FOR UPDATE`, `... ON UPDATE CASCADE` and PostgreSQL's
- * `INSERT ... ON CONFLICT DO UPDATE SET col = ...`.
- *
- * `KEY` is deliberately absent, because it is not sufficient on its own: only MySQL's
- * `ON DUPLICATE KEY UPDATE` suppresses, and a column genuinely named `key` immediately before an
- * `UPDATE` must not. {@link isNonTableUpdate} carries that two-word rule separately.
+ * Words which, standing **immediately** before `UPDATE`, mean that `UPDATE` introduces no table: `SELECT ... FOR
+ * UPDATE`, `... ON UPDATE CASCADE` and PostgreSQL's `INSERT ... ON CONFLICT DO UPDATE SET col = ...`.
  */
 const NON_TABLE_UPDATE_PREDECESSORS = ['for', 'on', 'do'];
 
@@ -178,14 +134,8 @@ const NON_TABLE_IDENTIFIERS = [
 ];
 
 /**
- * The single-word clause keywords that end a `WHERE` portion. Truncating at these is what stops a
- * column named only in the sort or in a `RETURNING` list from counting as a predicate conjunct.
- *
- * ★ A terminator only ends the predicate when it occurs at **parenthesis depth zero**. One that sits
- * inside a subquery — the `LIMIT` of `AND EXISTS (SELECT 1 FROM t LIMIT 1)` — ends nothing, and
- * truncating there would silently discard whatever followed the subquery, including an `OR` that
- * makes the whole predicate satisfiable. {@link extractWherePortionWithOffset} enforces the depth
- * rule; these lists only say which words are candidates.
+ * The single-word clause keywords that end a `WHERE` portion. Truncating at these is what stops a column named only
+ * in the sort or in a `RETURNING` list from counting as a predicate conjunct.
  */
 const WHERE_TERMINATOR_WORDS = [
     'having',
@@ -288,8 +238,6 @@ function stripLeadingNoise(query: string, lexicon: DialectLexicon = UNKNOWN_LEXI
             const blockEnd = skipBlockComment(trimmed, 0, lexicon);
             if (executableCommentBodyRuns(trimmed, 0, lexicon)) {
                 // The engine executes this body, so the statement's real leading keyword is inside it —
-                // `/*! DELETE FROM t *&#47;` is a delete, not a comment followed by nothing. Unwrapping
-                // rather than skipping is what keeps it from classifying as `other`.
                 text = executableCommentBody(trimmed, 0, blockEnd) + trimmed.slice(blockEnd);
                 continue;
             }
@@ -331,22 +279,8 @@ function dmlKindForKeyword(word: string | undefined): CapturedStatementKind | un
 }
 
 /**
- *
- * Classifies a `WITH` statement by **parsing its common-table-expression prologue structurally**,
- * definition by definition, and then reading the keyword that follows the last one.
- *
- * **Why the parse has to be structural.** A `WITH` statement's own kind is decided by the keyword
- * after its last definition, and that keyword can be `INSERT`, `UPDATE` or `DELETE` just as easily as
- * `SELECT` — every target engine supports a data-modifying statement with a CTE prologue, and
- * PostgreSQL additionally allows a definition body to write. Two cheaper implementations both produce
- * the same false pass, where a statement that changed rows is classified as a read and vanishes from
- * {@link QueryCaptureLogger.writesFor}, so a zero-write assertion passes over a write:
- *
- *  - **Searching the text for a keyword** reports `WITH x AS (SELECT 1) DELETE FROM t` as a read,
- *    because it contains `SELECT`.
- *  - **Taking the first depth-zero DML-looking word** reports `WITH "select" AS (SELECT 1) UPDATE t`
- *    as a read, because a quoted alias is a legal CTE name whose text is a keyword; a comment such as
- *    `WITH /* SELECT the owned rows *&#47; x AS (...) UPDATE t` fails the same way.
+ * Classifies a `WITH` statement by **parsing its common-table-expression prologue structurally**, definition by
+ * definition, and then reading the keyword that follows the last one.
  */
 function classifyCteStatement(
     query: string,
@@ -364,8 +298,6 @@ function classifyCteStatement(
 
     let cteBodyWrite: CapturedStatementKind | undefined;
     for (;;) {
-        // The alias. A quoted identifier is skipped whole, so `"select"`, `` `update` `` and
-        // `[delete]` are names rather than keywords; a bare word is consumed as the name it is.
         let cursor = skipTrivia(query, index, lexicon);
         if (cursor >= query.length) {
             return undefined;
@@ -381,7 +313,6 @@ function classifyCteStatement(
             cursor = alias.end;
         }
 
-        // An optional column list, which is a balanced group and never a body.
         let next = skipTrivia(query, cursor, lexicon);
         if (query.charAt(next) === '(') {
             const closing = findMatchingParenthesis(query, next, lexicon);
@@ -392,7 +323,6 @@ function classifyCteStatement(
             next = skipTrivia(query, cursor, lexicon);
         }
 
-        // `AS`, then an optional `[NOT] MATERIALIZED`.
         const asKeyword = readWord(query, cursor, lexicon);
         if (asKeyword === undefined || asKeyword.word !== 'as') {
             return undefined;
@@ -407,8 +337,6 @@ function classifyCteStatement(
             cursor = materialized.end;
         }
 
-        // The body, which must be a balanced group. Its own leading keyword is what identifies a
-        // data-modifying definition.
         const bodyStart = skipTrivia(query, cursor, lexicon);
         if (query.charAt(bodyStart) !== '(') {
             return undefined;
@@ -423,7 +351,6 @@ function classifyCteStatement(
         }
         index = bodyEnd + 1;
 
-        // A comma continues the prologue; anything else ends it.
         const afterBody = skipTrivia(query, index, lexicon);
         if (query.charAt(afterBody) !== ',') {
             index = afterBody;
@@ -474,8 +401,6 @@ function findMatchingParenthesis(
         }
         if (character === '/' && text.charAt(index + 1) === '*') {
             // Nested where the engine nests: a PostgreSQL CTE body containing `/* a /* b *&#47; c *&#47;`
-            // ends at the last delimiter, and a non-nesting scan would find the closing parenthesis in
-            // the wrong place — or not at all — and abandon the structural parse.
             index = skipBlockComment(text, index, lexicon);
             continue;
         }
@@ -502,16 +427,8 @@ function skipLineComment(text: string, openIndex: number): number {
 }
 
 /**
- * Returns the index immediately after the block comment starting at `openIndex`. An unterminated
- * comment consumes the rest of the text.
- *
- * ★ Nesting is engine-specific and the direction of the mistake is not symmetric. PostgreSQL nests
- * block comments, so in `/* a /* b *&#47; c *&#47; DELETE FROM reorder_list` the comment ends at the LAST
- * delimiter and the delete runs; a scanner that stops at the first delimiter reads `c *&#47; DELETE ...`,
- * takes `c` as the leading keyword, classifies `other`, and a zero-write assertion passes while rows
- * are gone. MySQL, MariaDB and SQLite do not nest, and there the opposite error applies: treating the
- * comment as nested would swallow SQL the engine really executes. So nesting is applied only where the
- * engine actually nests — never under the fail-closed default, where not nesting is the loud direction.
+ * Returns the index immediately after the block comment starting at `openIndex`. An unterminated comment consumes
+ * the rest of the text.
  */
 function skipBlockComment(
     text: string,
@@ -545,13 +462,6 @@ function skipBlockComment(
 
 /**
  * Returns the index immediately after a `#` line comment, which runs to the end of the line.
- *
- * ★ `#` is a comment on MySQL and MariaDB only, and it is also the fail-closed reading for an engine
- * this module has not been taught. Not recognising it is the silent failure: `# lead` followed by a
- * newline and `DELETE FROM reorder_list` is a delete on MySQL, while a scanner that reads `#` as the
- * leading token classifies the statement `other` and drops the write from `writesFor()`. Recognising it
- * on an engine that has no `#` at worst reads a statement that would not have parsed, which fails
- * loudly rather than quietly. See {@link DialectLexicon.hashComments}.
  */
 function skipHashComment(text: string, openIndex: number): number {
     const lineEnd = text.indexOf('\n', openIndex);
@@ -600,7 +510,6 @@ function skipTrivia(text: string, fromIndex: number, lexicon: DialectLexicon = U
         }
         if (character === '#' && lexicon.hashComments) {
             // Trivia on MySQL and MariaDB. Without this a `#` note anywhere inside a CTE prologue —
-            // `WITH # note` + newline + `x AS (...) DELETE FROM reorder_list` — stops the structural
             // parse dead, the statement classifies `other`, and the delete disappears from writesFor().
             index = skipHashComment(text, index);
             continue;
@@ -657,14 +566,7 @@ function skipStringLiteral(text: string, openIndex: number): number {
 }
 
 /**
- * @description
- * Extracts the tables a statement references, from table **positions** only.
- *
- * DDL is covered as well as DML, because the migration suite inspects the statements issued while a
- * migration is applied and reverted. `CREATE TABLE`, `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE`,
- * `DROP TABLE`, `DROP TABLE IF EXISTS`, `TRUNCATE TABLE`, a foreign key's `REFERENCES`,
- * `CREATE [UNIQUE] INDEX ... ON <table>`, `DROP INDEX ... ON <table>` and SQLite's table-rebuild
- * `RENAME TO <table>` all attribute their table.
+ * @description Extracts the tables a statement references, from table **positions** only.
  */
 export function extractStatementTables(query: string, dialect?: string): string[] {
     if (typeof query !== 'string' || query.length === 0) {
@@ -676,10 +578,8 @@ export function extractStatementTables(query: string, dialect?: string): string[
         for (let index = 0; index < tokens.length; index++) {
             const token = tokens[index];
             if (token.kind !== 'word') {
-                // ★ Only a *bare* word can introduce a table. A quoted token is a name or a value, never
+                // Only a *bare* word can introduce a table. A quoted token is a name or a value, never
                 // syntax, which is what stops MySQL's `SELECT "FROM" reorder_list` — a table-less select
-                // whose string literal carries the alias `reorder_list` — from being read as a `FROM`
-                // clause. A text scan that unwrapped the quotes first would make the keyword real, and an
                 // unrelated statement could then stand in for a missing plugin write.
                 continue;
             }
@@ -694,7 +594,6 @@ export function extractStatementTables(query: string, dialect?: string): string[
             }
         }
     } catch {
-        // A parse problem must never become a query failure or a test failure in the code under
         // test, so the statement is reported as referencing no table rather than throwing. The
         // statement itself is still captured, and `format()` still shows its text.
         return [];
@@ -703,15 +602,8 @@ export function extractStatementTables(query: string, dialect?: string): string[
 }
 
 /**
- * @description
- * The table (or tables) a row-level write **actually targets**, as distinct from every table the statement
- * mentions.
- *
- * **What it returns.** For an `INSERT`/`REPLACE ... INTO t`, an `UPDATE t`, or a `DELETE FROM t` — each
- * located at parenthesis depth zero, so a sub-query's own `FROM` cannot be mistaken for the target — the
- * target table name (or the whole comma-separated list, for MySQL's multi-table write forms), lower-cased and
- * de-duplicated. For a statement that is not a row-level write — a `SELECT`, a transaction-control statement,
- * DDL — an **empty array**, because such a statement targets no row.
+ * @description The table (or tables) a row-level write **actually targets**, as distinct from every table the
+ * statement mentions.
  */
 export function extractStatementTargetTables(query: string, dialect?: string): string[] {
     if (typeof query !== 'string' || query.length === 0) {
@@ -719,14 +611,10 @@ export function extractStatementTargetTables(query: string, dialect?: string): s
     }
     try {
         if (WRITE_KINDS.indexOf(classifyStatement(query, dialect)) === -1) {
-            // Not a row-level write: there is no target, and this is the one branch that may return an empty
-            // array without it meaning "could not tell".
             return [];
         }
         const tokens = tokeniseForTableScan(query, lexiconFor(dialect));
         const targets = writeTargetsFromTokens(tokens);
-        // The loud fallback. A write whose target could not be located is attributed to everything it
-        // references, so a filtered count over-reports rather than under-reports.
         return targets.length > 0 ? targets : extractStatementTables(query, dialect);
     } catch {
         return extractStatementTables(query, dialect);
@@ -735,15 +623,6 @@ export function extractStatementTargetTables(query: string, dialect?: string): s
 
 /**
  * Locates the target list of the first row-level write keyword at parenthesis depth zero.
- *
- * **A form this scan cannot certify yields nothing rather than a partial answer, and that is the load-bearing
- * decision here.** MySQL and MariaDB accept multi-table writes — `DELETE a, b FROM a JOIN b ON ...` and
- * `UPDATE a JOIN b ON ... SET a.x = 1, b.y = 2` — in which more than one table loses or changes rows. Reading
- * only the first name out of one of those would name a real target and silently omit a real target, and the
- * omission is the dangerous half: `writesFor('b')` would come back empty for a statement that writes `b`, so a
- * suite asserting "nothing wrote to `b`" would pass while `b` was being written. Returning nothing instead
- * routes the caller to its fallback, which attributes the statement to every table it references — so such
- * an assertion fails loudly and gets looked at.
  */
 function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
     let depth = 0;
@@ -766,10 +645,8 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
         }
         if (token.text === 'insert' || token.text === 'replace') {
             // `INSERT INTO t`, and the MySQL forms that put a modifier first — `INSERT IGNORE INTO t`,
-            // `INSERT LOW_PRIORITY INTO t`, `REPLACE DELAYED INTO t`. The target is whatever follows the
             // depth-zero `INTO`; where the dialect omits `INTO` altogether the name follows the keyword
             // directly. `INTO` is skipped here rather than through {@link SKIPPABLE_PRE_TABLE_WORDS},
-            // because that list is shared with the reference scan and widening it would change how every
             // other statement form is read.
             const intoIndex = depthZeroWordIndex(tokens, index + 1, 'into');
             return normaliseTableNames(
@@ -779,8 +656,6 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
         if (token.text === 'update' && !isNonTableUpdate(tokens, index)) {
             // The certifiable shape is `UPDATE <one table> [alias] SET ...`. Recognized MySQL/MariaDB write
             // modifiers are skipped by {@link skipWriteModifiers} before the target is read. A join, a comma
-            // or multi-target list, a missing depth-zero `SET`, or another uncertifiable structure is refused
-            // so the caller falls back to attributing every referenced table. See
             // {@link writeTargetsFromTokens}'s own note on why refusing beats guessing here.
             const setIndex = depthZeroWordIndex(tokens, index + 1, 'set');
             const updateFrom = skipWriteModifiers(tokens, index + 1);
@@ -792,10 +667,7 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
         }
         if (token.text === 'delete') {
             // The certifiable shape is `DELETE FROM <one table> ...`, which also covers PostgreSQL's
-            // `DELETE FROM a USING b` correctly: `USING` introduces a *source*, and only `a` loses rows.
             // Recognized MySQL/MariaDB modifiers before `FROM` are skipped by {@link skipWriteModifiers}.
-            // An identifier remaining between those modifiers and `FROM`, a join, a comma or multi-target
-            // list after `FROM`, or another uncertifiable structure is refused to the loud fallback.
             const fromIndex = depthZeroWordIndex(tokens, index + 1, 'from');
             if (
                 fromIndex === -1 ||
@@ -813,15 +685,6 @@ function writeTargetsFromTokens(tokens: ScanToken[]): string[] {
 
 /**
  * Words MySQL and MariaDB permit between a write keyword and its target table.
- *
- * They matter because `UPDATE` and `DELETE` have no `INTO` to anchor the scan the way `INSERT` does, so a
- * modifier sits exactly where the table name would and a naive scan reads it *as* the table. That failure is
- * silent in the worst direction — `UPDATE IGNORE t SET ...` would be filed under a table called `ignore`, and
- * `writesFor('t')` would then come back empty for a statement that writes `t` — and it is not fixed by
- * deferring to the reference scan, because that scan reads the modifier as the table too. The list is closed
- * and documented by both engines, so these words are *skipped* to reach the real target rather than refused,
- * exactly as {@link SKIPPABLE_PRE_TABLE_WORDS} skips `IF NOT EXISTS` and `ONLY`. Genuine multi-target forms are
- * a different matter and are refused; see {@link writeTargetsFromTokens}.
  */
 const WRITE_MODIFIER_WORDS = ['low_priority', 'high_priority', 'quick', 'delayed', 'ignore', 'concurrent'];
 
@@ -905,12 +768,6 @@ interface ScanToken {
 
 /**
  * Tokenises a statement for the table scan, discarding everything the database will not execute.
- *
- * String literals — including PostgreSQL's dollar-quoted form — and all three comment forms (`--`,
- * `/* *&#47;` and `#`) are dropped entirely, so `SELECT 'FROM reorder_list' AS note FROM customer` and
- * `SELECT $$FROM reorder_list$$ AS note FROM customer` both touch only `customer`. Getting this wrong is
- * not cosmetic: an exact plugin-statement count would otherwise accept an unrelated statement in place of
- * the one it was looking for, and a missing write would pass as a present one.
  */
 function tokeniseForTableScan(query: string, lexicon: DialectLexicon): ScanToken[] {
     const tokens: ScanToken[] = [];
@@ -944,12 +801,10 @@ function tokeniseForTableScan(query: string, lexicon: DialectLexicon): ScanToken
         if (character === '/' && query.charAt(index + 1) === '*') {
             const end = skipBlockComment(query, index, lexicon);
             if (executableCommentBodyRuns(query, index, lexicon)) {
-                // ★ Not a comment on this engine. `/*! ... *&#47;` and MariaDB's `/*M! ... *&#47;` are
+                // Not a comment on this engine. `/*! ... *&#47;` and MariaDB's `/*M! ... *&#47;` are
                 // *executed* by the MySQL family, so `/*! DELETE FROM reorder_list *&#47;` really does
                 // delete rows. Dropping the body would leave the statement with no tables and a kind of
-                // `other`, and a zero-write assertion would pass over a genuine delete. The body is
                 // therefore tokenised in place — recursively, so a nested quoted or dotted name inside it
-                // is read exactly as it would be outside.
                 for (const inner of tokeniseForTableScan(executableCommentBody(query, index, end), lexicon)) {
                     tokens.push(inner);
                 }
@@ -987,14 +842,8 @@ function tokeniseForTableScan(query: string, lexicon: DialectLexicon): ScanToken
 }
 
 /**
- * Whether the block comment at `openIndex` is one the target engine will **execute**, so that its body
- * must be read as SQL rather than discarded.
- *
- * True for `/*!` and MariaDB's `/*M!` — with or without a version prefix — under a string-quoting engine
- * (MySQL, MariaDB), which are the engines that run them. Also true under an **unknown** engine, which is
- * the fail-closed direction here: reading the body can only *add* tables and writes, so a zero-write
- * assertion fails loudly rather than passing over SQL that some engine would have run. Under an
- * identifier-quoting engine the construct really is an inert comment and is discarded.
+ * Whether the block comment at `openIndex` is one the target engine will **execute**, so that its body must be read
+ * as SQL rather than discarded.
  */
 function executableCommentBodyRuns(text: string, openIndex: number, lexicon: DialectLexicon): boolean {
     return isExecutableBlockComment(text, openIndex, lexicon);
@@ -1110,7 +959,7 @@ function statementIsIndexDdl(tokens: ScanToken[]): boolean {
 /**
  * Words that cannot be a table alias, so a comma after one of them is not a table-list separator.
  *
- * ★ This list is what keeps `UPDATE reorder_list SET "name" = $1, "nameKey" = $2` from filing `nameKey`
+ * This list is what keeps `UPDATE reorder_list SET "name" = $1, "nameKey" = $2` from filing `nameKey`
  * as a second table: without it, `SET` reads as an alias and the comma that separates two assignments
  * reads as the comma that separates two tables.
  */
@@ -1156,18 +1005,9 @@ const NON_ALIAS_WORDS = [
 ];
 
 /**
- * Every table name introduced at or after `index`, reading past the words that may sit between a
- * table-introducing keyword and its table (`IF NOT EXISTS`, `ONLY`), and **following a comma-separated
- * table list to its end**. Empty when no name follows — which is the answer for `FROM (SELECT ...)`,
- * where the next token is punctuation.
- *
- * ★ Why the comma list is followed rather than stopping at the first name. `FROM a, b` is the older join
- * syntax, and `UPDATE a, b SET ...` and `DELETE a, b FROM ...` are MySQL's multi-table write forms. Reading
- * only the first name in any of them would attribute a raw multi-table `UPDATE` naming a plugin table
- * second entirely to the first table — and `writesFor('reorder_list')` returning zero would then pass over
- * a write that really happened. That is the silent direction of
- * failure, which is the one this instrument may not have: for table attribution an extra name makes an
- * exact count fail loudly, whereas a missing name makes a "nothing was written" assertion pass quietly.
+ * Every table name introduced at or after `index`, reading past the words that may sit between a table-introducing
+ * keyword and its table (`IF NOT EXISTS`, `ONLY`), and **following a comma-separated table list to its end**. Empty
+ * when no name follows — which is the answer for `FROM (SELECT ...)`, where the next token is punctuation.
  */
 function tableTokensAfter(tokens: ScanToken[], index: number): string[] {
     const found: string[] = [];
@@ -1183,13 +1023,7 @@ function tableTokensAfter(tokens: ScanToken[], index: number): string[] {
             if (token.kind !== 'word' && token.kind !== 'quoted') {
                 return found;
             }
-            // ★ A qualified name must be consumed whole, and the **last** segment is the table.
-            // `FROM public.reorder_list`, `UPDATE "public"."reorder_list"` and
             // `REFERENCES catalog.schema.reorder_list` are all ordinary PostgreSQL, and stopping at the
-            // first segment would file every one of them under `public` or `catalog`. The plugin table
-            // would then be absent from `tables`, and `writesFor('reorder_list').length === 0` would
-            // pass over a write that really happened — silent, and on the connections most likely to be
-            // configured with a schema.
             let table = token.text;
             cursor++;
             while (
@@ -1205,7 +1039,6 @@ function tableTokensAfter(tokens: ScanToken[], index: number): string[] {
             expectingName = false;
             continue;
         }
-        // A name has been read; only an alias then a comma continues the list.
         if (token.kind === 'other' && token.text === ',') {
             cursor++;
             expectingName = true;
@@ -1216,7 +1049,6 @@ function tableTokensAfter(tokens: ScanToken[], index: number): string[] {
             continue;
         }
         if (token.kind === 'word' && NON_ALIAS_WORDS.indexOf(token.text) === -1) {
-            // A bare word that is not a clause keyword is this table's alias; a comma may still follow.
             cursor++;
             continue;
         }
@@ -1230,18 +1062,8 @@ function tableTokensAfter(tokens: ScanToken[], index: number): string[] {
 }
 
 /**
- * @description
- * Classifies a statement on its first keyword, after leading whitespace, leading SQL comments and a
+ * @description Classifies a statement on its first keyword, after leading whitespace, leading SQL comments and a
  * leading `(` have been discarded.
- *
- * **A `WITH` statement is classified by walking past its common-table-expression definitions, never
- * by searching its text for a keyword.** `WITH ... SELECT` is a `select`, and `WITH ... INSERT`,
- * `WITH ... UPDATE` and `WITH ... DELETE` are the corresponding **writes** — as is a statement whose
- * terminal keyword is `SELECT` but whose CTE body writes, such as PostgreSQL's
- * `WITH removed AS (DELETE FROM t RETURNING *) SELECT * FROM removed`. Classifying any of those as a
- * read would let a `writesFor(...)` count of zero pass while rows had been changed, which is the exact
- * false pass this instrument exists to prevent; {@link classifyCteStatement} carries the full
- * reasoning and the precedence rule.
  */
 export function classifyStatement(query: string, dialect?: string): CapturedStatementKind {
     if (typeof query !== 'string' || query.length === 0) {
@@ -1261,9 +1083,7 @@ export function classifyStatement(query: string, dialect?: string): CapturedStat
                 return extractStatementTables(query, dialect).length === 0 ? 'other' : 'select';
             case 'WITH': {
                 // A common-table-expression prologue hides the statement's real keyword behind its
-                // definitions, so the prologue is parsed definition by definition rather than searched
                 // through. See `classifyCteStatement` for the two cheaper implementations that both
-                // report a write as a read.
                 const cteKind = classifyCteStatement(stripLeadingNoise(query, lexicon), lexicon);
                 if (cteKind === undefined) {
                     return 'other';
@@ -1293,7 +1113,6 @@ export function classifyStatement(query: string, dialect?: string): CapturedStat
                 return 'other';
         }
     } catch {
-        // Classification degrades to `other` rather than throwing, for the same reason
         // `extractStatementTables` degrades to an empty list.
         return 'other';
     }
@@ -1322,11 +1141,6 @@ function resolveStatementText(statement: CapturedStatement | string): string {
 
 /**
  * Every quoted run of a statement replaced by spaces of the same length, delimiters included.
- *
- * The four delimiters cover every dialect this suite meets: `'` for a string on all of them, `"` for an
- * identifier on PostgreSQL and SQLite and a string on the MySQL family, a back quote for an identifier on the
- * MySQL family, and a bracket for one on SQL Server. Escaping and doubling inside each run are handled by the
- * same scanners the rest of this fixture uses, so a doubled quote does not terminate a run early.
  */
 function blankQuotedRuns(text: string): string {
     let output = '';
@@ -1347,19 +1161,7 @@ function blankQuotedRuns(text: string): string {
 }
 
 /**
- * @description
- * What kind of row lock a statement asks the engine for: `'exclusive'`, `'shared'`, or `'none'`.
- *
- * ★ **It exists because lock ORDER is a correctness property that no payload assertion can see.** Two
- * transactions taking the same two rows in opposite orders deadlock, and the engine resolves that by killing
- * one of them — which a caller observes as an operation that failed for no reason it can see, intermittently,
- * under load. The order a service actually takes its locks in is visible only in the statements it issued and
- * the sequence it issued them in, which is precisely what this instrument records. Reading the lock clause off
- * each statement turns "the parent is locked before the child" into an assertion.
- *
- * @param statement - A captured statement, or raw SQL text.
- * @returns `'exclusive'` for a `FOR UPDATE`, `'shared'` for a `FOR SHARE` or `LOCK IN SHARE MODE`, and
- * `'none'` when the statement asks for no row lock. An exclusive clause wins if somehow both appear.
+ * @description What kind of row lock a statement asks the engine for: `'exclusive'`, `'shared'`, or `'none'`.
  */
 export function classifyLockClause(statement: CapturedStatement | string): 'exclusive' | 'shared' | 'none' {
     const text = resolveStatementText(statement);
@@ -1380,16 +1182,10 @@ export function classifyLockClause(statement: CapturedStatement | string): 'excl
 }
 
 /**
- * The quote-stripped `WHERE` portion of a statement together with the number of positional `?`
- * placeholders that precede it.
- *
- * The count is what makes a positional placeholder inside the predicate resolvable to its bound
- * value: MySQL, MariaDB and SQLite render every placeholder as `?` and bind them **positionally
- * across the whole statement**, so the third `?` of an `UPDATE ... SET x = ? WHERE id = ? AND y = ?`
- * is `parameters[2]` — a number that cannot be recovered from the predicate alone.
+ * The quote-stripped `WHERE` portion of a statement together with the number of positional `?` placeholders that
+ * precede it.
  */
 interface WherePortion {
-    /** The predicate text, identifier quotes replaced by spaces, truncated at the first clause keyword. */
     text: string;
     /** How many `?` placeholders occur in the statement before this portion begins. */
     placeholderOffset: number;
@@ -1408,26 +1204,8 @@ function extractWherePortion(query: string, lexicon: DialectLexicon): string | u
 }
 
 /**
- *
- * The same extraction as {@link extractWherePortion}, additionally reporting how many positional
- * placeholders precede the predicate. Only the predicate-shape helpers need the offset; everything
- * else uses the simpler form.
- *
- * ★ **The scan is depth-, quote-, literal- and comment-aware, and every part of that matters.** A
- * textual search for the first `WHERE` and the first following clause keyword is wrong in three ways,
- * each of which silently narrows the predicate a shape assertion then inspects:
- *
- *  - **A nested terminator would truncate the predicate.** For the perfectly valid
- *    `WHERE id = $1 AND customerId = $2 AND channelId = $3 AND EXISTS (SELECT 1 FROM t LIMIT 1) OR 1=1`
- *    a textual search stops at the subquery's `LIMIT`, discarding the `OR 1=1` that makes the whole
- *    predicate satisfiable — and what is left reads as a clean three-way conjunction. That is a
- *    tenant-isolation bypass certified by a green assertion, so only a **depth-zero** terminator ends
- *    the predicate here.
- *  - **A nested `WHERE` would be read as the statement's own.** In
- *    `SELECT (SELECT 1 FROM x WHERE y = 1) FROM t WHERE id = $1` the first textual `WHERE` belongs to
- *    the subquery. Only a depth-zero `WHERE` is taken.
- *  - **A quoted identifier or a comment would be read as a keyword.** A column named `"where"` or
- *    `"limit"`, or the word in a `/* ... *&#47;` hint, is skipped rather than matched.
+ * The same extraction as {@link extractWherePortion}, additionally reporting how many positional placeholders
+ * precede the predicate. Only the predicate-shape helpers need the offset; everything else uses the simpler form.
  */
 function extractWherePortionWithOffset(query: string, lexicon: DialectLexicon): WherePortion | undefined {
     if (typeof query !== 'string' || query.length === 0) {
@@ -1448,7 +1226,6 @@ function extractWherePortionWithOffset(query: string, lexicon: DialectLexicon): 
         if (character === '#' && lexicon.hashComments) {
             // Trivia on the MySQL family, so a `#` note cannot contribute a keyword to this scan and
             // make a comment look like a terminator or a `WHERE`. On engines where `#` is an operator
-            // this branch is off and the character is scanned as ordinary text, which is what it is.
             index = skipHashComment(query, index);
             continue;
         }
@@ -1471,7 +1248,6 @@ function extractWherePortionWithOffset(query: string, lexicon: DialectLexicon): 
         }
         if (character === ')') {
             if (depth === 0) {
-                // A closing parenthesis with nothing open means the text cannot be read structurally.
                 return undefined;
             }
             depth--;
@@ -1485,9 +1261,7 @@ function extractWherePortionWithOffset(query: string, lexicon: DialectLexicon): 
         }
         if (character === ';' && depth === 0 && predicateStart !== -1) {
             // A statement separator ends the predicate as surely as a clause keyword does. Reading
-            // through it would leave the `;` inside the final leaf, where it defeats the anchored
             // comparison parse and costs a correctly scoped statement its certification. Whether text
-            // *follows* the separator is a separate question, refused by
             // {@link findDepthZeroStatementExpansion}.
             return buildWherePortion(query, predicateStart, index, placeholderOffset, lexicon);
         }
@@ -1564,7 +1338,6 @@ function blankComments(text: string, lexicon: DialectLexicon = UNKNOWN_LEXICON):
             const following = text.charAt(index + 2);
             if (following !== '' && !isWhitespace(following)) {
                 // Not trivia either: MySQL and MariaDB require whitespace after `--`, so `--1` is
-                // subtraction there and a comment elsewhere. Left in place so
                 // {@link findUncertifiableLexicalForm} can refuse it.
                 output += '--';
                 index += 2;
@@ -1581,7 +1354,6 @@ function blankComments(text: string, lexicon: DialectLexicon = UNKNOWN_LEXICON):
             if (isExecutableBlockComment(text, index, lexicon) || body.indexOf('/*') !== -1) {
                 // Not trivia. A MySQL or MariaDB executable comment (`/*!`, `/*M!`) runs on those
                 // engines, and a nested `/*` ends the comment in different places on PostgreSQL than
-                // on the rest — so leaving both in place is what lets
                 // {@link findUncertifiableLexicalForm} see them and refuse to certify.
                 output += text.slice(index, commentEnd);
             } else {
@@ -1610,7 +1382,6 @@ function buildWherePortion(
 ): WherePortion {
     const slice = blankComments(query.slice(predicateStart, predicateEnd), lexicon);
     // Where the engine reads `"..."` as a string, the region is data and is blanked with the other
-    // literals; only where it reads it as an identifier are the quotes stripped to expose a column name.
     const withoutQuotedData = lexicon.doubleQuote === 'string' ? blankDoubleQuotedStrings(slice) : slice;
     return {
         text: stripIdentifierQuotes(withoutQuotedData),
@@ -1658,22 +1429,7 @@ function containsStandaloneToken(text: string, token: string): boolean {
     return new RegExp(`(^|[^\\w.$])${escapeForRegExp(token)}($|[^\\w.$])`).test(text);
 }
 
-// Predicate-shape analysis.
-//
-// ★ Why a parser rather than a text search, stated once for the three helpers below. A scoped read or
-// a conditional write is required to carry the acting customer and the active channel **as conjuncts
 // beside the row's own identifier** (FEATURE-001-01 §2.6.1.1). Three shapes satisfy a text search for
-// those column names and yet fail that requirement outright:
-//
-//   1. `WHERE id = ? OR customerId = ? OR channelId = ?` — every name is present and every row in the
-//      table is reachable.
-//   2. `WHERE id = ? AND customerId = ? AND channelId = ?` with the values bound in the wrong order —
-//      the predicate has the right shape and scopes to the wrong tenant.
-//   3. `WHERE id = ? AND EXISTS (SELECT 1 FROM x WHERE customerId = ?)` — the name appears inside a
-//      subquery that may impose no scope on the addressed row at all.
-//
-// The parse below is deliberately conservative: a predicate it cannot read is reported as not
-// satisfying the requirement, never as satisfying it.
 
 /**
  * A boolean predicate as parsed from a `WHERE` portion. `and` and `or` carry their operands; a `leaf`
@@ -1758,16 +1514,9 @@ function normalisePlaceholders(portion: string, placeholderOffset: number): stri
 }
 
 /**
- * The boolean constructs this parser deliberately refuses to interpret, each with the reason it
- * cannot be interpreted safely. Encountering any of them makes the fragment **uncertifiable**: it is
- * neither read as a conjunction nor as a disjunction, and {@link predicateRequires} answers `false`.
- *
- *  - Guessing **wrongly permissive** certifies a predicate the database can satisfy without the
- *    ownership scope, so an ownership suite reports a tenant-isolation bypass as correctly scoped.
- *    `WHERE id = ? AND customerId = ? AND channelId = ? AND 0 || 1 = 1` is exactly that: a word-form
- *    parser sees a three-conjunct `AND` tree with all the required leaves and answers `true`, while
- *    MySQL and MariaDB — where `||` is logical OR unless `PIPES_AS_CONCAT` is enabled, and this
- *    repository enables nothing of the kind — evaluate `(scope AND 0) OR TRUE` and return every row.
+ * The boolean constructs this parser deliberately refuses to interpret, each with the reason it cannot be
+ * interpreted safely. Encountering any of them makes the fragment **uncertifiable**: it is neither read as a
+ * conjunction nor as a disjunction, and {@link predicateRequires} answers `false`.
  */
 const UNCERTIFIABLE_OPERATORS: Array<{ readonly token: string; readonly reason: string }> = [
     {
@@ -1812,19 +1561,8 @@ const UNCERTIFIABLE_WORDS: Array<{ readonly word: string; readonly reason: strin
 ];
 
 /**
- * @description
- * How an engine reads a double-quoted region — the one lexical difference between the four target
+ * @description How an engine reads a double-quoted region — the one lexical difference between the four target
  * engines that changes what a predicate *means* rather than merely how it is spelled.
- *
- * ★ Why this had to become a first-class input rather than a guess from the text. On PostgreSQL and the
- * SQLite family `"customerId"` is a column. On MySQL and MariaDB, whose default SQL mode does not
- * include `ANSI_QUOTES`, it is the string `'customerId'` — so
- * `WHERE target.id = 1 AND "customerId" = 'customerId' AND target.channelId = 2` compares a constant to
- * itself, is true for every row, and carries no customer scope at all. Read as an identifier it looks
- * like a perfectly ordinary equality on `customerId`. No amount of inspecting the *shape* of the quoted
- * text separates those two readings, because both are legal and the difference lives entirely in the
- * engine's configuration. So the engine is carried alongside the statement, and where it is not known
- * the region is refused.
  */
 export type DoubleQuoteMeaning = 'identifier' | 'string' | 'unknown';
 
@@ -1870,14 +1608,7 @@ export function doubleQuoteMeaningFor(driverType: string | undefined): DoubleQuo
 }
 
 /**
- * @description
- * Everything about a driver's **lexis** that changes what text the engine executes.
- *
- * - `"..."` is an identifier on PostgreSQL and SQLite, a string on MySQL and MariaDB.
- * - `# to end of line` is a comment on MySQL and MariaDB, and nothing at all elsewhere.
- * - `/* a /* b *&#47; c *&#47;` nests on PostgreSQL — the comment ends at the LAST delimiter — and does not
- *   nest on MySQL, MariaDB or SQLite, where it ends at the first.
- * - `/*! ... *&#47;` executes on MySQL and MariaDB; `/*M! ... *&#47;` executes on MariaDB only.
+ * @description Everything about a driver's **lexis** that changes what text the engine executes.
  */
 export interface DialectLexicon {
     /** How `"..."` reads. */
@@ -1899,19 +1630,8 @@ const NESTED_COMMENT_DRIVERS = ['postgres', 'aurora-postgres', 'cockroachdb'];
 const MYSQL_FAMILY_DRIVERS = ['mysql', 'mariadb', 'aurora-mysql'];
 
 /**
- * @description
- * Resolves the full lexical model for a driver type. An unrecognised or absent driver yields the
- * fail-closed model, and **fail-closed means a different thing per field**:
- *
- * - `doubleQuote: 'unknown'` — a double-quoted region cannot be read, so predicate certification
- *   *refuses* rather than guessing. Guessing would certify a bypass.
- * - `hashComments: true` — `#` is treated as a comment, so the SQL after it is still read. Ignoring it
- *   would hide a real write behind what MySQL sees as a comment; treating it as a comment on an engine
- *   that has no `#` at worst reads a statement that would not have parsed, which fails loudly.
- * - `nestedBlockComments: false` — **deliberately not `true`.** Nesting where the engine does not nest
- *   *swallows* the SQL that follows the first delimiter, which is the silent direction; not nesting
- *   where it does invents a statement, which is the loud one. So nesting is enabled only where it is
- *   real.
+ * @description Resolves the full lexical model for a driver type. An unrecognised or absent driver yields the fail-
+ * closed model, and **fail-closed means a different thing per field**:
  */
 export function lexiconFor(driverType: string | undefined): DialectLexicon {
     const normalised = typeof driverType === 'string' ? driverType.toLowerCase() : '';
@@ -1953,17 +1673,9 @@ function lexiconForStatement(
 }
 
 /**
- * The reasons a **lexical** form makes text uncertifiable. Each is a place where the four target
- * engines disagree about where a comment or a literal ends, and every one of them can therefore hide a
- * live top-level disjunction from a scanner that picks one engine's rule.
- *
- * ★ This list is **not** claimed to be exhaustive, and the contract does not rest on it being so — a claim
- * of exhaustiveness would be wrong, as MariaDB's `/*M!` and PostgreSQL's dollar quoting each show. What
- * makes the contract safe is not the length of this list but the
- * propagation rule in {@link combine}: a fragment this parser cannot read makes the **whole enclosing
- * node** unread, so a construct nobody has enumerated yet cannot smuggle a bypass past a clean sibling.
- * The entries here turn an unknown construct into a *named* refusal rather than a silent one, which is
- * worth having; they are not the safety property.
+ * The reasons a **lexical** form makes text uncertifiable. Each is a place where the four target engines disagree
+ * about where a comment or a literal ends, and every one of them can therefore hide a live top-level disjunction
+ * from a scanner that picks one engine's rule.
  */
 const UNCERTIFIABLE_LEXICAL_REASONS = {
     backslash:
@@ -1999,8 +1711,6 @@ const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*$/;
 
 function isAmbiguousDoubleQuotedRegion(text: string, openIndex: number): boolean {
     const end = skipQuotedIdentifier(text, openIndex);
-    // `skipQuotedIdentifier` returns the index just past the closing quote; an unterminated region runs
-    // to the end of the text, and is ambiguous by the same argument.
     const closed = text.charAt(end - 1) === '"' && end - 1 > openIndex;
     if (!closed) {
         return true;
@@ -2047,14 +1757,12 @@ function findUncertifiableLexicalForm(text: string, lexicon: DialectLexicon): st
         }
         if (character === '"') {
             if (lexicon.doubleQuote === 'unknown') {
-                // Neither reading can be ruled out, and they differ in whether the region constrains a
                 // column at all, so the statement is not certifiable. This is the whole reason the
                 // engine is carried on a captured statement.
                 return UNCERTIFIABLE_LEXICAL_REASONS.ambiguousDoubleQuote;
             }
             if (lexicon.doubleQuote === 'string') {
                 // The engine reads this as a string literal, and a literal is never a column, so it is
-                // skipped as data. `"customerId" = 'customerId'` is then a comparison of two constants
                 // rather than a predicate on `customerId`, which is exactly what the engine does.
                 index = skipQuotedIdentifier(text, index);
                 continue;
@@ -2067,7 +1775,6 @@ function findUncertifiableLexicalForm(text: string, lexicon: DialectLexicon): st
         }
         if (character === '`' || character === '[') {
             // Backticks and brackets are identifier quotes on every engine that accepts them at all and
-            // are never string delimiters, so they carry no ambiguity to refuse.
             index = skipQuotedIdentifier(text, index);
             continue;
         }
@@ -2278,10 +1985,6 @@ function splitTopLevel(text: string, keyword: 'and' | 'or'): string[] {
             }
             const word = text.slice(index, end).toLowerCase();
             if (word === 'between') {
-                // `x BETWEEN a AND b` spells one comparison with a keyword in the middle. That `AND` is
-                // part of the operator, not a connective, so the next one is skipped rather than split
-                // on — otherwise the range would break into two fragments neither of which is a
-                // predicate, and a legitimate range filter beside a real scope would stop parsing.
                 pendingBetween = true;
             } else if (word === keyword && !(keyword === 'and' && pendingBetween)) {
                 parts.push(text.slice(partStart, index));
@@ -2385,8 +2088,8 @@ function parseLeafComparison(leafText: string): LeafComparison | undefined {
 }
 
 /** The final segment of an identifier path, so `ReorderList . customerId` yields `customerId`. */
-function lastPathSegment(path: string): string {
-    const segments = path.split('.');
+function lastPathSegment(identifierPath: string): string {
+    const segments = identifierPath.split('.');
     return segments[segments.length - 1].replace(/^\s+|\s+$/g, '').toLowerCase();
 }
 
@@ -2394,8 +2097,8 @@ function lastPathSegment(path: string): string {
  * The segment immediately before the column in an identifier path — the relation the column belongs
  * to — or `undefined` when the column was written unqualified.
  */
-function pathQualifier(path: string): string | undefined {
-    const segments = path.split('.');
+function pathQualifier(identifierPath: string): string | undefined {
+    const segments = identifierPath.split('.');
     if (segments.length < 2) {
         return undefined;
     }
@@ -2462,7 +2165,6 @@ function predicateRequires(
         return node.children.length > 0;
     }
     if (node.kind === 'uncertifiable') {
-        // Fail closed. The fragment may or may not require this predicate; because the parser cannot
         // tell, it must not say that it does — see {@link UNCERTIFIABLE_OPERATORS}.
         return false;
     }
@@ -2476,13 +2178,7 @@ function predicateRequires(
     if (comparison.column !== requirement.column.toLowerCase()) {
         return false;
     }
-    // Relation agreement is required in **both** directions, which is what stops either half of the
-    // pair from being decided by silence:
-    //
-    //  - A comparison that names its relation must be matched by a requirement that names the same one.
-    //    Otherwise a scope proved on a joined alias would answer for the relation whose rows came back,
     //    and in a self-join those are the same table — see {@link LeafComparison.qualifier}.
-    //  - A requirement that names a relation must be matched by a comparison that names it too. A
     //    suite asking for `customerId` *of `ReorderList`* has said the statement is qualified; a bare
     //    `customerId` token is then not the thing it asked about.
     const declaredRelation =
@@ -2496,9 +2192,6 @@ function predicateRequires(
         return true;
     }
     if (requirement.value === undefined) {
-        // An explicit `undefined` is refused rather than read as "any value". A suite that passes a
-        // fixture identifier which was never assigned should fail loudly here, not silently fall back
-        // to the weaker column-only requirement; omitting the property is how "any value" is expressed.
         return false;
     }
     return operandMatchesValue(resolveOperand(comparison.operand, parameters), requirement.value);
@@ -2593,9 +2286,6 @@ function predicateMentionsColumn(
     }
     if (node.kind === 'uncertifiable') {
         // Fail closed, identically to {@link predicateRequires}, and for the stronger of the two
-        // reasons available here. Reporting the mention instead — on the grounds that a suite
-        // asserting a column is *absent* should fail loudly — would make an uncertifiable operand of a
-        // conjunction satisfy that conjunction, because an `and` node needs only one satisfying child.
         return false;
     }
     if (node.negated) {
@@ -2637,34 +2327,19 @@ function parseStatementPredicate(query: string, lexicon: DialectLexicon): Predic
  * One required predicate: a column, and optionally the value it must be compared against.
  */
 export interface ScopedPredicate {
-    /** The column that must be compared. Matched case-insensitively against the last path segment. */
     column: string;
     /**
      * The relation the column must belong to — the alias **as it appears in the statement**, so
      * `ReorderList` for TypeORM's `"ReorderList"."customerId"`, matched case-insensitively.
      */
     relation?: string;
-    /**
-     * The value it must be compared against. **Omit** the property to require only that the column is
-     * compared; passing it explicitly as `undefined` is refused rather than treated as "any value", so
-     * an identifier a fixture never assigned fails the assertion instead of quietly weakening it.
-     */
     value?: unknown;
 }
 
 /**
- * @description
- * True when **every** required column-and-value predicate is a **mandatory conjunct** of the
- * statement's `WHERE`: present in at least one operand of every conjunction, and in **every** operand
- * of every disjunction, with the required value bound to the required column.
- *
- * **Placeholder resolution covers all four engines.** PostgreSQL renders `$1`, `$2`, … and the others
- * render `?`; a positional `?` is resolved by counting the placeholders that precede the predicate,
- * because MySQL, MariaDB and SQLite bind positionally across the whole statement. An **inline literal**
- * is resolved too, which is not belt-and-braces: the SQLite family writes a numeric value straight
- * into the statement text and leaves `parameters` empty, and sql.js is the one engine on which an exact
- * statement count is asserted, so on precisely the counted engine a list identifier appears only as a
- * literal.
+ * @description True when **every** required column-and-value predicate is a **mandatory conjunct** of the
+ * statement's `WHERE`: present in at least one operand of every conjunction, and in **every** operand of every
+ * disjunction, with the required value bound to the required column.
  */
 export function whereRequiresScopedPredicates(
     statement: CapturedStatement | string,
@@ -2700,7 +2375,6 @@ export function whereRequiresScopedPredicates(
         return true;
     } catch {
         // A malformed statement is reported as not satisfying the requirement rather than throwing, so
-        // a parse problem can never be mistaken for a scoped predicate.
         return false;
     }
 }
@@ -2720,16 +2394,8 @@ interface SubqueryRelation {
 }
 
 /**
- * Clauses that decouple a sub-query's row count from the rows its predicate matched, and are therefore
- * refused outright inside an ownership sub-query.
- *
- * `group` and `having` are the load-bearing pair: an empty grouping set — `GROUP BY ()` on the MySQL family,
- * `GROUP BY GROUPING SETS (())` on PostgreSQL — produces ONE row for the whole input even when the input is
- * empty, so the enclosing `EXISTS` becomes true for a row nobody owns. `window`, `order`, `limit`, `offset`
- * and `fetch` cannot manufacture a row but can remove every one of them (`LIMIT 0`), which decouples the
- * `EXISTS` in the other direction. None appears in the SQL a query builder produces for this plugin, so
- * refusing all six costs nothing real and removes a whole class of shape this parser would otherwise have to
- * reason about.
+ * Clauses that decouple a sub-query's row count from the rows its predicate matched, and are therefore refused
+ * outright inside an ownership sub-query.
  */
 const ROW_COUNT_DECOUPLING_WORDS = ['group', 'having', 'window', 'order', 'limit', 'offset', 'fetch'];
 
@@ -2740,7 +2406,6 @@ const ROW_COUNT_DECOUPLING_WORDS = ['group', 'having', 'window', 'order', 'limit
 function subqueryReturnsOneRowPerMatch(subquery: string, lexicon: DialectLexicon): boolean {
     const tokens = tokeniseForTableScan(subquery, lexicon);
     // A sub-query that does not OPEN with `SELECT` is some other statement form — a `WITH` prelude, a
-    // parenthesised expression, a `VALUES` list — and is refused rather than read through.
     if (tokens.length === 0 || tokens[0].kind !== 'word' || tokens[0].text !== 'select') {
         return false;
     }
@@ -2776,15 +2441,8 @@ function subqueryReturnsOneRowPerMatch(subquery: string, lexicon: DialectLexicon
 }
 
 /**
- * The single relation a sub-query reads, or `undefined` where it reads none, reads more than one, or is
- * written in a form this scan cannot read.
- *
- * ★ **More than one relation is refused rather than analysed, and that is the fail-closed direction.** A
- * correlated ownership sub-query is a statement over exactly one table: the parent whose columns carry the
- * scope. Admit a second relation and the guarantee dissolves — `FROM reorder_list ol, reorder_list other`
- * lets the correlation address `ol` while the customer comparison addresses `other`, which is a predicate
- * satisfied by any list the caller owns and therefore reaches every line they can name. A join form does the
- * same. Neither occurs in the SQL a query builder produces for this plugin, so refusing costs nothing real.
+ * The single relation a sub-query reads, or `undefined` where it reads none, reads more than one, or is written in a
+ * form this scan cannot read.
  */
 function subqueryRelation(subquery: string, lexicon: DialectLexicon): SubqueryRelation | undefined {
     const tokens = tokeniseForTableScan(subquery, lexicon);
@@ -2802,7 +2460,6 @@ function subqueryRelation(subquery: string, lexicon: DialectLexicon): SubqueryRe
         }
         if (depth === 0 && token.kind === 'word' && token.text === 'from') {
             if (fromIndex !== -1) {
-                // A second depth-zero `FROM` is a second relation source, which this scan does not model.
                 return undefined;
             }
             fromIndex = index;
@@ -2815,12 +2472,9 @@ function subqueryRelation(subquery: string, lexicon: DialectLexicon): SubqueryRe
     if (cursor >= tokens.length) {
         return undefined;
     }
-    // A derived table — `FROM (SELECT ...)` — is punctuation here rather than a name, and is refused.
     if (tokens[cursor].kind !== 'word' && tokens[cursor].kind !== 'quoted') {
         return undefined;
     }
-    // A qualified name is consumed whole and its LAST segment is the table, so `public.reorder_list` is
-    // `reorder_list` rather than `public`.
     let table = tokens[cursor].text;
     cursor++;
     while (
@@ -2848,8 +2502,6 @@ function subqueryRelation(subquery: string, lexicon: DialectLexicon): SubqueryRe
         alias = tokens[cursor].text.toLowerCase();
         cursor++;
     }
-    // Only a predicate may follow the single relation. A comma continues a relation list and a join word
-    // introduces a second relation; both are refused, as is anything else this scan has not accounted for.
     if (cursor < tokens.length) {
         const next = tokens[cursor];
         if (next.kind !== 'word' || next.text !== 'where') {
@@ -2860,20 +2512,9 @@ function subqueryRelation(subquery: string, lexicon: DialectLexicon): SubqueryRe
 }
 
 /**
- * @description
- * One scope comparison a correlated ownership sub-query must carry: a column, the relation it may be
- * qualified by, and — unlike {@link ScopedPredicate}, from which this narrows — the value it must be
- * compared against, **required**.
- *
- * ★ **Why the value cannot be optional here.** {@link ScopedPredicate} treats an omitted `value` as
- * "require only that this column is compared", which is a reasonable weaker claim for a general predicate
- * assertion. It is not a reasonable claim for an ownership sub-query: `EXISTS (SELECT 1 FROM reorder_list ol
- * WHERE ol.id = "reorderListId" AND ol.customerId = $1 AND ol.channelId = $2)` has the right SHAPE whichever
- * way round `$1` and `$2` are bound, and the swapped binding scopes the write to a different tenant. A
- * column-only ownership requirement would certify it. So the property is required at compile time and
- * checked again at run time, and `undefined` is not an accepted value for it — the type is written as
- * "anything but `undefined`" so that both the omission and an explicitly-`undefined` fixture identifier are
- * compile errors rather than a silently weaker assertion.
+ * @description One scope comparison a correlated ownership sub-query must carry: a column, the relation it may be
+ * qualified by, and — unlike {@link ScopedPredicate}, from which this narrows — the value it must be compared
+ * against, **required**.
  */
 export interface CorrelatedOwnershipScopePredicate extends ScopedPredicate {
     /**
@@ -2891,17 +2532,12 @@ export interface CorrelatedOwnershipScopePredicate extends ScopedPredicate {
  * the row the statement is writing. See {@link whereRequiresCorrelatedOwnership}.
  */
 export interface CorrelatedOwnershipRequirement {
-    /**
-     * The table the sub-query must read — the parent table whose columns carry the scope. Matched
-     * case-insensitively and quote-agnostically against the single relation of the sub-query's `FROM`.
-     */
     table: string;
     /**
      * The correlation that ties the sub-query to the row the enclosing statement addresses, rather than to
      * the table at large.
      */
     correlation: {
-        /** The sub-query column compared — the parent's own identifier. */
         column: string;
         /** The enclosing statement's column it must be compared to — the child's reference to its parent. */
         outerColumn: string;
@@ -2910,36 +2546,13 @@ export interface CorrelatedOwnershipRequirement {
          */
         outerRelation?: string;
     };
-    /**
-     * The scope comparisons the sub-query must additionally require, each a mandatory conjunct of its
-     * predicate — for this plugin, the acting customer and the active channel.
-     */
     predicates: CorrelatedOwnershipScopePredicate[];
 }
 
 /**
- * @description
- * True when the statement's `WHERE` **requires** a correlated `EXISTS` sub-query that scopes the row being
- * addressed to its owner — the table, the correlation and every scope comparison all verified, and every
- * value resolved to its bound parameter.
- *
- * ★ **WHY THIS EXISTS, AND WHY THE OTHER TWO HELPERS CANNOT SERVE.** A `reorder_list_line` row stores its
- * parent's identifier, a variant reference and a quantity — no customer and no channel. So the only way a
- * line write can satisfy the contract's "one conditional statement whose `WHERE` carries the acting customer
- * and the active channel, with the affected-row count as the authority" is a sub-query over the parent table
- * (FEATURE-001-01 §2.11). {@link whereRequiresScopedPredicates} cannot certify that shape and must not
- * pretend to: its leaf recogniser accepts only `column <op> placeholder`, so an `EXISTS` is not a comparison
- * at all and the requirement fails closed. {@link whereMentionsColumns} refuses it even more explicitly — it
- * blanks any parenthesised `SELECT` before looking for a column name, precisely so that
- * `EXISTS (SELECT 1 FROM x WHERE customerId = ?)` is not mistaken for a predicate on the addressed row.
- * Both refusals are correct for what those helpers claim, but neither leaves a way to state the claim a line
- * write actually makes, and a suite reduced to scanning parameters or statement text for the customer's
- * identifier would be asserting presence rather than scope. This function closes that gap.
- *
- * @param statement A captured statement, whose bound parameters are used to resolve placeholders, or a raw
- * statement string, in which case only inline literals can be resolved.
- * @param requirement The table, correlation and scope comparisons the sub-query must carry.
- * @param dialect Overrides the statement's own recorded driver type, for a statement captured without one.
+ * @description True when the statement's `WHERE` **requires** a correlated `EXISTS` sub-query that scopes the row
+ * being addressed to its owner — the table, the correlation and every scope comparison all verified, and every value
+ * resolved to its bound parameter.
  */
 export function whereRequiresCorrelatedOwnership(
     statement: CapturedStatement | string,
@@ -3016,12 +2629,8 @@ function isUsableOwnershipRequirement(requirement: CorrelatedOwnershipRequiremen
         ) {
             return false;
         }
-        // The expected value is required, and re-checked here rather than left to the type. A suite compiled
-        // against an older shape, a value read out of a fixture that never assigned it, or a plain-JavaScript
         // caller can all present a predicate with no usable value — and {@link predicateRequires} reads an
         // ABSENT `value` as "require only that this column is compared", which for an ownership claim would
-        // certify a sub-query whose customer and channel parameters are bound the wrong way round. Refusing
-        // here is what keeps the compile-time requirement from being the only thing enforcing it.
         if (!Object.prototype.hasOwnProperty.call(predicate, 'value') || predicate.value === undefined) {
             return false;
         }
@@ -3079,8 +2688,6 @@ function leafIsCorrelatedOwnership(leafText: string, context: OwnershipContext):
     }
     const subquery = trimmed.slice(openIndex + 1, closeIndex);
     // The sub-query is re-examined for the refusals the outer statement was already checked for, because a
-    // construct that changes which rows it returns changes whether the `EXISTS` is satisfied — and a
-    // depth-zero set operator inside it does exactly that: `WHERE 1 = 0 UNION SELECT 1` is satisfied for
     // every row of the outer statement.
     if (
         findUncertifiableLexicalForm(subquery, context.lexicon) !== undefined ||
@@ -3098,15 +2705,11 @@ function leafIsCorrelatedOwnership(leafText: string, context: OwnershipContext):
         return false;
     }
     // Belt and braces over the same token stream the attribution scan uses: the sub-query must touch the one
-    // table and no other, anywhere in it — including inside a nested group the single-relation scan above
-    // reads past.
     const tables = extractStatementTables(subquery, context.dialect);
     if (tables.length !== 1 || tables[0] !== relation.table) {
         return false;
     }
-    // Placeholders are NOT re-normalised here. The whole outer `WHERE` portion was normalised before it was
     // split into leaves, so every `?` inside this sub-query already carries its statement-wide `$n` position;
-    // numbering it again from zero would resolve each one to the wrong parameter.
     const portion = extractWherePortionWithOffset(subquery, context.lexicon);
     if (portion === undefined) {
         return false;
@@ -3208,19 +2811,13 @@ function isCorrelationPair(
     ) {
         return false;
     }
-    // The sub-query's side must belong to the sub-query's relation. An unqualified column inside a verified
-    // single-relation sub-query can only be that relation's, so it is accepted; a column qualified by anything
-    // else is a comparison about some other relation.
     if (relationQualifiers(relation).indexOf(inner.qualifier) === -1) {
         return false;
     }
     if (typeof correlation.outerRelation === 'string' && correlation.outerRelation.length > 0) {
         return outer.qualifier === correlation.outerRelation.toLowerCase();
     }
-    // No outer relation was declared, so the reference may be written bare or qualified by the table the
     // enclosing statement writes — TypeORM does one on some engines and the other on others. What it may NOT
-    // be is qualified by the sub-query's own relation: `ol.id = ol.reorderListId` compares one row of the
-    // sub-query's table with itself and correlates to nothing outside it.
     if (outer.qualifier === undefined) {
         return true;
     }
@@ -3228,17 +2825,8 @@ function isCorrelationPair(
 }
 
 /**
- * @description
- * True when the statement's `WHERE` constrains **every** one of the given columns as a mandatory
+ * @description True when the statement's `WHERE` constrains **every** one of the given columns as a mandatory
  * conjunct, quote-agnostically.
- *
- *  - The portion examined runs from the statement's own `WHERE` keyword up to the first clause keyword
- *    that ends a `WHERE` (`GROUP BY`, `ORDER BY`, `HAVING`, `LIMIT`, `OFFSET`, `RETURNING`, `WINDOW`,
- *    `UNION`, `INTERSECT`, `EXCEPT`, `FETCH FIRST`/`FETCH NEXT`, `FOR UPDATE`/`FOR SHARE`). Without
- *    that truncation a column named only in the sort would count as a predicate conjunct. Both ends are
- *    resolved at **parenthesis depth zero**, so a subquery's own `WHERE` does not start the predicate
- *    and a subquery's own `LIMIT` does not end it — truncating at a nested terminator would silently
- *    discard whatever followed the subquery, an `OR` included.
  */
 export function whereMentionsColumns(
     statement: CapturedStatement | string,
@@ -3265,22 +2853,13 @@ export function whereMentionsColumns(
         return true;
     } catch {
         // A malformed statement is reported as not carrying the columns rather than throwing, so a
-        // parse problem can never be mistaken for a satisfied predicate.
         return false;
     }
 }
 
 /**
- * @description
- * True when the statement carries the given value — either as one of its bound parameters, or as an
+ * @description True when the statement carries the given value — either as one of its bound parameters, or as an
  * inline literal in its predicate.
- *
- * **Why the comparison is loose (`String(p) === String(value)`) rather than strict.** PostgreSQL
- * renders placeholders as `$1` while MySQL, MariaDB and SQLite render them as `?`, so the values
- * normally live in `parameters` and not in the statement text — and the harness's
- * `TestingEntityIdStrategy` presents identifiers externally as `T_1` while the bound parameter
- * carries the decoded identifier, which arrives as a number on one driver and a string on another.
- * **The caller is responsible for passing the decoded value**, not the external `T_n` form.
  */
 export function statementCarriesParameterValue(
     statement: CapturedStatement | readonly unknown[],
@@ -3314,8 +2893,6 @@ export function statementCarriesParameterValue(
             return false;
         }
         // The SQLite family inlines a numeric value into the statement text instead of binding it,
-        // so the predicate must be searched too. See this function's documentation for the driver
-        // line and for why it decides the counted assertions.
         const text = (statement as CapturedStatement).query;
         if (typeof text !== 'string' || text.length === 0) {
             return false;
@@ -3323,7 +2900,6 @@ export function statementCarriesParameterValue(
         const portion = extractWherePortion(text, lexiconFor((statement as CapturedStatement).dialect));
         return containsStandaloneToken(portion === undefined ? stripIdentifierQuotes(text) : portion, target);
     } catch {
-        // A parameter whose `toString` throws is reported as not matching rather than propagating.
         return false;
     }
 }
@@ -3336,13 +2912,7 @@ export function statementCarriesParameterValue(
  */
 export interface QueryCaptureFormatOptions {
     /**
-     * @description
-     * Renders every bound value and every quoted literal VERBATIM instead of describing it.
-     *
-     * Off by default, and the default is a security property rather than a style choice — see
-     * {@link QueryCaptureLogger.format}. Turn it on only for a local investigation, never in a committed
-     * assertion message: a failing assertion prints its message into the run's log, and a continuous
-     * integration log is readable by everyone who can see the build.
+     * @description Renders every bound value and every quoted literal VERBATIM instead of describing it.
      */
     readonly revealValues?: boolean;
 }
@@ -3388,12 +2958,6 @@ function describeParametersForDiagnostic(parameters: readonly unknown[] | undefi
 
 /**
  * Replaces every single-quoted literal in a statement with a description of its length.
- *
- * ★ WHY THE STATEMENT TEXT NEEDS THIS TOO, AND NOT ONLY THE PARAMETER LIST. The SQLite family — which is
- * the default engine for this package's suites — receives its values written INLINE rather than bound, so
- * a session look-up arrives as `... WHERE "token" = 'the-actual-token'` and describing the (empty)
- * parameter list would disclose it anyway. Numeric literals are deliberately left alone: they are the
- * identifiers a reader is diagnosing with, and they cannot carry a credential.
  */
 function redactQuotedLiterals(sql: string): string {
     let redacted = '';
@@ -3405,7 +2969,6 @@ function redactQuotedLiterals(sql: string): string {
             index++;
             continue;
         }
-        // Inside a literal. Consume to its close, counting the characters it held.
         let length = 0;
         let cursor = index + 1;
         let closed = false;
@@ -3431,7 +2994,6 @@ function redactQuotedLiterals(sql: string): string {
         redacted += `'<redacted:${length}>'`;
         if (!closed) {
             // An unterminated literal — a truncated statement, or one this scanner cannot read. Everything
-            // after the opening quote has already been replaced, which fails CLOSED.
             return redacted;
         }
         index = cursor;
@@ -3449,14 +3011,6 @@ const MIN_REDACTED_VALUE_LENGTH = 4;
 
 /**
  * Replaces the values a statement actually bound, wherever a driver's message repeats them.
- *
- * ★ WHY NOT THE QUOTED-LITERAL SCAN THAT THE STATEMENT TEXT GETS. A driver quotes more than the value into
- * its failure message: the MySQL family writes `Duplicate entry '<value>' for key '<constraint>'`, so a
- * scan that blanked every quoted run would take the CONSTRAINT NAME with it — and the constraint name is
- * the one part of that message the suites read, is not sensitive, and is what tells a reader which
- * invariant refused the write. Matching the bound values themselves is exact instead of heuristic: it
- * removes precisely what the statement supplied, leaves everything the driver added, and covers the forms
- * that are not quoted at all — PostgreSQL's `DETAIL: Key (col)=(value) already exists.` among them.
  */
 function redactKnownValues(text: string, parameters: readonly unknown[] | undefined): string {
     if (parameters === undefined) {
@@ -3465,8 +3019,6 @@ function redactKnownValues(text: string, parameters: readonly unknown[] | undefi
     let redacted = text;
     for (const value of parameters) {
         if (typeof value === 'string' && value.length >= MIN_REDACTED_VALUE_LENGTH) {
-            // `split`/`join` rather than a regular expression, so a value carrying regex metacharacters is
-            // matched literally rather than compiled into a pattern.
             redacted = redacted.split(value).join(`<redacted:${value.length}>`);
         }
     }
@@ -3483,8 +3035,6 @@ function safeStringify(value: unknown): string {
         const rendered = JSON.stringify(value);
         return rendered === undefined ? String(value) : rendered;
     } catch {
-        // Most probably a circular structure. Fall back to the default rendering rather than
-        // letting a diagnostic helper fail.
         try {
             return String(value);
         } catch {
@@ -3540,16 +3090,9 @@ function normaliseTableNames(tableNames: readonly string[]): string[] {
 }
 
 /**
- * @description
- * The canonical query-capture instrument: a TypeORM `Logger` that records every statement the data
- * source executes inside an explicitly opened window, so a specification can assert an **exact**
- * statement count, the order of the statements, the shape of their predicates and their bound
- * parameters.
- *
- * Install it by merging {@link queryCaptureConfig} — or the equivalent literal — into the config the
- * spec file built from its own top-level `testConfig()` call. It must be a **class instance** and
- * never an object literal; the module header explains why, and `reset()` silently stops working if
- * that is ignored.
+ * @description The canonical query-capture instrument: a TypeORM `Logger` that records every statement the data
+ * source executes inside an explicitly opened window, so a specification can assert an **exact** statement count,
+ * the order of the statements, the shape of their predicates and their bound parameters.
  */
 export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     private readonly capturedStatements: CapturedStatement[] = [];
@@ -3663,13 +3206,8 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     }
 
     /**
-     * @description
-     * Runs `fn` with the capture window open and closes it in a `finally`, so a throwing or
-     * rejecting operation still ends the window and the rejection still propagates unchanged.
-     *
-     * This is the mechanism behind epic §11.6.2's second rule — capture is bounded by the request
-     * rather than by the test — so fixture writes, authentication and cleanup stay outside every
-     * count.
+     * @description Runs `fn` with the capture window open and closes it in a `finally`, so a throwing or rejecting
+     * operation still ends the window and the rejection still propagates unchanged.
      */
     async capture<T>(fn: () => Promise<T>): Promise<T> {
         const wasEnabled = this.captureEnabled;
@@ -3745,15 +3283,8 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     }
 
     /**
-     * @description
-     * Every statement captured that is not transaction control, **whatever table it names** — including
+     * @description Every statement captured that is not transaction control, **whatever table it names** — including
      * statements against tables this plugin does not own, and table-less probes.
-     *
-     * Transaction control is excluded because it is bookkeeping rather than work, and its volume tracks
-     * the number of transactions rather than the size of the page — a read that opens one transaction
-     * per page contributes the same `START TRANSACTION`/`COMMIT` pair whatever the page size, so
-     * including it would only add a constant to both sides. It is excluded rather than dropped: the
-     * statements remain in {@link statements} for the same-transaction proofs that depend on them.
      */
     nonTransactionStatements(): CapturedStatement[] {
         return this.capturedStatements.filter(entry => entry.kind !== 'transaction');
@@ -3764,31 +3295,9 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     }
 
     /**
-     * @description
-     * A compact, deterministic, multi-line dump of everything captured — one line per statement,
-     * carrying its sequence, kind, runner identifier, transaction state, extracted tables, the
-     * statement text truncated to a character budget, and its parameters.
-     *
-     * ★ VALUES ARE DESCRIBED, NOT DISCLOSED, AND THAT IS THE POINT OF THE DEFAULT. This instrument is
-     * installed on the whole connection, so what it captures is not only the plugin's statements: a
-     * request that resolves a session issues a `SELECT` over `session` whose value is the caller's
-     * AUTHENTICATION TOKEN — bound as a parameter on the server engines, and written inline into the
-     * statement text on the SQLite family. A failing count assertion embeds this dump in its message, and
-     * that message goes into the run's log, which on continuous integration is readable by everyone who
-     * can see the build. So by default every bound value is replaced by a description of its type and
-     * size, and every quoted literal in the statement text by its length. Identifiers, table names,
-     * statement shape, numeric literals, transaction state and sequence — everything a reader diagnoses a
-     * count with — are untouched, and the raw values remain available to every ASSERTION through
-     * `statement.parameters`, which this method does not modify.
-     *
-     * Verbatim rendering is available, and it is deliberately explicit:
-     * `format(undefined, { revealValues: true })`. It is for a local investigation and must not be
-     * committed in an assertion message.
-     *
-     * @param maxQueryLength A character budget for the statement text. A control value for the dump,
-     * not a claim about any statement.
-     * @param options See {@link QueryCaptureFormatOptions}. Omitted, values are described rather than
-     * disclosed.
+     * @description A compact, deterministic, multi-line dump of everything captured — one line per statement,
+     * carrying its sequence, kind, runner identifier, transaction state, extracted tables, the statement text
+     * truncated to a character budget, and its parameters.
      */
     format(maxQueryLength = DEFAULT_FORMATTED_QUERY_LENGTH, options: QueryCaptureFormatOptions = {}): string {
         const budget =
@@ -3803,7 +3312,6 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
         const reveal = options.revealValues === true;
         for (const entry of this.capturedStatements) {
             // REDACTED BEFORE TRUNCATED, so a literal cut in half by the budget cannot leave its opening
-            // quote unmatched and its contents rendered as though they were SQL.
             const rendered = reveal ? entry.query : redactQuotedLiterals(entry.query);
             const text = rendered.length > budget ? `${rendered.slice(0, budget)}...` : rendered;
             const parts = [
@@ -3815,7 +3323,6 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
             ];
             if (entry.error !== undefined) {
                 // The driver's own message, with the values THIS statement bound removed from it and
-                // everything the driver added — the constraint name above all — left intact. See
                 // {@link redactKnownValues} for why this is not the same scan the statement text gets.
                 parts.push(
                     `error=${reveal ? entry.error : redactKnownValues(entry.error, entry.parameters)}`,
@@ -3852,22 +3359,12 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     }
 
     /**
-     * @description
-     * TypeORM's failed-statement hook.
-     *
-     * The record chosen is the most recent captured statement with the same text that does not
-     * already carry an error and was issued on the same query runner, which is correct even when the
-     * same statement text is issued twice in one window. A record is appended only when no such
-     * statement exists — the case where the window opened between the two hooks — so nothing is ever
-     * silently dropped.
+     * @description TypeORM's failed-statement hook.
      */
     logQueryError(error: string | Error, query: string, parameters?: any[], queryRunner?: QueryRunner): void {
         if (!this.captureEnabled) {
             return;
         }
-        // TypeORM's interface types this argument `string | Error`, and both arrive in practice. A
-        // string is used verbatim: passing it through the JSON stringifier would wrap it in quotes
-        // and defeat a substring assertion on a constraint name.
         const errorText =
             typeof error === 'string' ? error : error instanceof Error ? error.message : safeStringify(error);
         const existing = this.findCapturedStatement(query, queryRunner, true);
@@ -3968,9 +3465,7 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
     ): CapturedStatement {
         try {
             const text = typeof query === 'string' ? query : safeStringify(query);
-            // The driver type is read from the runner's own connection, which is the only place it can
             // be known for certain. It decides how `"..."` in this statement is read, so a statement
-            // captured without a runner is analysed under `'unknown'` and refuses those regions.
             const dialect = resolveDriverType(queryRunner);
             return {
                 query: text,
@@ -4052,13 +3547,7 @@ export class QueryCaptureLogger implements TypeOrmLoggerInterface {
 }
 
 /**
- * @description
- * The engine identifiers on which an **exact** statement count may be asserted.
- *
- * These are the SQLite-family identifiers, of which `sqljs` is the one the repository's e2e
- * configuration actually selects (`e2e-common/test-config.ts:L106`); `sqlite` and
- * `better-sqlite3` are included so a locally configured native SQLite run is treated the same way
- * rather than silently skipping.
+ * @description The engine identifiers on which an **exact** statement count may be asserted.
  */
 export const STATEMENT_COUNT_ENGINES: readonly string[] = ['sqljs', 'sqlite', 'better-sqlite3'];
 
@@ -4103,4 +3592,309 @@ export function queryCaptureConfig(capture: QueryCaptureLogger): QueryCaptureCon
             logger: capture,
         },
     };
+}
+
+// The engine decides which artefact a run applies: the checked-in migration where the shipped DDL matches the
+// engine, and otherwise the migration that engine's own lifecycle emits from the same entity metadata. Both
+
+/**
+ * @description
+ * A migration produced by the platform's lifecycle, loaded and ready to hand to `runMigrations`.
+ *
+ * @since 3.8.0
+ */
+export interface LifecycleMigration {
+    /** The class TypeORM will instantiate. Its name carries the trailing timestamp TypeORM orders by. */
+    readonly migrationClass: new () => MigrationInterface;
+    /** That class's name, which is also the name TypeORM records in its own bookkeeping table. */
+    readonly className: string;
+    /** The generated file's full text, so a caller can assert its dialect markers or its statements. */
+    readonly source: string;
+    /** Where the generator wrote it — always a temporary directory outside this repository. */
+    readonly filePath: string;
+    dispose(): Promise<void>;
+}
+
+/**
+ * @description Whether the checked-in migration can be applied on the given connection.
+ */
+export function committedMigrationApplies(engine: string): boolean {
+    return ['postgres', 'aurora-postgres'].includes(engine);
+}
+
+/**
+ * @description Generates a migration for the engine `config` points at, through the platform's own lifecycle, and
+ * loads the class out of the file it wrote.
+ */
+export async function generateLifecycleMigration(
+    config: Partial<VendureConfig>,
+    name: string,
+): Promise<LifecycleMigration> {
+    const outputDir = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-lifecycle-migration-'));
+    const dispose = async () => {
+        await fs.remove(outputDir);
+    };
+    try {
+        const filePath = await generateMigration(config, { name, outputDir });
+        if (filePath === undefined) {
+            throw new Error(
+                'generateMigration wrote no file, so the schema it was diffed against already carries ' +
+                    'every mapping the registered entities declare. A caller expecting the two plugin ' +
+                    'tables has to diff against the core schema alone.',
+            );
+        }
+        const source = await fs.readFile(filePath, 'utf-8');
+        return { ...loadMigrationClass(source, filePath), source, filePath, dispose };
+    } catch (err) {
+        await dispose();
+        throw err;
+    }
+}
+
+/**
+ * @description The SQL statements a generated migration file will actually execute, up and down, in order.
+ */
+export function extractGeneratedStatements(source: string): { up: string[]; down: string[] } {
+    const prefix = 'await queryRunner.query(';
+    const statements: { up: string[]; down: string[] } = { up: [], down: [] };
+    let section: 'up' | 'down' | undefined;
+    for (const line of source.split('\n')) {
+        if (line.includes('public async up(')) {
+            section = 'up';
+            continue;
+        }
+        if (line.includes('public async down(')) {
+            section = 'down';
+            continue;
+        }
+        const trimmed = line.trim();
+        if (section === undefined || !trimmed.startsWith(prefix)) {
+            continue;
+        }
+        const body = trimmed.slice(prefix.length);
+        const delimiter = body.charAt(0);
+        if (delimiter !== '"' && delimiter !== '`') {
+            throw new Error(
+                `a generated statement opens with ${JSON.stringify(delimiter)} rather than a quote or a ` +
+                    "backtick, so the generator's template has changed and this extraction is no longer valid",
+            );
+        }
+        let statement = '';
+        for (let index = 1; index < body.length; index++) {
+            const character = body.charAt(index);
+            if (character === '\\' && body.charAt(index + 1) === delimiter) {
+                statement += delimiter;
+                index++;
+                continue;
+            }
+            if (character === delimiter) {
+                break;
+            }
+            statement += character;
+        }
+        statements[section].push(statement);
+    }
+    return statements;
+}
+
+/**
+ * @description
+ * One teardown step: what it does, for a diagnosis, and how to do it.
+ *
+ * @since 3.8.0
+ */
+export interface CleanupStep {
+    /** What this step releases, phrased to read inside "teardown attempted … and N of them failed: …". */
+    readonly what: string;
+    run(): Promise<unknown> | unknown;
+}
+
+/**
+ * @description Attempts EVERY step, whatever any earlier one does, and reports all failures together afterwards.
+ */
+export async function attemptEveryCleanup(steps: readonly CleanupStep[]): Promise<void> {
+    const failures: string[] = [];
+    for (const step of steps) {
+        try {
+            await step.run();
+        } catch (error) {
+            // itself and therefore carries the statement and its bound parameters as enumerable properties —
+            // The label is guarded too, and that is not belt-and-braces: the natural way to make a per-item
+            failures.push(`${describeTeardownStage(step.what)} — ${redactTeardownDiagnostic(error)}`);
+        }
+    }
+    if (failures.length > 0) {
+        throw new Error(
+            `teardown attempted every step and ${failures.length} of ${steps.length} failed: ` +
+                failures.join('; '),
+        );
+    }
+}
+
+/**
+ * @description
+ * The isolated database, and how to remove it again.
+ *
+ * @since 3.8.0
+ */
+export interface IsolatedDatabase {
+    readonly dbConnectionOptions: DataSourceOptions;
+    dispose(): Promise<void>;
+}
+
+/**
+ * A database name (or file) unique to this clone and this caller.
+ *
+ * `CLONE_INDEX` is exported by the workspace for exactly this purpose — every host-global resource carries it —
+ * so two clones running this package's suites against one database server address different databases.
+ */
+function isolatedName(label: string): string {
+    const clone = (process.env.CLONE_INDEX ?? '000').replace(/[^a-z0-9]/gi, '');
+    return `e2e_reorder_state_${label.replace(/[^a-z0-9]/gi, '_')}_${clone}`.toLowerCase();
+}
+
+/**
+ * @description Creates the isolated database for the engine in use.
+ */
+export async function createIsolatedDatabase(
+    serverConfig: Required<VendureConfig>,
+    engine: string,
+    label: string,
+): Promise<IsolatedDatabase> {
+    const options = serverConfig.dbConnectionOptions as unknown as Record<string, unknown>;
+    if (engine === 'sqljs') {
+        const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'reorder-isolated-sqljs-'));
+        const location = path.join(directory, `${isolatedName(label)}.sqlite`);
+        return {
+            dbConnectionOptions: {
+                ...(options as object),
+                type: 'sqljs',
+                location,
+                autoSave: true,
+                database: undefined,
+                synchronize: false,
+                logging: false,
+            } as unknown as DataSourceOptions,
+            dispose: async () => {
+                await fs.remove(directory);
+            },
+        };
+    }
+
+    const database = isolatedName(label);
+    const maintenance = new DataSource({
+        ...(options as object),
+        // PostgreSQL requires a database to connect to before it can create another, and its always-present
+        // maintenance database is the conventional one. The MySQL family connects without naming one at all.
+        database: engine === 'postgres' ? 'postgres' : undefined,
+        synchronize: false,
+        migrationsRun: false,
+        dropSchema: false,
+        entities: [],
+        subscribers: [],
+        migrations: [],
+        logging: false,
+    } as unknown as DataSourceOptions);
+    await maintenance.initialize();
+    try {
+        await maintenance.query(`DROP DATABASE IF EXISTS ${database}`);
+        await maintenance.query(`CREATE DATABASE ${database}`);
+    } finally {
+        await maintenance.destroy();
+    }
+    return {
+        dbConnectionOptions: {
+            ...(options as object),
+            database,
+            synchronize: false,
+            logging: false,
+        } as unknown as DataSourceOptions,
+        dispose: async () => {
+            const cleanup = new DataSource({
+                ...(options as object),
+                database: engine === 'postgres' ? 'postgres' : undefined,
+                synchronize: false,
+                migrationsRun: false,
+                dropSchema: false,
+                entities: [],
+                subscribers: [],
+                migrations: [],
+                logging: false,
+            } as unknown as DataSourceOptions);
+            await cleanup.initialize();
+            try {
+                await cleanup.query(`DROP DATABASE IF EXISTS ${database}`);
+            } finally {
+                await cleanup.destroy();
+            }
+        },
+    };
+}
+
+/**
+ * @description
+ * Opens a data source with the four overrides the platform's own migration entry points apply
+ * (`packages/core/src/migrate.ts` L197-L205), plus no subscribers — Vendure's are dependency-injected and
+ * nothing here resolves a Nest container.
+ *
+ * @since 3.8.0
+ */
+export async function openDataSource(options: DataSourceOptions): Promise<DataSource> {
+    const dataSource = new DataSource({
+        ...(options as object),
+        migrationsRun: false,
+        dropSchema: false,
+        subscribers: [],
+        logging: false,
+    } as unknown as DataSourceOptions);
+    await dataSource.initialize();
+    return dataSource;
+}
+
+/**
+ * Transpiles the generated migration file in memory and returns the migration class it exports.
+ */
+function loadMigrationClass(
+    source: string,
+    filePath: string,
+): { migrationClass: new () => MigrationInterface; className: string } {
+    const transpiled = ts.transpileModule(source, {
+        compilerOptions: {
+            module: ts.ModuleKind.CommonJS,
+            target: ts.ScriptTarget.ES2019,
+        },
+        fileName: filePath,
+    });
+    const moduleExports: Record<string, unknown> = {};
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval
+    const evaluate = new Function('exports', 'require', 'module', transpiled.outputText);
+    evaluate(moduleExports, () => ({}), { exports: moduleExports });
+    const candidates = Object.values(moduleExports).filter(
+        (value): value is new () => MigrationInterface =>
+            typeof value === 'function' &&
+            typeof (value as { prototype?: { up?: unknown } }).prototype?.up === 'function',
+    );
+    if (candidates.length !== 1) {
+        throw new Error(
+            `the generated migration at ${filePath} exports ${candidates.length} migration classes, expected 1`,
+        );
+    }
+    const migrationClass = candidates[0];
+    if (!/\d+$/.test(migrationClass.name)) {
+        throw new Error(
+            `the generated migration class ${migrationClass.name} carries no trailing timestamp, which ` +
+                'TypeORM needs to order it',
+        );
+    }
+    return { migrationClass, className: migrationClass.name };
+}
+
+/**
+ * Exposed so a suite that owns its own isolated schema — the migration suite does — can put the platform's
+ * module-level configuration back after driving a migration entry point, without importing the platform's
+ * reset directly and having to reason about ordering.
+ */
+export async function restorePlatformConfig(serverConfig: Required<VendureConfig>): Promise<void> {
+    resetConfig();
+    await preBootstrapConfig(serverConfig);
 }

@@ -1,18 +1,3 @@
-/*
- * Unit specification for `ReorderPlugin` startup option validation — what it pins, and what it deliberately
- * leaves to another file.
- *
- * THE WHOLE SUBJECT OF THIS FILE IS ONE SENTENCE OF EPIC-001 SECTION 7.10, which the ledger states once as a
- * rule for every row rather than repeating per option: a value the plugin cannot use makes the plugin fail
- * to start, "with a named configuration error identifying the offending key", because "a bound that silently
- * degrades to 'admit everything' or 'admit nothing' is worse than no bound, because nothing fails while the
- * guarantee is gone". THAT SENTENCE HAS TWO HALVES AND BOTH ARE ASSERTED AT EVERY CELL BELOW. A cell that
- * asserted only that initialisation throws would leave a validator which refuses the WRONG key
- * indistinguishable from a correct one — the same reasoning EPIC-001 ruling R17 applies to a bare "the
- * request is refused". So each rejection cell pins the error class, the `optionKey` datum, the exact
- * requirement clause, the rendered description of the value, and that NO OTHER option key is named.
- */
-
 import { MODULE_METADATA } from '@nestjs/common/constants';
 import { ConfigService, I18nService, Logger, Type } from '@vendure/core';
 import fs from 'fs';
@@ -35,14 +20,8 @@ const OPTION_KEYS: ReadonlyArray<keyof ReorderPluginOptions> = [
 ];
 
 /**
- * The declared default of every option — the five values this run supplies, restated here as the expected
- * outcome rather than imported from the module under test.
- *
- * Restating them is the point. Reading the defaults out of `reorder.plugin.ts` would make this assertion
- * tautological: a typo that changed a default would change the expectation with it and nothing would fail.
- * Typing the constant as {@link ResolvedReorderPluginOptions} keeps the restatement honest in the other
- * direction, since adding a sixth option to the interface without a value here is a compile error rather
- * than a silently unasserted key.
+ * The declared default of every option — the five values this run supplies, restated here as the expected outcome
+ * rather than imported from the module under test.
  */
 const DECLARED_DEFAULTS: ResolvedReorderPluginOptions = {
     maxListsPerCustomer: 25,
@@ -75,13 +54,8 @@ const MUST_NOT_EXCEED_THE_32_BIT_CEILING =
 const MAX_SIGNED_32_BIT_INTEGER = 2147483647;
 
 /**
- * The platform's own default Shop list-query limit, restated here because it is the value a server carries
- * unless its configuration lowers it, and both page-size defaults have to sit at or below it.
- *
- * Not imported: it is a property of a resolved `VendureConfig` rather than an exported constant, and reading
- * it out of one would need a bootstrapped server — which is precisely what these cases avoid. The number is
- * pinned by the end-to-end suite instead, which reads it off a real server's own configuration.
- * (`packages/core/src/config/default-config.ts` L89.)
+ * The platform's own default Shop list-query limit, restated here because it is the value a server carries unless
+ * its configuration lowers it, and both page-size defaults have to sit at or below it.
  */
 const DEFAULT_SHOP_LIST_QUERY_LIMIT = 100;
 
@@ -100,13 +74,8 @@ function mustNotExceedShopLimit(limit: number): string {
 }
 
 /**
- * One row of the rejection matrix: a value the plugin must refuse, the requirement clause it must cite, and
- * the description it must render for the value.
- *
- * `value` is `unknown` rather than `number` on purpose. Roughly half the table is values TypeScript would
- * refuse at the call site, and they are exactly the values the run-time guard exists for — a JavaScript
- * caller, an environment variable or a JSON configuration file can produce any of them, and the guard is
- * what turns each into a startup failure instead of a bound that quietly means nothing.
+ * One row of the rejection matrix: a value the plugin must refuse, the requirement clause it must cite, and the
+ * description it must render for the value.
  */
 interface RejectedValueCase {
     /** The `it()` title fragment, so a failure names the cell without the file having to be opened. */
@@ -345,36 +314,22 @@ function expectInitToRefuse(
 ): ReorderPluginConfigurationError {
     const optionsBeforeTheAttempt = ReorderPlugin.options;
 
-    // Half one of the rule: initialisation FAILS, rather than the bound degrading to admit everything or
-    // nothing. Asserted in the callback form because that is the form which proves the call itself throws.
     expect(() => ReorderPlugin.init(optionsWith(key, value))).toThrowError(ReorderPluginConfigurationError);
     // Half two, in the form a developer reading a stack trace actually has: the offending key is legible in
-    // the message text itself, not only as structured data beside it. The two are asserted separately and
-    // not folded into one loose regexp, because a regexp that matched the class and the key together would
-    // pass on a message that named the right key for the wrong reason.
     expect(() => ReorderPlugin.init(optionsWith(key, value))).toThrowError(new RegExp(key));
 
     const error = captureInitFailure(optionsWith(key, value));
 
-    // The class is named three ways, because each survives a different kind of change: `instanceof` proves
-    // the prototype chain the plugin restores explicitly, `constructor.name` proves the class identity that
-    // survives minification of the message, and `name` proves the value that appears in a serialised error
     // and in a stack trace's first line.
     expect(error.constructor.name).toBe('ReorderPluginConfigurationError');
     expect(error.name).toBe('ReorderPluginConfigurationError');
-    // The offending key as data rather than as prose, so a caller can branch on it without parsing English.
     expect(error.optionKey).toBe(key);
-    // …and as prose as well, quoted exactly as the message quotes it.
     expect(error.message).toContain(`the "${key}" option`);
     expect(error.message).toContain(requirement);
     expect(error.message).toContain(`but received ${received}.`);
-    // The remedy is stated, since a startup failure that does not say what to do next is a worse failure.
     expect(error.message).toContain('Correct the value passed to ReorderPlugin.init()');
     expectNoOtherOptionKeyNamed(error.message, key);
 
-    // A refused value is never installed. `init()` validates the merged set BEFORE it stores it, so a
-    // rejected call leaves the previously resolved options exactly as they were — which is what stops a
-    // failed initialisation from leaving the plugin holding a value it has already refused.
     expect(ReorderPlugin.options).toEqual(optionsBeforeTheAttempt);
 
     return error;
@@ -390,11 +345,6 @@ describe('ReorderPlugin startup option validation', () => {
     });
 
     it('starts every case from the declared defaults, whatever order the cases run in', () => {
-        // Asserted rather than assumed, because `ReorderPlugin.options` is process-wide state reached through
-        // a getter with no setter: a cell that installed `maxLinesPerList: 7` and a sibling that expected the
-        // default would otherwise pass or fail according to the order the runner happened to choose. This is
-        // what makes the file's result identical in declaration order, in reverse, shuffled, and for any
-        // single case run alone.
         expect(ReorderPlugin.options).toEqual(DECLARED_DEFAULTS);
     });
 
@@ -424,9 +374,6 @@ describe('ReorderPlugin startup option validation', () => {
         });
 
         it('resolves exactly the five documented keys and no sixth', () => {
-            // The negative half of the option surface. There is deliberately no name-length option: that
-            // bound is the fixed constant equal to the `name` column's width, so an option would carry
-            // exactly one legal value.
             expect(Object.keys(ReorderPlugin.options).sort()).toEqual([...OPTION_KEYS].sort());
         });
 
@@ -454,10 +401,6 @@ describe('ReorderPlugin startup option validation', () => {
     });
 
     describe('an omitted key resolves to its declared default', () => {
-        // An omitted key and a key present with an explicit `undefined` or `null` are different inputs and
-        // resolve differently: the first takes the declared default, the second is refused by name. Both
-        // halves are asserted — the successes below, and the refusals in the matrix above — because a
-        // validator that conflated them would either reject a valid `init({})` or admit a malformed value.
         for (const key of OPTION_KEYS) {
             it(`takes the declared default for the four keys omitted alongside ${key}`, () => {
                 const supplied = readOption(DECLARED_DEFAULTS, key) + 1;
@@ -474,11 +417,6 @@ describe('ReorderPlugin startup option validation', () => {
         }
 
         it('distinguishes an omitted key from one explicitly supplied as undefined', () => {
-            // The two are different outcomes rather than one outcome spelled twice, which is the whole reason
-            // the merge keeps an explicit `undefined` instead of discarding it: an omitted key is a
-            // deployment accepting the default, whereas a key present with nothing usable in it is a mistake
-            // at the call site — typically an expression that evaluated to nothing — and substituting a bound
-            // for it would hide that mistake behind a healthy-looking server.
             expect(() => ReorderPlugin.init({})).not.toThrow();
             expect(ReorderPlugin.options.maxLinesPerList).toBe(200);
 
@@ -529,10 +467,6 @@ describe('ReorderPlugin startup option validation', () => {
 
         for (const key of OPTION_KEYS.filter(candidate => candidate !== 'maxQuantityPerLine')) {
             it(`applies no such ceiling to ${key}, which carries a lower bound only`, () => {
-                // The ceiling is key-specific because its reason is: only `maxQuantityPerLine` guards a
-                // 32-bit `int` column that `addItemToReorderList` accumulates into. Proving the other four
-                // accept the same value is what pins "the one key … carrying an upper bound as well as a
-                // lower one", and what would catch a ceiling accidentally hoisted out of its key test.
                 ReorderPlugin.init(optionsWith(key, MAX_SIGNED_32_BIT_INTEGER + 1));
 
                 expect(readOption(ReorderPlugin.options, key)).toBe(MAX_SIGNED_32_BIT_INTEGER + 1);
@@ -589,12 +523,7 @@ describe('ReorderPlugin startup option validation', () => {
     });
 
     describe('the refused value is described by kind and never by its content', () => {
-        // The message reaches the startup log, and a rejected value arrives from whatever the deployment's
         // configuration produced — so a string may be a credential or a connection URL assigned to the wrong
-        // key, may carry newlines or terminal escapes that forge surrounding log lines, and may be
-        // arbitrarily long. `reorder.plugin.ts` therefore renders the KIND of value, plus a string's length,
-        // and never the content. These cells are what stops that guarantee being lost to a later "helpful"
-        // change that interpolates the value back in.
         it('reports a string by its length and withholds its content', () => {
             const withheldValue = 'AN_OPTION_VALUE_WHOSE_CONTENT_MUST_NEVER_REACH_THE_LOG';
 
@@ -660,11 +589,6 @@ describe('ReorderPlugin startup option validation', () => {
 
             expect(descriptor).toBeDefined();
             expect(descriptor?.writable).toBeUndefined();
-            // And no setter — asserted behaviourally rather than by reading the descriptor's function slots,
-            // because the behaviour is the guarantee: assigning to an accessor that has no setter throws
-            // under the strict mode an ES module always carries. `ReorderPlugin.options = …` is therefore
-            // impossible at run time as well as being a compile error, which is what stops any later code
-            // installing a set the validator has never seen.
             expect(() => {
                 (ReorderPlugin as unknown as { options: ResolvedReorderPluginOptions }).options = {
                     ...DECLARED_DEFAULTS,
@@ -675,10 +599,6 @@ describe('ReorderPlugin startup option validation', () => {
         });
 
         it('refuses a write to a member of the resolved set', () => {
-            // A write that lowered a bound after startup validation had accepted it would leave nothing to
-            // report while the guarantee the bound exists to make was gone — worse than a wrong bound. The
-            // provider hands one object to every consumer of a registration, so a single write would lower
-            // the bound for all of them at once.
             const target = ReorderPlugin.options as { maxLinesPerList: number };
 
             expect(() => {
@@ -688,14 +608,6 @@ describe('ReorderPlugin startup option validation', () => {
         });
 
         it('gives two differently configured registrations their own options, whenever they bootstrap', () => {
-            /*
-             * THE ISOLATION PROPERTY, exercised in the order that can break it: BOTH registrations are created
-             * BEFORE either is bootstrapped. A provider that resolved its options lazily from module state
-             * would, in that order, hand each registration whatever the LAST `init()` had stored, so the
-             * earlier registration would silently enforce the later one's bounds. The order matters because it
-             * is reachable wherever one process holds two servers: a multi-tenant host, or a test file that
-             * builds two configurations before booting either.
-             */
             const first = ReorderPlugin.init({ maxListsPerCustomer: 10 });
             const second = ReorderPlugin.init({ maxListsPerCustomer: 20 });
 
@@ -704,8 +616,6 @@ describe('ReorderPlugin startup option validation', () => {
             expect(optionsBoundTo(first).maxListsPerCustomer).toBe(10);
             expect(optionsBoundTo(second).maxListsPerCustomer).toBe(20);
 
-            // A third initialisation, standing in for a third server configured after the other two have been
-            // built: it must move neither of them.
             ReorderPlugin.init({ maxListsPerCustomer: 30 });
 
             expect(optionsBoundTo(first).maxListsPerCustomer).toBe(10);
@@ -725,14 +635,6 @@ describe('ReorderPlugin startup option validation', () => {
         });
 
         it('keeps the bare class on the declared defaults, whatever any earlier init() asked for', () => {
-            /*
-             * THE OTHER HALF OF THE ISOLATION PROPERTY, and the one that survives longest if it is not asserted.
-             * A deployment may register `ReorderPlugin` itself instead of calling `init()`, and doing so is a
-             * request for the DOCUMENTED DEFAULTS. If the bare class's provider read the latest initialisation,
-             * a process in which some other server had called `init({ maxLinesPerList: 33 })` would hand that
-             * 33 to this one in place of the documented 200 — silently, and depending on the order the two were
-             * created in. A bound a deployment never asked for is the one thing a bound must never be.
-             */
             ReorderPlugin.init({ maxLinesPerList: 33 });
             ReorderPlugin.init({ maxListsPerCustomer: 3, maxQuantityPerLine: 7 });
             ReorderPlugin.init({ defaultReorderListsPageSize: 5, defaultReorderListLinesPageSize: 6 });
@@ -775,23 +677,9 @@ describe('the specifications this package discovers', () => {
     const PACKAGE_DIR = path.join(__dirname, '..');
 
     /**
-     * The unit inventory this package actually ships, and the one entry that is wider than the plan's.
-     *
-     * AAP section 0.5.1.7 enumerates THREE co-located specifications — this file and the two under
-     * `src/service`. `src/api/reorder-list-counter-repair.spec.ts` is a fourth, and it is listed here rather
-     * than allowed to fail this assertion because it is a declared addition and not a drift: section 0.6.1.2
-     * puts every co-located `.spec.ts` beneath `packages/reorder-plugin/src` in scope, and the file's own
-     * header states the deviation under section 0.8.2's no-silent-deviation obligation. What it guards is a
-     * class of defect no other specification can reach — WHEN the single-list read reconciles `lineCount`
-     * relative to GraphQL's own field execution, and WHICH parent object is eligible — both of which are
-     * invisible in the payload of every request that has nothing to repair, and both of which have been got
-     * wrong before.
-     *
-     * The assertion below remains an EXACT SET, so a fifth specification still has to be declared here before
-     * it can join the run.
+     * The unit inventory this package ships, which is the inventory AAP section 0.5.1.7 enumerates.
      */
     const UNIT_SPEC_FILES = [
-        'src/api/reorder-list-counter-repair.spec.ts',
         'src/reorder.plugin.spec.ts',
         'src/service/reorder-list-name.spec.ts',
         'src/service/reorder-list.service.spec.ts',
@@ -821,10 +709,6 @@ describe('the specifications this package discovers', () => {
     }
 
     it('holds exactly the declared specifications, and no undeclared one', () => {
-        // Vitest discovers specifications by PATTERN, so the inventory is only as stated as the filesystem
-        // is: an undeclared specification joins the run merely by existing, and this assertion is what makes
-        // that visible. Both directories are walked, because a `*.spec.ts` under `e2e/` would be collected by
-        // the unit run rather than by the e2e one, which supplies the server harness it would need.
         // {@link UNIT_SPEC_FILES} records which entry is wider than AAP section 0.5.1.7 and why.
         const onDisk = [...specsUnder('src'), ...specsUnder('e2e')].sort();
         expect(onDisk, 'the discovered unit inventory has changed').toEqual([...UNIT_SPEC_FILES].sort());
@@ -836,31 +720,9 @@ describe('the specifications this package discovers', () => {
         }
     });
 });
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
-// The bootstrap hook
-// ═════════════════════════════════════════════════════════════════════════════════════════════════════
 
 /**
  * `onApplicationBootstrap`, and the three acts it performs — no more than three.
- *
- * The three are: re-validating every option's integer bounds against the values actually held at boot;
- * validating both page-size defaults against the ACTIVE `apiOptions.shopListQueryLimit`, which is a check
- * `init()` cannot make because the configuration is not readable then; and registering the message
- * catalogue with `I18nService`. It performs no logging of its own, which is the subject of the last case
- * below.
- *
- * WHY THE ABSENCE IS ASSERTED RATHER THAN LEFT IMPLICIT. An earlier revision emitted two advisory lines from
- * this hook: one naming the platform's published security advisories against releases below 3.7.2, and one
- * naming the two check constraints TypeORM does not create on the MySQL family. Both were truthful, and
- * neither belonged here. AAP section 0.2.4.1 scopes this file to entity, provider and resolver registration,
- * the declared compatibility range, `init()`, startup option validation and the i18n catalogue; a hardcoded
- * advisory list and version floor inside a feature plugin additionally goes stale with no mechanism to
- * refresh it, so it would eventually mislead the operator it was written to inform. The engine limitation
- * conflict C-E records is stated where a reader actually meets it instead: the migration's own header, the
- * README, and a positive assertion in the migration end-to-end suite.
- *
- * So the cases below hold the hook to exactly what it is for, and the last one is the guard against the
- * removal being undone by accident.
  */
 describe('the bootstrap hook', () => {
     /**
@@ -881,10 +743,7 @@ describe('the bootstrap hook', () => {
             { addTranslationFile } as unknown as I18nService,
             {
                 dbConnectionOptions: { type: engine },
-                // The hook reads this to check both page sizes against the limit that will actually govern
-                // them, so the double carries it. `100` is the platform's own default
                 // (`packages/core/src/config/default-config.ts` L89), which is what a server carries unless
-                // its configuration lowers it.
                 apiOptions: { shopListQueryLimit },
             } as unknown as ConfigService,
         );
@@ -906,9 +765,7 @@ describe('the bootstrap hook', () => {
     });
 
     it('writes nothing to the startup log, on any engine', () => {
-        // ★ THE ASSERTION THAT KEEPS THE HOOK IN SCOPE. Every engine is driven, because the warning that
-        // used to be emitted here was decided by exactly this value, and `error`, `warn` and `info` are all
-        // watched so that a line cannot reappear at a different level and go unnoticed.
+        // THE ASSERTION THAT KEEPS THE HOOK IN SCOPE. Every engine is driven, because the warning that
         const error = vi.spyOn(Logger, 'error').mockImplementation(() => undefined);
         const warn = vi.spyOn(Logger, 'warn').mockImplementation(() => undefined);
         const info = vi.spyOn(Logger, 'info').mockImplementation(() => undefined);
@@ -928,10 +785,6 @@ describe('the bootstrap hook', () => {
     });
 
     it('declares no platform advisory list, version floor or engine posture of its own', () => {
-        // Read out of the shipped source rather than inferred from behaviour, because what is being asserted
-        // is that the DECLARATIONS are gone — a table of advisory identifiers and a hardcoded release floor
-        // are stale the moment they are written, and a behavioural assertion would pass on a version of this
-        // file that still carried them behind an unreached branch.
         const source = fs.readFileSync(path.join(__dirname, 'reorder.plugin.ts'), 'utf-8');
 
         for (const absent of [
@@ -951,9 +804,6 @@ describe('the bootstrap hook', () => {
     });
 
     it('does not refuse to start, and still re-validates the options it will serve with', () => {
-        // The hook's fail-closed acts are the two validations, and they must remain the ONLY things that can
-        // stop a boot here. Asserted alongside the catalogue registration so that "it does not throw" is
-        // not bought by the hook doing nothing.
         const { plugin, addTranslationFile } = bootstrapSubject('mariadb');
 
         expect(() => plugin.onApplicationBootstrap()).not.toThrow();
@@ -962,18 +812,6 @@ describe('the bootstrap hook', () => {
             'the catalogue registration must still have happened, so the hook was not short-circuited',
         ).toHaveBeenCalledTimes(1);
     });
-
-    // ────────────────────────────────────────────────────────────────────────────────────────────────────
-    // The one bound `init()` cannot check: a page size against the server's own Shop list-query limit.
-    //
-    // WHY THIS IS A BOOT FAILURE AND NOT A CAVEAT. Both page-size options are applied as the `take` of a
-    // `ListQueryBuilder` query when a caller supplies none, and `parseTakeSkipParams` throws
-    // `UserInputError('error.list-query-limit-exceeded')` when `take` exceeds `apiOptions.shopListQueryLimit`
-    // for a Shop request — this plugin leaves `ignoreQueryLimits` false deliberately. So a page size above
-    // the limit does not degrade to the limit: it makes EVERY read that omits `take` fail, on a server that
-    // started healthily. The refusal therefore has to happen at bootstrap, where the configured limit is
-    // finally readable, and it has to name which key is at fault.
-    // ────────────────────────────────────────────────────────────────────────────────────────────────────
 
     it.each([
         ['defaultReorderListsPageSize' as const, 24, 25],
@@ -996,19 +834,13 @@ describe('the bootstrap hook', () => {
             expect((caught as ReorderPluginConfigurationError).optionKey).toBe(key);
             expect((caught as Error).message).toContain(key);
             expect((caught as Error).message).toContain(mustNotExceedShopLimit(limit));
-            // The declared default is what was refused, so the message names a value the operator can find
-            // in their own configuration rather than an abstraction.
             expect((caught as Error).message).toContain(String(declaredDefault));
-            // And the hook failed CLOSED: the catalogue registration is behind the validations, so it did
-            // not run. A boot that got as far as registering translations would be a boot that continued.
             expect(addTranslationFile).not.toHaveBeenCalled();
         },
     );
 
     it('accepts a page size exactly equal to the server limit, because the platform test is strictly greater', () => {
         // The boundary matters in the accepting direction too: `parseTakeSkipParams` refuses `take > limit`,
-        // so a page size OF the limit is served. Refusing it here would be stricter than the platform and
-        // would reject a configuration that works.
         const { plugin, addTranslationFile } = bootstrapSubject('postgres', 50);
 
         expect(() => plugin.onApplicationBootstrap()).not.toThrow();
@@ -1016,9 +848,6 @@ describe('the bootstrap hook', () => {
     });
 
     it('leaves the three non-page-size options unbounded by the Shop limit', () => {
-        // `maxListsPerCustomer` (25), `maxLinesPerList` (200) and `maxQuantityPerLine` (999) are all above a
-        // limit of 10, and none of them is ever applied as a `take` — so a low limit must not refuse them.
-        // Without this case the check could be widened to every key and nothing would notice.
         const { plugin } = bootstrapSubject('postgres', 50);
 
         expect(() => plugin.onApplicationBootstrap()).not.toThrow();
@@ -1031,11 +860,6 @@ describe('the bootstrap hook', () => {
         ['a negative number', -1],
         ['a string', '100'],
     ])('draws no conclusion from a Shop limit that is %s', (_label, limit) => {
-        // A limit this plugin cannot read is the platform's own configuration to answer for. Comparing
-        // against it would produce a refusal naming a plugin key for somebody else's value — and worse,
-        // `25 > undefined` is false while `25 > '10'` is true, so an unguarded comparison would be
-        // arbitrary rather than merely wrong. The platform applies whatever it holds; this hook
-        // declines to conclude anything.
         const { plugin, addTranslationFile } = bootstrapSubject('postgres', limit);
 
         expect(() => plugin.onApplicationBootstrap()).not.toThrow();

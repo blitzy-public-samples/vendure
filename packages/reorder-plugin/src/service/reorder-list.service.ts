@@ -1325,7 +1325,7 @@ export class ReorderListService {
             return this.rethrowSanitisedFailure(err, operation);
         }
         if (!customer) {
-            // ★ AN AUTHENTICATED USER WITH NO CUSTOMER ROW IS A GUARD FAILURE, NOT A BROKEN INVARIANT, AND
+            // AN AUTHENTICATED USER WITH NO CUSTOMER ROW IS A GUARD FAILURE, NOT A BROKEN INVARIANT, AND
             // THE DIFFERENCE IS OBSERVABLE. It is a NORMAL platform state rather than upstream corruption:
             // the Shop API's own `login` applies no restriction on which `User` may authenticate
             // (`packages/core/src/service/services/auth.service.ts`), so an administrator's session — or one
@@ -1684,7 +1684,7 @@ export class ReorderListService {
      * describe; the recorded channel must be the request's active channel; and **the recorded session must be
      * this request's session**.
      *
-     * ★ THE LAST CONJUNCT IS THE ONE THAT IS EASY TO LEAVE OUT, AND IT IS WHAT MAKES THE CHECK ABOUT *WHO IS
+     * THE LAST CONJUNCT IS THE ONE THAT IS EASY TO LEAVE OUT, AND IT IS WHAT MAKES THE CHECK ABOUT *WHO IS
      * ASKING*. Without it the strongest statement available is "some user is authenticated and the row was read
      * in this channel" — which two different buyers in one channel both satisfy. A row read for buyer A, held
      * beyond its request by a cache or by an integration and then passed to a member here during buyer B's
@@ -2355,7 +2355,7 @@ export class ReorderListService {
             return this.rethrowSanitisedFailure(err, 'reconcileLineCount');
         }
         if (!result.affected) {
-            // ★ THE GUARDED ROW DID NOT MATCH, SO THIS REQUEST'S OBSERVED TOTAL IS NO LONGER THE COLUMN'S
+            // THE GUARDED ROW DID NOT MATCH, SO THIS REQUEST'S OBSERVED TOTAL IS NO LONGER THE COLUMN'S
             // VALUE — AND THE COLUMN IS THE AUTHORITY. Either a competing writer moved the counter between
             // the read and this statement, or the row is no longer reachable under this owner scope at all: a
             // list deleted in the same window matches neither guard. Nothing is retried, because whatever
@@ -2399,7 +2399,7 @@ export class ReorderListService {
             }
             const currentStored = Number(current.lineCount);
             if (!Number.isSafeInteger(currentStored) || currentStored < 0) {
-                // ★ THE ROW IS THERE AND ITS COUNTER IS NOT A COUNT. Reporting `observedTotal` here would be
+                // THE ROW IS THERE AND ITS COUNTER IS NOT A COUNT. Reporting `observedTotal` here would be
                 // the one thing this whole branch exists to avoid: answering with a number that is not the
                 // stored column while the stored column still exists, and doing it silently. The value is
                 // also not something this plugin can have produced — every write goes through a guarded
@@ -2681,8 +2681,9 @@ export class ReorderListService {
             // exactly one of them fail, and this catch is what turns that failure into the same result the
             // pre-check would have returned.
             //
-            // Catching the violation *inside* the callback and returning a union member from there is the
-            // shape this replaces, and it fails on PostgreSQL rather than merely being untidy. The platform
+            // The violation has to ESCAPE the callback rather than be caught inside it and turned into a
+            // union member there, and that is a correctness requirement on PostgreSQL rather than a matter
+            // of tidiness. The platform
             // runs this callback through a wrapper that COMMITs whatever the callback returns
             // (`packages/core/src/connection/transaction-wrapper.ts`), and because every mutation resolver
             // carries `@Transaction()`, that wrapper is nested: it opens a SAVEPOINT rather than a
@@ -2955,7 +2956,7 @@ export class ReorderListService {
         // already holds a lock on a LINE row and the insert path's first parent statement would then be a
         // parent lock taken while a child one is held. A fresh attempt holds neither.
         //
-        // ★ THE FRESHNESS IS THE RESOLVER'S DOING, NOT THIS LOOP'S, and it is a property this loop cannot
+        // THE FRESHNESS IS THE RESOLVER'S DOING, NOT THIS LOOP'S, and it is a property this loop cannot
         // establish for itself. `withTransaction` INHERITS an already-open transaction from the context, and
         // TypeORM opens a nested one as a savepoint (`SAVEPOINT typeorm_N` once `transactionDepth` is above
         // zero; every driver family here declares `transactionSupport = 'nested'`). Rolling back to a savepoint
@@ -4062,7 +4063,8 @@ export class ReorderListService {
      * Inserts the line for a list-and-variant pair, letting the per-variant uniqueness constraint refuse a
      * duplicate.
      *
-     * **It is an ordinary insert, and the ignore form it replaces was unsafe on two of the four engines.**
+     * **It is an ordinary insert rather than an ignoring one, because the ignore form is unsafe on two of the
+     * four engines.**
      * `orIgnore()` compiles to `ON CONFLICT DO NOTHING` on PostgreSQL and the SQLite family — narrow, and only
      * a conflict is absorbed — but on MySQL and MariaDB it compiles to `INSERT IGNORE`, which downgrades every
      * *ignorable* error of the statement to a warning: a foreign key that does not resolve, a value too long
