@@ -348,6 +348,27 @@ export class ReorderListShopResolver {
      * an unlimited public list query is a denial-of-service vector, and the configured default of
      * twenty-five is *stricter* than the Shop maximum the platform would otherwise substitute.
      *
+     * **A supplied `take` of zero or a negative number is therefore answered with an empty page, and every
+     * step of that is downstream of this method.** The platform clamps the forwarded value: its over-limit
+     * refusal is guarded on a *truthy* `take`, so a zero is never refused as over-limit, and the value is then
+     * reduced into the range `[0, limit]`, which lands both `-1` and `0` on zero
+     * (`packages/core/src/service/helpers/list-query-builder/list-query-builder.ts` L626-L648). TypeORM 0.3.28
+     * stores that zero as the query's `take`, a zero being applied rather than treated as absent
+     * (`node_modules/typeorm/query-builder/SelectQueryBuilder.js` L575-L581); and because this read joins
+     * nothing — its scope is two scalar columns on `reorder_list` — the value is copied into the statement's
+     * limit, whose "is it set" test admits zero, so the statement carries `LIMIT 0` (same file, L1379-L1391).
+     * The total is a separate statement carrying no limit, so the response is an empty `items` beside the
+     * correct **unfiltered** `totalItems`.
+     *
+     * A core list field answers the same input with every row instead — `products(options: { take: -1 })`
+     * returns the whole collection — and the difference is TypeORM's handling of an already-clamped zero
+     * rather than a decision either side made: those fields join, so the clamped zero is never copied into a
+     * limit, and the joined two-query pagination path is skipped as well, being gated on a truthy `skip` or
+     * `take` (same file, L1999-L2000). Neither answer is unbounded here: this page is at most the configured
+     * default and at most the platform's Shop maximum, whatever the caller sends. **A caller wanting the
+     * default should omit `take` or send it as `null`** — both take the configured default, whereas a zero is
+     * a page size the caller supplied and is answered as asked.
+     *
      * The service applies the same option for the same purpose on the same path, so this assignment cannot
      * disagree with it and cannot be applied twice to one request: both read one injected value, and once
      * `take` carries a value the service's own `??` on it does nothing. The 50 that governs the nested
@@ -362,7 +383,13 @@ export class ReorderListShopResolver {
      * nothing in the arguments can widen them.
      * @param args - The generator-supplied page options, and the forward-compatible sharing flag. Either may
      * arrive as an explicit `null` rather than absent — a `null` argument is a distinct value from an omitted
-     * one and does not receive the document's declared default — so both are normalised here.
+     * one and does not receive the document's declared default — so both are normalised here. For `options`
+     * the two are the same value in any case, because the generator gives the argument it adds a default of
+     * `null` (`packages/core/src/api/config/generate-list-options.ts` L87-L94), and an omitted argument is
+     * coerced to its declared default (`node_modules/graphql/execution/values.js` L183-L203); the plugin
+     * neither declares that default nor could remove it without hand-declaring a generator-owned input type,
+     * and it changes nothing, which `api-extensions.ts` records for a reviewer diffing the SDL against
+     * introspection.
      *
      * @since 3.8.0
      */

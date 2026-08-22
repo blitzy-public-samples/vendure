@@ -78,7 +78,7 @@ import {
     VendureEntity,
 } from '@vendure/core';
 import { randomUUID } from 'crypto';
-import { EntityMetadata, In, Not, SelectQueryBuilder } from 'typeorm';
+import { EntityMetadata, In, Not, QueryDeepPartialEntity, SelectQueryBuilder } from 'typeorm';
 
 import { loggerCtx, REORDER_PLUGIN_OPTIONS } from '../constants';
 import { ReorderListLine } from '../entities/reorder-list-line.entity';
@@ -2336,13 +2336,30 @@ export class ReorderListService {
             );
             return storedLineCount;
         }
+        // THE ONE `SET` CLAUSE IN THIS FILE THAT NAMES THE AUDIT COLUMN, AND THE REASON IT HAS TO. This
+        // statement is issued during a READ, so it may change exactly the one column the AAP's repair names
+        // (§0.5.2.3: `SET lineCount = :observed`) and nothing else — `updatedAt` is a published, sortable
+        // field of `ReorderList`, and a read that moved it would reorder a later `sort: { updatedAt: … }` page
+        // and would show every consumer using it for change detection or cache validation a modification that
+        // never happened. Left to itself the query builder appends `updatedAt = CURRENT_TIMESTAMP` to every
+        // `UPDATE` it renders for an entity carrying an update-date column
+        // (`node_modules/typeorm/query-builder/UpdateQueryBuilder.js` L400-L404), which is right for the six
+        // write paths and wrong here alone; naming the column in the `SET` values is what suppresses that
+        // append, because the same array the append consults is populated from the keys of these values
+        // (L301-L315). See `pinnedUpdateDateAssignment` for how the assignment is rendered.
+        //
+        // `result.affected` is unaffected by the extra assignment, which matters because the whole branch
+        // below reads that number as the authority. The MySQL family counts rows it CHANGED rather than rows
+        // it matched, and a matching row here always changes `lineCount`: the equal case returned above
+        // before any statement was issued, so this statement only ever runs with a value different from the
+        // one its own guard requires the row to hold.
         let result;
         try {
             result = await this.connection
                 .getRepository(ctx, ReorderList)
                 .createQueryBuilder('reorderlist')
                 .update()
-                .set({ lineCount: observedTotal })
+                .set({ lineCount: observedTotal, ...this.pinnedUpdateDateAssignment() })
                 .where('id = :id', { id: listId })
                 .andWhere('lineCount = :storedLineCount', { storedLineCount })
                 // THE OWNERSHIP CONJUNCTS, ON THE STATEMENT THAT WRITES. Bound under names of their own so a
@@ -3717,6 +3734,52 @@ export class ReorderListService {
      */
     private escapeColumn(columnName: string): string {
         return this.connection.rawConnection.driver.escape(columnName);
+    }
+
+    /**
+     * The `SET` entry that holds `reorder_list`'s update-date column at the value it already carries, for the
+     * one statement in this service that must leave it alone.
+     *
+     * **What it is for.** Every `UPDATE` the query builder renders for an entity carrying an update-date
+     * column gets `updatedAt = CURRENT_TIMESTAMP` appended to its `SET` clause, unless that column is already
+     * among the ones being set: the append is guarded by exactly the array the `SET` values populate
+     * (`node_modules/typeorm/query-builder/UpdateQueryBuilder.js` L301-L315 fills it, L400-L404 consults it).
+     * `VendureEntity` declares `@UpdateDateColumn() updatedAt` (`packages/core/src/entity/base/base.entity.ts`
+     * L32), so both plugin tables inherit it and every write this service issues moves it — which is correct
+     * on the six mutation paths and wrong on {@link ReorderListService.reconcileLineCount}, whose statement is
+     * issued while serving a READ. Spreading this into that statement's values suppresses the append and
+     * writes the column back unchanged, so a read cannot move a published, sortable field.
+     *
+     * **Why a self-assignment rather than an omission.** There is no option that turns the append off for one
+     * statement. Naming the column is the only mechanism, so it has to be named with a value — and the value
+     * that changes nothing is the column itself. A function-valued entry is how the query builder is handed a
+     * raw SQL expression rather than a bound parameter (rendered at L328-L335 of the same file), which is the
+     * same idiom the two counter statements and the accumulation use for their arithmetic.
+     *
+     * **Both names come from the entity's own metadata, and they are different names.** The `SET` key must be
+     * the property PATH, because that is what the builder resolves against the metadata, while the rendered
+     * expression must be the DATABASE name, because that is what the engine parses. Reading each from the
+     * column rather than writing `'updatedAt'` twice means a naming strategy that renamed the column could not
+     * leave this fragment naming one that does not exist. The identifier is escaped through the driver for the
+     * reason {@link ReorderListService.escapeColumn} gives — an unquoted camel-cased identifier is folded to
+     * lower case by PostgreSQL, where it then matches no column.
+     *
+     * **It names the list entity rather than accepting one.** Only one statement in this service is a write
+     * issued while serving a read, and it writes that table; every other write here is a mutation, where
+     * moving the audit column is the correct behaviour and suppressing it would be the defect.
+     *
+     * @returns The single-entry assignment, or an EMPTY object where the metadata carries no update-date
+     * column at all — in which case there is nothing to suppress, since the builder would then append nothing
+     * either, and a `SET` entry naming a column that does not exist is the one way to make this worse than
+     * doing nothing.
+     */
+    private pinnedUpdateDateAssignment(): QueryDeepPartialEntity<ReorderList> {
+        const updateDateColumn = this.connection.rawConnection.getMetadata(ReorderList).updateDateColumn;
+        if (!updateDateColumn) {
+            return {};
+        }
+        const pinnedValue = this.escapeColumn(updateDateColumn.databaseName);
+        return { [updateDateColumn.propertyPath]: () => pinnedValue } as QueryDeepPartialEntity<ReorderList>;
     }
 
     /**

@@ -83,9 +83,11 @@ export const REORDER_PLUGIN_OPTIONS = Symbol('REORDER_PLUGIN_OPTIONS');
  * project's existing end-to-end jobs exercise.
  *
  * A configurable bound above the column width would convert a validation failure a buyer can act on
- * into an opaque driver error, and a bound below it would restrict what no engine restricts. The
- * option would therefore carry exactly one legal value — the column's own width — and an option with
- * one legal value offers a deployment nothing except a way to break itself.
+ * into an opaque driver error on the three engines that enforce a declared width — and on the SQLite
+ * family, which treats a width as an affinity rather than a constraint, into an over-long value stored
+ * whole. A bound below it would restrict what no engine restricts. The option would therefore carry
+ * exactly one legal value — the column's own width — and an option with one legal value offers a
+ * deployment nothing except a way to break itself.
  *
  * One number consequently serves three places: this validation bound, the two `varchar(191)` columns
  * created by the additive migration, and the boundary the unit specification asserts at 190, 191 and

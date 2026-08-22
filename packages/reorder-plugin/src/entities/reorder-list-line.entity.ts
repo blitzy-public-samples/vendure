@@ -174,6 +174,20 @@ export class ReorderListLine extends VendureEntity {
      * width rather than widened, because that ceiling is what the plugin's configured upper bound is
      * validated against when the plugin initialises.
      *
+     * **Three of the four automated engines make that width a real ceiling and the SQLite family does
+     * not**, so the half of the rationale that holds everywhere is the published one rather than the
+     * stored one: the GraphQL `Int` this value is returned as is a signed 32-bit integer on every engine,
+     * while the column enforces the range only where the engine enforces a declared integer width.
+     * `2147483648` is refused by PostgreSQL 16.15 with `22003 integer out of range` and by MariaDB 11.5.2
+     * and MySQL 8.0.43 with errno 1264 `ER_WARN_DATA_OUT_OF_RANGE`; on the SQLite family TypeORM renders
+     * `int` as SQLite `integer`, a 64-bit storage class, and the same value is accepted and stored
+     * unchanged, reading back as given — measured on sql.js 1.13.0 (SQLite 3.49.1) and native SQLite
+     * 3.49.2. `2147483647` is accepted on all four. `maxQuantityPerLine` is what keeps a stored quantity
+     * inside the 32-bit range in process on every engine, and on the SQLite family it is the only thing
+     * that does — the same shape of gap the MySQL family has on the named check constraint discussed just
+     * below, and the package README states the two together. There is nothing narrower to declare here,
+     * SQLite offering no 32-bit integer type.
+     *
      * Two guards apply, and which of them comes first matters. The service is the primary guard: a
      * non-positive value, or a *resulting* value above the configured `maxQuantityPerLine`, is a
      * malformed request and is refused with the platform's own input error before any write is issued

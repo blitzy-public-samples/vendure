@@ -107,13 +107,41 @@ export const devConfig: VendureConfig = {
         // layouts would hand TypeORM two migrations of one name, which
         // `MigrationExecutor.checkForDuplicateMigrations` rejects outright rather than degrading.
         //
-        // `packages/dev-server/migration.ts`'s `run` and `revert` subcommands are what apply and reverse it,
-        // and every migration connection is forced to `synchronize: false` by the platform itself
-        // (`packages/core/src/migrate.ts:L197-L204`) whatever this object declares. This harness ships no core
+        // The platform's own `runMigrations` and `revertLastMigration` (`packages/core/src/migrate.ts:L40`
+        // and `:L89`) are what apply and reverse it — the pair the plugin's README documents, and the pair
+        // this plugin's own e2e suites call directly.
+        //
+        // `packages/dev-server/migration.ts`'s `run` and `revert` subcommands wrap that same pair, with one
+        // PRE-EXISTING caveat that predates this feature and is not this feature's to fix, since that file is
+        // outside the one clause this change is permitted. Under this repository's type-checking `ts-node` it
+        // does not compile at all: `migration.ts(16,13): error TS2345`, because commander's `action` accepts
+        // `void | Promise<void>` while `runMigrations` returns `Promise<string[]>`. Measured remedies, in
+        // order of preference: call `runMigrations`/`revertLastMigration` from `@vendure/core` directly, which
+        // is what this plugin's own e2e suites do and which depends on neither of the following; or run the
+        // subcommand with `TS_NODE_TRANSPILE_ONLY=true`, which additionally needs `packages/dashboard` to have
+        // been built, because this file imports `@vendure/dashboard/plugin`.
+        //
+        // Whichever route is taken, every migration connection is forced to `synchronize: false` by the
+        // platform itself (`packages/core/src/migrate.ts:L197-L204`) whatever this object declares. This
+        // harness ships no core
         // migrations of its own — the pattern above names a directory that does not exist — so its schema
         // comes from the schema builder, and `packages/dev-server/index.ts` runs `runMigrations` before
         // `bootstrap`: on an engine other than the one the plugin's migration was generated against, that call
         // reports its failure through `process.exitCode` rather than by throwing (`migrate.ts:L52-L59`).
+        //
+        // This harness's own thin CLI wrapper over that pair, `packages/dev-server/migration.ts`, needs two
+        // things before it can drive them in a checkout, and both PREDATE this feature: that file is
+        // byte-identical to the gate-E1 baseline commit. Its `run` subcommand hands commander an action
+        // returning `Promise<string[]>` (`migration.ts:L16-L18`) where commander accepts only `void` or
+        // `Promise<void>` (`commander/typings/index.d.ts:L516`), so ts-node's checker refuses the whole
+        // module — `migration.ts(16,13): error TS2345` — and with it BOTH subcommands;
+        // `TS_NODE_TRANSPILE_ONLY=true` bypasses that check, after which the wrapper does drive the two
+        // helpers above. It also loads this file, whose `@vendure/dashboard/plugin`,
+        // `@vendure/graphiql-plugin` and `@vendure/telemetry-plugin` imports resolve only to build output
+        // that `lerna run ci` does not produce — none of those three declares a `ci` script — so a full
+        // workspace build is the second thing. Correcting the first would mean editing `migration.ts`,
+        // and this file is the only one outside `packages/reorder-plugin/` this feature may touch, so that
+        // sibling is left exactly as it is.
         //
         // What the boot then does depends on the engine, and the two cases are NOT the same. `getDbConfig()`
         // is spread over this object, and its `postgres`, `sqlite` and `mysql`/`mariadb`/default branches each

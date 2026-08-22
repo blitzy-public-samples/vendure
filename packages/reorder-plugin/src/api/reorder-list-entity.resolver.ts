@@ -325,6 +325,27 @@ function resolvedLinePage(list: ReorderList, optionsKey: string): ReorderListLin
  * null as well as absent. Every other member — `skip`, `sort`, `filter`, `filterOperator` — is handed through
  * exactly as it arrived, so the caller's own paging and ordering reach the service unaltered.
  *
+ * **So a supplied `take` of zero or a negative number produces an empty nested page, and no step of that is a
+ * rule this function states.** The forwarded value is clamped by the platform, whose over-limit refusal is
+ * guarded on a *truthy* `take` — a zero is therefore never refused as over-limit — and which then reduces the
+ * value into the range `[0, limit]`, landing both `-1` and `0` on zero
+ * (`packages/core/src/service/helpers/list-query-builder/list-query-builder.ts` L626-L648). That zero does not
+ * reach the statement as a `LIMIT`, because one statement serves every parent on the page and no parent's
+ * limit may be imposed on it: {@link ReorderListService.getLinesForLists} reads the resolved window off the
+ * built query, clears its `take` and `skip`, and cuts each parent's page with a ranked half-open range —
+ * `rank > skip` and `rank <= skip + take` — which selects no row at a `take` of zero, while the grouped total
+ * is counted on a clone taken before that predicate and so still reports each parent's whole collection. The
+ * published page is an empty `items` beside a correct `totalItems`.
+ *
+ * The page is never unbounded whatever arrives: an absent or null `take` takes the configured default, and a
+ * supplied one above the platform's Shop maximum is refused with the platform's own input error rather than
+ * reduced to fit (STORY-001-01-04 AC-3), which is why a supplied value is forwarded rather than clamped here.
+ * A core list field answers the same non-positive input with every row instead, and the divergence is TypeORM
+ * 0.3.28's treatment of an already-clamped zero rather than a decision either side made: those fields join, so
+ * the zero is never copied into the statement's limit and the joined two-query pagination path is skipped as
+ * well, being gated on a truthy `skip` or `take` (`node_modules/typeorm/query-builder/SelectQueryBuilder.js`
+ * L1379-L1391, L1999-L2000).
+ *
  * It is a module function rather than a method because **both** callers must produce the identical object: the
  * field resolver, from its coerced `@Args()`, and the single-list read, from the same argument read off the
  * document. A second copy of this normalisation could substitute a different default and the two would then
@@ -1123,13 +1144,31 @@ export class ReorderListEntityResolver {
      * same path. In all three the line entry is still returned, carrying its populated `productVariantId` and
      * its unchanged quantity, which is exactly why the field is nullable.
      *
-     * **A DISABLED variant is not one of those cases and resolves normally.** A disabled variant is still
-     * resolvable in the channel and its `enabled` value is readable on the variant type the platform already
-     * publishes, so nulling it here would hide a variant the contract says to return (STORY-001-01-04). Neither
-     * the disabled flag nor the deletion timestamp is read as a precondition of the query, and neither is
-     * projected onto this plugin's payload as a field of its own: a saved list records intent rather than
-     * availability, and this payload carries no availability field at all. Surfacing availability is
-     * FEATURE-001-03's work and resolving it is FEATURE-001-04's.
+     * **A DISABLED variant is not one of those cases and resolves normally.** Disabling a variant does not make
+     * it unresolvable in the active channel: the channel-scoped load returns it, translated and priced, exactly
+     * as it returns an enabled one. So nulling it here would withhold a variant the contract says to return —
+     * STORY-001-01-04's disabled-and-deleted scenario requires both lines present with only the soft-deleted
+     * one's relation null, and the published field is nullable for the three cases above rather than for
+     * unavailability. Neither the disabled flag nor the deletion timestamp is read as a precondition of the
+     * query, and neither is projected onto this plugin's payload as a field of its own: a saved list records
+     * intent rather than availability, and this payload carries no availability field at all.
+     *
+     * **The corollary is a gap a storefront has to be told about rather than left to discover: nothing in this
+     * response marks a disabled variant.** The Shop API's `ProductVariant` publishes no `enabled` field — the
+     * shared type declares twenty and that is not one of them
+     * (`packages/core/src/api/schema/common/product.type.graphql` L42-L62), and `enabled: Boolean!` is added
+     * only by the Admin extension (`packages/core/src/api/schema/admin-api/product-admin.type.graphql`
+     * L10-L11) — so a client reading this payload cannot tell a disabled variant from an orderable one, and
+     * `stockLevel` is not a second-best signal for it: that field is computed from `trackInventory`, the
+     * recorded stock levels and the out-of-stock threshold, and reads `enabled` nowhere
+     * (`packages/core/src/service/services/product-variant.service.ts` L323-L340, L361-L365), so a disabled
+     * variant reports the same stock it reported while enabled. The asymmetry runs one step further and is
+     * worth stating rather than leaving to be discovered: the platform's own Shop catalogue read filters
+     * `enabled` out of a product's variants for a Shop request (same file, L169-L196), while the accessor this
+     * resolver batches through applies no such predicate (same file, L150-L163), so this payload can hand back
+     * a variant the storefront's own catalogue would not list. Closing the gap is deliberately not this
+     * feature's: availability is surfaced at preview time by FEATURE-001-03 and an unavailable line is resolved
+     * at commit time by FEATURE-001-04, which is where the parent feature places both.
      *
      * **One load per page, not one per entry.** Every line on the page registers its variant identifier in a
      * single request-scoped batch, de-duplicated, and the batch is loaded once through the channel-scoped

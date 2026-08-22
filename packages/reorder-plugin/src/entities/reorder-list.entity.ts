@@ -241,6 +241,21 @@ export class ReorderList extends VendureEntity {
      * option to configure either. It is not imported here, because an entity must not depend on the
      * plugin's own configuration module.
      *
+     * **On the SQLite family that width is a declaration and nothing more, so read it as the backstop it
+     * is rather than as a property of the stored value.** Those engines treat a column's declared type as
+     * an *affinity* rather than a constraint, so `varchar(191)` reaches `sqlite_master`
+     * intact and is then not applied: a 192-character value is accepted and stored whole, reading back at
+     * 192 characters with no truncation, measured on sql.js 1.13.0 (SQLite 3.49.1) and native SQLite
+     * 3.49.2. The other three of the four automated engines refuse it — PostgreSQL 16.15 with
+     * `22001 value too long for type character varying(191)`, MariaDB 11.5.2 and MySQL 8.0.43 with errno
+     * 1406 `ER_DATA_TOO_LONG` naming this column. No published behaviour turns on the difference, because
+     * `MAX_LIST_NAME_LENGTH` refuses an over-long name in process before any write is issued, on every
+     * engine. What the SQLite family lacks is only what stands *behind* that guard, which is the same
+     * thing the MySQL family lacks on the two named check constraints: the defence against a write that
+     * does not come through this plugin at all — direct SQL, or another application sharing the schema.
+     * The package README states both gaps together, and there is nothing to declare instead here, since
+     * SQLite offers no constrained-width text type.
+     *
      * @since 3.8.0
      */
     @Column({ type: 'varchar', length: 191, nullable: false })
@@ -260,7 +275,12 @@ export class ReorderList extends VendureEntity {
      * remain two distinct lists.
      *
      * Stored at the same 191-character width as {@link ReorderList.name} because it is the column
-     * that actually participates in `UQ_reorder_list_customer_channel_name_key`.
+     * that actually participates in `UQ_reorder_list_customer_channel_name_key` — and enforced by the
+     * engine on the same three of the four, so a 382-character key (the size 191 characters can reach
+     * after NFC composition, which is why this column is measured separately from the display value) is
+     * refused by PostgreSQL and the MySQL family and accepted whole by the SQLite family. See
+     * {@link ReorderList.name} for the measurement and for why the in-process bound, not this width, is
+     * what the guarantee rests on.
      *
      * **Canonicalising the value is only half of what makes the comparison engine-independent, and the other
      * half is this column's collation.** The pipeline decides which two names *ought* to collide; the

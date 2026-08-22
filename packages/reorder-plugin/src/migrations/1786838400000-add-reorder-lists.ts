@@ -16,9 +16,19 @@
  * the engine it was generated against, and what is written here is PostgreSQL DDL. `SERIAL`,
  * `TIMESTAMP … DEFAULT now()` and `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` are not legal on the SQLite
  * family, double-quoted identifiers are string literals on the MySQL family, and `down()` names the `public`
- * schema the generation connection was configured with. Applying this file therefore needs a PostgreSQL
- * deployment; a deployment on another engine generates its own file the same way, from the same two entity
- * classes. Plan section 0.2.3.1 records this as a known limitation.
+ * schema the generation connection was configured with. That is measured on the images the engine jobs use
+ * rather than deduced: the first statement below, applied verbatim through each engine's own driver, is
+ * accepted on PostgreSQL 16.15 and refused on MariaDB 11.5.2 and MySQL 8.0.43 with errno 1064
+ * `ER_PARSE_ERROR` and on sql.js 1.13.0 and native SQLite 3.49.2 with `near "(": syntax error`.
+ *
+ * So the two halves of the lifecycle claim are inseparable, and either one read on its own reverses the
+ * other's meaning: the data-bearing up → down → up round trip is verified on all four automated engines, and
+ * it is verified through THIS file on PostgreSQL and through that engine's OWN emission — generated the same
+ * way, from the same two entity classes — on the other three. This file applies on PostgreSQL alone. The
+ * package README's migration section carries that per-engine split as a table, because a reader who consults
+ * a coverage matrix alone is exactly the reader who would otherwise take "verified on all four" to mean
+ * "this file applies on all four". Plan section 0.2.3.1 records the emitted form's engine binding as a known
+ * limitation.
  *
  * Every table, column, name and referential action below is a literal read from no entity class, because the
  * generator serialises SQL rather than metadata lookups. A later change to `ReorderList` or

@@ -2853,6 +2853,51 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             return { list, trueTotal: 2 };
         }
 
+        /**
+         * Backdates one list's stored audit column to a KNOWN instant, and returns the value that landed.
+         *
+         * It exists so that "the repairing read did not move `updatedAt`" is decided by the engine's stored
+         * value rather than by its timestamp granularity. Every write before this point moved the column to
+         * *now*, so a defect that reassigned it to `CURRENT_TIMESTAMP` a few milliseconds later could store the
+         * same value it found on an engine whose column truncates below the second — and the assertion would
+         * pass on a defect. Backdating puts years between the two, so the two outcomes cannot be confused.
+         *
+         * The instant carries no sub-second component, because the four engines do not agree on the precision
+         * of a datetime column and a truncated fraction would make the round trip inexact for a reason that has
+         * nothing to do with what is being measured. The write goes through the entity so the driver renders
+         * the value in its own dialect, and the value that came back is READ AND RETURNED rather than assumed:
+         * the caller compares against what the row actually holds.
+         */
+        async function backdateStoredUpdatedAt(listId: ReorderApiId): Promise<number> {
+            const backdatedTo = new Date('2020-01-02T03:04:05.000Z');
+            await dataSource
+                .createQueryBuilder()
+                .update(ReorderList)
+                .set({ updatedAt: backdatedTo })
+                .where('id = :id', { id: decodeId(listId) })
+                .execute();
+            const stored = await readStoredList(listId);
+            const landed = new Date(stored?.updatedAt ?? 0).getTime();
+            expect(
+                landed,
+                'The audit column could not be backdated, so a repair that moved it would be ' +
+                    'indistinguishable from one that did not',
+            ).toBeLessThan(Date.now() - 60_000);
+            return landed;
+        }
+
+        /** The list's PUBLISHED `updatedAt`, taken through the collection read, which never repairs. */
+        async function publishedUpdatedAtThroughCollection(listId: ReorderApiId): Promise<string> {
+            const page = await shopClient.query<GetActiveCustomerReorderListsQuery>(
+                GET_ACTIVE_CUSTOMER_REORDER_LISTS,
+            );
+            const entry = page.activeCustomerReorderLists.items.find(
+                item => String(item.id) === String(listId),
+            );
+            expect(entry, 'The seeded list was absent from its owner\u2019s own page').toBeDefined();
+            return String(entry?.updatedAt);
+        }
+
         it('repairs on the first single-list read with exactly one guarded update and issues none on the second', async () => {
             const { list, trueTotal } = await seedListWithStaleCounter();
             const staleValue = 3;
@@ -2902,6 +2947,73 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             if (isStatementCountEngine()) {
                 expect(capture.writesFor(LIST_TABLE).length, countedDiagnostic()).toBe(0);
                 expect(capture.writesFor(LINE_TABLE).length, countedDiagnostic()).toBe(0);
+            }
+        });
+
+        it('repairs the counter without moving the published modification time of the row', async () => {
+            // A READ MAY CHANGE THE COUNTER AND NOTHING ELSE. `updatedAt` is a published, sortable field of
+            // `ReorderList`, so a repair that moved it would reorder a later page sorted on it and would show
+            // every consumer using it for change detection or cache validation a modification that never
+            // happened — and the specified repair sets `lineCount` alone. The query builder appends
+            // `updatedAt = CURRENT_TIMESTAMP` to every update it renders for an entity carrying an update-date
+            // column unless that column is itself among the ones being set, so the service names it and assigns
+            // it to itself. Both halves of that are asserted here: the user-visible one on all four engines
+            // through the published value, and the statement's own text on the engine where statement text is
+            // deterministic.
+            const { list, trueTotal } = await seedListWithStaleCounter();
+            const staleValue = 3;
+            const storedUpdatedAtBefore = await backdateStoredUpdatedAt(list.id);
+            const publishedUpdatedAtBefore = await publishedUpdatedAtThroughCollection(list.id);
+
+            capture.reset();
+            const repairing = await capture.capture(() =>
+                shopClient.query<
+                    GetActiveCustomerReorderListQuery,
+                    GetActiveCustomerReorderListQueryVariables
+                >(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: list.id }),
+            );
+            const repairWrites = capture.writesFor(LIST_TABLE);
+            const repairCapture = countedDiagnostic();
+
+            // The repair happened: the corrected value is in the same response and in the stored row.
+            expect(repairing.activeCustomerReorderList?.lineCount).toBe(trueTotal);
+            expect((await readStoredList(list.id))?.lineCount).toBe(trueTotal);
+
+            // AND THE AUDIT COLUMN DID NOT MOVE — the stored instant, and the published value read back
+            // afterwards through the same document the reproduction used, are both exactly what they were.
+            const storedUpdatedAtAfter = new Date((await readStoredList(list.id))?.updatedAt ?? 0).getTime();
+            expect(storedUpdatedAtAfter).toBe(storedUpdatedAtBefore);
+            expect(await publishedUpdatedAtThroughCollection(list.id)).toBe(publishedUpdatedAtBefore);
+            const afterRepair = await shopClient.query<
+                GetActiveCustomerReorderListQuery,
+                GetActiveCustomerReorderListQueryVariables
+            >(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: list.id });
+            expect(String(afterRepair.activeCustomerReorderList?.updatedAt)).toBe(publishedUpdatedAtBefore);
+            // The repairing response itself served the same value, so no client sees the field flicker either.
+            expect(String(repairing.activeCustomerReorderList?.updatedAt)).toBe(publishedUpdatedAtBefore);
+
+            if (isStatementCountEngine()) {
+                expect(repairWrites.length, repairCapture).toBe(1);
+                expect(repairWrites[0].kind, repairCapture).toBe('update');
+                // THE PIN, IN THE STATEMENT'S OWN TEXT: the audit column assigned the audit column, quoted the
+                // way the connected driver quotes an identifier rather than the way one engine does.
+                const auditColumn = quotedIdentifier(UPDATE_DATE_COLUMN);
+                expect(repairWrites[0].query, repairCapture).toContain(`${auditColumn} = ${auditColumn}`);
+                // And no fresh timestamp reached the clause, under any spelling the four engines use for one.
+                expect(repairWrites[0].query.toUpperCase(), repairCapture).not.toMatch(
+                    /CURRENT_TIMESTAMP|NOW\s*\(|LOCALTIMESTAMP|GETDATE/,
+                );
+                // The four conjuncts are untouched by the pin: the row, the stale counter it expects to find,
+                // and the ownership pair that scopes the write in the database rather than in the caller.
+                expect(
+                    whereRequiresScopedPredicates(repairWrites[0], [
+                        { column: 'id', value: decodeId(list.id) },
+                        { column: 'lineCount', value: staleValue },
+                        { column: 'customerId', value: actingCustomerDbId },
+                        { column: 'channelId', value: defaultChannelDbId },
+                    ]),
+                    repairCapture,
+                ).toBe(true);
             }
         });
 

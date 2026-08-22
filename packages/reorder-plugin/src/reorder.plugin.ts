@@ -98,16 +98,68 @@ const DEFAULT_REORDER_PLUGIN_OPTIONS: ResolvedReorderPluginOptions = Object.free
 const MIN_OPTION_VALUE = 1;
 
 /**
- * The largest signed 32-bit integer, and the additional ceiling on `maxQuantityPerLine` only.
+ * The largest signed 32-bit integer, and the additional ceiling on every option whose value cannot be
+ * carried at run time once it exceeds that range: `maxQuantityPerLine` and both page sizes. The remaining
+ * two options carry a lower bound only, and each key's own reason for carrying the ceiling — or not — is
+ * recorded in {@link MAX_SIGNED_32_BIT_CEILING_REASONS} rather than left to be inferred.
  *
  * It is not a round number chosen for tidiness. `addItemToReorderList` ACCUMULATES onto an existing line's
- * quantity, the column it accumulates into is a 32-bit `int`, and the GraphQL `Int` the value is published
- * as is a signed 32-bit integer, so a bound above this range would admit a resulting quantity that neither
- * the column nor the published type can represent (EPIC-001 section 7.10; FEATURE-001-01 section 2.11).
- * Refusing it at initialisation converts a driver-level overflow on some future request into a startup
- * failure naming the offending key.
+ * quantity, the column it accumulates into is declared a 32-bit `int`, and the GraphQL `Int` the value is
+ * published as is a signed 32-bit integer, so a bound above this range would admit a resulting quantity that
+ * neither the column nor the published type can represent (EPIC-001 section 7.10; FEATURE-001-01 section
+ * 2.11). A page size reaches the same ceiling by the other route: it is applied as the `take` of a Shop list
+ * query and travels through that same published `Int`, so a page above this range could never be served
+ * either. Refusing all three at initialisation converts a driver-level overflow, or a read that fails on
+ * every request, into a startup failure naming the offending key.
+ *
+ * Of the two reasons the quantity ceiling rests on, the published one holds on every engine and the stored
+ * one does not, which is why the ceiling is applied here rather than left to the database. PostgreSQL and the
+ * MySQL family enforce the declared integer width; the SQLite family treats it as an affinity and stores a
+ * 64-bit `integer`, so a value above this range is accepted there. See {@link ReorderListLine.quantity} for
+ * the measurement and the package README for the engine-scoped accounting.
  */
 const MAX_SIGNED_32_BIT_INTEGER = 2147483647;
+
+/**
+ * Why both page sizes carry the {@link MAX_SIGNED_32_BIT_INTEGER} ceiling.
+ *
+ * It is deliberately NOT the reason `maxQuantityPerLine` carries the same ceiling, and the two must not be
+ * collapsed into one sentence: a page size is never stored in a column, so citing a 32-bit column would
+ * state something untrue of it. What is true of it is the request path — the value is applied as the `take`
+ * of a Shop list query when a caller supplies none, and both that argument and the `totalItems` it is
+ * measured against are the published GraphQL `Int`, which is a signed 32-bit integer — so a page above the
+ * range is unserviceable rather than merely large.
+ *
+ * One constant shared by both keys, so the two can never drift into differently worded halves of one rule.
+ */
+const PAGE_SIZE_32_BIT_CEILING_REASON =
+    'because a page size is applied as the `take` of a Shop list query and is carried by the published ' +
+    'GraphQL Int, which is a signed 32-bit integer, so a larger page could never be served';
+
+/**
+ * The requirement clause each option carrying the {@link MAX_SIGNED_32_BIT_INTEGER} ceiling cites when a
+ * value exceeds it — and, by an ABSENT entry, which options carry no ceiling at all.
+ *
+ * A per-key map rather than a chain of `if`s, for two reasons. It keeps every key's reason beside the key it
+ * is true of, so neither page size can inherit the quantity column's justification and be refused for a
+ * reason that does not apply to it. And because it is keyed by `keyof ResolvedReorderPluginOptions`, a sixth
+ * option added to the interface is a key this map may carry: the decision is taken here, in one visible
+ * place, rather than escaping the rule by simply not appearing in a condition someone forgot to extend.
+ *
+ * `maxListsPerCustomer` and `maxLinesPerList` are absent deliberately. Both are compared against a count of
+ * rows, so a value above the 32-bit range does not make a request unserviceable — it makes the bound refuse
+ * nothing, which is a configuration mistake with no failing request behind it — whereas a quantity or a page
+ * size above the range is a value the column or the published type cannot carry at all.
+ */
+const MAX_SIGNED_32_BIT_CEILING_REASONS: Readonly<
+    Partial<Record<keyof ResolvedReorderPluginOptions, string>>
+> = Object.freeze({
+    maxQuantityPerLine:
+        'because the quantity column it guards is a 32-bit int and the published GraphQL Int is ' +
+        'a signed 32-bit integer',
+    defaultReorderListsPageSize: PAGE_SIZE_32_BIT_CEILING_REASON,
+    defaultReorderListLinesPageSize: PAGE_SIZE_32_BIT_CEILING_REASON,
+});
 
 /**
  * The keys validated at initialisation, in the order they are validated.
@@ -128,10 +180,12 @@ const VALIDATED_OPTION_KEYS: ReadonlyArray<keyof ResolvedReorderPluginOptions> =
 
 /**
  * The two options that are applied as a `take`, and are therefore bounded by the running server's own Shop
- * list-query limit as well as by the integer rules every option obeys.
+ * list-query limit as well as by the integer rules every option obeys and the
+ * {@link MAX_SIGNED_32_BIT_INTEGER} ceiling both of them carry.
  *
- * They are singled out because their upper bound is not a constant this file can check on its own: it is
- * `apiOptions.shopListQueryLimit`, which belongs to the configuration the server is being started with. See
+ * They are singled out because THIS upper bound is not a constant this file can check on its own: it is
+ * `apiOptions.shopListQueryLimit`, which belongs to the configuration the server is being started with,
+ * whereas the 32-bit ceiling is knowable without a server and is therefore applied in `init()`. See
  * {@link ReorderPlugin.validateAgainstShopListQueryLimit} for why an unchecked value is worse than a refused
  * boot.
  *
@@ -194,12 +248,15 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
 
 /**
  * @description
- * Thrown when {@link ReorderPlugin.init} is given an option value the plugin cannot use.
+ * Thrown when {@link ReorderPlugin.init} is given an option value the plugin cannot use, or an options
+ * argument that is not an object at all.
  *
  * It is a distinct class rather than a bare `Error` so that a caller — or a test — can discriminate a
  * configuration mistake from any other startup failure, and so that the offending key is available as data
  * on {@link ReorderPluginConfigurationError.optionKey} rather than only as prose inside a message that would
- * then have to be parsed. The message names the key as well, so a stack trace alone is enough to act on.
+ * then have to be parsed. The message names the key as well, so a stack trace alone is enough to act on. The
+ * one rejection that names no key is the argument itself, where `optionKey` is `null` and the message says so
+ * in those terms rather than inventing a key.
  *
  * **It is deliberately NOT one of the symbols the root barrel publishes.** `index.ts` publishes the surface a
  * deployment configures this plugin through — {@link ReorderPlugin}, `ReorderPluginOptions` and both entity
@@ -207,13 +264,13 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
  * which this class sets and neither of which needs the class itself to be in scope. That is what the example
  * below uses.
  *
- * **The message names the key and the KIND of value that arrived, and never the value's content.** The key
- * is what EPIC-001 section 7.10 requires the failure to identify, and it comes from a fixed set of five; the
- * rejected value comes from whatever the deployment's configuration produced, so it may be a credential or a
- * token assigned to the wrong key, may carry newlines or terminal escapes that forge surrounding log lines,
- * and may be arbitrarily long. This error is written to the startup log, where all three of those outlive the
- * process that raised them. See {@link describeRejectedValue} for exactly what is rendered and why a finite
- * number is the one value it will carry.
+ * **The message names the key — or the argument — and the KIND of value that arrived, and never the value's
+ * content.** The key is what EPIC-001 section 7.10 requires the failure to identify, and it comes from a
+ * fixed set of five; the rejected value comes from whatever the deployment's configuration produced, so it
+ * may be a credential or a token assigned to the wrong key, may carry newlines or terminal escapes that forge
+ * surrounding log lines, and may be arbitrarily long. This error is written to the startup log, where all
+ * three of those outlive the process that raised them. See {@link describeRejectedValue} for exactly what is
+ * rendered and why a finite number is the one value it will carry.
  *
  * Throwing at all is the point. EPIC-001 section 7.10 fixes the behaviour for every option in the ledger:
  * the plugin fails to start, with a named configuration error identifying the offending key, because a
@@ -228,7 +285,8 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
  *   ReorderPlugin.init({ maxLinesPerList: 0 });
  * } catch (e) {
  *   if ((e as Error).name === 'ReorderPluginConfigurationError') {
- *     // (e as { optionKey: string }).optionKey === 'maxLinesPerList'
+ *     // (e as { optionKey: string | null }).optionKey === 'maxLinesPerList'
+ *     // — and `null` where the options argument itself was refused rather than one option.
  *   }
  * }
  * ```
@@ -240,17 +298,24 @@ const I18N_RESOURCE_CANDIDATE_PATHS: readonly string[] = [
 export class ReorderPluginConfigurationError extends Error {
     /**
      * @description
-     * The single option key that was rejected. Validation stops at the first offender, so this names one
-     * key and never a set of them.
+     * The single option key that was rejected, or `null` when what was rejected is the options argument
+     * itself rather than one option — the shape {@link validateReorderPluginOptionsArgument} refuses, where
+     * there is no key to name because nothing was ever read out of the value. Validation of the keys stops at
+     * the first offender, so a non-`null` value names one key and never a set of them.
      *
      * @since 3.8.0
      */
-    readonly optionKey: keyof ReorderPluginOptions;
+    readonly optionKey: keyof ReorderPluginOptions | null;
 
-    constructor(optionKey: keyof ReorderPluginOptions, requirement: string, received: unknown) {
+    constructor(optionKey: keyof ReorderPluginOptions | null, requirement: string, received: unknown) {
         super(
-            `ReorderPlugin configuration is invalid: the "${optionKey}" option ${requirement}, ` +
-                `but received ${describeRejectedValue(received)}. ` +
+            // Two subjects, one message shape. A key-level rejection quotes the key, which is what EPIC-001
+            // section 7.10 requires the failure to identify; an argument-level rejection has no key, so it
+            // names the argument in those words rather than rendering `the "null" option`, which would read
+            // as a sixth option that does not exist.
+            `ReorderPlugin configuration is invalid: ` +
+                `${optionKey === null ? 'the options argument' : `the "${optionKey}" option`} ` +
+                `${requirement}, but received ${describeRejectedValue(received)}. ` +
                 `Correct the value passed to ReorderPlugin.init() — the plugin will not start until it is valid.`,
         );
         // Set explicitly rather than inherited, so that the class name survives in `error.name` and in any
@@ -401,14 +466,67 @@ function renderSafeNumber(value: number): string | undefined {
 
 /**
  * @description
+ * Validates the SHAPE of the argument {@link ReorderPlugin.init} was called with, before any of it is
+ * merged, and throws {@link ReorderPluginConfigurationError} carrying no key when it is not an object.
+ *
+ * `init()` is typed, so a TypeScript caller cannot reach this. A JavaScript caller can, and so can a
+ * configuration assembled from JSON, from environment variables or by a factory that returned the wrong
+ * thing — which is the same population every other check in this file exists for.
+ *
+ * **It runs before the spread, and that ordering is the whole of it.** Spreading a non-object contributes
+ * either nothing (`null`, a number, a boolean, a function) or, for a string, one enumerable index key per
+ * character: `init('nonsense')` would otherwise resolve, freeze and serve `{ 0: 'n', 1: 'o', … }` alongside
+ * the five declared defaults, and {@link ReorderPlugin.options} would report that object. Checking first
+ * means a rejected argument never builds an object at all — nothing is stored, and the previously resolved
+ * set stays in force exactly as it does for a rejected value.
+ *
+ * **Every non-object is refused rather than read as "no options supplied".** `null` and each primitive are an
+ * expression that failed to produce the object it was meant to; an array and a function are an object of the
+ * wrong kind. Treating any of them as an empty call would boot a server on the declared defaults while the
+ * bounds the deployment actually wrote were silently dropped, which is the failure mode EPIC-001 section 7.10
+ * makes this plugin fail fast on. The one shape that does mean "no options supplied" is an omitted argument —
+ * absorbed, along with an explicit `undefined`, by the parameter default of `init()`, so it arrives here as
+ * the empty object and resolves to the five declared defaults.
+ *
+ * The argument's KEYS are not this function's business: an unknown key on an accepted object is ignored as it
+ * always was, and the values of the known keys are checked by {@link validateResolvedReorderPluginOptions}
+ * after the merge.
+ *
+ * @param options - The argument as it actually arrived, typed `unknown` precisely because the point of the
+ * check is to hold when it is not what the signature says.
+ * @throws {@link ReorderPluginConfigurationError} with a `null` `optionKey`, the rejection being of the
+ * argument rather than of any one option. The rejected value is described by kind — and, for a string, by
+ * length — and never by its content, because this message reaches the startup log; see
+ * {@link describeRejectedValue}.
+ *
+ * @since 3.8.0
+ */
+function validateReorderPluginOptionsArgument(options: unknown): void {
+    // `typeof null` is `'object'` and so is an array's, so both are named explicitly. Everything else that
+    // must go — a function, whose `typeof` is `'function'`, and every primitive: string, number, boolean,
+    // bigint and symbol — fails the `typeof` test in the middle.
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new ReorderPluginConfigurationError(
+            null,
+            'must be an object carrying option keys — any subset of ReorderPluginOptions — or be omitted ' +
+                'altogether',
+            options,
+        );
+    }
+}
+
+/**
+ * @description
  * Validates a fully resolved option set and returns it unchanged, or throws
  * {@link ReorderPluginConfigurationError} naming the first key it cannot accept.
  *
  * The rule applied to all five keys is the same — an integer, finite, and at least
- * {@link MIN_OPTION_VALUE} — and `maxQuantityPerLine` additionally may not exceed
- * {@link MAX_SIGNED_32_BIT_INTEGER}. `Number.isInteger` is the test rather than truthiness or a `parseInt`
- * round trip, because it is false for `NaN`, for both infinities, for a fractional value and for every
- * non-number, which is exactly the set to refuse; `parseInt('25 lists')` would return 25 and admit rubbish.
+ * {@link MIN_OPTION_VALUE} — and every key listed in {@link MAX_SIGNED_32_BIT_CEILING_REASONS} additionally
+ * may not exceed {@link MAX_SIGNED_32_BIT_INTEGER}, citing that key's own reason for carrying the ceiling:
+ * `maxQuantityPerLine` and both page sizes carry it, and the two row-count bounds carry a lower bound only.
+ * `Number.isInteger` is the test rather than truthiness or a `parseInt` round trip, because it is false for
+ * `NaN`, for both infinities, for a fractional value and for every non-number, which is exactly the set to
+ * refuse; `parseInt('25 lists')` would return 25 and admit rubbish.
  *
  * An EXPLICIT `undefined` or `null` reaches this function and is refused. That is deliberate: a key omitted
  * altogether resolves to its declared default, whereas a key present with no usable value is a mistake at
@@ -442,12 +560,14 @@ function validateResolvedReorderPluginOptions(
                 value,
             );
         }
-        if (key === 'maxQuantityPerLine' && intValue > MAX_SIGNED_32_BIT_INTEGER) {
+        // An absent reason means this key carries no ceiling, which is the whole of how the two row-count
+        // bounds are exempted — there is no key test here to fall out of step with the map.
+        const ceilingReason = MAX_SIGNED_32_BIT_CEILING_REASONS[key];
+        if (ceilingReason !== undefined && intValue > MAX_SIGNED_32_BIT_INTEGER) {
             throw new ReorderPluginConfigurationError(
                 key,
                 `must not exceed ${String(MAX_SIGNED_32_BIT_INTEGER)}, the largest signed 32-bit integer, ` +
-                    'because the quantity column it guards is a 32-bit int and the published GraphQL Int is ' +
-                    'a signed 32-bit integer',
+                    ceilingReason,
                 value,
             );
         }
@@ -461,9 +581,10 @@ function validateResolvedReorderPluginOptions(
  * **It is a REPORT and not an authority, and the distinction is the whole of it.** No registration reads it:
  * a registration returned by `init()` is bound to the set that call resolved, and the bare class is bound to
  * the frozen declared defaults. So this variable being mutable cannot move what any server serves — which is
- * exactly the property that a provider reading it would have destroyed, because a process in which one server
- * called `init({ maxLinesPerList: 33 })` would then have handed that 33 to a second, bare server that had
- * asked for the documented 200.
+ * exactly the property that a provider reading it would have destroyed, because a process in which anything
+ * at all had called `init({ maxLinesPerList: 33 })` — a configuration assembled and never booted, a factory
+ * that initialises and discards — would then have handed that 33 to a bare-class server that had asked for
+ * the documented 200.
  *
  * It is module-private and there is deliberately no way to write to it from outside this module: the only
  * assignment is in `init()`, immediately after validation has accepted the merged values, and every read goes
@@ -540,10 +661,12 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
  * };
  * ```
  *
- * Every option is optional and merges over the default shown above, so `ReorderPlugin.init({})` — and
- * registering the bare `ReorderPlugin` class — both yield exactly those five values. A value that is
- * supplied but unusable is a different matter: it fails plugin initialisation immediately with a
- * {@link ReorderPluginConfigurationError} naming the offending key, rather than degrading the bound.
+ * Every option is optional and merges over the default shown above, so `ReorderPlugin.init({})`,
+ * `ReorderPlugin.init()` and registering the bare `ReorderPlugin` class all yield exactly those five values.
+ * A value that is supplied but unusable is a different matter: it fails plugin initialisation immediately
+ * with a {@link ReorderPluginConfigurationError} naming the offending key, rather than degrading the bound.
+ * An argument that is not an object at all — `null`, an array, a function or a primitive — fails the same
+ * way, naming the argument rather than a key, rather than being read as "no options supplied".
  *
  * ## Database migration
  *
@@ -652,9 +775,10 @@ let resolvedOptions: ResolvedReorderPluginOptions = DEFAULT_REORDER_PLUGIN_OPTIO
             //
             // It deliberately does NOT read `ReorderPlugin.options`. That accessor reports the most recent
             // initialisation, so reading it here would make a bare registration serve some OTHER
-            // configuration's bounds: a process in which one server called
-            // `init({ maxLinesPerList: 33 })` would silently give a second, bare server that same 33 rather
-            // than the documented 200, and nothing would fail to say so. A configuration a deployment never
+            // configuration's bounds: a process in which any earlier code had called
+            // `init({ maxLinesPerList: 33 })` — a configuration assembled and never booted, a factory that
+            // initialises and discards — would silently give a bare-class server that same 33 rather than
+            // the documented 200, and nothing would fail to say so. A configuration a deployment never
             // asked for is the one thing a bound must never be.
             //
             // `useValue` over an already-frozen constant rather than a factory, because there is nothing
@@ -723,11 +847,19 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      *
      * **It reports the latest initialisation, and NO registration serves from it.** Each `init()` returns a
      * registration carrying the set that call resolved, bound as a `useValue` at that moment; the bare class
-     * is bound to the frozen declared defaults. So every registration in a process serves the values it was
-     * itself created with, whatever order they were created and bootstrapped in, and this accessor reports
-     * whichever initialised last purely as a report of what was last accepted. Read
-     * {@link REORDER_PLUGIN_OPTIONS} from a server's own injector for the set THAT server serves with. See
-     * {@link createScopedRegistration}.
+     * is bound to the frozen declared defaults. So WHAT a registration serves is fixed when it is created,
+     * no later `init()` can reach or move it, and this accessor reports whichever initialised last purely as
+     * a report of what was last accepted.
+     *
+     * **WHICH registration a process's servers serve is the platform's decision and not this plugin's.**
+     * `PluginModule.forRoot()` is evaluated inside the `AppModule` decorator argument
+     * (`packages/core/src/app.module.ts` L24) and that module is imported once per process
+     * (`packages/core/src/bootstrap.ts` L202), so the plugin set of whichever configuration bootstraps FIRST
+     * is frozen into `AppModule` for the life of the process: in a process that bootstraps more than one
+     * server, every server serves that first configuration's registrations, and a second, differently
+     * configured bootstrap does not get its own bounds. Run one server per process — separate processes or
+     * workers — where two configurations must differ. Read {@link REORDER_PLUGIN_OPTIONS} from a server's own
+     * injector for the set that server serves with. See {@link createScopedRegistration}.
      *
      * **It is readable and not writable, deliberately.** An accessor with no setter over module-private
      * state, returning a frozen object, is what makes the startup validation hold for the life of the
@@ -756,10 +888,12 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      * to this resolved option set, for the `plugins` array.
      *
      * Each supplied key overrides its declared default and each omitted key takes it, so a partial call is
-     * valid and `init({})` yields the documented defaults. The merged result is then validated in full
+     * valid and `init({})` — like `init()` with no argument at all — yields the documented defaults. The
+     * argument's shape is checked before anything is merged and the merged result is then validated in full
      * BEFORE it is stored: a rejected call throws {@link ReorderPluginConfigurationError} naming the first
-     * unusable key and leaves {@link ReorderPlugin.options} exactly as it was, so a failed initialisation
-     * cannot leave the plugin holding a value it has already refused.
+     * unusable key, or the argument itself where that is what was wrong, and leaves
+     * {@link ReorderPlugin.options} exactly as it was, so a failed initialisation cannot leave the plugin
+     * holding a value it has already refused.
      *
      * Validation happens here rather than on first use because the required behaviour is that the plugin
      * fails to *start* (EPIC-001 section 7.10). A bound checked lazily would let a misconfigured server
@@ -772,20 +906,38 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      * ReorderPlugin.init({ maxListsPerCustomer: 25, maxLinesPerList: 200, maxQuantityPerLine: 999 });
      * ```
      *
-     * @param options - Any subset of {@link ReorderPluginOptions}; every omitted key takes its declared
-     * default.
+     * @param options - Any subset of {@link ReorderPluginOptions}, or nothing at all; every omitted key
+     * takes its declared default, so `init()`, `init(undefined)` and `init({})` all resolve exactly the five
+     * declared defaults. Where an argument IS supplied it has to be an object: `null`, an array, a function
+     * and every primitive are refused rather than read as "no options supplied". An unknown key on an
+     * accepted object is ignored.
      * @returns A `ReorderPlugin` registration class bound to exactly this resolved option set, for
-     * inclusion in the `plugins` array of your `VendureConfig`. Each call returns a distinct class, so two
-     * differently configured servers in one process keep their own bounds.
-     * @throws {@link ReorderPluginConfigurationError} if any resolved value is not a finite integer of at
-     * least 1, or if `maxQuantityPerLine` exceeds the largest signed 32-bit integer. One further bound is
-     * checked later, at bootstrap rather than here, because it belongs to the server rather than to the
+     * inclusion in the `plugins` array of your `VendureConfig`. Each call returns a distinct class whose
+     * bound set no later `init()` can reach or move. Which registration a process's servers actually serve
+     * is the platform's: `AppModule` is imported once per process (`packages/core/src/bootstrap.ts` L202)
+     * and evaluates `PluginModule.forRoot()` in its decorator argument
+     * (`packages/core/src/app.module.ts` L24), so a process that bootstraps two servers serves the first
+     * configuration's registrations to both. Use one process per server where two configurations must
+     * differ.
+     * @throws {@link ReorderPluginConfigurationError} if the supplied argument is not an object — `null`, an
+     * array, a function or a primitive — in which case `optionKey` is `null`, because the rejection is of the
+     * argument rather than of any one option; or if any resolved value is not a finite integer of at least 1;
+     * or if `maxQuantityPerLine` or either page size exceeds the largest signed 32-bit integer — the quantity
+     * because the column it guards is a 32-bit `int`, a page size because it is carried by the published
+     * GraphQL `Int`, and both refused here because neither needs a server to be knowable. One further bound
+     * is checked later, at bootstrap rather than here, because it belongs to the server rather than to the
      * option set: neither page size may exceed that server's `apiOptions.shopListQueryLimit`. See
      * {@link ReorderPlugin.validateAgainstShopListQueryLimit}.
      *
      * @since 3.8.0
      */
     static init(options: ReorderPluginOptions = {}): Type<ReorderPlugin> {
+        // The argument's SHAPE first, before a single key is merged. A non-object either contributes nothing
+        // to the spread below or — for a string — one index key per character, so checking here is what stops
+        // `init('nonsense')` freezing and serving `{ 0: 'n', 1: 'o', … }` beside the five declared defaults.
+        // An omitted argument and an explicit `undefined` never reach it: both take the parameter default
+        // above and arrive as the empty object, which is the documented "no options supplied" call.
+        validateReorderPluginOptionsArgument(options);
         // Spread order matters: the caller's keys win over the defaults. An explicitly-supplied
         // `undefined` therefore survives the merge and is refused by validation, which is the intended
         // difference between omitting a key and supplying nothing for it.
@@ -833,8 +985,8 @@ export class ReorderPlugin implements OnApplicationBootstrap {
         // a `ReorderPlugin` whose `init()` never ran the validator; a failure here prevents that server from
         // reaching a ready state.
         //
-        // It reads THIS REGISTRATION's options rather than the static, so that in a process holding more
-        // than one differently-configured registration each one checks the set it will actually serve with.
+        // It reads THIS REGISTRATION's options rather than the static, so that a registration checks the set
+        // it will itself serve with rather than whichever configuration initialised last in the process.
         const options = validateResolvedReorderPluginOptions(this.optionsInForce());
         // Then the one bound that cannot be checked by `init()`, because it is not a property of the option
         // set at all — it is a property of the server this registration has just been bootstrapped into.
@@ -857,10 +1009,13 @@ export class ReorderPlugin implements OnApplicationBootstrap {
      * operator knows which of the two, and against which limit.
      *
      * **Why it is here and not in `init()`.** `init()` runs while a configuration is being assembled and has
-     * no access to the `apiOptions` of the server that will eventually serve with it; two servers in one
-     * process may even carry different limits. `ConfigService` resolves the configuration this registration
-     * was bootstrapped into, so the comparison is made against the limit these reads will actually be
-     * measured against. The integer rules stay in `init()`, where they can fail before a server is built at all.
+     * no access to the `apiOptions` of the server that will eventually serve with it; one registration may
+     * even be handed to configurations carrying different limits. `ConfigService` resolves the configuration
+     * this registration was bootstrapped into, so the comparison is made against the limit these reads will
+     * actually be measured against. The integer rules stay in `init()`, and so does the
+     * {@link MAX_SIGNED_32_BIT_INTEGER} ceiling both page sizes carry, because each of those can fail before
+     * a server is built at all. A page size therefore has two upper bounds, and each is checked at the
+     * earliest moment it is knowable.
      *
      * **Equal to the limit is accepted**, because the builder's own test is strictly greater — a page size of
      * exactly the limit is served, and refusing it here would be stricter than the platform.
@@ -968,12 +1123,26 @@ export class ReorderPlugin implements OnApplicationBootstrap {
  * `B.init({ maxListsPerCustomer: 20 })` would leave A's provider resolving 20, because a provider factory
  * reading module state runs when A bootstraps — after B's `init()` has already written the variable. Nothing
  * would fail and nothing would log; A would simply enforce a bound its own configuration never asked for.
- * That is reachable wherever one process holds more than one server: a multi-tenant host, and any test file
- * that builds two configurations before booting either.
+ * Every configuration assembled in a process is exposed to that, whether or not it is ever bootstrapped.
  *
  * So each `init()` returns a distinct subclass of `ReorderPlugin` whose options provider is a `useValue`
  * capturing the set that call resolved. The value is fixed at registration time and no later `init()` can
  * reach it — there is no shared slot to overwrite.
+ *
+ * **What this does NOT buy is two differently configured servers in one process, and that limit is the
+ * platform's rather than this plugin's.** `PluginModule.forRoot()` is evaluated inside the `AppModule`
+ * decorator argument (`packages/core/src/app.module.ts` L24) and that module is imported once per process
+ * (`packages/core/src/bootstrap.ts` L202), so the plugin set of whichever configuration bootstraps FIRST is
+ * frozen into `AppModule` for the life of the process, and every server bootstrapped after it in that process
+ * serves those same registrations — a second, differently configured bootstrap does not get its own bounds.
+ * Two configurations that must differ therefore need one server per process: separate processes or workers,
+ * a test file that boots two of them included.
+ *
+ * The mechanism earns its place regardless, on three properties that hold in every process: a registration's
+ * bound set is fixed when it is created and no later `init()` can reach or move it; the bare class is bound to
+ * the frozen declared defaults rather than to the latest initialisation; and {@link ReorderPlugin.options} is
+ * a report that nothing serves from. Together they are what make the one server a process does bootstrap
+ * serve exactly the set its own registration carries, instead of whichever configuration initialised last.
  *
  * **What the subclass declares, and what it deliberately inherits.** It declares only the two module-scoped
  * keys, `imports` and `providers`. It has to declare `imports` as well as `providers` even though the value is
@@ -998,8 +1167,8 @@ export class ReorderPlugin implements OnApplicationBootstrap {
  * documented defaults, so the base class's provider is `useValue: DEFAULT_REORDER_PLUGIN_OPTIONS` and its
  * `optionsInForce()` returns the same object. Were either to read {@link ReorderPlugin.options} instead,
  * isolating the scoped registrations would leave the hole open at the one registration that never asked for
- * anything: a process where one server called `init({ maxLinesPerList: 33 })` would give a second, bare
- * server that same 33 in place of the documented 200, silently and in an order-dependent way.
+ * anything: a process where anything at all had called `init({ maxLinesPerList: 33 })` would give a
+ * bare-class server that same 33 in place of the documented 200, silently and in an order-dependent way.
  *
  * **What the static means.** {@link ReorderPlugin.options} reports the most recently resolved set, which is
  * the shape EPIC-001 section 7.10 and the AAP prescribe — a readable static behind a validated `init()`. It

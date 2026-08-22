@@ -166,6 +166,15 @@ const REORDER_LIST_LINE_COLUMNS = [
     'quantity',
 ];
 
+/**
+ * The audit column both plugin entities inherit from `VendureEntity`
+ * [packages/core/src/entity/base/base.entity.ts:L32], named once because two separate things read it: the
+ * metadata double reports it as the update-date column, and the counter repair's assertion checks that the
+ * repair pinned it. A published, sortable field is what it is on the API side, which is why a READ may not
+ * move it.
+ */
+const UPDATE_DATE_COLUMN = 'updatedAt';
+
 const REORDER_LIST_TABLE = 'reorder_list';
 const REORDER_LIST_LINE_TABLE = 'reorder_list_line';
 
@@ -531,6 +540,17 @@ interface HarnessPlan {
     tablePathFor?: (tableName: string) => string;
     listColumns: string[];
     lineColumns: string[];
+    /**
+     * The property the metadata double reports as each entity's update-date column, or `undefined` to model
+     * metadata carrying none.
+     *
+     * It exists because the counter repair — the one write this service issues while serving a READ — reads
+     * that column off the metadata and pins it to itself, so the builder does not append
+     * `updatedAt = CURRENT_TIMESTAMP` and move a published, sortable field. A test needs both answers: the
+     * real one, and the empty one that proves the pin is omitted rather than guessed where there is no such
+     * column to pin.
+     */
+    updateDateColumnProperty: string | undefined;
     listFindOne: (options: Record<string, unknown>) => ReorderList | null;
     /**
      * How many rows the **advisory name pre-check** finds — the count whose predicate carries `nameKey`
@@ -583,6 +603,7 @@ class ServiceHarness {
         tableQualifier: undefined,
         listColumns: [...REORDER_LIST_COLUMNS],
         lineColumns: [...REORDER_LIST_LINE_COLUMNS],
+        updateDateColumnProperty: UPDATE_DATE_COLUMN,
         listFindOne: () => ownedList(),
         conflictingNameCount: () => 0,
         listGetOne: () => ownedList(),
@@ -857,8 +878,15 @@ class ServiceHarness {
                 : name === 'ReorderListLine'
                   ? this.plan.lineColumns
                   : [];
+        // A real `ColumnMetadata` carries THREE names and they are not interchangeable: `propertyName` and
+        // `propertyPath` are what a query builder resolves a `SET` key or an order key against, while
+        // `databaseName` is what the engine parses [node_modules/typeorm/metadata/ColumnMetadata.d.ts:L162,
+        // L178]. The double supplies all three, because a fragment that reads one and renders the other — the
+        // audit-column pin below does exactly that — cannot be judged by a double holding only one.
         const column = (property: string) =>
-            columns.includes(property) ? { databaseName: property, propertyName: property } : undefined;
+            columns.includes(property)
+                ? { databaseName: property, propertyName: property, propertyPath: property }
+                : undefined;
         const tableName = tableFor(name);
         return {
             name,
@@ -876,6 +904,16 @@ class ServiceHarness {
                   : `${this.plan.tableQualifier}.${tableName}`,
             findColumnWithPropertyName: column,
             findColumnWithPropertyPath: column,
+            // THE INHERITED AUDIT COLUMN, reported the way `EntityMetadata` reports it: as the column itself
+            // rather than as a name [node_modules/typeorm/metadata/EntityMetadata.d.ts:L226]. Both plugin
+            // entities inherit `@UpdateDateColumn() updatedAt` from `VendureEntity`, so the double answers
+            // whichever of them the plan says declares it, and `undefined` for a plan that names none — which
+            // is how "an entity whose metadata carries no update-date column" is reachable at all, since the
+            // real one always has it.
+            updateDateColumn:
+                this.plan.updateDateColumnProperty === undefined
+                    ? undefined
+                    : column(this.plan.updateDateColumnProperty),
             // The relation look-up the create path's owner lock resolves its column name through.
             findRelationWithPropertyPath: (propertyPath: string) =>
                 name === 'Customer' && propertyPath === 'user'
@@ -4331,11 +4369,74 @@ describe('ReorderListService', () => {
             const updates = statementsOfKind(harness, 'ReorderList', 'update');
             expect(repaired).toBe(2);
             expect(updates).toHaveLength(1);
-            expect(updates[0].updateSet).toEqual({ lineCount: 2 });
+            // THE COUNTER IS THE ONLY VALUE THIS STATEMENT CHANGES, and the audit column is named beside it
+            // for the sole purpose of leaving it where it stands — see the case below for why naming it is
+            // what keeps it still. Asserting the key SET rather than the whole object is what makes both
+            // halves of that claim fail separately: a third column would break the first expectation, and a
+            // pin that had become a real assignment would break the third.
+            expect(Object.keys(updates[0].updateSet ?? {}).sort()).toEqual(['lineCount', UPDATE_DATE_COLUMN]);
+            expect(updates[0].updateSet?.lineCount).toBe(2);
+            // An ABSOLUTE assignment of the observed total, not arithmetic over the stored value: the guard
+            // in the predicate is what makes the repair idempotent, and an increment would defeat it.
+            expect(typeof updates[0].updateSet?.lineCount).not.toBe('function');
             expect(conditionTextOf(updates[0])).toContain('id = :id');
             expect(conditionTextOf(updates[0])).toContain('lineCount = :storedLineCount');
             expect(updates[0].parameters.id).toBe(LIST_ID);
             expect(updates[0].parameters.storedLineCount).toBe(4);
+        });
+
+        it('pins the update-date column to itself, so the read leaves the published modification time alone', async () => {
+            // THE ONE WRITE THIS SERVICE ISSUES WHILE SERVING A READ, AND THEREFORE THE ONE THAT MAY NOT MOVE
+            // `updatedAt`. The column is a published, sortable field of `ReorderList`, so a read that moved it
+            // would reorder a later page sorted on it and would show every consumer using it for change
+            // detection a modification that never happened; the repair the AAP specifies sets `lineCount` and
+            // nothing else. Left alone the query builder APPENDS `updatedAt = CURRENT_TIMESTAMP` to every
+            // update it renders for an entity carrying an update-date column, and it skips that append only for
+            // a column already among the ones being set
+            // [node_modules/typeorm/query-builder/UpdateQueryBuilder.js:L400-L404] — so naming the column with
+            // a self-assignment is the mechanism, and this case is what holds it in place. The six mutation
+            // paths must keep moving the column, which is asserted where they are: the rename's own case
+            // requires its `SET` to name `name` and `nameKey` and nothing else, leaving the append in force.
+            const list = await readList();
+
+            await service.reconcileLineCount(ctx, list, 4, 2);
+
+            const update = statementsOfKind(harness, 'ReorderList', 'update')[0];
+            // The rendered assignment is the column itself — `"updatedAt" = "updatedAt"` — quoted by the
+            // driver rather than written bare, because PostgreSQL folds an unquoted camel-cased identifier to
+            // lower case and would then match no column.
+            expect(setExpressionOf(update, UPDATE_DATE_COLUMN)).toBe(escaped(UPDATE_DATE_COLUMN));
+            expect(harness.escapedIdentifiers).toContain(UPDATE_DATE_COLUMN);
+            // And nothing resembling a fresh timestamp reached the clause, under any of the spellings the four
+            // engines and the builder use for one.
+            expect(setExpressionOf(update, UPDATE_DATE_COLUMN).toUpperCase()).not.toMatch(
+                /CURRENT_TIMESTAMP|NOW\s*\(|GETDATE|LOCALTIMESTAMP|DATETIME\s*\(|DEFAULT/,
+            );
+            // The value is a raw expression rather than a bound parameter, which is what keeps the write a
+            // no-op on the column instead of a re-assignment of a value this process chose.
+            expect(typeof update.updateSet?.[UPDATE_DATE_COLUMN]).toBe('function');
+            expect(Object.values(update.parameters)).not.toContainEqual(expect.any(Date));
+            // The column name came from the entity's own metadata rather than from a literal in the service,
+            // so a naming strategy that renamed it could not leave the fragment naming a column that is gone.
+            expect(harness.metadataRequests).toContain('ReorderList');
+        });
+
+        it('omits the pin, and writes only the counter, where the metadata carries no update-date column', async () => {
+            // The complement of the case above, and the reason the pin is conditional rather than assumed.
+            // Where there is no update-date column there is nothing to append and nothing to suppress, and a
+            // `SET` entry naming a column the table does not have would fail at the engine — so the statement
+            // must fall back to exactly the assignment the AAP specifies. Unreachable through the shipped
+            // entities, both of which inherit the column; asserted because the guard that makes it unreachable
+            // is in this service rather than in the schema.
+            harness.plan.updateDateColumnProperty = undefined;
+            const list = await readList();
+
+            const repaired = await service.reconcileLineCount(ctx, list, 4, 2);
+
+            const update = statementsOfKind(harness, 'ReorderList', 'update')[0];
+            expect(repaired).toBe(2);
+            expect(update.updateSet).toEqual({ lineCount: 2 });
+            expect(update.conditions).toHaveLength(4);
         });
 
         it('scopes that update by the acting customer and the active channel, not by the id alone', async () => {

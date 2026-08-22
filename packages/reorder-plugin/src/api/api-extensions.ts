@@ -20,6 +20,29 @@ import gql from 'graphql-tag';
  * add are a widening that later features widen further. A second rule applies only to `deleteReorderList` and
  * is stated beside its union below, where a client meets it.
  *
+ * **One detail of the live schema is the generator's rather than this document's, and a reviewer diffing the
+ * published SDL against introspection meets it on both paginated fields:** they publish their
+ * generator-supplied argument with a default of `null` — introspection reads
+ * `activeCustomerReorderLists(includeShared: Boolean = false, options: ReorderListListOptions = null)` and
+ * `lines(options: ReorderListLineListOptions = null)`. Nothing below declares that default, and the feature
+ * contract's SDL block declares none either. The platform's list-options generator constructs the argument
+ * with `defaultValue: null` at the point where it ADDS one
+ * [packages/core/src/api/config/generate-list-options.ts:L87-L94], and it adds one exactly where no argument
+ * of the row's options type is already declared — which is why core's own hand-declared paginated fields,
+ * `products(options: ProductListOptions)` among them
+ * [packages/core/src/api/schema/shop-api/shop.api.graphql:L45], carry no default while these two do.
+ * Declaring the argument here to strip the default is not available: the input type behind it is the
+ * generator's, and naming a type this document does not declare is the unknown-type build failure EPIC-001
+ * ruling R10 forbids, which is also why the argument itself is left undeclared.
+ *
+ * That default is behaviourally inert, and by construction rather than by luck. An omitted argument is
+ * coerced to its declared default, so `options` reaches a resolver as an explicit `null` rather than as
+ * absent [node_modules/graphql/execution/values.js:L183-L203] — and both readers treat a null exactly as they
+ * treat an absent value, the collection read through `args.options?.take ?? default` and the nested `lines`
+ * field through the normaliser its two callers share. `options` omitted, `options: null` and `options: {}`
+ * therefore resolve the identical page, and a client that sends nothing is paged by the plugin's configured
+ * default rather than by the platform's larger Shop maximum.
+ *
  * `@since 3.8.0` is a derivation, not a quotation: it applies the contribution guide's next-minor rule
  * [CONTRIBUTING.md:§New features] to this checkout's declared version 3.7.0
  * [packages/core/package.json:L2-L3].

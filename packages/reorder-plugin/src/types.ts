@@ -35,10 +35,15 @@
  * input a deployment supplies — and re-asserted once more when the application bootstraps, which catches a
  * plugin registered as a bare class whose `init()` never ran the validator. Neither check is ever performed
  * per request. A value that is not an integer, is not finite, or is below one fails plugin initialisation
- * with a named configuration error identifying the offending key; `maxQuantityPerLine` additionally rejects a
- * value above the largest signed 32-bit integer, 2147483647. Initialisation fails rather than the bound
- * degrading, because a bound that silently becomes "admit everything" or "admit nothing" is worse than no
- * bound at all: nothing fails, while the guarantee the bound existed to make is gone.
+ * with a named configuration error identifying the offending key. Three keys additionally reject a value
+ * above the largest signed 32-bit integer, 2147483647 — `maxQuantityPerLine` because the column it guards is
+ * a 32-bit `int`, and both page sizes because a page size is applied as the `take` of a Shop list query and
+ * is carried by the published GraphQL `Int` — while the two row-count bounds carry a lower bound only. Each
+ * page size carries a second upper bound as well, `apiOptions.shopListQueryLimit`, which belongs to the
+ * server rather than to the option set and is therefore checked at application bootstrap instead.
+ * Initialisation fails rather than the bound degrading, because a bound that silently becomes "admit
+ * everything" or "admit nothing" is worse than no bound at all: nothing fails, while the guarantee the bound
+ * existed to make is gone.
  *
  * @example
  * ```ts
@@ -116,10 +121,12 @@ export interface ReorderPluginOptions {
      *
      * Must be an integer, finite, at least 1, and no greater than the largest signed 32-bit integer,
      * 2147483647. That ceiling is load-bearing rather than decorative: `addItemToReorderList` accumulates
-     * onto an existing line, the column it accumulates into is a 32-bit `int`, and the GraphQL `Int` the
-     * value is published as is a signed 32-bit integer, so a bound above that range would admit an
-     * accumulation that neither the column nor the published type can represent. It is the one key in this
-     * interface carrying an upper bound as well as a lower one.
+     * onto an existing line, the column it accumulates into is declared a 32-bit `int` — a width
+     * PostgreSQL and the MySQL family enforce and the SQLite family does not — and the GraphQL `Int` the
+     * value is published as is a signed 32-bit integer on every engine, so a bound above that range would
+     * admit an accumulation the published type cannot represent anywhere, and the column cannot represent
+     * on the engines that enforce its width. Both page sizes carry the same numeric ceiling for a different
+     * reason of their own; the two row-count bounds carry no upper bound at all.
      *
      * Declared by EPIC-001 section 7.10, the single authority for every configured key; owning story
      * STORY-001-01-01.
@@ -140,13 +147,22 @@ export interface ReorderPluginOptions {
      * `ignoreQueryLimits` remains false on every query, so a caller asking for more than the platform limit
      * is refused by the platform rather than by plugin code.
      *
-     * Must be an integer, finite, at least 1, and **no greater than the running server's own
-     * `apiOptions.shopListQueryLimit`** (100 unless your configuration lowers it). That upper bound is not a
-     * style preference: the value is applied as the `take` of a Shop list query, and the platform refuses a
-     * larger page outright rather than clamping it, so a page size above the limit would make every read
-     * that omits `take` fail. It is therefore checked when the plugin is bootstrapped into a server, and a
-     * server whose limit is below this value fails to start with a named error rather than starting and then
-     * failing every such read.
+     * Must be an integer, finite, at least 1, and no greater than EITHER of two upper bounds. **They are
+     * checked at different moments and for different reasons, and both are startup failures naming this
+     * key.**
+     *
+     * - **No greater than the largest signed 32-bit integer, 2147483647**, checked in
+     *   `ReorderPlugin.init()`. The value is applied as the `take` of a Shop list query and is carried by the
+     *   published GraphQL `Int`, which is a signed 32-bit integer, so a larger page could never be served
+     *   whatever server it is given to. That makes the ceiling knowable without a server, and it is therefore
+     *   refused at the earliest point it can be: while the configuration is being assembled.
+     * - **No greater than the running server's own `apiOptions.shopListQueryLimit`** (100 unless your
+     *   configuration lowers it), checked when the plugin is bootstrapped into that server. This bound is not
+     *   a style preference either: the platform refuses a `take` above its limit outright rather than
+     *   clamping it, so a page size above the limit would make every read that omits `take` fail. It cannot
+     *   be checked any earlier, because the limit belongs to the server being started rather than to the
+     *   option set — two servers in one process may carry different limits — so a server whose limit is below
+     *   this value fails to start rather than starting and then failing every such read.
      *
      * @default 25
      * @since 3.8.0
@@ -164,9 +180,12 @@ export interface ReorderPluginOptions {
      * the argument entirely still receives a bounded page rather than every line of the list. `lineCount`
      * remains on the parent type for a client that needs only a summary and no page of lines at all.
      *
-     * Must be an integer, finite, at least 1, and **no greater than the running server's own
-     * `apiOptions.shopListQueryLimit`**, for the reason given on `defaultReorderListsPageSize`: the nested
-     * read goes through the same builder, so the same refusal applies to a value above the limit.
+     * Must be an integer, finite, at least 1, and no greater than either of the two upper bounds given on
+     * `defaultReorderListsPageSize`, for the same reasons and at the same two moments: the largest signed
+     * 32-bit integer, 2147483647, refused in `ReorderPlugin.init()` because the value is carried by the
+     * published GraphQL `Int` wherever it is used; and the running server's own
+     * `apiOptions.shopListQueryLimit`, refused when the plugin is bootstrapped into that server. The nested
+     * read goes through the same builder as the root one, so both refusals apply to it identically.
      *
      * @default 50
      * @since 3.8.0

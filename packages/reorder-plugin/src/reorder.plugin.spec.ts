@@ -42,16 +42,47 @@ const MUST_BE_A_FINITE_INTEGER =
 const MUST_BE_AT_LEAST_ONE = 'must be at least 1';
 
 /**
- * The requirement clause carried when `maxQuantityPerLine` — and only that key — exceeds the largest signed
- * 32-bit integer. The clause names the reason as well as the number, so the whole of it is pinned: the
- * ceiling exists because the column the bound guards is a 32-bit `int` and the published GraphQL `Int` is a
- * signed 32-bit integer, and a shortened expectation would not notice that reason going missing.
+ * The requirement clause carried when `maxQuantityPerLine` exceeds the largest signed 32-bit integer. The
+ * clause names the reason as well as the number, so the whole of it is pinned: that ceiling exists because
+ * the column the bound guards is a 32-bit `int` and the published GraphQL `Int` is a signed 32-bit integer,
+ * and a shortened expectation would not notice that reason going missing.
  */
 const MUST_NOT_EXCEED_THE_32_BIT_CEILING =
     'must not exceed 2147483647, the largest signed 32-bit integer, because the quantity column it ' +
     'guards is a 32-bit int and the published GraphQL Int is a signed 32-bit integer';
 
+/**
+ * The requirement clause carried when a PAGE SIZE exceeds the same number. It is a separate expectation
+ * rather than a reuse of the one above, and deliberately so: a page size is never stored in a column, so the
+ * quantity key's reason would be false of it. The reason true of it is the request path — the value is
+ * applied as the `take` of a Shop list query and is carried by the published GraphQL `Int` — and it is
+ * pinned in full for the same purpose, so the reason cannot silently disappear from the refusal.
+ */
+const PAGE_SIZE_MUST_NOT_EXCEED_THE_32_BIT_CEILING =
+    'must not exceed 2147483647, the largest signed 32-bit integer, because a page size is applied as ' +
+    'the `take` of a Shop list query and is carried by the published GraphQL Int, which is a signed ' +
+    '32-bit integer, so a larger page could never be served';
+
 const MAX_SIGNED_32_BIT_INTEGER = 2147483647;
+
+/**
+ * The two keys that carry the 32-bit ceiling because their value is a page rather than a stored quantity.
+ */
+const PAGE_SIZE_KEYS: ReadonlyArray<keyof ReorderPluginOptions> = [
+    'defaultReorderListsPageSize',
+    'defaultReorderListLinesPageSize',
+];
+
+/**
+ * The two keys that carry a LOWER bound only, listed explicitly rather than derived by filtering
+ * {@link OPTION_KEYS}. A filter would silently absorb a sixth option into the no-ceiling set and assert that
+ * an unbounded value is correct for it; naming these two means a new option has to be placed on one side of
+ * the rule or the other by hand.
+ */
+const LOWER_BOUND_ONLY_KEYS: ReadonlyArray<keyof ReorderPluginOptions> = [
+    'maxListsPerCustomer',
+    'maxLinesPerList',
+];
 
 /**
  * The platform's own default Shop list-query limit, restated here because it is the value a server carries unless
@@ -214,6 +245,50 @@ const REJECTED_VALUES: readonly RejectedValueCase[] = [
 ];
 
 /**
+ * The requirement clause carried when the ARGUMENT to `init()` is not an option object at all. Quoted
+ * verbatim, because the clause is what tells an operator the argument — rather than one of the five keys —
+ * is what has to change.
+ */
+const MUST_BE_AN_OBJECT_ARGUMENT =
+    'must be an object carrying option keys — any subset of ReorderPluginOptions — or be omitted altogether';
+
+/**
+ * One row of the argument-shape matrix: a value that is not an option object, and the description the refusal
+ * must render for it.
+ */
+interface RejectedArgumentCase {
+    /** The `it()` title fragment, so a failure names the cell without the file having to be opened. */
+    readonly label: string;
+    readonly value: unknown;
+    /** The verbatim rendering of the value the message must contain after "but received ". */
+    readonly received: string;
+}
+
+/**
+ * Every argument shape `init()` must refuse: `null`, an array, a function and each primitive.
+ *
+ * None of them can be reached from TypeScript, and all of them are reachable from JavaScript, from a JSON
+ * configuration file and from any expression that returned the wrong thing. A string is the consequential
+ * one: spread into the merge it contributes one enumerable index key per character, so accepting it would
+ * resolve, freeze and serve `{ 0: 'n', 1: 'o', … }` beside the five declared defaults.
+ */
+const REJECTED_ARGUMENTS: readonly RejectedArgumentCase[] = [
+    { label: 'null', value: null, received: 'null' },
+    { label: 'an empty array', value: [], received: 'an array' },
+    { label: 'a populated array', value: [{ maxLinesPerList: 7 }], received: 'an array' },
+    { label: 'a string', value: 'nonsense', received: 'a string of length 8' },
+    { label: 'a number', value: 42, received: 'the number 42' },
+    { label: 'a boolean', value: true, received: 'a boolean (true)' },
+    { label: 'a function', value: () => ({ maxLinesPerList: 7 }), received: 'a function' },
+    { label: 'a bigint', value: BigInt(42), received: 'a bigint' },
+    {
+        label: 'a symbol',
+        value: Symbol('an options argument that arrived as a symbol'),
+        received: 'a symbol',
+    },
+];
+
+/**
  * Builds an option set carrying exactly one key, so that a cell can name one offender and the remaining four
  * keys take their declared defaults through the merge.
  */
@@ -285,6 +360,25 @@ function captureInitFailure(options: ReorderPluginOptions): ReorderPluginConfigu
     let caught: unknown;
     try {
         ReorderPlugin.init(options);
+    } catch (thrown) {
+        caught = thrown;
+    }
+    expect(caught).toBeInstanceOf(ReorderPluginConfigurationError);
+    expect(caught).toBeInstanceOf(Error);
+    return caught as ReorderPluginConfigurationError;
+}
+
+/**
+ * Runs `init()` with an argument that is not an option object, and returns the refusal it raised.
+ *
+ * The cast is the cell rather than a convenience: `init()` is typed, so the caller this guards against is a
+ * JavaScript one, a JSON configuration file or an expression that produced the wrong thing — and the `expect`
+ * inside turns "the call did not throw at all" into a failure that names that fact.
+ */
+function captureArgumentFailure(value: unknown): ReorderPluginConfigurationError {
+    let caught: unknown;
+    try {
+        ReorderPlugin.init(value as ReorderPluginOptions);
     } catch (thrown) {
         caught = thrown;
     }
@@ -442,14 +536,89 @@ describe('ReorderPlugin startup option validation', () => {
         }
     });
 
-    describe('the maxQuantityPerLine ceiling, proved on both sides', () => {
-        it('accepts the largest signed 32-bit integer exactly', () => {
+    describe('a non-object argument fails initialisation and names the argument, not an option', () => {
+        it.each(REJECTED_ARGUMENTS)('refuses $label', ({ value, received }) => {
+            const optionsBeforeTheAttempt = ReorderPlugin.options;
+
+            const error = captureArgumentFailure(value);
+
+            expect(error.constructor.name).toBe('ReorderPluginConfigurationError');
+            expect(error.name).toBe('ReorderPluginConfigurationError');
+            // There is no key to name, because nothing was ever read out of the value.
+            expect(error.optionKey).toBeNull();
+            expect(error.message).toContain('the options argument');
+            // The subject is rendered by branch rather than by interpolating the key, so `null` must never
+            // reach the message as a sixth option that does not exist.
+            expect(error.message).not.toContain('the "null" option');
+            expect(error.message).toContain(MUST_BE_AN_OBJECT_ARGUMENT);
+            expect(error.message).toContain(`but received ${received}.`);
+            // The tail is the instruction a caller acts on, and it is the same instruction for both kinds of
+            // rejection.
+            expect(error.message).toContain('Correct the value passed to ReorderPlugin.init()');
+
+            // A refused argument installs nothing, exactly as a refused value installs nothing: the set
+            // already in force is the same object it was before the attempt.
+            expect(ReorderPlugin.options).toBe(optionsBeforeTheAttempt);
+            expect(ReorderPlugin.options).toEqual(DECLARED_DEFAULTS);
+        });
+
+        it('names none of the five option keys, the rejection being of the argument itself', () => {
+            const error = captureArgumentFailure(42);
+
+            for (const key of OPTION_KEYS) {
+                expect(error.message).not.toContain(key);
+            }
+        });
+
+        it('withholds the content of a string argument, rendering its kind and length only', () => {
+            const withheldValue = 'AN_OPTIONS_ARGUMENT_WHOSE_CONTENT_MUST_NEVER_REACH_THE_LOG';
+
+            const error = captureArgumentFailure(withheldValue);
+
+            expect(error.message).toContain(`a string of length ${String(withheldValue.length)}`);
+            expect(error.message).not.toContain(withheldValue);
+        });
+
+        it('resolves no index key from a string, so a refused argument cannot pollute the option set', () => {
+            expect(() => ReorderPlugin.init('nonsense' as unknown as ReorderPluginOptions)).toThrowError(
+                ReorderPluginConfigurationError,
+            );
+
+            expect(Object.keys(ReorderPlugin.options).sort()).toEqual([...OPTION_KEYS].sort());
+            expect(ReorderPlugin.options).toEqual(DECLARED_DEFAULTS);
+        });
+
+        it('accepts an omitted argument, an explicit undefined and an empty object alike', () => {
+            expect(optionsBoundTo(ReorderPlugin.init())).toEqual(DECLARED_DEFAULTS);
+            expect(optionsBoundTo(ReorderPlugin.init(undefined))).toEqual(DECLARED_DEFAULTS);
+            expect(optionsBoundTo(ReorderPlugin.init({}))).toEqual(DECLARED_DEFAULTS);
+            expect(ReorderPlugin.options).toEqual(DECLARED_DEFAULTS);
+        });
+
+        it('accepts an object carrying an unknown key, which is neither validated nor honoured', () => {
+            const registration = ReorderPlugin.init({
+                anUnknownOptionKey: 'neither validated nor read',
+            } as unknown as ReorderPluginOptions);
+
+            for (const key of OPTION_KEYS) {
+                expect(readOption(optionsBoundTo(registration), key)).toBe(
+                    readOption(DECLARED_DEFAULTS, key),
+                );
+            }
+        });
+    });
+
+    describe('the signed 32-bit ceiling, proved on both sides for every key that carries it', () => {
+        // Three keys carry it and two do not, and both halves are asserted: an unusable value is refused at
+        // `init()` — the earliest point it is knowable, before any server exists — while a row-count bound
+        // above the range is accepted, because it refuses nothing rather than making a request unserviceable.
+        it('accepts the largest signed 32-bit integer exactly for maxQuantityPerLine', () => {
             ReorderPlugin.init({ maxQuantityPerLine: MAX_SIGNED_32_BIT_INTEGER });
 
             expect(ReorderPlugin.options.maxQuantityPerLine).toBe(MAX_SIGNED_32_BIT_INTEGER);
         });
 
-        it('refuses the first integer above it, naming the key and the reason', () => {
+        it('refuses the first integer above it for maxQuantityPerLine, naming the key and the reason', () => {
             const error = expectInitToRefuse(
                 'maxQuantityPerLine',
                 MAX_SIGNED_32_BIT_INTEGER + 1,
@@ -460,7 +629,7 @@ describe('ReorderPlugin startup option validation', () => {
             expect(error.optionKey).toBe('maxQuantityPerLine');
         });
 
-        it('refuses a value far above it', () => {
+        it('refuses a value far above it for maxQuantityPerLine', () => {
             expectInitToRefuse(
                 'maxQuantityPerLine',
                 Number.MAX_SAFE_INTEGER,
@@ -469,13 +638,56 @@ describe('ReorderPlugin startup option validation', () => {
             );
         });
 
-        for (const key of OPTION_KEYS.filter(candidate => candidate !== 'maxQuantityPerLine')) {
-            it(`applies no such ceiling to ${key}, which carries a lower bound only`, () => {
+        for (const key of PAGE_SIZE_KEYS) {
+            it(`accepts the largest signed 32-bit integer exactly for ${key}`, () => {
+                ReorderPlugin.init(optionsWith(key, MAX_SIGNED_32_BIT_INTEGER));
+
+                expect(readOption(ReorderPlugin.options, key)).toBe(MAX_SIGNED_32_BIT_INTEGER);
+            });
+
+            it(`refuses the first integer above it for ${key}, naming the key and the page-size reason`, () => {
+                const error = expectInitToRefuse(
+                    key,
+                    MAX_SIGNED_32_BIT_INTEGER + 1,
+                    PAGE_SIZE_MUST_NOT_EXCEED_THE_32_BIT_CEILING,
+                    'the number 2147483648',
+                );
+
+                expect(error.optionKey).toBe(key);
+                // The refusal must not borrow the quantity key's justification, which is untrue of a page.
+                expect(error.message).not.toContain('the quantity column it guards');
+            });
+
+            it(`refuses a value far above it for ${key}, at init() rather than at bootstrap`, () => {
+                const error = expectInitToRefuse(
+                    key,
+                    Number.MAX_SAFE_INTEGER,
+                    PAGE_SIZE_MUST_NOT_EXCEED_THE_32_BIT_CEILING,
+                    'the number 9007199254740991',
+                );
+
+                expect(error.optionKey).toBe(key);
+                // The other upper bound belongs to the server and is checked later; this refusal is the
+                // 32-bit one, so it must not be reported as a Shop list-query limit failure.
+                expect(error.message).not.toContain('apiOptions.shopListQueryLimit');
+            });
+        }
+
+        for (const key of LOWER_BOUND_ONLY_KEYS) {
+            it(`applies no such ceiling to ${key}, a row-count bound that refuses nothing`, () => {
                 ReorderPlugin.init(optionsWith(key, MAX_SIGNED_32_BIT_INTEGER + 1));
 
                 expect(readOption(ReorderPlugin.options, key)).toBe(MAX_SIGNED_32_BIT_INTEGER + 1);
             });
         }
+
+        it('splits the five keys between the two rules with none left out and none in both', () => {
+            // The rule is only as complete as the two lists are: this is what makes a sixth option — or a key
+            // moved from one rule to the other — a failure here rather than an untested value.
+            expect([...PAGE_SIZE_KEYS, 'maxQuantityPerLine', ...LOWER_BOUND_ONLY_KEYS].sort()).toEqual(
+                [...OPTION_KEYS].sort(),
+            );
+        });
     });
 
     describe('one offender at a time: the first key in validation order is the one named', () => {
@@ -616,7 +828,14 @@ describe('ReorderPlugin startup option validation', () => {
             expect(ReorderPlugin.options.maxLinesPerList).toBe(200);
         });
 
-        it('gives two differently configured registrations their own options, whenever they bootstrap', () => {
+        // These two cells assert what a registration is BOUND to, which is fixed when `init()` creates it and
+        // is beyond the reach of every later `init()`. They deliberately assert nothing about which
+        // registration a process's servers serve: `AppModule` is imported once per process
+        // (`packages/core/src/bootstrap.ts` L202) and evaluates `PluginModule.forRoot()` in its decorator
+        // argument (`packages/core/src/app.module.ts` L24), so a process that bootstraps two servers serves
+        // the first configuration's registrations to both, and that is the platform's behaviour rather than
+        // this plugin's to guarantee or to test here.
+        it('binds each registration to the set its own init() resolved, beyond the reach of a later init()', () => {
             const first = ReorderPlugin.init({ maxListsPerCustomer: 10 });
             const second = ReorderPlugin.init({ maxListsPerCustomer: 20 });
 
@@ -634,7 +853,7 @@ describe('ReorderPlugin startup option validation', () => {
             expect(optionsBoundTo(second).maxLinesPerList).toBe(DECLARED_DEFAULTS.maxLinesPerList);
         });
 
-        it('re-asserts its OWN options at bootstrap, not whichever configuration initialised last', () => {
+        it('re-validates the set its own registration carries, not whichever configuration initialised last', () => {
             const first = ReorderPlugin.init({ maxLinesPerList: 11 });
             ReorderPlugin.init({ maxLinesPerList: 22 });
 

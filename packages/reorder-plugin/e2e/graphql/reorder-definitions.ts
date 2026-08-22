@@ -95,12 +95,19 @@ import gql from 'graphql-tag';
  * been SOFT-deleted (the platform's own variant deletion, which sets a timestamp and leaves the row in
  * place), or the channel-scoped load simply does not answer for the identifier.
  *
- * A DISABLED variant is NOT one of them and resolves normally. It is still resolvable in the channel
- * and its `enabled` value is readable on the variant type the platform already publishes, so nulling it
- * would hide a variant the contract says to return — a test expecting `null` for a disabled variant
- * would be asserting the opposite of the requirement and would pass only against a defect. Neither the
- * disabled flag nor the deletion timestamp is selected here in any case: a saved list records intent
- * rather than availability, and surfacing availability belongs to a later feature.
+ * A DISABLED variant is NOT one of them and resolves normally, because it is still resolvable in the
+ * active channel — so nulling it would hide a variant the contract says to return, and a test expecting
+ * `null` for a disabled variant would be asserting the opposite of the requirement and would pass only
+ * against a defect [tickets/EPIC-001/FEATURE-001-01/STORY-001-01-04-read-reorder-lists-via-shop-api.md
+ * :§7 scenario 2]. What that leaves unsaid is worth saying, because an earlier revision of this comment
+ * said the opposite: the disabled state is NOT readable anywhere in this payload, and it is not readable
+ * on the variant type the Shop API publishes either — Shop `ProductVariant` carries no `enabled` field,
+ * that flag being Admin-only [packages/core/src/api/schema/common/product.type.graphql,
+ * packages/core/src/api/schema/admin-api/product-admin.type.graphql]. Neither the disabled flag nor the
+ * deletion timestamp is selected here in any case: a saved list records intent rather than availability,
+ * so surfacing availability is FEATURE-001-03's work and resolving an unavailable line is
+ * FEATURE-001-04's. A suite here therefore asserts the retained, non-null relation and nothing about
+ * whether the buyer could act on it.
  */
 export const REORDER_LIST_LINE_FRAGMENT = gql`
     fragment ReorderListLineFields on ReorderListLine {

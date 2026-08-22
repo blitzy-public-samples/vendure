@@ -532,9 +532,11 @@ export function toNameKey(displayName: string): string {
  *    why the enumeration is narrow rather than a general property class, and {@link findDisallowedCharacter}
  *    for why this test of the *display* value necessarily runs after the two above.
  * 4. **A derived `nameKey` longer than the same maximum is refused, even where the display value fitted.**
- *    Both stored values are bounded because both occupy a `varchar(191)` column, and normalisation is not
- *    guaranteed to shorten: NFC canonical composition can *lengthen* a string, so a display value at or
- *    under the bound can still yield an over-long key. 191 repetitions of U+0344 COMBINING GREEK DIALYTIKA
+ *    Both stored values are bounded because both occupy a column *declared* `varchar(191)` — a width
+ *    PostgreSQL and the MySQL family enforce and the SQLite family treats as an affinity and does not,
+ *    which is exactly why the bound is applied here in process rather than left to the engine — and
+ *    normalisation is not guaranteed to shorten: NFC canonical composition can *lengthen* a string, so a
+ *    display value at or under the bound can still yield an over-long key. 191 repetitions of U+0344 COMBINING GREEK DIALYTIKA
  *    TONOS is the worked case — 191 code points, so it passes rejections 1 to 3, and NFC expands it to 382,
  *    which this rejection refuses. It is necessarily evaluated after the three above, because the key does
  *    not exist until the display value has been accepted. For a name composed of characters NFC leaves
