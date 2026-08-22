@@ -62,6 +62,7 @@ import { Inject, Injectable } from '@nestjs/common';
 import { DeletionResponse, DeletionResult } from '@vendure/common/lib/generated-types';
 import { PaginatedList } from '@vendure/common/lib/shared-types';
 import {
+    ConfigService,
     Customer,
     ForbiddenError,
     I18nError,
@@ -422,6 +423,108 @@ type ReorderListFailureClass = 'a database query failure' | 'an unexpected error
  */
 function sameId(left: ID, right: ID): boolean {
     return String(left) === String(right);
+}
+
+/**
+ * The inclusive bounds of the column an `'increment'` primary key is stored in.
+ *
+ * `VendureEntity`'s identifier is `@PrimaryGeneratedColumn(entityIdStrategy.primaryKeyType)` and every
+ * `@EntityId()` foreign-key column becomes `'int'` for that strategy — both set from the configured strategy at
+ * bootstrap (`packages/core/src/entity/set-entity-id-strategy.ts`) — so the addressable range is the signed
+ * 32-bit one and nothing wider. The plugin class declares the same ceiling for an unrelated reason (an option
+ * value carried by the published GraphQL `Int`); it is re-declared here rather than shared because the two
+ * numbers happen to coincide and are not the same requirement, so a change to either must not silently move
+ * the other.
+ */
+const MIN_ADDRESSABLE_INCREMENT_ID = -2147483648;
+const MAX_ADDRESSABLE_INCREMENT_ID = 2147483647;
+
+/**
+ * An identifier written as an optionally-signed run of decimal digits, with surrounding whitespace tolerated
+ * because the platform's own decoders tolerate it (`+' 1 '` is `1`, and a request that sends a padded id is
+ * addressing row one).
+ *
+ * It is deliberately NOT `Number.isFinite`-style parsing: `'0x10'`, `'1e3'` and `'1.5'` are all numbers to a
+ * coercion and none of them is a decimal integer, so admitting them would let a caller address row 16, row 1000
+ * or a fractional row through a spelling the column never contains.
+ */
+const INTEGRAL_ID_PATTERN = /^\s*[+-]?\d+\s*$/;
+
+/**
+ * @description
+ * Whether an identifier can address a row at all, given the primary-key type the configured
+ * `EntityIdStrategy` stores identifiers under. `false` means no row can carry it, so the operation's own
+ * not-found answer is the correct one and no statement need be issued.
+ *
+ * **Why this cannot be left to the database, which is the shape it replaces.** An id reaches this module
+ * *already decoded* by the configured strategy, and the shipped decoders normalise only what they can:
+ * `AutoIncrementIdStrategy.decodeId` is `+id` with `NaN` mapped to `-1`
+ * (`packages/core/src/config/entity/auto-increment-id-strategy.ts`), so `'abc'` arrives as `-1` — an ordinary
+ * integer that simply matches no row — while `'2147483648'`, `'99999999999999999999'`, `'-2147483649'` and
+ * `'1.5'` arrive as perfectly valid JavaScript numbers that the `int` column cannot hold. Handing one of those
+ * to a statement makes the ENGINE the arbiter, and the four supported engines do not agree: PostgreSQL raises
+ * `QueryFailedError` (`value "…" is out of range for type integer`), which this service correctly refuses to
+ * read and therefore reports as its generic internal failure, while the MySQL family and the SQLite family
+ * coerce and answer "no such row". The same request consequently produced a 500-shaped result on one engine
+ * and the published not-found on another, and on the read that publishes "NULL — never an error" it produced
+ * an `errors` entry the contract does not allow. Deciding here makes the answer identical on all four.
+ *
+ * **It also keeps the disclosure boundary closed rather than widening it.** The alternative — classifying the
+ * driver failure after the fact — requires reading a caught error's message, which is exactly what
+ * {@link ReorderListService.rethrowSanitisedFailure} exists to forbid: a driver message carries the statement,
+ * the schema names and sometimes the values. Refusing up front needs no error text at all, and it removes the
+ * ERROR-level log line each such request used to emit, so a caller can no longer inflate error logs by sending
+ * ids no row could carry.
+ *
+ * **This is not access control and must never be mistaken for it.** Ownership and channel scoping are
+ * conjuncts of the statements themselves and are unaffected; refusing an unaddressable id only decides
+ * *whether a statement is worth issuing*. That is why the unknown case below admits rather than refuses: an
+ * admitted value still faces the full predicate.
+ *
+ * @param id - The identifier as it reached the service, already decoded by the configured strategy.
+ * @param primaryKeyType - The `primaryKeyType` of the configured `EntityIdStrategy`, or `undefined` where the
+ * running configuration is not resolvable. Anything other than `'increment'` — including `undefined` — admits
+ * the value unchanged, which is a reasoned boundary rather than a gap: a `'uuid'` strategy stores identifiers
+ * in a `varchar` column that binds any string at all, and a uuid-SHAPE test here would refuse real rows under
+ * a custom `EntityIdStrategy` whose `decodeId` yields something other than a canonical uuid (an encoding
+ * scheme is precisely what that hook is published for). The residual is stated rather than hidden: under a
+ * uuid strategy a malformed identifier still reaches the driver, and on PostgreSQL a `uuid`-typed column would
+ * refuse it there.
+ *
+ * @example
+ * ```ts
+ * isAddressableReorderListId(2147483647, 'increment'); // true  — the largest id the column holds
+ * isAddressableReorderListId(2147483648, 'increment'); // false — one past it, no row can carry it
+ * isAddressableReorderListId('1e3', 'increment');      // false — a number to a coercion, not a decimal id
+ * isAddressableReorderListId('1e3', 'uuid');           // true  — a varchar column binds it
+ * ```
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @docsPage ReorderListService
+ * @since 3.8.0
+ */
+export function isAddressableReorderListId(id: ID, primaryKeyType: string | undefined): boolean {
+    if (primaryKeyType !== 'increment') {
+        return true;
+    }
+    // The two branches answer the same question about two different arrivals of an identifier. A NUMBER is
+    // what the configured decoder hands the api layer, so the only thing left to establish is that it is a
+    // whole number — `Number.isInteger` also refuses `NaN` and both infinities, which are the values a
+    // coercion of hostile input produces. A STRING reaches this module when a service caller composes an id
+    // itself rather than taking one off a request, and it is checked against the decimal spelling rather than
+    // coerced, so `'0x10'`, `'1e3'` and `'1.5'` cannot be admitted as 16, 1000 or a fractional row while
+    // `'-1'`, `'0'` and `' 1 '` — each of which addresses a real row or a real absence today — still are.
+    const integral = typeof id === 'number' ? Number.isInteger(id) : INTEGRAL_ID_PATTERN.test(String(id));
+    if (!integral) {
+        return false;
+    }
+    // The range is asked of the NUMERIC value in both branches, because a spelling can be a perfectly good
+    // decimal integer and still name a row the column could never hold — twenty digits of nine is the case
+    // that motivated this. `Number(...)` is exact for every value inside the range, so a borderline id is
+    // never admitted by a rounding artefact: the first magnitude at which the conversion loses precision is
+    // far above the ceiling being compared against.
+    const numeric = typeof id === 'number' ? id : Number(String(id));
+    return numeric >= MIN_ADDRESSABLE_INCREMENT_ID && numeric <= MAX_ADDRESSABLE_INCREMENT_ID;
 }
 
 /**
@@ -1174,6 +1277,25 @@ export class ReorderListService {
         private listQueryBuilder: ListQueryBuilder,
         private requestContextCache: RequestContextCacheService,
         @Inject(REORDER_PLUGIN_OPTIONS) private options: ResolvedReorderPluginOptions,
+        /*
+         * The running configuration, read for ONE fact: the primary-key type identifiers are stored under. See
+         * {@link ReorderListService.primaryKeyType} for why that fact decides an answer rather than a
+         * statement, and {@link isAddressableReorderListId} for what is decided.
+         *
+         * IT IS OPTIONAL TO TYPESCRIPT AND STILL REQUIRED BY THE CONTAINER, which is the narrow shape this
+         * parameter needs and the reason it is not written as a plain required one. `@Optional()` is
+         * deliberately absent, so Nest resolves the token like any other constructor dependency and a server
+         * whose injector could not supply it fails to start rather than running with the check disabled —
+         * `PluginCommonModule` imports and exports `ConfigModule`, so it always can. The `?` therefore says
+         * nothing about production: it keeps a DIRECT construction — the migration end-to-end suite builds
+         * this service against a bare data source, and the unit specification builds it against a test
+         * double — compiling and behaving exactly as it does today, rather than forcing a collaborator on
+         * call sites that have no configuration to give. An absent configuration admits every identifier
+         * unchanged, which is the same reasoned boundary a non-`'increment'` primary key takes and is safe
+         * for the same reason: the ownership-and-channel predicate is unaffected, so nothing about access
+         * depends on this parameter.
+         */
+        private configService?: ConfigService,
     ) {}
 
     /*
@@ -1237,6 +1359,65 @@ export class ReorderListService {
      */
     private get supportsPessimisticLocking(): boolean {
         return ENGINES_SUPPORTING_PESSIMISTIC_LOCKING.includes(this.connection.rawConnection.options.type);
+    }
+
+    /**
+     * The primary-key type identifiers are stored under, resolved the way the platform itself resolves it, or
+     * `undefined` where no configuration was supplied to this instance.
+     *
+     * **The `??` is required rather than defensive.** The platform reads
+     * `config.entityOptions.entityIdStrategy ?? config.entityIdStrategy` when it applies the strategy to every
+     * entity at bootstrap (`packages/core/src/bootstrap.ts` L313), and `entityOptions.entityIdStrategy` stays
+     * OPTIONAL on `RuntimeVendureConfig` — the type omits that one key from its `Required<…>`
+     * (`packages/core/src/config/vendure-config.ts` L1404) — precisely so a deployment may configure the
+     * strategy under either the current key or the deprecated top-level one. Reading only the first would
+     * answer `undefined` for a server configured through the second and quietly disable the check there;
+     * reading only the second would answer the DEFAULT strategy for a server that had overridden it, which is
+     * worse, because it would be a confident wrong answer.
+     *
+     * Read from the configuration on each call rather than captured, for the same reason
+     * {@link ReorderListService.supportsPessimisticLocking} reads the connection options on each call: the
+     * configuration is the authority, reading it is a property access, and a captured copy would be a second
+     * place the answer could live.
+     */
+    private get primaryKeyType(): string | undefined {
+        const config = this.configService;
+        if (config === undefined) {
+            return undefined;
+        }
+        // The optional access on the resolved strategy is about a configuration that reports NO strategy at
+        // all, which the types say cannot happen and a partially-built configuration can still produce. It
+        // needs no branch of its own: an absent strategy yields `undefined`, and `undefined` is not
+        // `'increment'`, so it takes the same admit-unchanged path a `'uuid'` strategy takes.
+        const strategy = config.entityOptions.entityIdStrategy ?? config.entityIdStrategy;
+        return strategy?.primaryKeyType;
+    }
+
+    /**
+     * Whether an identifier this request supplied can address a row under the configured primary-key type.
+     *
+     * One line, and it exists so that no call site has to remember to pass the primary-key type: every guard
+     * site below reads the same configuration through the same accessor, so they cannot disagree about which
+     * strategy is in force. See {@link isAddressableReorderListId} for the decision itself, why it is made
+     * before a statement rather than after a driver failure, and why it is not access control.
+     *
+     * **Where the guards sit, and why the positions are fixed.** Each one answers with the outcome its own
+     * operation already publishes for an identifier that names nothing, so an unaddressable id is
+     * indistinguishable from an unknown one — which is the same non-enumerability property the ownership
+     * predicate provides, extended to a class of value the predicate never got to see. Three rules place them:
+     *
+     *   - AFTER the session guard and AFTER request-level input validation, so `FORBIDDEN` for a caller with no
+     *     session and `USER_INPUT_ERROR` for a malformed name or quantity keep the precedence they have today.
+     *     An unauthenticated request carrying an unaddressable id is refused as forbidden, not as not-found.
+     *   - BEFORE the transaction opens, on every write, so no transaction, no lock and no statement is spent on
+     *     a request that cannot address a row. This is what removes the ERROR-level log line the driver failure
+     *     used to produce, and it makes the refusal cost exactly zero statements against either plugin table.
+     *   - The LIST identifier first and the LINE identifier only after the list has been ADMITTED, because a
+     *     caller who cannot reach a list must learn nothing about which of its lines exist. That is the
+     *     existing rule on both line operations and the guards do not weaken it.
+     */
+    private isAddressableId(id: ID): boolean {
+        return isAddressableReorderListId(id, this.primaryKeyType);
     }
 
     /**
@@ -1505,12 +1686,22 @@ export class ReorderListService {
      * It is deliberately not `getEntityOrThrow`, which raises an entity-not-found error — a distinguishable
      * refusal that would confirm the existence of another buyer's row to anyone who counts, given that
      * identifiers are sequential under the default id strategy.
+     *
+     * **The addressability guard below is defence in depth and is not what the operations rely on.** Every
+     * public entry point refuses an unaddressable identifier itself, before it opens a transaction, because
+     * only the operation knows which of its published outcomes to answer with and only the operation can
+     * refuse before taking a lock. This guard exists so that a call site added later cannot reach a statement
+     * with such a value at all, and it costs one comparison on a path that was about to issue a statement. It
+     * answers `null`, which is this method's own normalised answer for every row a caller cannot reach.
      */
     private findOwnedList(
         ctx: RequestContext,
         id: ID,
         scope: ReorderListOwnerScope,
     ): Promise<ReorderList | null> {
+        if (!this.isAddressableId(id)) {
+            return Promise.resolve(null);
+        }
         // Declared without `async` deliberately: the body is one repository call, and the scope recording is a
         // continuation on its promise rather than a second awaited step.
         return this.connection
@@ -1633,6 +1824,13 @@ export class ReorderListService {
         scope: ReorderListOwnerScope,
         mode: 'pessimistic_read' | 'pessimistic_write',
     ): Promise<ReorderList | null> {
+        // The same defence-in-depth guard {@link ReorderListService.findOwnedList} carries, repeated because
+        // this method has TWO paths and only one of them delegates there: the locking branch below composes its
+        // own query builder, so a guard on the delegate alone would cover the engines without row locks and not
+        // the three with them.
+        if (!this.isAddressableId(id)) {
+            return Promise.resolve(null);
+        }
         if (!this.supportsPessimisticLocking) {
             return this.findOwnedList(ctx, id, scope);
         }
@@ -1849,7 +2047,9 @@ export class ReorderListService {
      *
      * @param ctx - The request context, whose active channel and authenticated session are the scope.
      * @param id - The list identifier. A value the configured id strategy cannot decode matches no row and
-     * takes the same normalised `null` path as every other inaccessible case.
+     * takes the same normalised `null` path as every other inaccessible case, and a value no row could carry
+     * at all — one outside the range the identifier column holds, or a fractional one — takes it too, before
+     * any statement is issued. See {@link isAddressableReorderListId}.
      * @param includeShared - Accepted at both values and answered identically under this feature, because no
      * share row can exist until list sharing ships: the set the non-default value asks for is empty by
      * construction rather than withheld. The non-default value is therefore **not refused** — refusing it
@@ -1876,6 +2076,16 @@ export class ReorderListService {
                 return null;
             }
             return this.rethrowSanitisedFailure(err, 'getReorderList');
+        }
+        if (!this.isAddressableId(id)) {
+            // AN IDENTIFIER NO ROW CAN CARRY IS THE SAME `null` AS AN IDENTIFIER NO ROW HAPPENS TO CARRY, and
+            // this field's published description makes that mandatory rather than merely tidy: it answers
+            // "NULL — never an error", so an `errors` entry here would breach the contract whatever its code.
+            // It is placed AFTER the scope resolution deliberately, so an unauthenticated caller still meets
+            // the session guard first and the read's own `null`-for-a-refusal convention keeps its precedence;
+            // the two answers are indistinguishable in any case, which is the property the guard preserves.
+            // Nothing is logged: this is an ordinary caller-supplied value, not a failure.
+            return null;
         }
         try {
             return await this.findOwnedList(ctx, id, scope);
@@ -2778,6 +2988,14 @@ export class ReorderListService {
     ): Promise<UpdateReorderListResult> {
         const scope = await this.getOwnerScope(ctx, 'updateReorderList');
         const { name, nameKey } = canonicaliseReorderListName(input.name);
+        if (!this.isAddressableId(input.id)) {
+            // An identifier no row can carry gets the outcome an identifier no row DOES carry gets, so the two
+            // stay indistinguishable, and it is refused here — after the session guard and after the name
+            // canonicalisation above, both of which keep their precedence, and before the transaction opens, so
+            // nothing is locked and no statement is issued for a write that cannot address anything. See
+            // {@link ReorderListService.isAddressableId}.
+            return new ReorderListNotFoundError();
+        }
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
@@ -2875,6 +3093,13 @@ export class ReorderListService {
      */
     async deleteReorderList(ctx: RequestContext, id: ID): Promise<DeleteReorderListResult> {
         const scope = await this.getOwnerScope(ctx, 'deleteReorderList');
+        if (!this.isAddressableId(id)) {
+            // The same normalised not-found a repeat delete and a foreign list produce, refused before the
+            // transaction opens so no lock is taken and no `DELETE` is issued for a request that addresses no
+            // row. After the session guard, which keeps its precedence. See
+            // {@link ReorderListService.isAddressableId}.
+            return new ReorderListNotFoundError();
+        }
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
@@ -2962,6 +3187,16 @@ export class ReorderListService {
         input: AddItemToReorderListInput,
     ): Promise<AddItemToReorderListResult> {
         const scope = await this.getOwnerScope(ctx, 'addItemToReorderList');
+        if (!this.isAddressableId(input.reorderListId)) {
+            // The list identifier is refused HERE, outside the retry loop, so no transaction is opened and no
+            // attempt is spent on a request that cannot address a list. The VARIANT identifier is deliberately
+            // NOT checked here: it belongs to step two of the fixed three-step order this operation documents,
+            // and hoisting it would answer a variant question before the list had been admitted — telling a
+            // caller who cannot reach the list something about the catalogue instead of nothing. It is guarded
+            // at its own step inside {@link ReorderListService.addItemWithinTransaction}. See
+            // {@link ReorderListService.isAddressableId}.
+            return new ReorderListNotFoundError();
+        }
 
         // Bounded retries, and each retry is a WHOLE FRESH TRANSACTION rather than a second attempt inside a
         // failed one. Three states require one. Two are a concurrent request having created the very line this
@@ -3074,7 +3309,18 @@ export class ReorderListService {
         // is the price of asking the platform rather than reading the table directly, which is the trade
         // the architecture requires — a channel-scoped existence check with a narrower cost is not part of
         // the collaborator's published surface.
-        const variant = await this.productVariantService.findOne(ctx, input.productVariantId, []);
+        //
+        // A VARIANT IDENTIFIER NO ROW CAN CARRY IS REFUSED WITHOUT ASKING THE COLLABORATOR, and it is refused
+        // at exactly this step rather than earlier. The list has been admitted above, so the property that a
+        // caller who cannot reach the list learns nothing about anything else is intact, and the answer is the
+        // identical `UserInputError` an unresolvable variant already produces — the same key, the same
+        // interpolated id — so the two are indistinguishable to a caller. Not calling the collaborator is the
+        // point: `ProductVariantService.findOne` would hand the value straight to a statement, where the `int`
+        // column refuses it on PostgreSQL and coerces it on the other three engines, which is the whole of
+        // this defect on the variant argument. See {@link ReorderListService.isAddressableId}.
+        const variant = this.isAddressableId(input.productVariantId)
+            ? await this.productVariantService.findOne(ctx, input.productVariantId, [])
+            : undefined;
         if (!variant) {
             throw withoutStackFrames(
                 new UserInputError(VARIANT_NOT_FOUND_KEY, {
@@ -3370,6 +3616,14 @@ export class ReorderListService {
         // precedes it is the owner-scope read above, which touches neither plugin table: who is asking has
         // to be established before what they asked for is judged.
         this.validateQuantity(input.quantity);
+        if (!this.isAddressableId(input.reorderListId)) {
+            // The LIST identifier, refused after the session guard and after the quantity validation above —
+            // both of which keep their precedence — and before the transaction opens. The LINE identifier is
+            // checked further down, only once this list has been admitted, because a caller who cannot reach
+            // the list must learn nothing about which of its lines exist. See
+            // {@link ReorderListService.isAddressableId}.
+            return new ReorderListNotFoundError();
+        }
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
@@ -3395,6 +3649,17 @@ export class ReorderListService {
                     // channel's list, and deliberately NOT the line-level not-found: a caller who cannot
                     // reach the list must learn nothing about which of its lines exist.
                     return new ReorderListNotFoundError();
+                }
+
+                if (!this.isAddressableId(input.lineId)) {
+                    // THE LINE IDENTIFIER, AND ONLY NOW THAT THE LIST HAS BEEN ADMITTED. The answer is the
+                    // line-level not-found this operation already publishes for a line the list does not hold,
+                    // so the two are indistinguishable; the ordering is what keeps it honest, because reaching
+                    // this line at all means the caller owns the list in the active channel. No `UPDATE` is
+                    // issued: the statement below would otherwise carry a value the line table's `int` column
+                    // cannot hold, which PostgreSQL refuses outright and the other three engines coerce. See
+                    // {@link ReorderListService.isAddressableId}.
+                    return new ReorderListLineNotFoundError();
                 }
 
                 const result = await this.connection
@@ -3470,6 +3735,12 @@ export class ReorderListService {
         input: RemoveReorderListLineInput,
     ): Promise<RemoveReorderListLineResult> {
         const scope = await this.getOwnerScope(ctx, 'removeReorderListLine');
+        if (!this.isAddressableId(input.reorderListId)) {
+            // The LIST identifier, after the session guard and before the transaction opens, so no lock is
+            // taken and no `DELETE` is issued. The LINE identifier is checked below, after admission, for the
+            // reason that ordering exists at all. See {@link ReorderListService.isAddressableId}.
+            return new ReorderListNotFoundError();
+        }
 
         try {
             return await this.connection.withTransaction(ctx, async transactionCtx => {
@@ -3483,6 +3754,14 @@ export class ReorderListService {
                 const parent = await this.findOwnedListForUpdate(transactionCtx, input.reorderListId, scope);
                 if (!parent) {
                     return new ReorderListNotFoundError();
+                }
+                if (!this.isAddressableId(input.lineId)) {
+                    // THE LINE IDENTIFIER, AND ONLY NOW THAT THE PARENT HAS BEEN ADMITTED — the same ordering
+                    // and the same reason as the adjust path. The answer is the line-level not-found a second
+                    // remove of the same line already produces, so the two are indistinguishable, and no
+                    // `DELETE` is issued for a value the line table's `int` column cannot hold. See
+                    // {@link ReorderListService.isAddressableId}.
+                    return new ReorderListLineNotFoundError();
                 }
                 const result = await this.connection
                     .getRepository(transactionCtx, ReorderListLine)
@@ -3514,6 +3793,34 @@ export class ReorderListService {
 
     // Write-side conventions, shared by all six mutations so that none of them can quietly differ.
 
+    /*
+     * WHERE IDENTIFIER ADDRESSABILITY IS ESTABLISHED, AND WHICH HELPERS BELOW THEREFORE CARRY NO GUARD OF
+     * THEIR OWN. Stated once, here, because "this helper needs no check" is only a safe claim while the set of
+     * callers it rests on is written down.
+     *
+     * Every caller-supplied identifier is refused at the operation that received it — the list identifier
+     * before the transaction opens, the line identifier after the list is admitted, the variant identifier at
+     * its own step of the add path — so by the time any helper below runs, each identifier it was handed is
+     * either one of those admitted values or a value read out of a row. The four resolvers that DO carry a
+     * guard (`findOwnedList`, `findOwnedListUnderLock`, `findOwnedListNow`, `findLineById`) carry it as
+     * defence in depth for a caller added later, not because a present caller can reach them unguarded.
+     *
+     * The rest deliberately carry none, and each omission has a reason that is a fact rather than a
+     * convention:
+     *
+     *   - `accumulateLineQuantity` and `insertLine` are handed `existingLine.id` and `list.id` — values READ
+     *     OUT OF A ROW the engine returned, so they are by construction values the column holds. A guard there
+     *     would be checking the database's own output.
+     *   - `claimLineCapacity` and `findLineForVariant` take `list.id` for the same reason, and the variant
+     *     identifier only after the add path's variant step has refused an unaddressable one.
+     *   - `releaseLineCapacity` and `reloadOwnedList` take the identifier their operation already admitted;
+     *     `reloadOwnedList` additionally goes through `findOwnedList`, so it inherits that guard anyway.
+     *   - The four conditional write statements (the rename `UPDATE`, the list `DELETE`, the line `UPDATE` and
+     *     the line `DELETE`) address the identifiers their own operation guarded, in the same method body, a
+     *     few lines below the guard. Repeating the check between the guard and the statement would assert
+     *     something the surrounding code has just established.
+     */
+
     /**
      * Resolves one list under the full predicate by a **current** read, for the zero-affected path of a write.
      *
@@ -3534,12 +3841,20 @@ export class ReorderListService {
      * this one has not seen.
      *
      * It is issued **only** on a zero-affected path, so a successful write never pays for it.
+     *
+     * The addressability guard is the same defence in depth {@link ReorderListService.findOwnedList} carries,
+     * for the same reason and with the same answer. It is unreachable today — every caller of the three
+     * classifiers this serves is downstream of an entry-point guard — which is exactly why it is one line and
+     * not a branch anything reports on.
      */
     private async findOwnedListNow(
         ctx: RequestContext,
         id: ID,
         scope: ReorderListOwnerScope,
     ): Promise<ReorderList | null> {
+        if (!this.isAddressableId(id)) {
+            return null;
+        }
         const queryBuilder = this.connection
             .getRepository(ctx, ReorderList)
             .createQueryBuilder('reorderlist')
@@ -3709,8 +4024,16 @@ export class ReorderListService {
      * It is current for the reason {@link ReorderListService.findOwnedListNow} sets out, and no relation is
      * joined for the reason {@link ReorderListService.findLineForVariant} sets out — PostgreSQL refuses a lock
      * on the nullable side of an outer join, so a relation condition would fail on one engine only.
+     *
+     * BOTH identifiers are guarded, which is one more than the sole caller needs. Its list identifier was
+     * refused at the operation's entry and its line identifier after the list was admitted, so neither can be
+     * unaddressable here; the guard is the same defence in depth the list resolvers carry, and answering `null`
+     * is what this method already answers for a line the list does not hold.
      */
     private findLineById(ctx: RequestContext, listId: ID, lineId: ID): Promise<ReorderListLine | null> {
+        if (!this.isAddressableId(listId) || !this.isAddressableId(lineId)) {
+            return Promise.resolve(null);
+        }
         const queryBuilder = this.connection
             .getRepository(ctx, ReorderListLine)
             .createQueryBuilder('reorderlistline')
@@ -4033,6 +4356,12 @@ export class ReorderListService {
      * two concurrent adds: both read six, both compute twelve, both store twelve, and the buyer who asked for
      * eighteen holds twelve. `quantity = quantity + :delta` is evaluated by the engine against the row's
      * current value, so the second writer increments the first writer's result.
+     *
+     * **No addressability guard, and that is a fact about the arguments rather than an exception.** `lineId`
+     * and `listId` are read off rows the engine returned — the line the add path resolved, and the list it
+     * admitted — so they are values the identifier column demonstrably holds. Checking them here would be
+     * checking the database's own output; the caller-supplied identifiers were refused before this attempt
+     * opened. See the note above {@link ReorderListService.findOwnedListNow}.
      *
      * @returns `'accumulated'` when the row was updated; `'line-replaced'` when the addressed line has gone and
      * a *different* row now holds this variant, which is a concurrent insert to reconcile onto rather than a

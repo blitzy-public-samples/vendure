@@ -53,15 +53,22 @@ import { MAX_LIST_NAME_LENGTH } from '../constants';
  * The plugin's translation bundle registers exactly four keys and this is the only one of them about a
  * name. Its registered English text states the whole name contract in one sentence, and it states it
  * SPECIFICALLY rather than in a category: a length between one and the maximum measured on the canonical
- * form, no control character (U+0000–U+001F, U+007F–U+009F), no U+200B zero-width space, no U+FEFF byte
- * order mark, and a normalised key still within the same bound. It interpolates `max` twice because two of
- * those clauses carry the bound. Naming the characters rather than calling them "control or zero-width" is
- * deliberate: the earlier wording described a wider set than the code refuses, so a buyer whose emoji name
- * was accepted could not tell from the message that it would be, and one whose vertical tab was refused
- * could not tell why. That is why all FOUR rejections below share this key: whichever clause a name broke,
- * the sentence a buyer reads names the rule they have to satisfy. The key's own spelling still says `empty`, which is narrower than what it now
- * describes; it is kept exactly as registered because the key is the published identifier and renaming it
- * would break every caller matching on it, while the text behind it is free to state the contract in full.
+ * form; tab, line feed and carriage return counted as whitespace and therefore accepted; no OTHER control
+ * character (U+0000–U+001F, vertical tab U+000B and form feed U+000C included, and U+007F–U+009F); no
+ * U+200B zero-width space; no U+FEFF byte order mark; and a normalised key still within the same bound. It
+ * interpolates `max` twice because two of those clauses carry the bound. Naming the characters rather than
+ * calling them "control or zero-width" is deliberate: the earlier wording described a wider set than the
+ * code refuses, so a buyer whose emoji name was accepted could not tell from the message that it would be,
+ * and one whose vertical tab was refused could not tell why. Naming the three C0 characters the pipeline
+ * consumes is deliberate for the same reason and in the opposite direction: an unqualified "U+0000 to
+ * U+001F" is literally read as refusing tab, line feed and carriage return, which
+ * {@link WHITESPACE_CHARACTER_CLASS} collapses and this module accepts, so a message that stated the range
+ * plainly told a buyer their tab had been refused when their name had in fact been stored. That is why all
+ * FOUR rejections below share this key: whichever clause a name broke, the sentence a buyer reads names the
+ * rule they have to satisfy, and it names it as the code applies it. The key's own spelling still says
+ * `empty`, which is narrower than what it now describes; it is kept exactly as registered because the key
+ * is the published identifier and renaming it would break every caller matching on it, while the text
+ * behind it is free to state the contract in full.
  * Inventing a fifth key would surface to the caller as the raw key text, because nothing would register a
  * translation for it.
  */

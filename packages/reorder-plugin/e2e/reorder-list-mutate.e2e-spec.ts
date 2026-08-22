@@ -130,9 +130,10 @@ const QUANTITY_ABOVE_MAXIMUM_MESSAGE =
  */
 const NAME_EMPTY_MESSAGE =
     'The reorder list name must be between 1 and 191 characters once surrounding whitespace is removed ' +
-    'and internal whitespace is collapsed, must contain no control character (U+0000 to U+001F, U+007F ' +
-    'to U+009F), no zero-width space (U+200B) and no byte order mark (U+FEFF), and must still be within ' +
-    '191 characters once Unicode-normalised';
+    'and internal whitespace is collapsed, where tab, line feed and carriage return count as whitespace ' +
+    'and are accepted, must otherwise contain no control character (U+0000 to U+001F, which includes ' +
+    'vertical tab U+000B and form feed U+000C, and U+007F to U+009F), no zero-width space (U+200B) and ' +
+    'no byte order mark (U+FEFF), and must still be within 191 characters once Unicode-normalised';
 
 const MONETARY_OR_STOCK_FIELD_NAME = /price|currenc|stock|money|amount|saleable|inventory|tax/i;
 

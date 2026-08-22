@@ -1921,6 +1921,138 @@ describe('STORY-001-01-04 reorder list reads (Shop API)', () => {
             const accessible = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: own.id });
             expect((accessible.data?.activeCustomerReorderList as { id: string } | null)?.id).toBe(own.id);
         });
+
+        it('answers an identifier no row could carry with the same bare null and no errors entry', async () => {
+            /*
+             * THE IDENTIFIERS THIS FIELD USED TO ANSWER WITH AN `errors` ENTRY.
+             *
+             * `AC-4` above sends identifiers that name no row; these name no row a row COULD carry. Under the
+             * default `'increment'` primary key every identifier column is `int`, so a value outside the signed
+             * 32-bit range — or a fractional one, which the deployment decoder `+id` passes through unchanged —
+             * cannot be bound at all. Handed to a statement it makes the ENGINE the arbiter: PostgreSQL raises
+             * `value out of range for type integer`, which the service correctly refuses to read and therefore
+             * reports as its generic internal failure with an ERROR-level log line, while the MySQL and SQLite
+             * families coerce and answer no-such-row. This field publishes "NULL — never an error", so the
+             * PostgreSQL answer breached the contract and the four engines disagreed with each other.
+             *
+             * The assertion is the WHOLE envelope, exactly as `AC-4` asserts it, and equality with the envelope
+             * an ordinary unknown identifier produces — because indistinguishability is the property, not merely
+             * the absence of an error.
+             */
+            const own = await seedList('Owned across an unaddressable read');
+
+            /*
+             * A NOTE ON WHAT THIS FILE'S DECODER DOES TO THESE STRINGS, because it decides which class each one
+             * lands in. The e2e harness configures `TestingEntityIdStrategy`, whose `decodeId` is
+             * `parseInt(id.replace('T_', ''), 10)` — it TRUNCATES a fraction rather than preserving it. So a
+             * bare `'1.5'` would arrive as `1` and address whichever row the fixture happens to have created
+             * first, which is why no such spelling is sent here: the fractional VALUE reaching the service is
+             * pinned by the unit specification, where the decoder is not in the way. What IS sent is a
+             * fractional spelling whose integer part the column cannot hold either, so it lands on the guard
+             * under both decoders, and `'0.5'`, which truncates to `0` — an identifier no sequence issues —
+             * and therefore answers the same null through the ordinary absent-row path.
+             */
+            const unaddressable: Array<{ label: string; id: string }> = [
+                { label: 'one past the int ceiling', id: '2147483648' },
+                { label: 'past the unsigned 32-bit range', id: '4294967296' },
+                { label: 'twenty digits', id: '9'.repeat(20) },
+                { label: 'one below the int floor', id: '-2147483649' },
+                { label: 'forty digits', id: '9'.repeat(40) },
+                { label: 'a fraction past the int ceiling', id: '2147483648.5' },
+            ];
+            const expectedEnvelope: GraphQlEnvelope = { data: { activeCustomerReorderList: null } };
+
+            const reference = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, {
+                id: UNKNOWN_LIST_ID,
+            });
+            expect(reference).toEqual(expectedEnvelope);
+
+            for (const { label, id } of unaddressable) {
+                const envelope = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id });
+
+                expect(envelope, `${label}: ${JSON.stringify(envelope)}`).toEqual(expectedEnvelope);
+                // `errors` and `extensions` must be ABSENT keys rather than empty ones, which is what the whole
+                // envelope comparison and this key list together establish.
+                expect(Object.keys(envelope).sort(), label).toEqual(['data']);
+                expect(envelope.errors, label).toBeUndefined();
+                expect(envelope.extensions, label).toBeUndefined();
+                expect(envelope, label).toEqual(reference);
+            }
+
+            // A fractional spelling below one, which this file's decoder truncates onto an identifier no
+            // sequence issues. The answer is the same bare null either way, which is the contract.
+            const belowOne = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: '0.5' });
+            expect(belowOne).toEqual(expectedEnvelope);
+            expect(belowOne).toEqual(reference);
+
+            // THE IN-RANGE CONTROL, which was never broken and must not become a refusal: the largest
+            // identifier the column holds is addressable, so it is answered by a statement rather than ahead
+            // of one.
+            const ceiling = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: '2147483647' });
+            expect(ceiling).toEqual(expectedEnvelope);
+            expect(ceiling).toEqual(reference);
+
+            // And the caller's own list still reads back, so none of the above narrowed what is reachable.
+            const accessible = await rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id: own.id });
+            expect((accessible.data?.activeCustomerReorderList as { id: string } | null)?.id).toBe(own.id);
+        });
+
+        it('issues no statement at all for an unaddressable identifier, and one for the in-range control', async () => {
+            /*
+             * The PLUGIN-STATEMENT boundary, and the one place an exact zero is the right number.
+             *
+             * The reads-nothing contract further down asserts EXACTLY ONE statement for an identifier that
+             * names no row, because the server cannot discover a row's absence without asking. An identifier no
+             * row could CARRY is the opposite case: there is nothing to ask, the answer is knowable from the
+             * identifier alone, and issuing the statement is what produced the driver failure and the
+             * ERROR-level log line in the first place. Zero is therefore both correct and the evidence that the
+             * refusal happens ahead of the statement rather than inside the engine.
+             */
+            await seedList('Owned across a counted unaddressable read');
+
+            async function readAndCount(id: string): Promise<GraphQlEnvelope> {
+                capture.reset();
+                return capture.capture(() => rawShopRequest(GET_ACTIVE_CUSTOMER_REORDER_LIST, { id }));
+            }
+
+            const refused = await readAndCount('2147483648');
+            expect(refused.data).toEqual({ activeCustomerReorderList: null });
+            expect(refused.errors, JSON.stringify(refused)).toBeUndefined();
+            if (isStatementCountEngine()) {
+                expect(capture.count(LIST_TABLE), countedDiagnostic()).toBe(0);
+                expect(capture.count(LINE_TABLE), countedDiagnostic()).toBe(0);
+                expect(capture.writesFor(LIST_TABLE).length, countedDiagnostic()).toBe(0);
+                expect(capture.writesFor(LINE_TABLE).length, countedDiagnostic()).toBe(0);
+            }
+
+            const fractionalPastTheCeiling = await readAndCount('2147483648.5');
+            expect(fractionalPastTheCeiling.data).toEqual({ activeCustomerReorderList: null });
+            expect(fractionalPastTheCeiling.errors, JSON.stringify(fractionalPastTheCeiling)).toBeUndefined();
+            if (isStatementCountEngine()) {
+                expect(capture.count(LIST_TABLE), countedDiagnostic()).toBe(0);
+                expect(capture.count(LINE_TABLE), countedDiagnostic()).toBe(0);
+            }
+
+            const ceiling = await readAndCount('2147483647');
+            expect(ceiling.data).toEqual({ activeCustomerReorderList: null });
+            expect(ceiling.errors, JSON.stringify(ceiling)).toBeUndefined();
+            if (isStatementCountEngine()) {
+                // ONE statement, carrying the full predicate: the in-range identifier reaches the database
+                // exactly as it did before, and the row's absence is what answers.
+                expect(capture.count(LIST_TABLE), countedDiagnostic()).toBe(1);
+                expect(capture.selectsFor(LIST_TABLE).length, countedDiagnostic()).toBe(1);
+                expect(capture.writesFor(LIST_TABLE).length, countedDiagnostic()).toBe(0);
+                const [statement] = capture.selectsFor(LIST_TABLE);
+                expect(
+                    whereRequiresScopedPredicates(statement, [
+                        { column: 'id', relation: listAlias, value: 2147483647 },
+                        { column: 'customerId', relation: listAlias, value: actingCustomerDbId },
+                        { column: 'channelId', relation: listAlias, value: defaultChannelDbId },
+                    ]),
+                    capture.format(),
+                ).toBe(true);
+            }
+        });
     });
 
     // AC-5 — the unauthenticated and cross-customer collection reads. A READ answers with an empty collection

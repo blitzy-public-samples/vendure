@@ -6,6 +6,7 @@
 import { DeletionResponse, DeletionResult, LogicalOperator } from '@vendure/common/lib/generated-types';
 import {
     Channel,
+    ConfigService,
     Customer,
     ForbiddenError,
     ID,
@@ -41,6 +42,7 @@ import {
     ReorderListNameConflictError,
     ReorderListNotFoundError,
     ReorderListService,
+    isAddressableReorderListId,
 } from './reorder-list.service';
 
 const USER_ID = 'T_10';
@@ -1556,6 +1558,43 @@ function captureThrow(work: () => unknown): unknown {
         return err;
     }
     return undefined;
+}
+
+/**
+ * A configuration double reporting ONE fact: the primary-key type the configured `EntityIdStrategy` stores
+ * identifiers under.
+ *
+ * That is the whole of what the service reads from the configuration, so the double carries nothing else — a
+ * fuller `ConfigService` would invite a test to depend on a second fact this collaborator is not consulted
+ * for. It is cast rather than constructed for the reason every other collaborator here is: the real class
+ * reads a complete runtime configuration, and building one would make these tests depend on the platform's
+ * defaults instead of on the value under test.
+ *
+ * @param primaryKeyType - What the reported strategy answers, or `undefined` to model a configuration that
+ * reports no strategy at all.
+ * @param placement - Which of the two keys the platform reads carries the strategy. Both are exercised,
+ * because the service resolves them as `entityOptions.entityIdStrategy ?? entityIdStrategy` exactly as
+ * `bootstrap` does, and a deployment configured through the deprecated top-level key must not silently lose
+ * the check.
+ */
+function configReportingPrimaryKeyType(
+    primaryKeyType: string | undefined,
+    placement: 'entityOptions' | 'deprecated-top-level' = 'entityOptions',
+): ConfigService {
+    const strategy =
+        primaryKeyType === undefined
+            ? undefined
+            : {
+                  primaryKeyType,
+                  encodeId: (primaryKey: ID) => String(primaryKey),
+                  decodeId: (id: string) => id,
+              };
+    return {
+        entityOptions: {
+            entityIdStrategy: placement === 'entityOptions' ? strategy : undefined,
+        },
+        entityIdStrategy: placement === 'deprecated-top-level' ? strategy : undefined,
+    } as unknown as ConfigService;
 }
 
 describe('ReorderListService', () => {
@@ -5697,6 +5736,433 @@ describe('ReorderListService', () => {
 
             expect(thrown).toBeInstanceOf(InternalServerError);
             expect(writeStatements(harness)).toEqual([]);
+        });
+    });
+
+    describe('an identifier no row could carry, refused before a statement rather than by the driver', () => {
+        /*
+         * WHY THIS BLOCK CONFIGURES SOMETHING NO OTHER BLOCK DOES. Every other block in this file constructs
+         * the service without a configuration, so its identifiers — `'T_100'` and the rest — are admitted
+         * unchanged and nothing here changes what they assert; the last test of this block pins that
+         * explicitly. This block supplies a configuration reporting an `'increment'` primary key, which is
+         * what a default deployment runs, and under it an identifier is a decimal integer the `int` column can
+         * hold.
+         *
+         * What is being pinned is that an identifier OUTSIDE that set is answered by the operation's own
+         * published not-found outcome, at zero statements, rather than handed to a statement where the engine
+         * decides: PostgreSQL raises and the failure is sanitised into a generic internal error with an
+         * ERROR-level log line, while the MySQL and SQLite families coerce and answer not-found. That
+         * divergence is the defect; the guard removes it by deciding in one place, so all four engines answer
+         * alike.
+         */
+        const LIVE_LIST_ID = 100;
+        const LIVE_LINE_ID = 200;
+        const LIVE_VARIANT_ID = 300;
+        /** The largest identifier the column holds, which must keep working exactly as it does today. */
+        const CEILING_ID = 2147483647;
+
+        /**
+         * Every class of identifier the finding was filed on, in the arrival form the platform's own decoder
+         * produces: `AutoIncrementIdStrategy.decodeId` is `+id`, so each of these reaches the service as a
+         * perfectly ordinary JavaScript number that the `int` column cannot hold.
+         *
+         * The two long ones are written as a conversion rather than as literals so the test states the digit
+         * COUNT it is about; a twenty- or forty-digit literal would additionally be a number no source form
+         * can represent exactly, which is a separate fact and not the one under test.
+         */
+        const UNADDRESSABLE_IDS: ReadonlyArray<{ label: string; id: ID }> = [
+            { label: 'one past the int ceiling', id: 2147483648 },
+            { label: 'a value past the unsigned 32-bit range', id: 4294967296 },
+            { label: 'twenty digits', id: Number('9'.repeat(20)) },
+            { label: 'one below the int floor', id: -2147483649 },
+            { label: 'forty digits', id: Number('9'.repeat(40)) },
+            { label: 'a fractional value', id: 1.5 },
+            { label: 'a fractional value below one', id: 0.5 },
+        ];
+
+        let incrementScoped: ReorderListService;
+
+        beforeEach(() => {
+            incrementScoped = new ReorderListService(
+                harness.connection,
+                harness.productVariantService as unknown as ProductVariantService,
+                harness.listQueryBuilder as unknown as ListQueryBuilder,
+                requestContextCache,
+                options,
+                configReportingPrimaryKeyType('increment'),
+            );
+            // A table holding exactly one list, addressed by a decimal identifier. It is what makes the
+            // list-ADMITTED half of this block meaningful: the two line guards and the variant guard are only
+            // reachable once the caller has been shown to own the list in the active channel, so a plan that
+            // could not admit the list would pass those tests for the wrong reason.
+            harness.plan.listFindOne = rowMatchingPredicate(ownedList({ id: LIVE_LIST_ID }));
+            harness.plan.listGetOne = () => ownedList({ id: LIVE_LIST_ID });
+        });
+
+        describe('the decision the helper makes, which is the same one at every guard site', () => {
+            it('admits the largest identifier the int column holds and refuses the first one past it', () => {
+                expect(isAddressableReorderListId(2147483647, 'increment')).toBe(true);
+                expect(isAddressableReorderListId(2147483648, 'increment')).toBe(false);
+            });
+
+            it('admits the smallest identifier the int column holds and refuses the first one below it', () => {
+                // The floor is asserted even though a generated identifier never reaches it, because the
+                // bound is a property of the COLUMN rather than of the sequence, and a caller can send any
+                // number at all. `-1` — what the default decoder answers for an undecodable value — sits
+                // inside it, which is why `'abc'` still behaves as an ordinary absence rather than becoming a
+                // refusal with a different shape.
+                expect(isAddressableReorderListId(-2147483648, 'increment')).toBe(true);
+                expect(isAddressableReorderListId(-2147483649, 'increment')).toBe(false);
+                expect(isAddressableReorderListId(-1, 'increment')).toBe(true);
+            });
+
+            it('admits a whole number and refuses a fractional one', () => {
+                expect(isAddressableReorderListId(1, 'increment')).toBe(true);
+                expect(isAddressableReorderListId(1.5, 'increment')).toBe(false);
+                expect(isAddressableReorderListId(0.5, 'increment')).toBe(false);
+                // `1.0` is the integer one to every reader of JavaScript, and the finding's own control
+                // confirmed it already worked; it must not become a refusal.
+                expect(isAddressableReorderListId(1.0, 'increment')).toBe(true);
+            });
+
+            it('refuses the values a coercion of hostile input produces', () => {
+                expect(isAddressableReorderListId(Number.NaN, 'increment')).toBe(false);
+                expect(isAddressableReorderListId(Number.POSITIVE_INFINITY, 'increment')).toBe(false);
+                expect(isAddressableReorderListId(Number.NEGATIVE_INFINITY, 'increment')).toBe(false);
+            });
+
+            it('refuses a string that is a number only to a coercion, rather than admitting what it coerces to', () => {
+                // The string branch exists for a service caller that composes an identifier itself instead of
+                // taking a decoded one off a request. Admitting these would let such a caller address row 16
+                // or row 1000 through a spelling the column never contains, and would put a fractional value
+                // in front of a statement.
+                expect(isAddressableReorderListId('0x10', 'increment')).toBe(false);
+                expect(isAddressableReorderListId('1e3', 'increment')).toBe(false);
+                expect(isAddressableReorderListId('1.5', 'increment')).toBe(false);
+                expect(isAddressableReorderListId('T_100', 'increment')).toBe(false);
+            });
+
+            it('admits the decimal spellings that address a real row or a real absence today', () => {
+                expect(isAddressableReorderListId('1', 'increment')).toBe(true);
+                expect(isAddressableReorderListId(' 1 ', 'increment')).toBe(true);
+                expect(isAddressableReorderListId('-1', 'increment')).toBe(true);
+                expect(isAddressableReorderListId('+7', 'increment')).toBe(true);
+                expect(isAddressableReorderListId('0', 'increment')).toBe(true);
+                expect(isAddressableReorderListId('0000000042', 'increment')).toBe(true);
+            });
+
+            it('refuses an empty string, which is a number only because it coerces to zero', () => {
+                // The empty string carries no digit, so as a STRING it is refused. That is not a behaviour
+                // change on the wire: an empty identifier in a request is decoded to `0` before it arrives,
+                // and `0` is admitted below — it simply matches no row, which is what it did before.
+                expect(isAddressableReorderListId('', 'increment')).toBe(false);
+                expect(isAddressableReorderListId('   ', 'increment')).toBe(false);
+                expect(isAddressableReorderListId(0, 'increment')).toBe(true);
+            });
+
+            it('refuses a twenty-digit and a forty-digit identifier in either arrival form', () => {
+                expect(isAddressableReorderListId(Number('9'.repeat(20)), 'increment')).toBe(false);
+                expect(isAddressableReorderListId(Number('9'.repeat(40)), 'increment')).toBe(false);
+                expect(isAddressableReorderListId('9'.repeat(20), 'increment')).toBe(false);
+                expect(isAddressableReorderListId('9'.repeat(40), 'increment')).toBe(false);
+            });
+
+            it('admits every one of them unchanged under a primary key that is not an increment', () => {
+                // A `'uuid'` strategy stores identifiers in a `varchar` column that binds any string at all,
+                // and a uuid-SHAPE test here would refuse real rows under a custom `EntityIdStrategy` whose
+                // `decodeId` yields something other than a canonical uuid. Admitting is therefore the
+                // reasoned answer rather than a gap, and the ownership-and-channel predicate is untouched
+                // either way.
+                for (const candidate of ['0x10', '1e3', '1.5', '', 'T_100', '9'.repeat(40)]) {
+                    expect(isAddressableReorderListId(candidate, 'uuid')).toBe(true);
+                }
+                expect(isAddressableReorderListId(2147483648, 'uuid')).toBe(true);
+            });
+
+            it('admits every one of them unchanged where no primary-key type is resolvable', () => {
+                expect(isAddressableReorderListId(2147483648, undefined)).toBe(true);
+                expect(isAddressableReorderListId('T_100', undefined)).toBe(true);
+            });
+        });
+
+        describe('the primary-key type, resolved the way the platform resolves it', () => {
+            for (const placement of ['entityOptions', 'deprecated-top-level'] as const) {
+                it(`reads the configured strategy from the ${placement} key`, async () => {
+                    // Both keys are read because `bootstrap` reads both — `entityOptions.entityIdStrategy ??
+                    // entityIdStrategy` — and `entityOptions.entityIdStrategy` is optional on the runtime
+                    // configuration precisely so a deployment may still configure the deprecated one. Reading
+                    // only the current key would silently disable the guard on such a deployment.
+                    const scoped = new ReorderListService(
+                        harness.connection,
+                        harness.productVariantService as unknown as ProductVariantService,
+                        harness.listQueryBuilder as unknown as ListQueryBuilder,
+                        requestContextCache,
+                        options,
+                        configReportingPrimaryKeyType('increment', placement),
+                    );
+
+                    expect(await scoped.getReorderList(ctx, 2147483648)).toBeNull();
+                    expect(pluginStatements(harness)).toEqual([]);
+                });
+            }
+
+            it('admits the identifier where the configuration reports no strategy at all', async () => {
+                const scoped = new ReorderListService(
+                    harness.connection,
+                    harness.productVariantService as unknown as ProductVariantService,
+                    harness.listQueryBuilder as unknown as ListQueryBuilder,
+                    requestContextCache,
+                    options,
+                    configReportingPrimaryKeyType(undefined),
+                );
+
+                await scoped.getReorderList(ctx, 2147483648);
+
+                expect(pluginStatements(harness)).toHaveLength(1);
+            });
+
+            it('admits the identifier where no configuration was supplied to the instance', async () => {
+                // This is the shape every other block in this file constructs, and the one the migration
+                // end-to-end suite constructs against a bare data source. It is asserted rather than assumed,
+                // because it is the reason none of those tests changed.
+                await service.getReorderList(ctx, LIST_ID);
+
+                expect(pluginStatements(harness)).toHaveLength(1);
+            });
+        });
+
+        for (const { label, id: unaddressable } of UNADDRESSABLE_IDS) {
+            describe(`${label}, on each of the six identifier-addressing operations`, () => {
+                it('answers the single read with a bare null, issuing no statement', async () => {
+                    // The published description of this field is "NULL — never an error", so an `errors` entry
+                    // would breach the contract whatever its code. `null` is also what an unknown identifier
+                    // and another buyer's identifier answer, so the three stay indistinguishable.
+                    const result = await incrementScoped.getReorderList(ctx, unaddressable);
+
+                    expect(result).toBeNull();
+                    expect(pluginStatements(harness)).toEqual([]);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers the rename with the list not-found result, opening no transaction', async () => {
+                    const result = await incrementScoped.updateReorderList(ctx, {
+                        id: unaddressable,
+                        name: 'Pantry',
+                    });
+
+                    expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                    expect(pluginStatements(harness)).toEqual([]);
+                    expect(harness.transactionsOpened).toBe(0);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers the delete with the list not-found result, opening no transaction', async () => {
+                    const result = await incrementScoped.deleteReorderList(ctx, unaddressable);
+
+                    expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                    expect(pluginStatements(harness)).toEqual([]);
+                    expect(harness.transactionsOpened).toBe(0);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers an add addressed at that list with the list not-found result, reading no variant', async () => {
+                    const result = await incrementScoped.addItemToReorderList(ctx, {
+                        reorderListId: unaddressable,
+                        productVariantId: LIVE_VARIANT_ID,
+                        quantity: 1,
+                    });
+
+                    expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                    expect(pluginStatements(harness)).toEqual([]);
+                    expect(harness.transactionsOpened).toBe(0);
+                    // The catalogue is not consulted for a list the caller cannot reach, which is the same
+                    // ordering rule that governs an unknown list identifier.
+                    expect(harness.productVariantService.findOne).not.toHaveBeenCalled();
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers an add carrying that variant with the published variant message, asking the catalogue nothing', async () => {
+                    const failure = await captureRejection(() =>
+                        incrementScoped.addItemToReorderList(ctx, {
+                            reorderListId: LIVE_LIST_ID,
+                            productVariantId: unaddressable,
+                            quantity: 1,
+                        }),
+                    );
+
+                    // The identical refusal an unresolvable variant already produces — same key, same
+                    // interpolated identifier — so the two are indistinguishable to a caller.
+                    expect(failure).toBeInstanceOf(UserInputError);
+                    expect((failure as UserInputError).message).toBe(VARIANT_NOT_FOUND_KEY);
+                    expect((failure as UserInputError).variables).toEqual({ id: String(unaddressable) });
+                    // Not calling the collaborator is the point: it would hand the value straight to a
+                    // statement of its own, outside this service's control.
+                    expect(harness.productVariantService.findOne).not.toHaveBeenCalled();
+                    // The list admission read is expected and is the only statement; nothing is written and
+                    // the line table is never addressed.
+                    expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
+                    expect(statementsAgainst(harness, 'ReorderListLine')).toEqual([]);
+                    expect(writeStatements(harness)).toEqual([]);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers an adjust addressed at that list with the list not-found result, opening no transaction', async () => {
+                    const result = await incrementScoped.adjustReorderListLine(ctx, {
+                        reorderListId: unaddressable,
+                        lineId: LIVE_LINE_ID,
+                        quantity: 2,
+                    });
+
+                    expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                    expect(result).not.toBeInstanceOf(ReorderListLineNotFoundError);
+                    expect(pluginStatements(harness)).toEqual([]);
+                    expect(harness.transactionsOpened).toBe(0);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers an adjust carrying that line with the line not-found result, once the list is admitted', async () => {
+                    const result = await incrementScoped.adjustReorderListLine(ctx, {
+                        reorderListId: LIVE_LIST_ID,
+                        lineId: unaddressable,
+                        quantity: 2,
+                    });
+
+                    // The line-level not-found, and it is only reachable because the list was admitted first:
+                    // a caller who cannot reach the list learns nothing about which of its lines exist.
+                    expect(result).toBeInstanceOf(ReorderListLineNotFoundError);
+                    expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
+                    expect(statementsAgainst(harness, 'ReorderListLine')).toEqual([]);
+                    expect(writeStatements(harness)).toEqual([]);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers a remove addressed at that list with the list not-found result, opening no transaction', async () => {
+                    const result = await incrementScoped.removeReorderListLine(ctx, {
+                        reorderListId: unaddressable,
+                        lineId: LIVE_LINE_ID,
+                    });
+
+                    expect(result).toBeInstanceOf(ReorderListNotFoundError);
+                    expect(result).not.toBeInstanceOf(ReorderListLineNotFoundError);
+                    expect(pluginStatements(harness)).toEqual([]);
+                    expect(harness.transactionsOpened).toBe(0);
+                    expect(loggedErrors).toEqual([]);
+                });
+
+                it('answers a remove carrying that line with the line not-found result, once the list is admitted', async () => {
+                    const result = await incrementScoped.removeReorderListLine(ctx, {
+                        reorderListId: LIVE_LIST_ID,
+                        lineId: unaddressable,
+                    });
+
+                    expect(result).toBeInstanceOf(ReorderListLineNotFoundError);
+                    expect(rowLookupsAgainst(harness, 'ReorderList')).toHaveLength(1);
+                    expect(statementsAgainst(harness, 'ReorderListLine')).toEqual([]);
+                    expect(writeStatements(harness)).toEqual([]);
+                    expect(loggedErrors).toEqual([]);
+                });
+            });
+        }
+
+        describe('the precedence the guard must not disturb', () => {
+            it('refuses an unauthenticated write as forbidden rather than as not-found', async () => {
+                // The session guard runs first and keeps running first. A caller with no session learns that
+                // they are not authorised, never whether the identifier they sent could address anything.
+                const anonymous = createCtx({ anonymous: true });
+
+                const thrown = await captureRejection(() =>
+                    incrementScoped.deleteReorderList(anonymous, 2147483648),
+                );
+
+                expect(thrown).toBeInstanceOf(ForbiddenError);
+                expect(pluginStatements(harness)).toEqual([]);
+            });
+
+            it('answers an unauthenticated single read with the same null it already answers', async () => {
+                const anonymous = createCtx({ anonymous: true });
+
+                expect(await incrementScoped.getReorderList(anonymous, 2147483648)).toBeNull();
+                expect(pluginStatements(harness)).toEqual([]);
+            });
+
+            it('refuses a malformed name before it considers the identifier', async () => {
+                // Request-level input validation keeps its precedence, so a rename carrying both faults is
+                // answered as the input error a caller can act on rather than as a not-found.
+                const thrown = await captureRejection(() =>
+                    incrementScoped.updateReorderList(ctx, { id: 2147483648, name: '   ' }),
+                );
+
+                expect(thrown).toBeInstanceOf(UserInputError);
+                expect(pluginStatements(harness)).toEqual([]);
+                expect(harness.transactionsOpened).toBe(0);
+            });
+
+            it('refuses a malformed quantity before it considers the identifier', async () => {
+                const thrown = await captureRejection(() =>
+                    incrementScoped.adjustReorderListLine(ctx, {
+                        reorderListId: 2147483648,
+                        lineId: LIVE_LINE_ID,
+                        quantity: 0,
+                    }),
+                );
+
+                expect(thrown).toBeInstanceOf(UserInputError);
+                expect((thrown as UserInputError).message).toBe(QUANTITY_MUST_BE_POSITIVE_KEY);
+                expect(pluginStatements(harness)).toEqual([]);
+                expect(harness.transactionsOpened).toBe(0);
+            });
+        });
+
+        describe('the identifiers that were always addressable, which must be untouched', () => {
+            it('reads the row an in-range identifier addresses, with the full predicate intact', async () => {
+                const result = await incrementScoped.getReorderList(ctx, LIVE_LIST_ID);
+
+                expect(result).toBeInstanceOf(ReorderList);
+                const lookups = pluginStatements(harness);
+                expect(lookups).toHaveLength(1);
+                expect(lookups[0].findOptions?.where).toEqual({
+                    id: LIVE_LIST_ID,
+                    customerId: CUSTOMER_ID,
+                    channelId: CHANNEL_ID,
+                });
+            });
+
+            it('still issues its statement for the largest identifier the column holds', async () => {
+                // The finding's own control, kept as one: the ceiling is inside the range, so the guard must
+                // let it reach the statement and the statement must answer for itself.
+                const result = await incrementScoped.getReorderList(ctx, CEILING_ID);
+
+                expect(result).toBeNull();
+                const lookups = pluginStatements(harness);
+                expect(lookups).toHaveLength(1);
+                expect((lookups[0].findOptions?.where as Record<string, unknown>).id).toBe(CEILING_ID);
+            });
+
+            it('still consults the catalogue for an in-range variant identifier', async () => {
+                await incrementScoped.addItemToReorderList(ctx, {
+                    reorderListId: LIVE_LIST_ID,
+                    productVariantId: LIVE_VARIANT_ID,
+                    quantity: 1,
+                });
+
+                expect(harness.productVariantService.findOne).toHaveBeenCalledTimes(1);
+                expect(harness.productVariantService.findOne).toHaveBeenCalledWith(
+                    expect.anything(),
+                    LIVE_VARIANT_ID,
+                    [],
+                );
+            });
+
+            it('still writes the line an in-range line identifier addresses', async () => {
+                const result = await incrementScoped.adjustReorderListLine(ctx, {
+                    reorderListId: LIVE_LIST_ID,
+                    lineId: LIVE_LINE_ID,
+                    quantity: 2,
+                });
+
+                expect(result).toBeInstanceOf(ReorderList);
+                expect(statementsOfKind(harness, 'ReorderListLine', 'update')).toHaveLength(1);
+            });
         });
     });
 });
