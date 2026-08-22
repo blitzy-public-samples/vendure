@@ -20,10 +20,12 @@ import {
 import { DashboardPlugin } from '@vendure/dashboard/plugin';
 import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
 import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
+import { ReorderPlugin } from '@vendure/reorder-plugin';
 import { TelemetryPlugin } from '@vendure/telemetry-plugin';
 import 'dotenv/config';
 import path from 'path';
 import { DataSourceOptions } from 'typeorm';
+
 import { NavModifierPlugin } from './test-plugins/nav-modifier-plugin/nav-modifier-plugin';
 // import { FieldTestPlugin } from './test-plugins/field-test/field-test-plugin';
 import { ReviewsPlugin } from './test-plugins/reviews/reviews-plugin';
@@ -96,7 +98,63 @@ export const devConfig: VendureConfig = {
     dbConnectionOptions: {
         synchronize: false,
         logging: false,
-        migrations: [path.join(__dirname, 'migrations/*.ts')],
+        // FEATURE-001-01: the ONE clause this feature appends here. `ReorderPlugin` owns its migration inside
+        // its own package, so it is registered from there rather than copied into this directory — a glob at
+        // the plugin's own `src/migrations/`, in the same form as the pattern beside it. This repository is a
+        // source checkout, which is why the pattern names `src/migrations/*.ts`; an installed package carries
+        // only the compiled layout and names `lib/src/migrations/*.js` instead, as the plugin's README
+        // records. Exactly one pattern is named, because two patterns matching the same migration under two
+        // layouts would hand TypeORM two migrations of one name, which
+        // `MigrationExecutor.checkForDuplicateMigrations` rejects outright rather than degrading.
+        //
+        // The platform's own `runMigrations` and `revertLastMigration` (`packages/core/src/migrate.ts:L40`
+        // and `:L89`) are what apply and reverse it — the pair the plugin's README documents, and the pair
+        // this plugin's own e2e suites call directly.
+        //
+        // `packages/dev-server/migration.ts`'s `run` and `revert` subcommands wrap that same pair, with one
+        // PRE-EXISTING caveat that predates this feature and is not this feature's to fix, since that file is
+        // outside the one clause this change is permitted. Under this repository's type-checking `ts-node` it
+        // does not compile at all: `migration.ts(16,13): error TS2345`, because commander's `action` accepts
+        // `void | Promise<void>` while `runMigrations` returns `Promise<string[]>`. Measured remedies, in
+        // order of preference: call `runMigrations`/`revertLastMigration` from `@vendure/core` directly, which
+        // is what this plugin's own e2e suites do and which depends on neither of the following; or run the
+        // subcommand with `TS_NODE_TRANSPILE_ONLY=true`, which additionally needs `packages/dashboard` to have
+        // been built, because this file imports `@vendure/dashboard/plugin`.
+        //
+        // Whichever route is taken, every migration connection is forced to `synchronize: false` by the
+        // platform itself (`packages/core/src/migrate.ts:L197-L204`) whatever this object declares. This
+        // harness ships no core
+        // migrations of its own — the pattern above names a directory that does not exist — so its schema
+        // comes from the schema builder, and `packages/dev-server/index.ts` runs `runMigrations` before
+        // `bootstrap`: on an engine other than the one the plugin's migration was generated against, that call
+        // reports its failure through `process.exitCode` rather than by throwing (`migrate.ts:L52-L59`).
+        //
+        // This harness's own thin CLI wrapper over that pair, `packages/dev-server/migration.ts`, needs two
+        // things before it can drive them in a checkout, and both PREDATE this feature: that file is
+        // byte-identical to the gate-E1 baseline commit. Its `run` subcommand hands commander an action
+        // returning `Promise<string[]>` (`migration.ts:L16-L18`) where commander accepts only `void` or
+        // `Promise<void>` (`commander/typings/index.d.ts:L516`), so ts-node's checker refuses the whole
+        // module — `migration.ts(16,13): error TS2345` — and with it BOTH subcommands;
+        // `TS_NODE_TRANSPILE_ONLY=true` bypasses that check, after which the wrapper does drive the two
+        // helpers above. It also loads this file, whose `@vendure/dashboard/plugin`,
+        // `@vendure/graphiql-plugin` and `@vendure/telemetry-plugin` imports resolve only to build output
+        // that `lerna run ci` does not produce — none of those three declares a `ci` script — so a full
+        // workspace build is the second thing. Correcting the first would mean editing `migration.ts`,
+        // and this file is the only one outside `packages/reorder-plugin/` this feature may touch, so that
+        // sibling is left exactly as it is.
+        //
+        // What the boot then does depends on the engine, and the two cases are NOT the same. `getDbConfig()`
+        // is spread over this object, and its `postgres`, `sqlite` and `mysql`/`mariadb`/default branches each
+        // set `synchronize: true` — so on those four the schema builder still provisions the schema and the
+        // failed migration costs nothing but a non-zero exit code. Its `sqljs` branch sets no `synchronize` at
+        // all, so the `false` declared above stays effective there: a failed migration on sql.js leaves the
+        // schema EMPTY and the boot proceeds against it, which surfaces as a missing-table error on first use
+        // rather than as a migration failure. The migration-owned flow is exercised by the plugin's own e2e
+        // suites instead, against a schema the migration itself created.
+        migrations: [
+            path.join(__dirname, 'migrations/*.ts'),
+            path.join(__dirname, '../reorder-plugin/src/migrations/*.ts'),
+        ],
         ...getDbConfig(),
     },
     paymentOptions: {
@@ -202,6 +260,14 @@ export const devConfig: VendureConfig = {
         DashboardPlugin.init({
             route: 'dashboard',
             appDir: dashboardAppDir,
+        }),
+        // FEATURE-001-01: Named Reorder Lists with Line Quantities
+        ReorderPlugin.init({
+            maxListsPerCustomer: 25,
+            maxLinesPerList: 200,
+            maxQuantityPerLine: 999,
+            defaultReorderListsPageSize: 25,
+            defaultReorderListLinesPageSize: 50,
         }),
     ],
 };

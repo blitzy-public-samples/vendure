@@ -1,0 +1,8 @@
+{
+    "error": {
+        "reorder-list-line-quantity-above-maximum": "The resulting quantity for this reorder list line would exceed the maximum of { max }",
+        "reorder-list-line-quantity-must-be-positive": "The quantity for a reorder list line must be a positive integer",
+        "reorder-list-name-empty": "The reorder list name must be between 1 and { max } characters once surrounding whitespace is removed and internal whitespace is collapsed, where tab, line feed and carriage return count as whitespace and are accepted, must otherwise contain no control character (U+0000 to U+001F, which includes vertical tab U+000B and form feed U+000C, and U+007F to U+009F), no zero-width space (U+200B) and no byte order mark (U+FEFF), and must still be within { max } characters once Unicode-normalised",
+        "reorder-list-variant-not-found": "No ProductVariant with the id \"{ id }\" could be found in the active Channel"
+    }
+}

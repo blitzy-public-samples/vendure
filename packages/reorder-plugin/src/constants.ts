@@ -1,0 +1,100 @@
+/**
+ * Module-level constants for `@vendure/reorder-plugin`.
+ *
+ * This module has no imports, by design. It is read by the plugin class, by the reorder-list
+ * service and by the pure name-canonicalisation helpers, so keeping it dependency-free guarantees
+ * that none of those modules can form an import cycle through it, and that a unit specification can
+ * import a single value without pulling the platform in behind it. Every shipped first-party plugin
+ * declares its constants the same way — see `packages/harden-plugin/src/constants.ts`.
+ */
+
+/**
+ * @description
+ * The logger context supplied to every `Logger` call this plugin makes. A stable context string is
+ * what lets an operator identify this plugin's output and filter the server log down to it.
+ *
+ * Filtering is the whole of the promise. The platform's default logger applies one log level to the
+ * whole server and the logger interface defines no per-context threshold, so a stable context does
+ * not by itself let an operator raise or lower the level for this plugin alone; a custom logger
+ * implementation, or a downstream log pipeline, can key such a policy off this value.
+ *
+ * The value is the plugin class name, with no suffix and no surrounding brackets, which is the
+ * convention each shipped first-party plugin follows in its own `src/constants.ts`.
+ *
+ * @example
+ * ```ts
+ * Logger.warn(`Repaired a stale lineCount on reorder list ${String(listId)}`, loggerCtx);
+ * ```
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @since 3.8.0
+ */
+export const loggerCtx = 'ReorderPlugin';
+
+/**
+ * @description
+ * The dependency-injection token that the validated options are bound to. `ReorderPlugin.init()` captures
+ * and validates the values a deployment supplied, merges the declared default for every key it omitted, and
+ * the plugin registers the frozen result as a provider against this token; each consumer reads it by
+ * injecting the token.
+ *
+ * The bound value is a `ResolvedReorderPluginOptions` — every key present and validated — rather than the
+ * partial {@link ReorderPluginOptions} a caller passes to `init()`, which is what lets a consumer read a
+ * bound without restating its default.
+ *
+ * @example
+ * ```ts
+ * constructor(@Inject(REORDER_PLUGIN_OPTIONS) private options: ResolvedReorderPluginOptions) {}
+ * ```
+ *
+ * It is a `Symbol` rather than a string so that the token cannot collide with one declared by
+ * another plugin — a string token is only as unique as its spelling, whereas every `Symbol()` call
+ * produces a distinct value. This too is the convention across the shipped first-party plugins. The
+ * symbol's description is deliberately identical to the exported identifier, so that a provider
+ * resolution failure names the constant a developer then has to go and find.
+ *
+ * That spelling is load-bearing. The provider registration and every injection site must name this
+ * exact identifier, and a mismatch between them is not reported where it is written: it surfaces at
+ * server start as an unresolved-dependency failure from the Nest injector.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @since 3.8.0
+ */
+export const REORDER_PLUGIN_OPTIONS = Symbol('REORDER_PLUGIN_OPTIONS');
+
+/**
+ * @description
+ * The maximum number of Unicode code points either stored form of a reorder list name may contain.
+ * **Both stored values are measured against it**: the display `name`, which is the submitted value
+ * after leading and trailing whitespace has been removed and internal whitespace runs collapsed; and
+ * the derived `nameKey`, that display value NFC-normalised and lower-cased. A name is refused as a
+ * malformed request, with no row written, when either exceeds this bound.
+ *
+ * Both measurements are needed because NFC composition is not guaranteed to shorten a string and can
+ * lengthen one, so a display value inside the bound can still derive a key outside it — 191
+ * repetitions of U+0344 normalise to 382 code points. For a name whose characters NFC leaves alone
+ * the two measurements are equal, which is the ordinary case.
+ *
+ * This is a constant rather than a plugin option, and that is deliberate. 191 is not a product
+ * judgement about how long a list name ought to be; it is an engine ceiling. Both `name` and
+ * `nameKey` on the `reorder_list` table are declared `varchar(191)`, and `nameKey` participates in
+ * the composite unique index over `(customerId, channelId, nameKey)`. 191 is the width at which a
+ * four-byte UTF-8 index stays inside the key-size limit on the MySQL and MariaDB engines that the
+ * project's existing end-to-end jobs exercise.
+ *
+ * A configurable bound above the column width would convert a validation failure a buyer can act on
+ * into an opaque driver error on the three engines that enforce a declared width — and on the SQLite
+ * family, which treats a width as an affinity rather than a constraint, into an over-long value stored
+ * whole. A bound below it would restrict what no engine restricts. The option would therefore carry
+ * exactly one legal value — the column's own width — and an option with one legal value offers a
+ * deployment nothing except a way to break itself.
+ *
+ * One number consequently serves three places: this validation bound, the two `varchar(191)` columns
+ * created by the additive migration, and the boundary the unit specification asserts at 190, 191 and
+ * 192 characters. Changing it means changing both columns in a further migration; there is no
+ * `maxListNameLength` option to change instead.
+ *
+ * @docsCategory core plugins/ReorderPlugin
+ * @since 3.8.0
+ */
+export const MAX_LIST_NAME_LENGTH = 191;
